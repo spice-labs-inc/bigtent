@@ -1,0 +1,33 @@
+[package]
+name = "bigtent"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.79"
+regex = "1.10.3"
+rbase64 = "2.0.3"
+md5 = "0.7.0"
+hex = "0.4.3"
+shellexpand = "3.1.0"
+
+# Web Framework stuff
+tokio = { version = "1.36.0", features = ["full"] }
+axum = "0.7.4"
+axum-macros = "0.4.1"
+url = "2.5.0"
+serde = {version = "1.0.196", features = ["std", "derive"]}
+serde_json = "1.0.113"
+im = {version = "15.1.0", features = ["serde"]}
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"]}
+tower-http = { version = "0.5.1", features = ["trace"] }
+
+# Execution stuff
+lazy_static = "1.4.0"
+async-channel = "2.2.0"
+arc-swap = "1.6.0"
+clap = { version = "4.5.0", features = ["derive"] }
+toml = "0.8.10"
