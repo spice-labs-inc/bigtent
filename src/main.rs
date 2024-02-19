@@ -29,7 +29,7 @@ use tokio::{
 };
 use toml::{Table, Value};
 use tower_http::trace::{self, TraceLayer};
-use tracing::{info, instrument, Level};
+use tracing::{instrument, Level};
 
 #[derive(Parser, Debug, Default, Clone, PartialEq)]
 #[command(version, about, long_about = None)]
@@ -123,10 +123,10 @@ impl EntriesAndFiles {
         find_entry(hash, &self.entries)
     }
 
-    pub fn bytes_for(&self, eo: &EntryOffset) -> Result<Vec<u8>> {
+    pub fn bytes_for(&self, eo: &EntryOffset) -> Result<String> {
         let mut fp = self.get_file_pointer();
-        
-        let content: Result<Vec<u8>> = fp
+
+        let content: Result<String> = fp
             .seek(std::io::SeekFrom::Start(eo.loc))
             .map_err(|e| e.into())
             .and({
@@ -144,16 +144,15 @@ impl EntriesAndFiles {
         Ok(content?)
     }
 
-
-    pub async fn find_item(&self, item: u128) -> Option<Vec<u8>> {
+    pub async fn find_item(&self, item: u128) -> Option<String> {
         let eo = self.find(item)?;
-        let (tx, rx) = oneshot::channel::<Result<Vec<u8>>>();
+        let (tx, rx) = oneshot::channel::<Result<String>>();
         LOOKUP_TX.send((eo, tx)).await.ok()?;
         let answer = rx.await.ok()?.ok();
         answer
     }
 
-    pub async fn lazy_find(&self, mut items: Vec<u128>) -> Result<Vec<u8>> {
+    pub async fn lazy_find(&self, mut items: Vec<u128>) -> Result<String> {
         let lazy = std::iter::from_fn(move || {
             let item = items.pop()?;
             Some(self.find(item))
@@ -161,7 +160,7 @@ impl EntriesAndFiles {
 
         match lazy.skip_while(|p| p.is_none()).next() {
             Some(Some(eo)) => {
-                let (tx, rx) = oneshot::channel::<Result<Vec<u8>>>();
+                let (tx, rx) = oneshot::channel::<Result<String>>();
                 LOOKUP_TX.send((eo, tx)).await?;
                 let answer = rx.await??;
                 Ok(answer)
@@ -192,7 +191,7 @@ impl EntriesAndFiles {
                         println!("Cnt {}", cnt);
                     }
                     // let mut line = String::new();
-                    
+
                     reader.read_until(b'\n', &mut buf)?;
                     let bl = buf.len();
                     if bl == 0 {
@@ -201,7 +200,7 @@ impl EntriesAndFiles {
                     }
 
                     let mut idx = 0;
-                    
+
                     let comma = loop {
                         if idx >= bl {
                             bail!("Unable to find comma in {}", String::from_utf8_lossy(&buf));
@@ -248,7 +247,7 @@ impl EntriesAndFiles {
     }
 }
 
-fn decode_line(line: &str) -> Result<(u128, String, Vec<u8>)> {
+fn decode_line(line: &str) -> Result<(u128, String, String)> {
     let comma = line.find(',').ok_or(anyhow::Error::msg("no comma found"))?;
     let sep = line
         .find("||,||")
@@ -257,13 +256,10 @@ fn decode_line(line: &str) -> Result<(u128, String, Vec<u8>)> {
     let path = &line[(comma + 1)..sep];
     let rest = &line[(sep + 5)..(line.len() - 1)];
 
-    let decoded = match rbase64::decode(rest) {
-        Ok(v) => v,
-        Err(e) => {bail!(format!("Decode error {}", e));}
-    };
+    let decoded = rest;
 
     let hash_i = u128::from_str_radix(hash, 16)?;
-    Ok((hash_i, path.to_string(), decoded))
+    Ok((hash_i, path.to_string(), decoded.to_string()))
 }
 
 fn find_entry(to_find: u128, offsets: &[EntryOffset]) -> Option<EntryOffset> {
@@ -316,12 +312,12 @@ lazy_static! {
     static ref ENTRIES_AND_FILES: ArcSwap<EntriesAndFiles> =
         ArcSwap::new(Arc::new(EntriesAndFiles::new(None, 1).unwrap()));
     static ref LOOKUP_CHANS: (
-        async_channel::Sender<(EntryOffset, Sender<Result<Vec<u8>>>)>,
-        async_channel::Receiver<(EntryOffset, Sender<Result<Vec<u8>>>)>
+        async_channel::Sender<(EntryOffset, Sender<Result<String>>)>,
+        async_channel::Receiver<(EntryOffset, Sender<Result<String>>)>
     ) = async_channel::bounded(100);
-    static ref LOOKUP_TX: async_channel::Sender<(EntryOffset, Sender<Result<Vec<u8>>>)> =
+    static ref LOOKUP_TX: async_channel::Sender<(EntryOffset, Sender<Result<String>>)> =
         LOOKUP_CHANS.0.clone();
-    static ref LOOKUP_RX: async_channel::Receiver<(EntryOffset, Sender<Result<Vec<u8>>>)> =
+    static ref LOOKUP_RX: async_channel::Receiver<(EntryOffset, Sender<Result<String>>)> =
         LOOKUP_CHANS.1.clone();
     static ref SERVICE_THREADS: ArcSwap<Vec<JoinHandle<()>>> = ArcSwap::new(Arc::new(Vec::new()));
 }
@@ -342,7 +338,7 @@ fn build_json_vec(instr: Vec<u8>) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], instr).into_response()
 }
 
-fn _build_json_str(instr: String) -> Response {
+fn build_json_str(instr: String) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], instr).into_response()
 }
 
@@ -369,7 +365,7 @@ fn check_md5(it: Option<&String>) -> Option<u128> {
     }
 }
 
-async fn lazy_find(what: Vec<u128>) -> Result<Vec<u8>> {
+async fn lazy_find(what: Vec<u128>) -> Result<String> {
     ENTRIES_AND_FILES.load().lazy_find(what).await
 }
 
@@ -400,7 +396,7 @@ async fn serve_purl(Path(purl): Path<String>) -> Result<Response, StatusCode> {
 
     let found = lazy_find(totry).await;
     match found {
-        Ok(found) => Ok(build_json_vec(found)),
+        Ok(found) => Ok(build_json_str(found)),
         _ => Ok(not_found()),
     }
 }
@@ -418,7 +414,7 @@ async fn serve_gitoid(Path(path): Path<String>) -> Result<Response, StatusCode> 
 
     let found = lazy_find(totry).await;
     match found {
-        Ok(found) => Ok(build_json_vec(found)),
+        Ok(found) => Ok(build_json_str(found)),
         _ => Ok(not_found()),
     }
 }
@@ -428,7 +424,7 @@ async fn find_items_and_parents(inp: Vec<String>) -> HashMap<String, SJValue> {
     let mut ret = HashMap::new();
     let mut found = IMHashMap::new();
     for s in inp.iter() {
-       found = found.update(s.to_string(), false);
+        found = found.update(s.to_string(), false);
     }
 
     while found.values().any(|v| !v) {
@@ -438,7 +434,7 @@ async fn find_items_and_parents(inp: Vec<String>) -> HashMap<String, SJValue> {
                 let mut done = false;
 
                 if let Some(inner) = it {
-                    if let Ok(json) = serde_json::from_slice::<SJValue>(&inner) {
+                    if let Ok(json) = serde_json::from_str::<SJValue>(&inner) {
                         done = true;
                         if let Some(contained_by) = json.get("containedBy") {
                             if let Some(items) = contained_by.as_array() {
@@ -530,12 +526,11 @@ async fn main() -> Result<()> {
                 None => break,
                 Some(_) => {
                     println!("Got sighup!");
-                    thread::spawn(|| {
-                    match update_entries_and_files() {
+                    thread::spawn(|| match update_entries_and_files() {
                         Ok(_) => println!("Successfully updated!"),
 
                         Err(e) => println!("failed to update {}", e),
-                    }});
+                    });
                 }
             }
         }
@@ -551,6 +546,9 @@ async fn main() -> Result<()> {
 
     // build our application with a single route
     let app = Router::new()
+        .route("/omnibor/purl/*path", get(serve_purl))
+        .route("/omnibor/bulk", post(serve_aggregate))
+        .route("/omnibor/*path", get(serve_gitoid))
         .route("/purl/*path", get(serve_purl))
         .route("/bulk", post(serve_aggregate))
         .route("/*path", get(serve_gitoid))
