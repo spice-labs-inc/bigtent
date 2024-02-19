@@ -22,4 +22,7 @@ To create an OmniBOR Corpus, use [Goat Rodeo](https://gitlab.com/spicelabs1/goat
 
 ## Stuff
 
+[Matrix Discussion](https://matrix.to/#/#spice-labs:matrix.org)
+
+
 License: Apache 2.0
