@@ -27,18 +27,6 @@ pub struct Args {
     /// the port to bind to
     #[arg(long, short)]
     port: Option<u16>,
-
-    /// Should an index be created (must also specify --source and --out)
-    #[arg(long, action)]
-    index: bool,
-
-    /// The source of the index
-    #[arg(long)]
-    source: Option<String>,
-
-    /// the out destination for the index
-    #[arg(long)]
-    out: Option<String>,
 }
 
 impl Args {
@@ -51,32 +39,6 @@ impl Args {
 
     pub fn num_threads(&self) -> u16 {
         self.threads.unwrap_or(7)
-    }
-
-    pub fn build_index(&self) -> bool {
-        self.index
-    }
-
-    pub fn index_source(&self) -> Result<File> {
-      match &self.source {
-        Some(name) => {
-          let expanded_name = shellexpand::tilde(name).to_string();
-          let ret = File::open(expanded_name)?;
-          Ok(ret)
-        }
-        None => bail!("No corpus source file specified for indexing with `--source` option")
-      }
-    }
-
-    pub fn index_dest(&self) -> Result<String> {
-      match &self.out {
-        Some(name) => {
-          let expanded_name = shellexpand::tilde(name).to_string();
-         
-          Ok(expanded_name)
-        }
-        None => bail!("No destination index file specified for indexing with `--out` option")
-      }
     }
 
     pub fn conf_file(&self) -> Result<String> {

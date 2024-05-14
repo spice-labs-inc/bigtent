@@ -4,26 +4,24 @@ use flume::{Receiver, Sender};
 use im::HashSet;
 use pipe::PipeWriter;
 use scopeguard::defer;
-use serde_json::Value as SJValue;
+use serde_cbor::Value;
 use std::{
-    fs::File,
-    io::{BufRead, BufReader, BufWriter, Read, Seek, Write},
-    sync::{atomic::AtomicU32, Arc, Mutex},
-    thread::{self, JoinHandle},
-    time::Instant,
+    fs::File, io::{BufReader, BufWriter, Read, Write}, path::PathBuf, sync::{atomic::AtomicU32, Arc, Mutex}, thread::{self, JoinHandle}, time::Instant
 };
 use thousands::Separable;
-use toml::{map::Map, Table, Value};
-
+use toml::{map::Map, Table};
+// use num_traits::ops::bytes::ToBytes;
 use crate::{
-    config::Args,
-    util::{find_entry, md5hash_str},
+    config::Args, envelopes::EntryEnvelope, rodeo::GoatRodeoBundle, util::{as_array, as_obj, as_str, cbor_to_json_str, find_entry, md5hash_str}
 };
+
+pub type MD5Hash = [u8; 16];
 
 #[derive(Debug)]
 pub struct Index {
     threads: Mutex<Vec<JoinHandle<()>>>,
-    path_and_index: ArcSwap<(String, Vec<EntryOffset>)>,
+    path_and_index: ArcSwap<GoatRodeoBundle>,
+
     args: Args,
     config_table: ArcSwap<Table>,
     // oc_path: ArcSwap<String>,
@@ -32,47 +30,55 @@ pub struct Index {
 }
 
 impl Index {
-    pub fn find(&self, hash: u128) -> Option<EntryOffset> {
-        find_entry(hash, &self.path_and_index.load().1)
+    pub fn find(&self, hash: MD5Hash) -> Result<Option<EntryOffset>> {
+        let index = self.path_and_index.load().get_index()?;
+        Ok(find_entry(hash, &index))
     }
 
-    pub fn line_for_hash_from_file<R: Seek + Read>(
-        &self,
-        hash: u128,
-        file: &mut BufReader<R>,
-    ) -> Result<String> {
-        let entry_offset = match self.find(hash) {
+    pub fn entry_for(&self, _file_hash: u64, _offset: u64) -> Result<(EntryEnvelope, Value)> {
+        todo!()
+    }
+    pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<(EntryEnvelope, Value)>> {
+        match index_loc {
+            IndexLoc::Loc { offset, file_hash } => Ok(vec![self.entry_for(*file_hash, *offset)?]),
+            IndexLoc::Chain(offsets) => {
+                let mut ret = vec![];
+                for offset in offsets {
+                    let mut some = self.data_for_entry_offset(&offset)?;
+                    ret.append(&mut some);
+                }
+                Ok(ret)
+            }
+        }
+    }
+
+    pub fn data_for_hash(&self, hash: MD5Hash) -> Result<Vec<(EntryEnvelope, Value)>> {
+        let entry_offset = match self.find(hash)? {
             Some(eo) => eo,
-            _ => bail!(format!("Could not find entry for hash {:x}", hash)),
+            _ => bail!(format!("Could not find entry for hash {:x?}", hash)),
         };
 
-        file.seek(std::io::SeekFrom::Start(entry_offset.loc))?;
-
-        let mut ret = String::new();
-        file.read_line(&mut ret)?;
-        Ok(match ret.find("||,||") {
-            Some(offset) => ret[offset + 5..].to_string(),
-            _ => ret,
-        })
+        self.data_for_entry_offset(&entry_offset.loc)
     }
 
-    pub fn line_for_str_from_file<R: Seek + Read>(
-        &self,
-        data: &str,
-        file: &mut BufReader<R>,
-    ) -> Result<String> {
-        self.line_for_hash_from_file(md5hash_str(data), file)
+    pub fn line_for_hash(&self, hash: MD5Hash) -> Result<Value> {
+        let mut lines = self.data_for_hash(hash)?;
+        if lines.len() == 1 {
+            let ret = lines.pop().unwrap(); // we know this is okay because we just tested len
+            return Ok(ret.1);
+        } else {
+            bail!("FIXME -- got a set of hashes and we don't know how to merge yeat!!!")
+        }
     }
 
-    pub fn line_for_hash(&self, hash: u128) -> Result<String> {
-        let file = File::open(&*self.path_and_index.load().0)?;
-        let mut buf = BufReader::new(file);
-        self.line_for_hash_from_file(hash, &mut buf)
+    pub fn line_for_key(&self, data: &str) -> Result<Value> {
+        let md5_hash = md5hash_str(data);
+        self.line_for_hash(md5_hash)
     }
 
-    pub fn line_for_string(&self, data: &str) -> Result<String> {
-        self.line_for_hash(md5hash_str(data))
-    }
+    // pub fn line_for_string(&self, data: &str) -> Result<String> {
+    //     self.line_for_hash(md5hash_str(data))
+    // }
 
     pub fn bulk_serve(&self, data: Vec<String>, dest: PipeWriter) -> Result<()> {
         self.sender
@@ -82,9 +88,9 @@ impl Index {
 
     pub fn do_north_serve(
         &self,
-        data: String,
+        data: Value,
         gitoid: String,
-        hash: u128,
+        hash: MD5Hash,
         dest: PipeWriter,
     ) -> Result<()> {
         self.sender
@@ -111,15 +117,15 @@ impl Index {
         }
     }
 
-    fn contained_by(data: &str) -> Result<HashSet<String>> {
-        let v: SJValue = serde_json::from_str(data)?;
+    fn contained_by(data: &Value) -> Result<HashSet<String>> {
+        let v = data;
         let mut ret = HashSet::new();
 
-        if let Some(obj) = v.as_object() {
-            if let Some(contained_by) = obj.get("containedBy") {
-                if let Some(arr) = contained_by.as_array() {
+        if let Some(obj) = as_obj(v) {
+            if let Some(contained_by) = obj.get(&Value::Text("containedBy".into())) {
+                if let Some(arr) = as_array(contained_by) {
                     for v in arr {
-                        if let Some(gitoid) = v.as_str() {
+                        if let Some(gitoid) = as_str(v) {
                             ret.insert(gitoid.to_string());
                         }
                     }
@@ -130,19 +136,17 @@ impl Index {
         Ok(ret)
     }
 
-    fn north_send(&self, gitoid: String, initial_body: String, tx: PipeWriter) -> Result<()> {
+    fn north_send(&self, gitoid: String, initial_body: Value, tx: PipeWriter) -> Result<()> {
         let start = Instant::now();
-        let file = File::open(&*self.path_and_index.load().0)?;
         let mut br = BufWriter::new(tx);
-        let mut buf = BufReader::new(file);
         let mut found = HashSet::new();
         let mut to_find = Index::contained_by(&initial_body)?;
         found.insert(gitoid.clone());
-        br.write_fmt(format_args!("{{ \"{}\": {}\n", gitoid, initial_body))?;
+        br.write_fmt(format_args!("{{ \"{}\": {:?}\n", gitoid, initial_body))?;
         let cnt = AtomicU32::new(0);
 
         defer! {
-          println!("Sent {} in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(), 
+          println!("Sent {} in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
           Instant::now().duration_since(start));
         }
         fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
@@ -161,9 +165,13 @@ impl Index {
             }
             for this_oid in to_search {
                 found = found.update(this_oid.clone());
-                match self.line_for_str_from_file(&this_oid, &mut buf) {
+                match self.line_for_key(&this_oid) {
                     Ok(item) => {
-                        br.write_fmt(format_args!(",\n \"{}\": [{}]\n", this_oid, item))?;
+                        br.write_fmt(format_args!(
+                            ",\n \"{}\": [{}]\n",
+                            this_oid,
+                            cbor_to_json_str(&item)
+                        ))?;
                         let and_then = Index::contained_by(&item)?;
                         to_find = to_find.union(and_then);
                     }
@@ -180,9 +188,7 @@ impl Index {
     }
 
     fn bulk_send(&self, data: Vec<String>, dest: PipeWriter) -> Result<()> {
-        let file = File::open(&*self.path_and_index.load().0)?;
         let mut br = BufWriter::new(dest);
-        let mut buf = BufReader::new(file);
         let mut first = true;
         br.write(b"{\n")?;
         for v in data {
@@ -190,9 +196,9 @@ impl Index {
                 br.write(b",")?;
             }
             first = false;
-            match self.line_for_str_from_file(&v, &mut buf) {
-                Ok(json) => {
-                    br.write_fmt(format_args!("\"{}\": [{}]\n", v, json))?;
+            match self.line_for_key(&v) {
+                Ok(cbor) => {
+                    br.write_fmt(format_args!("\"{}\": [{}]\n", v, cbor_to_json_str(&cbor)))?;
                 }
                 Err(_) => {
                     br.write_fmt(format_args!("\"{}\": []\n", v))?;
@@ -254,40 +260,39 @@ impl Index {
         Ok(())
     }
 
-    pub fn get_config_table(&self) -> Arc<Map<String, Value>> {
+    pub fn get_config_table(&self) -> Arc<Map<String, toml::Value>> {
         self.config_table.load().clone()
     }
 
     fn info_from_config(
         file_name: &str,
         conf: &Table,
-    ) -> Result<(String, String, Vec<EntryOffset>)> {
-        let oc_path = match conf.get("oc_path") {
-            Some(Value::String(index)) => shellexpand::tilde(index).to_string(),
+    ) -> Result<GoatRodeoBundle> {
+
+        let index_name = match conf.get("bundle_path") {
+            Some(toml::Value::String(index)) => shellexpand::tilde(index).to_string(),
             _ => bail!(format!(
-                "Could not find 'oc_path' key in configuration file {}",
+                "Could not find 'bundle_path' key in configuration file {}",
                 file_name
             )),
         };
 
-        let index_name = match conf.get("oc_index") {
-            Some(Value::String(index)) => shellexpand::tilde(index).to_string(),
-            _ => bail!(format!(
-                "Could not find 'oc_index' key in configuration file {}",
-                file_name
-            )),
+        let envelope_path = PathBuf::from(index_name.clone());
+        let envelope_dir = match envelope_path.parent()  {
+            Some(path) => path.to_path_buf(),
+            None => bail!("Path Bundle '{}' does not have a parent directory", index_name),
         };
 
-        let oc_index = EntryOffset::build_from_index_file(&index_name)?;
-
-        Ok((oc_path, index_name, oc_index))
+        let bundle = GoatRodeoBundle::new(&envelope_dir, &envelope_path);
+        
+        bundle
     }
 
     pub fn rebuild(&self) -> Result<()> {
         let config_table = self.args.read_conf_file()?;
-        let (oc_path, _, oc_index) =
+        let new_bundle =
             Index::info_from_config(&self.args.conf_file()?, &config_table)?;
-        self.path_and_index.store(Arc::new((oc_path, oc_index)));
+        self.path_and_index.store(Arc::new(new_bundle));
         Ok(())
     }
 
@@ -300,12 +305,12 @@ impl Index {
 
         let config_table = args.read_conf_file()?;
 
-        let (oc_path, _, oc_index) = Index::info_from_config(&args.conf_file()?, &config_table)?;
+        let bundle = Index::info_from_config(&args.conf_file()?, &config_table)?;
 
         let ret = Arc::new(Index {
             threads: Mutex::new(vec![]),
             config_table: ArcSwap::new(Arc::new(config_table)),
-            path_and_index: ArcSwap::new(Arc::new((oc_path.clone(), oc_index))),
+            path_and_index: ArcSwap::new(Arc::new(bundle)),
             args: args.clone(),
             receiver: rx.clone(),
             sender: tx.clone(),
@@ -335,43 +340,55 @@ enum IndexMsg {
     Bulk(Vec<String>, PipeWriter),
     North {
         #[allow(dead_code)]
-        hash: u128,
+        hash: MD5Hash,
         gitoid: String,
-        initial_body: String,
+        initial_body: Value,
         tx: PipeWriter,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexLoc {
+    Loc { offset: u64, file_hash: u64 },
+    Chain(Vec<IndexLoc>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct EntryOffset {
-    pub hash: u128,
-    pub loc: u64,
+    pub hash: [u8; 16],
+    pub loc: IndexLoc,
 }
 
 impl EntryOffset {
-    pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
-        writer.write(&self.hash.to_be_bytes())?;
-        writer.write(&self.loc.to_be_bytes())?;
-        Ok(())
-    }
+    // pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+    //     writer.write(&self.hash)?;
+    //     writer.write(&self.loc.to_be_bytes())?;
+    //     Ok(())
+    // }
 
     pub fn read<R: Read>(reader: &mut R) -> Result<EntryOffset> {
         let mut hash_bytes = u128::default().to_be_bytes();
+        let mut file_bytes = u64::default().to_be_bytes();
         let mut loc_bytes = u64::default().to_be_bytes();
         let hl = reader.read(&mut hash_bytes)?;
+        let fl = reader.read(&mut file_bytes)?;
         let ll = reader.read(&mut loc_bytes)?;
-        if hl != hash_bytes.len() || ll != loc_bytes.len() {
+        if hl != hash_bytes.len() || ll != loc_bytes.len() || fl != file_bytes.len() {
             bail!("Failed to read enough bytes for EntryOffset")
         }
         Ok(EntryOffset {
-            hash: u128::from_be_bytes(hash_bytes),
-            loc: u64::from_be_bytes(loc_bytes),
+            hash: hash_bytes,
+            loc: IndexLoc::Loc {
+                offset: u64::from_be_bytes(file_bytes),
+                file_hash: u64::from_be_bytes(file_bytes),
+            },
         })
     }
 
     pub fn build_from_index_file(file_name: &str) -> Result<Vec<EntryOffset>> {
-        // make sure the buffer is a multiple of 24 (the length of the u128 + u64)
-        let mut reader = BufReader::with_capacity(24 * 4096, File::open(file_name)?);
+        // make sure the buffer is a multiple of 24 (the length of the u128 + u64 + u64)
+        let mut reader = BufReader::with_capacity(32 * 4096, File::open(file_name)?);
         let mut stuff = vec![];
 
         loop {

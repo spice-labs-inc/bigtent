@@ -1,25 +1,27 @@
 use anyhow::Result;
 use std::io::{Read, Seek};
 
-use crate::index::EntryOffset;
+use crate::index::{EntryOffset, IndexLoc};
 
 pub struct FileReader<R: Read + Seek> {
     the_file: R,
     buffer: [u8; 4096],
     inner_pos: usize,
     current_buffer_size: isize,
+    file_hash: u64
 }
 
 impl<R> FileReader<R>
 where
     R: Read + Seek,
 {
-    pub fn new(file: R) -> FileReader<R> {
+    pub fn new(file_hash: u64,file: R) -> FileReader<R> {
         return FileReader {
             the_file: file,
             inner_pos: 0,
             current_buffer_size: -1,
             buffer: [0u8; 4096],
+            file_hash
         };
     }
 
@@ -73,7 +75,7 @@ where
             }
 
             if next_char == b'\n' {
-                let hash = build_hash_offset(String::from_utf8(hex)?, the_pos)?;
+                let hash = build_hash_offset(String::from_utf8(hex)?, the_pos, self.file_hash)?;
                 return Ok((Some(hash), false));
             }
 
@@ -105,7 +107,7 @@ where
             cnt += 1;
             if cnt % 100_000 == 0 {
               use thousands::Separable;
-                println!("Loops {} and offset {}", cnt.separate_with_commas(), eoo.map(|e| e.loc).unwrap_or(u64::MAX).separate_with_commas());
+                println!("Loops {}", cnt.separate_with_commas());
             }
         }
 
@@ -113,15 +115,15 @@ where
     }
 }
 
-fn build_hash_offset(hash: String, pos: u64) -> Result<EntryOffset> {
+fn build_hash_offset(hash: String, pos: u64, file: u64) -> Result<EntryOffset> {
     let real_hash = match hash.find(",") {
         Some(x) => hash[..x].to_string(),
         _ => hash,
     };
 
-    let hash_bin = u128::from_str_radix(&real_hash, 16)?;
+    let hash_bin = u128::from_str_radix(&real_hash, 16)?.to_be_bytes();
     Ok(EntryOffset {
         hash: hash_bin,
-        loc: pos,
+        loc: IndexLoc::Loc { offset: pos, file_hash: file },
     })
 }

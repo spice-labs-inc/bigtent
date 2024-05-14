@@ -1,12 +1,8 @@
 use anyhow::{bail, Result};
-
-use bigtent::{config::Args, index::Index, indexer::FileReader, server::run_web_server};
+use bigtent::{config::Args, index::Index,server::run_web_server};
 use clap::Parser;
-
-use scopeguard::defer;
 use signal_hook::{consts::SIGHUP, iterator::Signals};
-use std::{fs::File, io::BufWriter, thread, time::Instant};
-use thousands::Separable;
+use std::{ thread, time::Instant};
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -17,23 +13,7 @@ fn main() -> Result<()> {
 
     println!("Args {:?}, threads {} ", args, args.num_threads(),);
 
-    if args.build_index() {
-        let start = Instant::now();
-        defer! {
-          println!("Building index took {:?}", Instant::now().duration_since(start));
-        }
-        let file = args.index_source()?;
-        let mut indexer = FileReader::new(file);
-        let out = File::create(args.index_dest()?)?;
-        let all = indexer.build_index()?;
-        println!("Build index of {}", all.len().separate_with_commas());
-       
-        let mut bw = BufWriter::new(out);
-
-        for eo in all {
-            eo.write(&mut bw)?;
-        }
-    } else if args.conf_file().is_ok() {
+ if args.conf_file().is_ok() {
         let index_build_start = Instant::now();
         let index = Index::new_arc(args)?;
 
@@ -65,7 +45,7 @@ fn main() -> Result<()> {
 
         run_web_server(index);
     } else {
-        bail!("There must either be indexing with the `--index` option or run the server with the `--conf` option")
+        bail!("run the server with the `--conf` option")
     }
 
     Ok(())

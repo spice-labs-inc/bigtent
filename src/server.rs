@@ -7,7 +7,7 @@ use serde_json::Value as SJValue;
 
 use crate::{
     index::Index,
-    util::{md5hash_str, read_all},
+    util::{cbor_to_json_str, md5hash_str, read_all},
 };
 
 fn parse_body_to_json(request: &Request) -> Result<SJValue> {
@@ -76,31 +76,28 @@ fn basic_bulk_serve(index: &Index, request: &Request) -> Response {
 }
 
 fn north_serve(index: &Index, _request: &Request, path: &str) -> Response {
-  let hash = md5hash_str(path);
-  match index.line_for_hash(hash) {
-      Ok(line) => {
-        let (rx, tx) = pipe::pipe();
-        match index.do_north_serve(line, path.to_string(), hash, tx) {
-          Ok(_) =>
-        Response {
-            status_code: 200,
-            headers: vec![("Content-Type".into(), "application/json".into())],
-            data: ResponseBody::from_reader(rx),
-            upgrade: None,
-        },
-        _ => Response {
-          status_code: 500,
-          headers: vec![],
-          data: ResponseBody::from_string("Failed to serve north"),
-          upgrade: None,
-      }
-      }
-        
-      },
-      _ => rouille::Response::empty_404(),
-  }
+    let hash = md5hash_str(path);
+    match index.line_for_hash(hash) {
+        Ok(line) => {
+            let (rx, tx) = pipe::pipe();
+            match index.do_north_serve(line, path.to_string(), hash, tx) {
+                Ok(_) => Response {
+                    status_code: 200,
+                    headers: vec![("Content-Type".into(), "application/json".into())],
+                    data: ResponseBody::from_reader(rx),
+                    upgrade: None,
+                },
+                _ => Response {
+                    status_code: 500,
+                    headers: vec![],
+                    data: ResponseBody::from_string("Failed to serve north"),
+                    upgrade: None,
+                },
+            }
+        }
+        _ => rouille::Response::empty_404(),
+    }
 }
-
 
 fn fix_path(p: String) -> String {
     if p.starts_with("/omnibor") {
@@ -122,13 +119,12 @@ fn line_serve(index: &Index, _request: &Request, path: String) -> Response {
         Ok(line) => Response {
             status_code: 200,
             headers: vec![("Content-Type".into(), "application/json".into())],
-            data: ResponseBody::from_string(line),
+            data: ResponseBody::from_string(cbor_to_json_str(&line)),
             upgrade: None,
         },
         _ => rouille::Response::empty_404(),
     }
 }
-
 
 pub fn run_web_server(index: Arc<Index>) -> () {
     rouille::start_server(
@@ -146,7 +142,9 @@ pub fn run_web_server(index: Arc<Index>) -> () {
             let path_str: &str = &path;
             match (request.method(), path_str) {
                 ("POST", "bulk") => basic_bulk_serve(&index, request),
-                ("GET", url) if url.starts_with("north/") => north_serve(&index, request, &url[6..]),
+                ("GET", url) if url.starts_with("north/") => {
+                    north_serve(&index, request, &url[6..])
+                }
                 ("GET", _url) => line_serve(&index, request, path),
                 _ => rouille::Response::empty_404(),
             }

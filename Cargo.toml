@@ -6,10 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.79"
-regex = "1.10.3"
+anyhow = "1.0.83"
+regex = "1.10.4"
 md5 = "0.7.0"
+sha2 = "0.10.8"
 hex = "0.4.3"
+bytes = "1.6.0"
+hex-literal = "0.4.1"
 shellexpand = "3.1.0"
 
 # Web Framework stuff
@@ -18,22 +21,26 @@ rouille = "3.6.2"
 # axum = "0.7.4"
 # axum-macros = "0.4.1"
 url = "2.5.0"
-serde = {version = "1.0.196", features = ["std", "derive"]}
-serde_json = "1.0.113"
+serde = {version = "1.0.201", features = ["std", "derive"]}
+serde_json = "1.0.117"
+serde_cbor = "0.11.2"
+
 im = {version = "15.1.0", features = ["serde"]}
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"]}
-# tower-http = { version = "0.5.1", features = ["trace"] }
+
 
 # Execution stuff
 signal-hook = "0.3.17"
 # lazy_static = "1.4.0"
 # async-channel = "2.2.0"
-arc-swap = "1.6.0"
-clap = { version = "4.5.0", features = ["derive"] }
-toml = "0.8.10"
+arc-swap = "1.7.1"
+clap = { version = "4.5.4", features = ["derive"] }
+toml = "0.8.12"
 thousands = "0.2.0"
 pipe = "0.4.0"
 
 flume = "0.11.0"
 scopeguard = "1.2.0"
+
+rand = "0.8.5"
