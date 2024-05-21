@@ -77,10 +77,10 @@ fn basic_bulk_serve(index: &Index, request: &Request) -> Response {
 
 fn north_serve(index: &Index, _request: &Request, path: &str) -> Response {
     let hash = md5hash_str(path);
-    match index.line_for_hash(hash) {
+    match index.data_for_hash(hash) {
         Ok(line) => {
             let (rx, tx) = pipe::pipe();
-            match index.do_north_serve(line, path.to_string(), hash, tx) {
+            match index.do_north_serve(line.1, path.to_string(), hash, tx) {
                 Ok(_) => Response {
                     status_code: 200,
                     headers: vec![("Content-Type".into(), "application/json".into())],
@@ -115,12 +115,20 @@ fn fix_path(p: String) -> String {
 
 fn line_serve(index: &Index, _request: &Request, path: String) -> Response {
     let hash = md5hash_str(&path);
-    match index.line_for_hash(hash) {
-        Ok(line) => Response {
-            status_code: 200,
-            headers: vec![("Content-Type".into(), "application/json".into())],
-            data: ResponseBody::from_string(cbor_to_json_str(&line)),
-            upgrade: None,
+    match index.data_for_hash(hash) {
+        Ok(line) => match cbor_to_json_str(&line.1) {
+            Ok(line) => Response {
+                status_code: 200,
+                headers: vec![("Content-Type".into(), "application/json".into())],
+                data: ResponseBody::from_string(line),
+                upgrade: None,
+            },
+            Err(_e) => Response {
+                status_code: 500,
+                headers: vec![],
+                data: ResponseBody::from_string("Error"),
+                upgrade: None,
+            },
         },
         _ => rouille::Response::empty_404(),
     }

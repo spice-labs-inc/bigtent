@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use arc_swap::ArcSwap;
-use im::HashSet;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
 
@@ -14,6 +14,7 @@ use std::{
 
 use crate::envelopes::EntryEnvelope;
 use crate::index::EntryOffset;
+use crate::structs::Item;
 use crate::util::{
     byte_slice_to_u63, hex_to_u64, read_cbor, read_len_and_cbor, read_u16, read_u32,
     sha256_for_reader,
@@ -155,6 +156,19 @@ impl DataFile {
         let len = read_u16(&mut my_file.deref())?;
         let _ = read_u32(&mut my_file.deref())?;
         read_cbor(&mut my_file.deref(), len as usize)
+    }
+
+    pub fn read_envelope_and_item_at(&self, pos: u64) -> Result<(EntryEnvelope, Item)> {
+        let mut my_file = self
+            .file
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
+        my_file.seek(SeekFrom::Start(pos))?;
+        let env_len = read_u16(&mut my_file.deref())?;
+        let item_len = read_u32(&mut my_file.deref())?;
+        let env = read_cbor(&mut my_file.deref(), env_len as usize)?;
+        let item = read_cbor(&mut *my_file, item_len as usize)?;
+        Ok((env, item))
     }
 }
 
@@ -416,6 +430,92 @@ impl GoatRodeoBundle {
 }
 
 #[test]
+fn test_generated_bundle() {
+    use crate::index::Index;
+    use std::time::Instant;
+
+    let test_path = "../goatrodeo/frood_dir/";
+
+    let goat_rodeo_test_data: PathBuf = test_path.into();
+    // punt test is the files don't exist
+    if !goat_rodeo_test_data.is_dir() {
+        return;
+    }
+
+    let start = Instant::now();
+    let files = match GoatRodeoBundle::bundle_files_in_dir(test_path.into()) {
+        Ok(v) => v,
+        Err(e) => {
+            assert!(false, "Failure to read files {:?}", e);
+            todo!()
+        }
+    };
+
+    println!(
+        "Finding files took {:?}",
+        Instant::now().duration_since(start)
+    );
+    assert!(files.len() > 0, "We should find some files");
+    let mut pass_num = 0;
+    for bundle in files {
+        let complete_index = bundle.get_index().unwrap();
+        assert!(
+            complete_index.len() > 200,
+            "Expecting a large index, got {} entries",
+            complete_index.len()
+        );
+        println!("Index size {}", complete_index.len());
+        let index = Index::new(bundle, 4, None);
+        let mut purls = vec![];
+        for idx in complete_index.iter() {
+            match index.data_for_hash(idx.hash) {
+                Ok((_env, item)) => {
+                    if item.identifier.starts_with("pkg:") {
+                        purls.push(item.identifier.clone());
+                    }
+                }
+                Err(e) => {
+                    assert!(false, "Failed with error {}", e);
+                    todo!();
+                }
+            }
+        }
+
+        pass_num += 1;
+        println!(
+            "Read index for pass {} at {:?}",
+            pass_num,
+            Instant::now().duration_since(start)
+        );
+
+        assert!(
+            purls.len() > 20,
+            "We expect a bunch of pURLs, but got {}",
+            purls.len()
+        );
+
+        let start = Instant::now();
+        let purl_cnt = purls.len();
+
+        for p in purls {
+            let item = index.data_for_key(&p).unwrap();
+            let actual = index.data_for_key(&item.connections[0].0).unwrap();
+            assert!(
+                actual.alt_identifiers.contains(&p),
+                "the connected item should contain the pURL"
+            );
+        }
+
+        println!(
+            "Fetched {} items for pass {} at {:?}",
+            purl_cnt,
+            pass_num,
+            Instant::now().duration_since(start)
+        );
+    }
+}
+
+#[test]
 fn test_files_in_dir() {
     use std::time::{Duration, Instant};
 
@@ -468,202 +568,3 @@ fn test_files_in_dir() {
         total_index_size
     );
 }
-
-/*
-#[derive(Debug)]
-pub struct GrdWalker {
-    hash: u64,
-    name: String,
-    data_file: File,
-    index_file: File,
-    data_env: Value,
-    idx_env: Value,
-    data_beginning: u64,
-    idx_beginning: u64,
-}
-
-impl GrdWalker {
-    pub fn new(dir: &PathBuf, hash: u64) -> Result<GrdWalker> {
-        let mut base_path = dir.clone();
-        base_path.push(format!("{:016x}", hash));
-        let mut path = base_path.clone();
-        path.set_extension("grd");
-        let mut idx_path = base_path.clone();
-        idx_path.set_extension("gri");
-
-        // open and get info from the data file
-        let mut data_file = File::open(path.clone())?;
-        let dfp: &mut File = &mut data_file;
-        let magic = read_u32(dfp)?;
-        if magic != GrdWalker::DataFileMagicNumber {
-            bail!(
-                "Unexpected magic number {:x}, expecting {:x} for data file {:?}",
-                magic,
-                GrdWalker::DataFileMagicNumber,
-                path
-            );
-        }
-
-        let env: Value = read_len_and_cbor(dfp)?;
-
-        let cur_pos: u64 = data_file.seek(std::io::SeekFrom::Current(0))?;
-
-        // open and get info from the index file
-        let mut idx_file = File::open(idx_path.clone())?;
-        let ifp: &mut File = &mut idx_file;
-        let magic = read_u32(ifp)?;
-        if magic != GrdWalker::IndexFileMagicNumber {
-            bail!(
-                "Unexpected magic number {:x}, expecting {:x} for data file {:?}",
-                magic,
-                GrdWalker::IndexFileMagicNumber,
-                idx_path
-            );
-        }
-
-        let idx_env: Value = read_len_and_cbor(ifp)?;
-
-        match traverse_value(&idx_env, vec!["datafile"]) {
-            Some(Value::Integer(n)) => {
-                if n != hash as i128 {
-                    bail!(
-                        "Opened index for hash {:x}, but the listed hash was {:x}",
-                        hash,
-                        n
-                    );
-                }
-            }
-            _ => bail!(
-                "Could not find numeric 'datafile' attribute in Index Env {:?}",
-                idx_env
-            ),
-        };
-
-        let idx_pos: u64 = idx_file.seek(SeekFrom::Current(0))?;
-
-        Ok(GrdWalker {
-            data_file,
-            index_file: idx_file,
-            data_env: env,
-            data_beginning: cur_pos,
-            idx_env,
-            idx_beginning: idx_pos,
-            hash,
-            name: match path.as_os_str().to_str().map(|s| s.to_string()) {
-                Some(v) => v,
-                _ => bail!("Couldn't turn {:?} into a String", path),
-            },
-        })
-    }
-    #[allow(non_upper_case_globals)]
-    pub const DataFileMagicNumber: u32 = 0x00be1100; // Bell
-
-    #[allow(non_upper_case_globals)]
-    pub const IndexFileMagicNumber: u32 = 0x54154170; // Shishitō
-
-    pub fn read_whole_index(&mut self) -> Result<Vec<EntryOffset>> {
-        self.index_file.seek(SeekFrom::Start(self.idx_beginning))?;
-        todo!("Implement")
-    }
-
-    pub fn get_data_env<'a>(&'a self) -> &'a Value {
-        &self.data_env
-    }
-
-    pub fn get_name<'a>(&'a self) -> &'a str {
-        &self.name
-    }
-
-    pub fn get_hash(&self) -> u64 {
-        self.hash
-    }
-
-    pub fn get_index_env<'a>(&'a self) -> &'a Value {
-        &self.idx_env
-    }
-
-    pub fn items<'a>(&'a mut self) -> Option<BothIterator<'a>> {
-        self.to_beginning().ok()?;
-
-        Some(BothIterator::new(self))
-    }
-
-    pub fn envelopes<'a>(&'a mut self) -> Option<EnvIterator<'a>> {
-        self.to_beginning().ok()?;
-
-        Some(EnvIterator::new(self))
-    }
-
-    pub fn to_beginning(&mut self) -> Result<()> {
-        self.data_file
-            .seek(std::io::SeekFrom::Start(self.data_beginning))?;
-        Ok(())
-    }
-
-    fn read_both(&mut self) -> Option<(Value, Value)> {
-        let env_len = read_u16(&mut self.data_file).ok()? as usize;
-
-        // end
-        if env_len == 0xffff {
-            self.data_file.seek(std::io::SeekFrom::Current(8)).ok()?; // see to end of file
-            return None;
-        }
-        let body_len = read_u32(&mut self.data_file).ok()? as usize;
-        let env = read_cbor(&mut self.data_file, env_len).ok()?;
-        let body = read_cbor(&mut self.data_file, body_len).ok()?;
-        Some((env, body))
-    }
-
-    fn read_env(&mut self) -> Option<Value> {
-        let env_len = read_u16(&mut self.data_file).ok()? as usize;
-
-        // end
-        if env_len == 0xffff {
-            self.data_file.seek(std::io::SeekFrom::Current(8)).ok()?; // see to end of file
-            return None;
-        }
-        let body_len = read_u32(&mut self.data_file).ok()? as usize;
-        let env = read_cbor(&mut self.data_file, env_len).ok()?;
-        self.data_file
-            .seek(std::io::SeekFrom::Current(body_len as i64))
-            .ok()?;
-        Some(env)
-    }
-}
-
-pub struct BothIterator<'a> {
-    pub walker: &'a mut GrdWalker,
-}
-
-impl<'a> BothIterator<'a> {
-    pub fn new(walker: &'a mut GrdWalker) -> BothIterator<'a> {
-        BothIterator { walker }
-    }
-}
-
-impl<'a> Iterator for BothIterator<'a> {
-    type Item = (Value, Value);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.walker.read_both()
-    }
-}
-
-pub struct EnvIterator<'a> {
-    pub walker: &'a mut GrdWalker,
-}
-
-impl<'a> EnvIterator<'a> {
-    pub fn new(walker: &'a mut GrdWalker) -> EnvIterator<'a> {
-        EnvIterator { walker }
-    }
-}
-
-impl<'a> Iterator for EnvIterator<'a> {
-    type Item = Value;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.walker.read_env()
-    }
-}
-*/

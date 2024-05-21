@@ -5,3 +5,4 @@ pub mod server;
 pub mod indexer;
 pub mod envelopes;
 pub mod rodeo;
+pub mod structs;

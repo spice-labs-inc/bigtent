@@ -1,18 +1,26 @@
 use anyhow::{bail, Result};
 use arc_swap::ArcSwap;
 use flume::{Receiver, Sender};
-use im::HashSet;
 use pipe::PipeWriter;
 use scopeguard::defer;
-use serde_cbor::Value;
 use std::{
-    fs::File, io::{BufReader, BufWriter, Read, Write}, path::PathBuf, sync::{atomic::AtomicU32, Arc, Mutex}, thread::{self, JoinHandle}, time::Instant
+    collections::HashSet,
+    fs::File,
+    io::{BufReader, BufWriter, Read, Write},
+    path::PathBuf,
+    sync::{atomic::AtomicU32, Arc, Mutex},
+    thread::{self, JoinHandle},
+    time::Instant,
 };
 use thousands::Separable;
 use toml::{map::Map, Table};
 // use num_traits::ops::bytes::ToBytes;
 use crate::{
-    config::Args, envelopes::EntryEnvelope, rodeo::GoatRodeoBundle, util::{as_array, as_obj, as_str, cbor_to_json_str, find_entry, md5hash_str}
+    config::Args,
+    envelopes::EntryEnvelope,
+    rodeo::GoatRodeoBundle,
+    structs::{EdgeType, Item},
+    util::{cbor_to_json_str, find_entry, md5hash_str},
 };
 
 pub type MD5Hash = [u8; 16];
@@ -35,24 +43,59 @@ impl Index {
         Ok(find_entry(hash, &index))
     }
 
-    pub fn entry_for(&self, _file_hash: u64, _offset: u64) -> Result<(EntryEnvelope, Value)> {
-        todo!()
+    pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<(EntryEnvelope, Item)> {
+        let data_files = &self.path_and_index.load().data_files;
+        let data_file = data_files.get(&file_hash);
+        match data_file {
+            Some(df) => {
+              let (env, mut item) = df.read_envelope_and_item_at(offset)?;
+              match item.reference.0 {
+                0 => {item.reference.0 = file_hash}
+                v if v != file_hash => {bail!("Got item {} that should have had a file_hash of {:016x}, but had {:016x}", item.identifier, file_hash, item.reference.0,)}
+                _ => {}
+              }
+
+              if item.reference.1 != offset {
+                bail!("Expecting item {} to have offset {}, but reported offset {}", item.identifier, offset, item.reference.1)
+              }
+
+              Ok((env, item))
+            },
+            None => bail!("Couldn't find file for hash {:x}", file_hash),
+        }
     }
-    pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<(EntryEnvelope, Value)>> {
+
+    pub fn data_for_entry_offset(
+        &self,
+        index_loc: &IndexLoc,
+    ) -> Result<(EntryEnvelope, Item)> {
         match index_loc {
-            IndexLoc::Loc { offset, file_hash } => Ok(vec![self.entry_for(*file_hash, *offset)?]),
+            IndexLoc::Loc { offset, file_hash } => Ok(self.entry_for(*file_hash, *offset)?),
             IndexLoc::Chain(offsets) => {
                 let mut ret = vec![];
                 for offset in offsets {
-                    let mut some = self.data_for_entry_offset(&offset)?;
-                    ret.append(&mut some);
+                    let some = self.data_for_entry_offset(&offset)?;
+                    ret.push(some);
                 }
-                Ok(ret)
+                if ret.len() == 0 {
+                  bail!("Got a location chain with zero entries!!");
+                } else if ret.len() == 1 {
+                  Ok(ret.pop().unwrap()) // we know this is okay because we just tested length
+                } else {
+
+                  let (env, base) = ret.pop().unwrap(); // we know this is okay because ret has more than 1 element
+                  let mut to_merge = vec![];
+                  for (_, item) in ret {
+                    to_merge.push(item);
+                  }
+                  let final_base = base.merge(to_merge);
+                  Ok((env, final_base))
+                }
             }
         }
     }
 
-    pub fn data_for_hash(&self, hash: MD5Hash) -> Result<Vec<(EntryEnvelope, Value)>> {
+    pub fn data_for_hash(&self, hash: MD5Hash) -> Result<(EntryEnvelope, Item)> {
         let entry_offset = match self.find(hash)? {
             Some(eo) => eo,
             _ => bail!(format!("Could not find entry for hash {:x?}", hash)),
@@ -61,24 +104,12 @@ impl Index {
         self.data_for_entry_offset(&entry_offset.loc)
     }
 
-    pub fn line_for_hash(&self, hash: MD5Hash) -> Result<Value> {
-        let mut lines = self.data_for_hash(hash)?;
-        if lines.len() == 1 {
-            let ret = lines.pop().unwrap(); // we know this is okay because we just tested len
-            return Ok(ret.1);
-        } else {
-            bail!("FIXME -- got a set of hashes and we don't know how to merge yeat!!!")
-        }
-    }
 
-    pub fn line_for_key(&self, data: &str) -> Result<Value> {
+    pub fn data_for_key(&self, data: &str) -> Result<Item> {
         let md5_hash = md5hash_str(data);
-        self.line_for_hash(md5_hash)
+        self.data_for_hash(md5_hash).map(|v| v.1)
     }
 
-    // pub fn line_for_string(&self, data: &str) -> Result<String> {
-    //     self.line_for_hash(md5hash_str(data))
-    // }
 
     pub fn bulk_serve(&self, data: Vec<String>, dest: PipeWriter) -> Result<()> {
         self.sender
@@ -88,7 +119,7 @@ impl Index {
 
     pub fn do_north_serve(
         &self,
-        data: Value,
+        data: Item,
         gitoid: String,
         hash: MD5Hash,
         dest: PipeWriter,
@@ -117,30 +148,22 @@ impl Index {
         }
     }
 
-    fn contained_by(data: &Value) -> Result<HashSet<String>> {
-        let v = data;
+    fn contained_by(data: &Item) -> HashSet<String> {
         let mut ret = HashSet::new();
-
-        if let Some(obj) = as_obj(v) {
-            if let Some(contained_by) = obj.get(&Value::Text("containedBy".into())) {
-                if let Some(arr) = as_array(contained_by) {
-                    for v in arr {
-                        if let Some(gitoid) = as_str(v) {
-                            ret.insert(gitoid.to_string());
-                        }
-                    }
-                }
+        for edge in data.connections.iter() {
+            if edge.1 == EdgeType::ContainedBy {
+                ret.insert(edge.0.clone());
             }
         }
 
-        Ok(ret)
+        ret
     }
 
-    fn north_send(&self, gitoid: String, initial_body: Value, tx: PipeWriter) -> Result<()> {
+    fn north_send(&self, gitoid: String, initial_body: Item, tx: PipeWriter) -> Result<()> {
         let start = Instant::now();
         let mut br = BufWriter::new(tx);
         let mut found = HashSet::new();
-        let mut to_find = Index::contained_by(&initial_body)?;
+        let mut to_find = Index::contained_by(&initial_body);
         found.insert(gitoid.clone());
         br.write_fmt(format_args!("{{ \"{}\": {:?}\n", gitoid, initial_body))?;
         let cnt = AtomicU32::new(0);
@@ -152,7 +175,7 @@ impl Index {
         fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
             let mut ret = a.clone();
             for i in b.clone() {
-                ret = ret.without(&i);
+                ret.remove(&i);
             }
             ret
         }
@@ -164,16 +187,16 @@ impl Index {
                 break;
             }
             for this_oid in to_search {
-                found = found.update(this_oid.clone());
-                match self.line_for_key(&this_oid) {
+                found.insert(this_oid.clone());
+                match self.data_for_key(&this_oid) {
                     Ok(item) => {
                         br.write_fmt(format_args!(
                             ",\n \"{}\": [{}]\n",
                             this_oid,
-                            cbor_to_json_str(&item)
+                            cbor_to_json_str(&item)?
                         ))?;
-                        let and_then = Index::contained_by(&item)?;
-                        to_find = to_find.union(and_then);
+                        let and_then = Index::contained_by(&item);
+                        to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
                     }
                     _ => {
                         br.write_fmt(format_args!(",\n \"{}\": []\n", this_oid,))?;
@@ -196,9 +219,9 @@ impl Index {
                 br.write(b",")?;
             }
             first = false;
-            match self.line_for_key(&v) {
+            match self.data_for_key(&v) {
                 Ok(cbor) => {
-                    br.write_fmt(format_args!("\"{}\": [{}]\n", v, cbor_to_json_str(&cbor)))?;
+                    br.write_fmt(format_args!("\"{}\": [{}]\n", v, cbor_to_json_str(&cbor)?))?;
                 }
                 Err(_) => {
                     br.write_fmt(format_args!("\"{}\": []\n", v))?;
@@ -264,11 +287,7 @@ impl Index {
         self.config_table.load().clone()
     }
 
-    fn info_from_config(
-        file_name: &str,
-        conf: &Table,
-    ) -> Result<GoatRodeoBundle> {
-
+    fn info_from_config(file_name: &str, conf: &Table) -> Result<GoatRodeoBundle> {
         let index_name = match conf.get("bundle_path") {
             Some(toml::Value::String(index)) => shellexpand::tilde(index).to_string(),
             _ => bail!(format!(
@@ -278,26 +297,64 @@ impl Index {
         };
 
         let envelope_path = PathBuf::from(index_name.clone());
-        let envelope_dir = match envelope_path.parent()  {
+        let envelope_dir = match envelope_path.parent() {
             Some(path) => path.to_path_buf(),
-            None => bail!("Path Bundle '{}' does not have a parent directory", index_name),
+            None => bail!(
+                "Path Bundle '{}' does not have a parent directory",
+                index_name
+            ),
         };
 
         let bundle = GoatRodeoBundle::new(&envelope_dir, &envelope_path);
-        
+
         bundle
     }
 
     pub fn rebuild(&self) -> Result<()> {
         let config_table = self.args.read_conf_file()?;
-        let new_bundle =
-            Index::info_from_config(&self.args.conf_file()?, &config_table)?;
+        let new_bundle = Index::info_from_config(&self.args.conf_file()?, &config_table)?;
         self.path_and_index.store(Arc::new(new_bundle));
         Ok(())
     }
 
     pub fn the_args(&self) -> Args {
         self.args.clone()
+    }
+
+    /// Create a new Index based on an existing GoatRodeo instance with the number of threads
+    /// and an optional set of args. This is meant to be used to create an Index without
+    /// a well defined set of Args
+    pub fn new(bundle: GoatRodeoBundle, num_threads: u16, args_opt: Option<Args>) -> Arc<Index> {
+        let (tx, rx) = flume::unbounded();
+
+        let args = args_opt.unwrap_or_default();
+        let config_table = args.read_conf_file().unwrap_or_default();
+
+        let ret = Arc::new(Index {
+            threads: Mutex::new(vec![]),
+            config_table: ArcSwap::new(Arc::new(config_table)),
+            path_and_index: ArcSwap::new(Arc::new(bundle)),
+            args: args,
+            receiver: rx.clone(),
+            sender: tx.clone(),
+        });
+
+        // let mut handles = vec![];
+        for _x in 0..num_threads {
+            let my_index = ret.clone();
+            let handle = thread::spawn(move || {
+                Index::thread_handler_loop(my_index).unwrap();
+            });
+
+            // put in braces to ensure the lock is retained for a very short time
+            {
+                // unwrap because there's no way the lock is poisoned
+                let mut x = ret.threads.lock().unwrap();
+                x.push(handle);
+            }
+        }
+
+        ret
     }
 
     pub fn new_arc(args: Args) -> Result<Arc<Index>> {
@@ -342,7 +399,7 @@ enum IndexMsg {
         #[allow(dead_code)]
         hash: MD5Hash,
         gitoid: String,
-        initial_body: Value,
+        initial_body: Item,
         tx: PipeWriter,
     },
 }
@@ -380,7 +437,7 @@ impl EntryOffset {
         Ok(EntryOffset {
             hash: hash_bytes,
             loc: IndexLoc::Loc {
-                offset: u64::from_be_bytes(file_bytes),
+                offset: u64::from_be_bytes(loc_bytes),
                 file_hash: u64::from_be_bytes(file_bytes),
             },
         })

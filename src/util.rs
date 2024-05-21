@@ -1,14 +1,10 @@
 use crate::index::{EntryOffset, MD5Hash};
 use anyhow::{bail, Result};
 
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
-use serde_json::json;
 use sha2::Sha256;
-use std::{
-    collections::{BTreeMap, HashMap},
-    io::Read,
-};
+use std::{collections::BTreeMap, io::Read};
 
 pub fn hex_to_md5bytes(it: &str) -> Option<MD5Hash> {
     hex::decode(it)
@@ -43,7 +39,10 @@ pub fn hex_to_u64(it: &str) -> Option<u64> {
 pub fn byte_slice_to_u63(it: &[u8]) -> Result<u64> {
     let mut buff = [0u8; 8];
     if it.len() < 8 {
-        bail!("The byte slice for a 64 bit number must have at least 8 bytes, this has {} bytes", it.len());
+        bail!(
+            "The byte slice for a 64 bit number must have at least 8 bytes, this has {} bytes",
+            it.len()
+        );
     }
 
     for x in 0..8 {
@@ -193,7 +192,19 @@ pub fn read_cbor<T: DeserializeOwned, R: Read>(file: &mut R, len: usize) -> Resu
         bail!("Wanted to read {} bytes, but only got {}", len, read_len);
     }
 
-    serde_cbor::from_reader(&*buffer).map_err(|e| e.into())
+    match serde_cbor::from_slice(&*buffer) {
+      Ok(v) => Ok(v),
+      Err(e) => {
+        match serde_cbor::from_slice::<Value>(&*&buffer) {
+          Ok(v) => {
+            println!("Deserialized value {:?}", v);
+
+          },
+          Err(_) => {}
+        }
+        bail!("Failed to deserialize with error {}", e);
+      }
+    }
 }
 
 pub fn traverse_value(v: &Value, path: Vec<&str>) -> Option<Value> {
@@ -231,39 +242,40 @@ pub fn as_str<'a>(v: &'a Value) -> Option<&'a String> {
     }
 }
 
-pub fn cbor_to_json(input: &Value) -> serde_json::Value {
-    match input {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(v) => serde_json::Value::Bool(*v),
-        Value::Integer(n) => json!(n),
-        Value::Float(f) => json!(f),
-        Value::Bytes(b) => json!(b),
-        Value::Text(s) => json!(s),
-        Value::Array(a) => {
-            let mut ra = vec![];
-            for v in a {
-                ra.push(cbor_to_json(v))
-            }
-            json!(ra)
-        }
-        Value::Map(m) => {
-            let mut ma: HashMap<String, serde_json::Value> = HashMap::new();
-            for (k, v) in m {
-                match k {
-                    Value::Text(s) => {
-                        ma.insert(s.to_string(), cbor_to_json(v));
-                    }
-                    _ => todo!("Maybe we should handle other cases {:?}", k),
-                }
-            }
-            json!(ma)
-        }
-        Value::Tag(_, _) => todo!(),
-        _ => serde_json::Value::Null,
-    }
-}
+// pub fn cbor_to_json(input: &Value) -> serde_json::Value {
+//     match input {
+//         Value::Null => serde_json::Value::Null,
+//         Value::Bool(v) => serde_json::Value::Bool(*v),
+//         Value::Integer(n) => json!(n),
+//         Value::Float(f) => json!(f),
+//         Value::Bytes(b) => json!(b),
+//         Value::Text(s) => json!(s),
+//         Value::Array(a) => {
+//             let mut ra = vec![];
+//             for v in a {
+//                 ra.push(cbor_to_json(v))
+//             }
+//             json!(ra)
+//         }
+//         Value::Map(m) => {
+//             let mut ma: HashMap<String, serde_json::Value> = HashMap::new();
+//             for (k, v) in m {
+//                 match k {
+//                     Value::Text(s) => {
+//                         ma.insert(s.to_string(), cbor_to_json(v));
+//                     }
+//                     _ => todo!("Maybe we should handle other cases {:?}", k),
+//                 }
+//             }
+//             json!(ma)
+//         }
+//         Value::Tag(_, _) => todo!(),
+//         _ => serde_json::Value::Null,
+//     }
+// }
 
-pub fn cbor_to_json_str(input: &Value) -> String {
-    let json: serde_json::Value = cbor_to_json(input);
-    serde_json::to_string_pretty(&json).unwrap() // FIXME is this smart?
+pub fn cbor_to_json_str<T: Serialize>(input: &T) -> Result<String> {
+    let json: serde_json::Value = serde_json::to_value(input)?;
+    let ret = serde_json::to_string_pretty(&json)?;
+    Ok(ret)
 }
