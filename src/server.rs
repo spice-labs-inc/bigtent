@@ -114,6 +114,7 @@ fn fix_path(p: String) -> String {
 }
 
 fn line_serve(index: &Index, _request: &Request, path: String) -> Response {
+  // FIXME -- deal with getting a raw MD5 hex string
     let hash = md5hash_str(&path);
     match index.data_for_hash(hash) {
         Ok(line) => match cbor_to_json_str(&line.1) {

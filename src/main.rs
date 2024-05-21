@@ -1,8 +1,8 @@
 use anyhow::{bail, Result};
-use bigtent::{config::Args, index::Index,server::run_web_server};
+use bigtent::{config::Args, index::Index, rodeo::GoatRodeoBundle, server::run_web_server};
 use clap::Parser;
 use signal_hook::{consts::SIGHUP, iterator::Signals};
-use std::{ thread, time::Instant};
+use std::{thread, time::Instant};
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -13,7 +13,21 @@ fn main() -> Result<()> {
 
     println!("Args {:?}, threads {} ", args, args.num_threads(),);
 
- if args.conf_file().is_ok() {
+    if args.rodeo.is_some() && args.rodeo.clone().unwrap().exists() {
+        let whole_path = args.rodeo.clone().unwrap().canonicalize()?;
+        let dir_path = whole_path.parent().unwrap().to_path_buf();
+        let index_build_start = Instant::now();
+        let bundle = GoatRodeoBundle::new(&dir_path, &whole_path)?;
+
+        let index = Index::new(bundle, args.num_threads(), Some(args));
+
+        println!(
+            "Initial index build in {:?}",
+            Instant::now().duration_since(index_build_start)
+        );
+
+        run_web_server(index);
+    } else if args.conf_file().is_ok() {
         let index_build_start = Instant::now();
         let index = Index::new_arc(args)?;
 

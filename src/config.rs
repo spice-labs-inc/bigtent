@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::Read,
     net::{SocketAddr, ToSocketAddrs},
+    path::PathBuf,
 };
 use toml::Table;
 
@@ -27,6 +28,9 @@ pub struct Args {
     /// the port to bind to
     #[arg(long, short)]
     port: Option<u16>,
+
+    #[arg(long, short)]
+    pub rodeo: Option<PathBuf>,
 }
 
 impl Args {
