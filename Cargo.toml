@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.83"
+anyhow = "1.0.86"
 regex = "1.10.4"
 md5 = "0.7.0"
 sha2 = "0.10.8"
@@ -17,11 +17,8 @@ shellexpand = "3.1.0"
 
 # Web Framework stuff
 rouille = "3.6.2"
-# tokio = { version = "1.36.0", features = ["full"] }
-# axum = "0.7.4"
-# axum-macros = "0.4.1"
 url = "2.5.0"
-serde = {version = "1.0.201", features = ["std", "derive"]}
+serde = {version = "1.0.202", features = ["std", "derive"]}
 serde_json = "1.0.117"
 serde_cbor = "0.11.2"
 
@@ -32,11 +29,9 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"]}
 
 # Execution stuff
 signal-hook = "0.3.17"
-# lazy_static = "1.4.0"
-# async-channel = "2.2.0"
 arc-swap = "1.7.1"
 clap = { version = "4.5.4", features = ["derive"] }
-toml = "0.8.12"
+toml = "0.8.13"
 thousands = "0.2.0"
 pipe = "0.4.0"
 
