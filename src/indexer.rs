@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::io::{Read, Seek};
 
-use crate::index::{EntryOffset, IndexLoc};
+use crate::index::{ItemOffset, IndexLoc};
 
 pub struct FileReader<R: Read + Seek> {
     the_file: R,
@@ -54,7 +54,7 @@ where
         return Ok((ret, false));
     }
 
-    pub fn next_hash(&mut self) -> Result<(Option<EntryOffset>, bool)> {
+    pub fn next_hash(&mut self) -> Result<(Option<ItemOffset>, bool)> {
         let end = self.ensure_buffer()?;
 
         if end {
@@ -89,7 +89,7 @@ where
         }
     }
 
-    pub fn build_index(&mut self) -> Result<Vec<EntryOffset>> {
+    pub fn build_index(&mut self) -> Result<Vec<ItemOffset>> {
         let mut ret = vec![];
         let mut cnt = 0;
         loop {
@@ -115,14 +115,14 @@ where
     }
 }
 
-fn build_hash_offset(hash: String, pos: u64, file: u64) -> Result<EntryOffset> {
+fn build_hash_offset(hash: String, pos: u64, file: u64) -> Result<ItemOffset> {
     let real_hash = match hash.find(",") {
         Some(x) => hash[..x].to_string(),
         _ => hash,
     };
 
     let hash_bin = u128::from_str_radix(&real_hash, 16)?.to_be_bytes();
-    Ok(EntryOffset {
+    Ok(ItemOffset {
         hash: hash_bin,
         loc: IndexLoc::Loc { offset: pos, file_hash: file },
     })

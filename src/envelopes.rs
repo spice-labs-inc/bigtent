@@ -3,7 +3,6 @@ use rand::{rngs::ThreadRng, Rng};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-
 /** Contains an MD5 hash
  *
  * @param hash
@@ -22,17 +21,17 @@ impl MD5 {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
-pub struct Position {
-    #[serde(alias = "o")]
-    #[serde(rename(serialize = "o"))]
-    pub offset: u64,
-}
+type Position = u64;
 
-impl Position {
-    pub fn random(rng: &mut ThreadRng) -> Position {
-        Position { offset: rng.gen() }
-    }
+// #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+// pub struct Position {
+//     #[serde(alias = "o")]
+//     #[serde(rename(serialize = "o"))]
+//     pub offset: u64,
+// }
+
+pub fn random_position(rng: &mut ThreadRng) -> Position {
+    rng.gen()
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
@@ -120,28 +119,25 @@ impl PayloadCompression {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
-pub struct MultifilePosition {
-    #[serde(alias = "o")]
-    #[serde(rename(serialize = "o"))]
-    pub offset: Position,
+// #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+// pub struct MultifilePosition {
+//     #[serde(alias = "o")]
+//     #[serde(rename(serialize = "o"))]
+//     pub offset: Position,
 
-    #[serde(alias = "t")]
-    #[serde(rename(serialize = "t"))]
-    pub other: u64,
+//     #[serde(alias = "t")]
+//     #[serde(rename(serialize = "t"))]
+//     pub other: u64,
+// }
+
+type MultifilePosition = (u64, u64);
+
+pub const MULTIFILE_NOOP: MultifilePosition = (0u64, 0u64);
+pub fn multifile_position_rand(rng: &mut ThreadRng) -> MultifilePosition {
+    (rng.gen(), rng.gen())
 }
-
-impl MultifilePosition {
-    pub fn random(rng: &mut ThreadRng) -> MultifilePosition {
-        MultifilePosition {
-            offset: Position::random(rng),
-            other: rng.gen(),
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
-pub struct EntryEnvelope {
+pub struct ItemEnvelope {
     #[serde(alias = "h")]
     #[serde(rename(serialize = "h"))]
     pub key_md5: MD5,
@@ -174,18 +170,18 @@ pub struct EntryEnvelope {
     pub merged_with_previous: bool,
 }
 
-impl EntryEnvelope {
-    pub fn from_bin<R: Read>(r: &mut R) -> Result<EntryEnvelope> {
+impl ItemEnvelope {
+    pub fn from_bin<R: Read>(r: &mut R) -> Result<ItemEnvelope> {
         serde_cbor::from_reader(r).map_err(|e| e.into())
     }
 
-    pub fn random() -> EntryEnvelope {
+    pub fn random() -> ItemEnvelope {
         let mut rng = rand::thread_rng();
-        EntryEnvelope {
+        ItemEnvelope {
             key_md5: MD5::random(&mut rng),
-            position: Position::random(&mut rng),
+            position: random_position(&mut rng),
             timestamp: rng.gen(),
-            previous_version: MultifilePosition::random(&mut rng),
+            previous_version: multifile_position_rand(&mut rng),
             backpointer: rng.gen(),
             data_len: rng.gen::<u32>() & 0x7ffffff,
             data_format: PayloadFormat::random(&mut rng),
@@ -204,30 +200,15 @@ impl EntryEnvelope {
     }
 }
 
-// #[test]
-// fn test_read_data() {
-//     for i in 0..=1000 {
-//         let mut fr = std::fs::File::open(format!("test_data/test_{}.bin", i)).unwrap();
-//         let ee = EntryEnvelope::from_bin(&mut fr).unwrap();
-//         let f2 = std::fs::File::open(format!("test_data/test_{}.msgpack", i)).unwrap();
-
-//         let e2 = serde_cbor::from_read(f2).unwrap();
-//         assert_eq!(ee, e2);
-//     }
-// }
-
 #[test]
 fn test_read_write_data() {
     for _i in 0..=1000 {
-        let e: EntryEnvelope = EntryEnvelope::random();
+        let e: ItemEnvelope = ItemEnvelope::random();
         let bytes = e.bytes().unwrap();
-        let e2 = EntryEnvelope::from_bin(&mut &*bytes).unwrap();
+        let e2 = ItemEnvelope::from_bin(&mut &*bytes).unwrap();
 
         assert_eq!(e, e2);
 
         assert_eq!(bytes, e2.bytes().unwrap());
-
-        // let mut f = std::fs::File::create(format!("test_data/data_{}.cbor", _i)).unwrap();
-        // f.write_all(&bytes).unwrap();
     }
 }

@@ -17,10 +17,10 @@ use toml::{map::Map, Table};
 // use num_traits::ops::bytes::ToBytes;
 use crate::{
     config::Args,
-    envelopes::EntryEnvelope,
+    envelopes::ItemEnvelope,
     rodeo::GoatRodeoBundle,
     structs::{EdgeType, Item},
-    util::{cbor_to_json_str, find_entry, md5hash_str},
+    util::cbor_to_json_str,
 };
 
 pub type MD5Hash = [u8; 16];
@@ -28,7 +28,7 @@ pub type MD5Hash = [u8; 16];
 #[derive(Debug)]
 pub struct Index {
     threads: Mutex<Vec<JoinHandle<()>>>,
-    path_and_index: ArcSwap<GoatRodeoBundle>,
+    bundle: ArcSwap<GoatRodeoBundle>,
 
     args: Args,
     config_table: ArcSwap<Table>,
@@ -38,78 +38,25 @@ pub struct Index {
 }
 
 impl Index {
-    pub fn find(&self, hash: MD5Hash) -> Result<Option<EntryOffset>> {
-        let index = self.path_and_index.load().get_index()?;
-        Ok(find_entry(hash, &index))
+    pub fn find(&self, hash: MD5Hash) -> Result<Option<ItemOffset>> {
+        self.bundle.load().find(hash)
     }
 
-    pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<(EntryEnvelope, Item)> {
-        let data_files = &self.path_and_index.load().data_files;
-        let data_file = data_files.get(&file_hash);
-        match data_file {
-            Some(df) => {
-              let (env, mut item) = df.read_envelope_and_item_at(offset)?;
-              match item.reference.0 {
-                0 => {item.reference.0 = file_hash}
-                v if v != file_hash => {bail!("Got item {} that should have had a file_hash of {:016x}, but had {:016x}", item.identifier, file_hash, item.reference.0,)}
-                _ => {}
-              }
-
-              if item.reference.1 != offset {
-                bail!("Expecting item {} to have offset {}, but reported offset {}", item.identifier, offset, item.reference.1)
-              }
-
-              Ok((env, item))
-            },
-            None => bail!("Couldn't find file for hash {:x}", file_hash),
-        }
+    pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<(ItemEnvelope, Item)> {
+        self.bundle.load().entry_for(file_hash, offset)
     }
 
-    pub fn data_for_entry_offset(
-        &self,
-        index_loc: &IndexLoc,
-    ) -> Result<(EntryEnvelope, Item)> {
-        match index_loc {
-            IndexLoc::Loc { offset, file_hash } => Ok(self.entry_for(*file_hash, *offset)?),
-            IndexLoc::Chain(offsets) => {
-                let mut ret = vec![];
-                for offset in offsets {
-                    let some = self.data_for_entry_offset(&offset)?;
-                    ret.push(some);
-                }
-                if ret.len() == 0 {
-                  bail!("Got a location chain with zero entries!!");
-                } else if ret.len() == 1 {
-                  Ok(ret.pop().unwrap()) // we know this is okay because we just tested length
-                } else {
-
-                  let (env, base) = ret.pop().unwrap(); // we know this is okay because ret has more than 1 element
-                  let mut to_merge = vec![];
-                  for (_, item) in ret {
-                    to_merge.push(item);
-                  }
-                  let final_base = base.merge(to_merge);
-                  Ok((env, final_base))
-                }
-            }
-        }
+    pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<(ItemEnvelope, Item)> {
+        self.bundle.load().data_for_entry_offset(index_loc)
     }
 
-    pub fn data_for_hash(&self, hash: MD5Hash) -> Result<(EntryEnvelope, Item)> {
-        let entry_offset = match self.find(hash)? {
-            Some(eo) => eo,
-            _ => bail!(format!("Could not find entry for hash {:x?}", hash)),
-        };
-
-        self.data_for_entry_offset(&entry_offset.loc)
+    pub fn data_for_hash(&self, hash: MD5Hash) -> Result<(ItemEnvelope, Item)> {
+        self.bundle.load().data_for_hash(hash)
     }
-
 
     pub fn data_for_key(&self, data: &str) -> Result<Item> {
-        let md5_hash = md5hash_str(data);
-        self.data_for_hash(md5_hash).map(|v| v.1)
+        self.bundle.load().data_for_key(data)
     }
-
 
     pub fn bulk_serve(&self, data: Vec<String>, dest: PipeWriter) -> Result<()> {
         self.sender
@@ -313,7 +260,7 @@ impl Index {
     pub fn rebuild(&self) -> Result<()> {
         let config_table = self.args.read_conf_file()?;
         let new_bundle = Index::info_from_config(&self.args.conf_file()?, &config_table)?;
-        self.path_and_index.store(Arc::new(new_bundle));
+        self.bundle.store(Arc::new(new_bundle));
         Ok(())
     }
 
@@ -333,7 +280,7 @@ impl Index {
         let ret = Arc::new(Index {
             threads: Mutex::new(vec![]),
             config_table: ArcSwap::new(Arc::new(config_table)),
-            path_and_index: ArcSwap::new(Arc::new(bundle)),
+            bundle: ArcSwap::new(Arc::new(bundle)),
             args: args,
             receiver: rx.clone(),
             sender: tx.clone(),
@@ -367,7 +314,7 @@ impl Index {
         let ret = Arc::new(Index {
             threads: Mutex::new(vec![]),
             config_table: ArcSwap::new(Arc::new(config_table)),
-            path_and_index: ArcSwap::new(Arc::new(bundle)),
+            bundle: ArcSwap::new(Arc::new(bundle)),
             args: args.clone(),
             receiver: rx.clone(),
             sender: tx.clone(),
@@ -412,19 +359,13 @@ pub enum IndexLoc {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct EntryOffset {
+pub struct ItemOffset {
     pub hash: [u8; 16],
     pub loc: IndexLoc,
 }
 
-impl EntryOffset {
-    // pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
-    //     writer.write(&self.hash)?;
-    //     writer.write(&self.loc.to_be_bytes())?;
-    //     Ok(())
-    // }
-
-    pub fn read<R: Read>(reader: &mut R) -> Result<EntryOffset> {
+impl ItemOffset {
+    pub fn read<R: Read>(reader: &mut R) -> Result<ItemOffset> {
         let mut hash_bytes = u128::default().to_be_bytes();
         let mut file_bytes = u64::default().to_be_bytes();
         let mut loc_bytes = u64::default().to_be_bytes();
@@ -434,7 +375,7 @@ impl EntryOffset {
         if hl != hash_bytes.len() || ll != loc_bytes.len() || fl != file_bytes.len() {
             bail!("Failed to read enough bytes for EntryOffset")
         }
-        Ok(EntryOffset {
+        Ok(ItemOffset {
             hash: hash_bytes,
             loc: IndexLoc::Loc {
                 offset: u64::from_be_bytes(loc_bytes),
@@ -443,13 +384,13 @@ impl EntryOffset {
         })
     }
 
-    pub fn build_from_index_file(file_name: &str) -> Result<Vec<EntryOffset>> {
+    pub fn build_from_index_file(file_name: &str) -> Result<Vec<ItemOffset>> {
         // make sure the buffer is a multiple of 24 (the length of the u128 + u64 + u64)
         let mut reader = BufReader::with_capacity(32 * 4096, File::open(file_name)?);
         let mut stuff = vec![];
 
         loop {
-            match EntryOffset::read(&mut reader) {
+            match ItemOffset::read(&mut reader) {
                 Ok(eo) => {
                     stuff.push(eo);
                 }

@@ -6,3 +6,5 @@ pub mod indexer;
 pub mod envelopes;
 pub mod rodeo;
 pub mod structs;
+mod old_format;
+pub mod merger;
