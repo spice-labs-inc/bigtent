@@ -42,14 +42,18 @@ pub struct IndexFile {
 
 impl IndexFile {
     pub fn new(dir: &PathBuf, hash: u64) -> Result<IndexFile> {
-        let mut file = BufReader::new(GoatRodeoBundle::find_file(&dir, hash, "gri")?);
-        let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file)?)?;
-        if tested_hash != hash {
-            bail!(
-                "Index file for {:016x} does not match {:016x}",
-                hash,
-                tested_hash
-            );
+        // ensure we close `file` after computing the hash
+        {
+            let mut file = GoatRodeoBundle::find_file(&dir, hash, "gri")?;
+
+            let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file)?)?;
+            if tested_hash != hash {
+                bail!(
+                    "Index file for {:016x} does not match {:016x}",
+                    hash,
+                    tested_hash
+                );
+            }
         }
 
         let mut file = BufReader::new(GoatRodeoBundle::find_file(&dir, hash, "gri")?);
@@ -80,6 +84,7 @@ impl IndexFile {
         let mut ret = Vec::with_capacity(self.envelope.size as usize);
         let mut last = [0u8; 16];
         let mut not_sorted = false;
+
         let mut my_file = self
             .file
             .lock()
@@ -88,6 +93,7 @@ impl IndexFile {
         fp.seek(SeekFrom::Start(self.data_offset))?;
         let mut buf = vec![];
         fp.read_to_end(&mut buf)?;
+
         let mut info: &[u8] = &buf;
         for _ in 0..self.envelope.size {
             let eo = ItemOffset::read(&mut info)?;
@@ -254,11 +260,6 @@ impl GoatRodeoBundle {
             bail!("Loaded a bundle with an invalid magic number: {:?}", env);
         }
 
-        println!(
-            "Loaded bundle file at {:?}",
-            Instant::now().duration_since(start)
-        );
-
         let mut index_files = HashMap::new();
         let mut indexed_hashes: HashSet<u64> = HashSet::new();
 
@@ -270,21 +271,12 @@ impl GoatRodeoBundle {
             }
 
             index_files.insert(*index_file, the_file);
-
-            println!(
-                "Loaded index file at {:?}",
-                Instant::now().duration_since(start)
-            );
         }
 
         let mut data_files = HashMap::new();
         for data_file in &env.data_files {
             let the_file = DataFile::new(&dir, *data_file)?;
             data_files.insert(*data_file, the_file);
-            println!(
-                "Loaded data file at {:?}",
-                Instant::now().duration_since(start)
-            );
         }
 
         for data_key in data_files.keys() {
@@ -492,9 +484,9 @@ impl GoatRodeoBundle {
                         to_merge.push(item);
                     }
                     let mut final_base = base.clone();
-                    
+
                     for m2 in to_merge {
-                      final_base = final_base.merge(m2);
+                        final_base = final_base.merge(m2);
                     }
                     Ok((env, final_base))
                 }
@@ -519,102 +511,140 @@ impl GoatRodeoBundle {
 
 #[test]
 fn test_generated_bundle() {
-    use crate::index::Index;
-    
     use std::time::Instant;
 
-    let test_path = "../goatrodeo/res_for_big_tent/";
+    let test_paths: Vec<String> = vec![
+        "../goatrodeo/res_for_big_tent/".into(),
+    ];
 
-    let goat_rodeo_test_data: PathBuf = test_path.into();
-    // punt test is the files don't exist
-    if !goat_rodeo_test_data.is_dir() {
-        return;
-    }
-
-    let start = Instant::now();
-    let files = match GoatRodeoBundle::bundle_files_in_dir(test_path.into()) {
-        Ok(v) => v,
-        Err(e) => {
-            assert!(false, "Failure to read files {:?}", e);
+    for test_path in &test_paths {
+        println!("\n\n==============\n\nTesting path {}", test_path);
+        let goat_rodeo_test_data: PathBuf = test_path.into();
+        // punt test is the files don't exist
+        if !goat_rodeo_test_data.is_dir() {
             return;
         }
-    };
-
-    println!(
-        "Finding files took {:?}",
-        Instant::now().duration_since(start)
-    );
-    assert!(files.len() > 0, "We should find some files");
-    let mut pass_num = 0;
-    for bundle in files {
-        let complete_index = bundle.get_index().unwrap();
-        assert!(
-            complete_index.len() > 200,
-            "Expecting a large index, got {} entries",
-            complete_index.len()
-        );
-        println!("Index size {}", complete_index.len());
-        let index = Index::new(bundle, 4, None);
-        let mut purls = vec![];
-        for idx in complete_index.iter() {
-            match index.data_for_hash(idx.hash) {
-                Ok((_env, item)) => {
-                    if item.identifier.starts_with("pkg:") {
-                        purls.push(item.identifier.clone());
-                    }
-                }
-                Err(e) => {
-                    assert!(false, "Failed with error {}", e);
-                    return;
-                }
-            }
-        }
-
-        pass_num += 1;
-        println!(
-            "Read index for pass {} at {:?}",
-            pass_num,
-            Instant::now().duration_since(start)
-        );
-
-        assert!(
-            purls.len() > 20,
-            "We expect a bunch of pURLs, but got {}",
-            purls.len()
-        );
 
         let start = Instant::now();
-        let purl_cnt = purls.len();
-
-        for p in purls {
-            let item = index.data_for_key(&p).unwrap();
-            let actual = index
-                .data_for_key(
-                    &item
-                        .connections
-                        .iter()
-                        .take(1)
-                        .collect::<Vec<&(String, crate::structs::EdgeType, Option<String>)>>()[0]
-                        .0,
-                )
-                .unwrap();
-            assert!(
-                actual
-                    .connections
-                    .into_iter()
-                    .map(|v| v.0)
-                    .collect::<Vec<String>>()
-                    .contains(&p),
-                "the connected item should contain the pURL"
-            );
-        }
+        let files = match GoatRodeoBundle::bundle_files_in_dir(test_path.into()) {
+            Ok(v) => v,
+            Err(e) => {
+                assert!(false, "Failure to read files {:?}", e);
+                return;
+            }
+        };
 
         println!(
-            "Fetched {} items for pass {} at {:?}",
-            purl_cnt,
-            pass_num,
+            "Finding files took {:?}",
             Instant::now().duration_since(start)
         );
+        assert!(files.len() > 0, "We should find some files");
+        let mut pass_num = 0;
+        for bundle in files {
+            pass_num += 1;
+            let complete_index = bundle.get_index().unwrap();
+
+            println!(
+                "Loaded index for pass {} at {:?}",
+                pass_num,
+                Instant::now().duration_since(start)
+            );
+
+            assert!(
+                complete_index.len() > 200,
+                "Expecting a large index, got {} entries",
+                complete_index.len()
+            );
+            println!("Index size {}", complete_index.len());
+
+            for i in complete_index.deref() {
+                bundle.find(i.hash).unwrap().unwrap();
+            }
+
+            /*
+            let purl_pointer = bundle.data_for_key("pkg:maven").unwrap();
+
+            let mut purls = vec![];
+
+            for v in purl_pointer.connections {
+                if let (gitoid, Some(purl)) = (v.0, v.2) {
+                    purls.push((gitoid, purl));
+                }
+            }
+
+            println!(
+                "Read index for pass {} at {:?}",
+                pass_num,
+                Instant::now().duration_since(start)
+            );
+
+            assert!(
+                purls.len() > 5000,
+                "We expect a bunch of pURLs, but got {}",
+                purls.len()
+            );
+
+            let start = Instant::now();
+            let purl_cnt = purls.len();
+
+            println!("Looking up {} pURLs", purls.len());
+
+            let mut purl_loop_cnt = 0;
+
+            for (gitoid, p) in purls {
+                let i = bundle.data_for_key(&gitoid).unwrap();
+                let item = match bundle.data_for_key(&p) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let md5 = md5hash_str(&p);
+                        for i in complete_index.deref() {
+                            if md5 == i.hash {
+                                println!("Found hash {:?}", md5);
+                            }
+                        }
+                        assert!(false, "Failed to find {} error {} item {:?}", p, e, i);
+
+                        return;
+                    }
+                };
+                let actual = bundle
+                    .data_for_key(
+                        &item.connections.iter().take(1).collect::<Vec<&(
+                            String,
+                            crate::structs::EdgeType,
+                            Option<String>,
+                        )>>()[0]
+                            .0,
+                    )
+                    .unwrap();
+                assert!(
+                    actual
+                        .connections
+                        .into_iter()
+                        .map(|v| v.0)
+                        .collect::<Vec<String>>()
+                        .contains(&p),
+                    "the connected item should contain the pURL"
+                );
+                purl_loop_cnt += 1;
+                if purl_loop_cnt % 2000 == 0 {
+                    println!(
+                        "pURL loop {} at {:?}",
+                        purl_loop_cnt,
+                        Instant::now().duration_since(start)
+                    )
+                }
+            }
+
+
+            println!(
+                "Fetched {} items for pass {} at {:?}",
+                purl_cnt,
+                pass_num,
+                Instant::now().duration_since(start)
+            );
+            */
+        }
     }
 }
 

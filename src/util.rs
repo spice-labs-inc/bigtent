@@ -3,8 +3,12 @@ use anyhow::{bail, Result};
 
 use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
-use sha2::Sha256;
-use std::{collections::BTreeMap, io::{Read, Write}, time::SystemTime};
+use boring::sha;
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+    time::SystemTime,
+};
 const BYTE_BUFFER_SIZE: usize = 32768;
 
 pub fn hex_to_md5bytes(it: &str) -> Option<MD5Hash> {
@@ -61,10 +65,10 @@ pub fn check_md5(it: Option<&String>) -> Option<MD5Hash> {
 }
 
 pub fn millis_now() -> i64 {
-  SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 pub fn find_item(to_find: [u8; 16], offsets: &[ItemOffset]) -> Option<ItemOffset> {
@@ -97,9 +101,8 @@ pub fn md5hash_str(st: &str) -> MD5Hash {
 }
 
 pub fn sha256_for_reader<R: Read>(r: &mut R) -> Result<[u8; 32]> {
-    use sha2::Digest;
     // create a Sha256 object
-    let mut hasher = Sha256::new();
+    let mut hasher = sha::Sha256::new();
     let mut buffer = [0u8; BYTE_BUFFER_SIZE];
     loop {
         let read = r.read(&mut buffer)?;
@@ -108,7 +111,7 @@ pub fn sha256_for_reader<R: Read>(r: &mut R) -> Result<[u8; 32]> {
         }
         hasher.update(&buffer[0..read]);
     }
-    Ok(hasher.finalize().into())
+    Ok(hasher.finish().into())
 }
 
 #[test]
@@ -201,50 +204,53 @@ pub fn read_cbor<T: DeserializeOwned, R: Read>(file: &mut R, len: usize) -> Resu
     }
 
     match serde_cbor::from_slice(&*buffer) {
-      Ok(v) => Ok(v),
-      Err(e) => {
-        match serde_cbor::from_slice::<Value>(&*&buffer) {
-          Ok(v) => {
-            println!("Deserialized value {:?}", v);
-
-          },
-          Err(_) => {}
+        Ok(v) => Ok(v),
+        Err(e) => {
+            match serde_cbor::from_slice::<Value>(&*&buffer) {
+                Ok(v) => {
+                    println!("Deserialized value {:?}", v);
+                }
+                Err(_) => {}
+            }
+            bail!("Failed to deserialize with error {}", e);
         }
-        bail!("Failed to deserialize with error {}", e);
-      }
     }
 }
 
 pub fn write_int<W: Write>(target: &mut W, val: u32) -> Result<()> {
-  target.write(&val.to_be_bytes())?;
-  Ok(())
+    target.write(&val.to_be_bytes())?;
+    Ok(())
 }
 
 pub fn write_short<W: Write>(target: &mut W, val: u16) -> Result<()> {
-  target.write(&val.to_be_bytes())?;
-  Ok(())
+    target.write(&val.to_be_bytes())?;
+    Ok(())
 }
 
 pub fn write_long<W: Write>(target: &mut W, val: u64) -> Result<()> {
-  target.write(&val.to_be_bytes())?;
-  Ok(())
+    target.write(&val.to_be_bytes())?;
+    Ok(())
 }
 
 pub fn write_envelope<W: Write, T: Serialize>(target: &mut W, envelope: &T) -> Result<()> {
-  let bytes = serde_cbor::to_vec(envelope)?;
-  write_short(target, bytes.len() as u16)?;
-  target.write(&bytes)?;
-  Ok(())
+    let bytes = serde_cbor::to_vec(envelope)?;
+    write_short(target, bytes.len() as u16)?;
+    target.write(&bytes)?;
+    Ok(())
 }
 
-pub fn write_envelope_and_payload<W: Write, T: Serialize, T2: Serialize>(target: &mut W, envelope: &T, payload: &T2) -> Result<()> {
-  let env_bytes = serde_cbor::to_vec(envelope)?;
-  let payload_bytes = serde_cbor::to_vec(payload)?;
-  write_short(target, env_bytes.len() as u16)?;
-  write_int(target, payload_bytes.len() as u32)?;
-  target.write(&env_bytes)?;
-  target.write(&payload_bytes)?;
-  Ok(())
+pub fn write_envelope_and_payload<W: Write, T: Serialize, T2: Serialize>(
+    target: &mut W,
+    envelope: &T,
+    payload: &T2,
+) -> Result<()> {
+    let env_bytes = serde_cbor::to_vec(envelope)?;
+    let payload_bytes = serde_cbor::to_vec(payload)?;
+    write_short(target, env_bytes.len() as u16)?;
+    write_int(target, payload_bytes.len() as u32)?;
+    target.write(&env_bytes)?;
+    target.write(&payload_bytes)?;
+    Ok(())
 }
 
 pub fn traverse_value(v: &Value, path: Vec<&str>) -> Option<Value> {
