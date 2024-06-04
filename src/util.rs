@@ -1,9 +1,9 @@
 use crate::index::{ItemOffset, MD5Hash};
 use anyhow::{bail, Result};
 
+use boring::sha;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
-use boring::sha;
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
@@ -154,28 +154,21 @@ pub fn read_all<R: Read>(r: &mut R, max: usize) -> Result<Vec<u8>> {
 
 pub fn read_u16<R: Read>(r: &mut R) -> Result<u16> {
     let mut buf = [0u8; 2];
-    let len = r.read(&mut buf)?;
-    if len != buf.len() {
-        bail!("Tried to read {} and only read {}", buf.len(), len);
-    }
+    r.read_exact(&mut buf)?;
     Ok(u16::from_be_bytes(buf))
 }
 
 pub fn read_u32<R: Read>(r: &mut R) -> Result<u32> {
     let mut buf = [0u8; 4];
-    let len = r.read(&mut buf)?;
-    if len != buf.len() {
-        bail!("Tried to read {} and only read {}", buf.len(), len);
-    }
+    r.read_exact(&mut buf)?;
+
     Ok(u32::from_be_bytes(buf))
 }
 
 pub fn read_u64<R: Read>(r: &mut R) -> Result<u64> {
     let mut buf = [0u8; 8];
-    let len = r.read(&mut buf)?;
-    if len != buf.len() {
-        bail!("Tried to read {} and only read {}", buf.len(), len);
-    }
+    r.read_exact(&mut buf)?;
+
     Ok(u64::from_be_bytes(buf))
 }
 
@@ -185,10 +178,7 @@ pub fn read_len_and_cbor<T: DeserializeOwned, R: Read>(file: &mut R) -> Result<T
     for _ in 0..len {
         buffer.push(0u8);
     }
-    let read_len = file.read(&mut buffer)?;
-    if read_len != len {
-        bail!("Wanted to read {} bytes, but only got {}", len, read_len);
-    }
+    file.read_exact(&mut buffer)?;
 
     serde_cbor::from_reader(&*buffer).map_err(|e| e.into())
 }
@@ -198,10 +188,7 @@ pub fn read_cbor<T: DeserializeOwned, R: Read>(file: &mut R, len: usize) -> Resu
     for _ in 0..len {
         buffer.push(0u8);
     }
-    let read_len = file.read(&mut buffer)?;
-    if read_len != len {
-        bail!("Wanted to read {} bytes, but only got {}", len, read_len);
-    }
+    file.read_exact(&mut buffer)?;
 
     match serde_cbor::from_slice(&*buffer) {
         Ok(v) => Ok(v),
@@ -223,6 +210,11 @@ pub fn write_int<W: Write>(target: &mut W, val: u32) -> Result<()> {
 }
 
 pub fn write_short<W: Write>(target: &mut W, val: u16) -> Result<()> {
+    target.write(&val.to_be_bytes())?;
+    Ok(())
+}
+
+pub fn write_short_signed<W: Write>(target: &mut W, val: i16) -> Result<()> {
     target.write(&val.to_be_bytes())?;
     Ok(())
 }

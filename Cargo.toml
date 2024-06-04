@@ -15,6 +15,7 @@ hex = "0.4.3"
 bytes = "1.6.0"
 hex-literal = "0.4.1"
 shellexpand = "3.1.0"
+chrono = "0.4.38"
 
 # Web Framework stuff
 rouille = "3.6.2"

@@ -358,6 +358,18 @@ pub enum IndexLoc {
     Chain(Vec<IndexLoc>),
 }
 
+impl IndexLoc {
+    pub fn as_vec(&self) -> Vec<IndexLoc> {
+        match self {
+            IndexLoc::Chain(v) => v.clone(),
+            il @ IndexLoc::Loc {
+                offset: _,
+                file_hash: _,
+            } => vec![il.clone()],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ItemOffset {
     pub hash: [u8; 16],

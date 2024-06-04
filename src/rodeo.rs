@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::ops::Deref;
-
-use std::time::Instant;
 use std::{
     collections::HashMap,
     fs::{read_dir, File},
@@ -56,7 +54,7 @@ impl IndexFile {
             }
         }
 
-        let mut file = BufReader::new(GoatRodeoBundle::find_file(&dir, hash, "gri")?);
+        let mut file = GoatRodeoBundle::find_file(&dir, hash, "gri")?;
 
         let ifp = &mut file;
         let magic = read_u32(ifp)?;
@@ -75,7 +73,7 @@ impl IndexFile {
 
         Ok(IndexFile {
             envelope: idx_env,
-            file: Arc::new(Mutex::new(file)),
+            file: Arc::new(Mutex::new(BufReader::new(file))),
             data_offset: idx_pos,
         })
     }
@@ -83,7 +81,7 @@ impl IndexFile {
     pub fn read_index(&self) -> Result<Vec<ItemOffset>> {
         let mut ret = Vec::with_capacity(self.envelope.size as usize);
         let mut last = [0u8; 16];
-        let mut not_sorted = false;
+        // let mut not_sorted = false;
 
         let mut my_file = self
             .file
@@ -98,15 +96,16 @@ impl IndexFile {
         for _ in 0..self.envelope.size {
             let eo = ItemOffset::read(&mut info)?;
             if eo.hash < last {
-                not_sorted = true;
+                // not_sorted = true;
+                bail!("Not sorted!!! last {:?} eo.hash {:?}", last, eo.hash);
             }
             last = eo.hash;
             ret.push(eo);
         }
 
-        if not_sorted {
-            ret.sort_by(|a, b| a.hash.cmp(&b.hash))
-        }
+        // if not_sorted {
+        //     ret.sort_by(|a, b| a.hash.cmp(&b.hash))
+        // }
 
         Ok(ret)
     }
@@ -127,7 +126,7 @@ pub struct DataFileEnvelope {
 #[derive(Debug, Clone)]
 pub struct DataFile {
     pub envelope: DataFileEnvelope,
-    pub file: Arc<Mutex<File>>,
+    pub file: Arc<Mutex<BufReader<File>>>,
     pub data_offset: u64,
 }
 
@@ -147,13 +146,25 @@ impl DataFile {
 
         let env: DataFileEnvelope = read_len_and_cbor(dfp)?;
 
-        let cur_pos: u64 = data_file.seek(SeekFrom::Current(0))?;
+        let cur_pos: u64 = data_file.stream_position()?;
         // FIXME do additional validation of the envelope
         Ok(DataFile {
             envelope: env,
-            file: Arc::new(Mutex::new(data_file)),
+            file: Arc::new(Mutex::new(BufReader::with_capacity(4096, data_file))),
             data_offset: cur_pos,
         })
+    }
+
+    fn seek_to(file: &mut BufReader<File>, desired_pos: u64) -> Result<()> {
+      let pos = file.stream_position()?;
+      if pos == desired_pos {
+        return Ok(());
+      }
+
+      let rel_seek = (desired_pos as i64) - (pos as i64);
+
+      file.seek_relative(rel_seek)?;
+      Ok(())
     }
 
     pub fn read_envelope_at(&self, pos: u64) -> Result<ItemEnvelope> {
@@ -161,10 +172,11 @@ impl DataFile {
             .file
             .lock()
             .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
-        my_file.seek(SeekFrom::Start(pos))?;
-        let len = read_u16(&mut my_file.deref())?;
-        let _ = read_u32(&mut my_file.deref())?;
-        read_cbor(&mut my_file.deref(), len as usize)
+          DataFile::seek_to(&mut my_file, pos)?;
+        let my_reader: &mut BufReader<File> = &mut my_file;
+        let len = read_u16(my_reader)?;
+        let _ = read_u32(my_reader)?;
+        read_cbor(my_reader, len as usize)
     }
 
     pub fn read_envelope_and_item_at(&self, pos: u64) -> Result<(ItemEnvelope, Item)> {
@@ -172,10 +184,11 @@ impl DataFile {
             .file
             .lock()
             .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
-        my_file.seek(SeekFrom::Start(pos))?;
-        let env_len = read_u16(&mut my_file.deref())?;
-        let item_len = read_u32(&mut my_file.deref())?;
-        let env = read_cbor(&mut my_file.deref(), env_len as usize)?;
+        DataFile::seek_to(&mut my_file, pos)?;
+        let my_reader: &mut BufReader<File> = &mut my_file;
+        let env_len = read_u16(my_reader)?;
+        let item_len = read_u32(my_reader)?;
+        let env = read_cbor(my_reader, env_len as usize)?;
         let item = read_cbor(&mut *my_file, item_len as usize)?;
         Ok((env, item))
     }
@@ -213,14 +226,24 @@ impl GoatRodeoBundle {
     #[allow(non_upper_case_globals)]
     pub const BundleFileMagicNumber: u32 = 0xba4a4a; // Banana
 
+    pub fn clone_with(&self, index: Vec<ItemOffset>, data_files: HashMap<u64, DataFile>, index_files: HashMap<u64, IndexFile>) -> GoatRodeoBundle {
+      GoatRodeoBundle {
+        envelope: self.envelope.clone(),
+        path: self.path.clone(),
+        envelope_path: self.envelope_path.clone(),
+        data_files: data_files,
+        index_files: index_files,
+        index: Arc::new(ArcSwap::new(Arc::new(Some(Arc::new(index))))),
+        building_index: Arc::new(Mutex::new(false)),
+    }
+    }
+
     pub fn new(dir: &PathBuf, envelope_path: &PathBuf) -> Result<GoatRodeoBundle> {
         let file_path = envelope_path.clone();
         let file_name = match file_path.file_name().map(|e| e.to_str()).flatten() {
             Some(n) => n.to_string(),
             _ => bail!("Unable to get filename for {:?}", file_path),
         };
-
-        let start = Instant::now();
 
         let hash: u64 = match hex_to_u64(&file_name[(file_name.len() - 20)..(file_name.len() - 4)])
         {
@@ -341,7 +364,9 @@ impl GoatRodeoBundle {
             let mut the_index = index.read_index()?;
             if ret.len() == 0 {
                 ret = the_index;
-            } else if the_index.len() == 0 { // do nothing... nothing to sort
+            } else if the_index.len() == 0 { 
+              
+              // do nothing... nothing to sort
             } else if the_index[0].hash > ret[ret.len() - 1].hash {
                 // append the_index to ret
                 ret.append(&mut the_index);
@@ -395,7 +420,7 @@ impl GoatRodeoBundle {
         Ok(ret_arc)
     }
 
-    pub fn data_file(&self, hash: u64) -> Result<Arc<Mutex<File>>> {
+    pub fn data_file(&self, hash: u64) -> Result<Arc<Mutex<BufReader<File>>>> {
         match self.data_files.get(&hash) {
             Some(df) => Ok(df.file.clone()),
             None => bail!("Data file '{:016x}.grd' not found", hash),
@@ -514,6 +539,8 @@ fn test_generated_bundle() {
     use std::time::Instant;
 
     let test_paths: Vec<String> = vec![
+        "../../tmp/oc_dest/result_aa".into(),
+        "../../tmp/oc_dest/result_ab".into(),
         "../goatrodeo/res_for_big_tent/".into(),
     ];
 
@@ -522,7 +549,7 @@ fn test_generated_bundle() {
         let goat_rodeo_test_data: PathBuf = test_path.into();
         // punt test is the files don't exist
         if !goat_rodeo_test_data.is_dir() {
-            return;
+            break;
         }
 
         let start = Instant::now();
@@ -560,90 +587,6 @@ fn test_generated_bundle() {
             for i in complete_index.deref() {
                 bundle.find(i.hash).unwrap().unwrap();
             }
-
-            /*
-            let purl_pointer = bundle.data_for_key("pkg:maven").unwrap();
-
-            let mut purls = vec![];
-
-            for v in purl_pointer.connections {
-                if let (gitoid, Some(purl)) = (v.0, v.2) {
-                    purls.push((gitoid, purl));
-                }
-            }
-
-            println!(
-                "Read index for pass {} at {:?}",
-                pass_num,
-                Instant::now().duration_since(start)
-            );
-
-            assert!(
-                purls.len() > 5000,
-                "We expect a bunch of pURLs, but got {}",
-                purls.len()
-            );
-
-            let start = Instant::now();
-            let purl_cnt = purls.len();
-
-            println!("Looking up {} pURLs", purls.len());
-
-            let mut purl_loop_cnt = 0;
-
-            for (gitoid, p) in purls {
-                let i = bundle.data_for_key(&gitoid).unwrap();
-                let item = match bundle.data_for_key(&p) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let md5 = md5hash_str(&p);
-                        for i in complete_index.deref() {
-                            if md5 == i.hash {
-                                println!("Found hash {:?}", md5);
-                            }
-                        }
-                        assert!(false, "Failed to find {} error {} item {:?}", p, e, i);
-
-                        return;
-                    }
-                };
-                let actual = bundle
-                    .data_for_key(
-                        &item.connections.iter().take(1).collect::<Vec<&(
-                            String,
-                            crate::structs::EdgeType,
-                            Option<String>,
-                        )>>()[0]
-                            .0,
-                    )
-                    .unwrap();
-                assert!(
-                    actual
-                        .connections
-                        .into_iter()
-                        .map(|v| v.0)
-                        .collect::<Vec<String>>()
-                        .contains(&p),
-                    "the connected item should contain the pURL"
-                );
-                purl_loop_cnt += 1;
-                if purl_loop_cnt % 2000 == 0 {
-                    println!(
-                        "pURL loop {} at {:?}",
-                        purl_loop_cnt,
-                        Instant::now().duration_since(start)
-                    )
-                }
-            }
-
-
-            println!(
-                "Fetched {} items for pass {} at {:?}",
-                purl_cnt,
-                pass_num,
-                Instant::now().duration_since(start)
-            );
-            */
         }
     }
 }
@@ -652,13 +595,13 @@ fn test_generated_bundle() {
 fn test_files_in_dir() {
     use std::time::{Duration, Instant};
 
-    let goat_rodeo_test_data: PathBuf = "../goatrodeo/frood_dir/".into();
+    let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
     // punt test is the files don't exist
     if !goat_rodeo_test_data.is_dir() {
         return;
     }
 
-    let files = match GoatRodeoBundle::bundle_files_in_dir("../goatrodeo/frood_dir/".into()) {
+    let files = match GoatRodeoBundle::bundle_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
         Ok(v) => v,
         Err(e) => {
             assert!(false, "Failure to read files {:?}", e);
