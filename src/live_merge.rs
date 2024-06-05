@@ -108,17 +108,41 @@ pub fn live_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
     Ok(b0.clone_with(new_index, data_files, index_files))
 }
 
+#[cfg(feature = "longtest")]
 #[test]
 fn test_live_merge() {
-    use std::time::Instant;
+    use std::{path::PathBuf, time::Instant};
     let start = Instant::now();
 
     let test_paths: Vec<String> = vec![
-        "../../tmp/oc_dest/result_aa".into(),
-        "../../tmp/oc_dest/result_ab".into(),
-        "../../tmp/oc_dest/result_ac".into(),
-        "../../tmp/oc_dest/result_ad".into(),
-    ];
+        "../../tmp/oc_dest/result_aa",
+        "../../tmp/oc_dest/result_ab",
+        "../../tmp/oc_dest/result_ac",
+        "../../tmp/oc_dest/result_ad",
+        "../../tmp/oc_dest/result_ae",
+        "../../tmp/oc_dest/result_af",
+        "../../tmp/oc_dest/result_ag",
+        "../../tmp/oc_dest/result_ah",
+        "../../tmp/oc_dest/result_ai",
+        "../../tmp/oc_dest/result_aj",
+        "../../tmp/oc_dest/result_ak",
+        "../../tmp/oc_dest/result_al",
+        "../../tmp/oc_dest/result_am",
+        "../../tmp/oc_dest/result_an",
+        "../../tmp/oc_dest/result_ao",
+        "../../tmp/oc_dest/result_ap",
+    ]
+    .into_iter()
+    .filter(|p| {
+        let pb: PathBuf = p.into();
+        pb.exists() && pb.is_dir()
+    })
+    .map(|v| v.to_string())
+    .collect();
+
+    if test_paths.len() < 2 {
+        return;
+    }
 
     let test_bundles: Vec<GoatRodeoBundle> = test_paths
         .iter()

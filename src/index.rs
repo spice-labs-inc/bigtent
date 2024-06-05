@@ -234,11 +234,11 @@ impl Index {
         self.config_table.load().clone()
     }
 
-    fn info_from_config(file_name: &str, conf: &Table) -> Result<GoatRodeoBundle> {
+    fn info_from_config(file_name: PathBuf, conf: &Table) -> Result<GoatRodeoBundle> {
         let index_name = match conf.get("bundle_path") {
             Some(toml::Value::String(index)) => shellexpand::tilde(index).to_string(),
             _ => bail!(format!(
-                "Could not find 'bundle_path' key in configuration file {}",
+                "Could not find 'bundle_path' key in configuration file {:?}",
                 file_name
             )),
         };
@@ -259,7 +259,7 @@ impl Index {
 
     pub fn rebuild(&self) -> Result<()> {
         let config_table = self.args.read_conf_file()?;
-        let new_bundle = Index::info_from_config(&self.args.conf_file()?, &config_table)?;
+        let new_bundle = Index::info_from_config(self.args.conf_file()?, &config_table)?;
         self.bundle.store(Arc::new(new_bundle));
         Ok(())
     }
@@ -309,7 +309,7 @@ impl Index {
 
         let config_table = args.read_conf_file()?;
 
-        let bundle = Index::info_from_config(&args.conf_file()?, &config_table)?;
+        let bundle = Index::info_from_config(args.conf_file()?, &config_table)?;
 
         let ret = Arc::new(Index {
             threads: Mutex::new(vec![]),

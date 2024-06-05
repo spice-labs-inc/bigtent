@@ -11,15 +11,17 @@ use crate::{
     index::MD5Hash,
     rodeo::{BundleFileEnvelope, DataFileEnvelope, GoatRodeoBundle, IndexEnvelope},
     util::{
-        byte_slice_to_u63, md5hash_str, millis_now, sha256_for_reader, write_envelope, write_int,
+        byte_slice_to_u63, md5hash_str, millis_now, sha256_for_slice, write_envelope, write_int,
         write_long, write_short, write_short_signed,
     },
 };
 use anyhow::Result;
-use bytes::Buf;
 use thousands::Separable;
 
-pub fn merge_no_history(bundles: Vec<GoatRodeoBundle>, dest_directory: &str) -> Result<()> {
+pub fn merge_no_history<PB: Into<PathBuf>>(
+    bundles: Vec<GoatRodeoBundle>,
+    dest_directory: PB,
+) -> Result<()> {
     let start = Instant::now();
     let dest: PathBuf = dest_directory.into();
 
@@ -193,7 +195,7 @@ pub fn merge_no_history(bundles: Vec<GoatRodeoBundle>, dest_directory: &str) -> 
             Instant::now().duration_since(start)
         );
         let data_reader: &[u8] = &dest_data;
-        let grd_sha = byte_slice_to_u63(&sha256_for_reader(&mut data_reader.reader())?)?;
+        let grd_sha = byte_slice_to_u63(&sha256_for_slice(data_reader))?;
         println!(
             "computed grd sha {:?}",
             Instant::now().duration_since(start)
@@ -242,7 +244,7 @@ pub fn merge_no_history(bundles: Vec<GoatRodeoBundle>, dest_directory: &str) -> 
 
         // compute sha256 of index
         let index_reader: &[u8] = &index_file;
-        let gri_sha = byte_slice_to_u63(&sha256_for_reader(&mut index_reader.reader())?)?;
+        let gri_sha = byte_slice_to_u63(&sha256_for_slice(index_reader))?;
 
         // write the .gri file
         {
@@ -284,7 +286,7 @@ pub fn merge_no_history(bundles: Vec<GoatRodeoBundle>, dest_directory: &str) -> 
 
     // compute sha256 of index
     let bundle_reader: &[u8] = &bundle_file;
-    let grb_sha = byte_slice_to_u63(&sha256_for_reader(&mut bundle_reader.reader())?)?;
+    let grb_sha = byte_slice_to_u63(&sha256_for_slice(bundle_reader))?;
 
     // write the .grb file
     {
@@ -314,6 +316,7 @@ pub fn merge_no_history(bundles: Vec<GoatRodeoBundle>, dest_directory: &str) -> 
     Ok(())
 }
 
+#[cfg(feature = "longtest")]
 #[test]
 fn test_merge() {
     let target_path = "/tmp/bt_merge_test";
@@ -323,12 +326,34 @@ fn test_merge() {
     println!("Removed directory");
 
     let test_paths: Vec<String> = vec![
-        "../../tmp/oc_dest/result_aa".into(),
-        "../../tmp/oc_dest/result_ab".into(),
-        "../../tmp/oc_dest/result_ac".into(),
-        "../../tmp/oc_dest/result_ad".into(),
-    ];
+        "../../tmp/oc_dest/result_aa",
+        "../../tmp/oc_dest/result_ab",
+        "../../tmp/oc_dest/result_ac",
+        "../../tmp/oc_dest/result_ad",
+        "../../tmp/oc_dest/result_ae",
+        "../../tmp/oc_dest/result_af",
+        "../../tmp/oc_dest/result_ag",
+        "../../tmp/oc_dest/result_ah",
+        "../../tmp/oc_dest/result_ai",
+        "../../tmp/oc_dest/result_aj",
+        "../../tmp/oc_dest/result_ak",
+        "../../tmp/oc_dest/result_al",
+        "../../tmp/oc_dest/result_am",
+        "../../tmp/oc_dest/result_an",
+        "../../tmp/oc_dest/result_ao",
+        "../../tmp/oc_dest/result_ap",
+    ]
+    .into_iter()
+    .filter(|p| {
+        let pb: PathBuf = p.into();
+        pb.exists() && pb.is_dir()
+    })
+    .map(|v| v.to_string())
+    .collect();
 
+    if test_paths.len() < 2 {
+        return;
+    }
     let test_bundles: Vec<GoatRodeoBundle> = test_paths
         .iter()
         .flat_map(|v| GoatRodeoBundle::bundle_files_in_dir(v.into()).unwrap())

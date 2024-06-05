@@ -17,9 +17,9 @@ pub enum EdgeType {
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
 pub struct ItemMetaData {
     pub file_names: HashSet<String>,
-    pub file_type: String,
-    pub file_sub_type: String,
-    pub extra: HashMap<String, String>,
+    pub file_type: HashSet<String>,
+    pub file_sub_type: HashSet<String>,
+    pub extra: HashMap<String, HashSet<String>>,
 }
 
 impl ItemMetaData {
@@ -30,11 +30,31 @@ impl ItemMetaData {
                 it.extend(other.file_names);
                 it
             },
-            file_type: self.file_type.clone(),
-            file_sub_type: self.file_sub_type.clone(),
+            file_type: {
+                let mut it = self.file_type.clone();
+                it.extend(other.file_type.clone());
+                it
+            },
+            file_sub_type: {
+                let mut it = self.file_sub_type.clone();
+                it.extend(other.file_sub_type.clone());
+                it
+            },
             extra: {
                 let mut it = self.extra.clone();
-                it.extend(other.extra);
+                for (k, v) in other.extra.iter() {
+                    let v = v.clone();
+                    let the_val = match it.get(k) {
+                        Some(mine) => {
+                            let mut tmp = mine.clone();
+                            tmp.extend(v);
+                            tmp
+                        }
+                        None => v,
+                    };
+
+                    it.insert(k.clone(), the_val);
+                }
                 it
             },
         }
@@ -68,15 +88,13 @@ impl Item {
     }
 
     pub fn merge(&self, other: Item) -> Item {
-        
-
-        Item{
-          identifier: self.identifier.clone(),
+        Item {
+            identifier: self.identifier.clone(),
             reference: self.reference,
             connections: {
-              let mut it = self.connections.clone();
-              it.extend(other.connections);
-              it
+                let mut it = self.connections.clone();
+                it.extend(other.connections);
+                it
             },
             previous_reference: self.previous_reference,
             metadata: match (&self.metadata, other.metadata) {
@@ -90,9 +108,6 @@ impl Item {
             _timestamp: millis_now(),
             _version: self._version,
             _type: self._type.clone(),
-
         }
-
-        
     }
 }

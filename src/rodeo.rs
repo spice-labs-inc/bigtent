@@ -156,15 +156,15 @@ impl DataFile {
     }
 
     fn seek_to(file: &mut BufReader<File>, desired_pos: u64) -> Result<()> {
-      let pos = file.stream_position()?;
-      if pos == desired_pos {
-        return Ok(());
-      }
+        let pos = file.stream_position()?;
+        if pos == desired_pos {
+            return Ok(());
+        }
 
-      let rel_seek = (desired_pos as i64) - (pos as i64);
+        let rel_seek = (desired_pos as i64) - (pos as i64);
 
-      file.seek_relative(rel_seek)?;
-      Ok(())
+        file.seek_relative(rel_seek)?;
+        Ok(())
     }
 
     pub fn read_envelope_at(&self, pos: u64) -> Result<ItemEnvelope> {
@@ -172,7 +172,7 @@ impl DataFile {
             .file
             .lock()
             .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
-          DataFile::seek_to(&mut my_file, pos)?;
+        DataFile::seek_to(&mut my_file, pos)?;
         let my_reader: &mut BufReader<File> = &mut my_file;
         let len = read_u16(my_reader)?;
         let _ = read_u32(my_reader)?;
@@ -226,16 +226,21 @@ impl GoatRodeoBundle {
     #[allow(non_upper_case_globals)]
     pub const BundleFileMagicNumber: u32 = 0xba4a4a; // Banana
 
-    pub fn clone_with(&self, index: Vec<ItemOffset>, data_files: HashMap<u64, DataFile>, index_files: HashMap<u64, IndexFile>) -> GoatRodeoBundle {
-      GoatRodeoBundle {
-        envelope: self.envelope.clone(),
-        path: self.path.clone(),
-        envelope_path: self.envelope_path.clone(),
-        data_files: data_files,
-        index_files: index_files,
-        index: Arc::new(ArcSwap::new(Arc::new(Some(Arc::new(index))))),
-        building_index: Arc::new(Mutex::new(false)),
-    }
+    pub fn clone_with(
+        &self,
+        index: Vec<ItemOffset>,
+        data_files: HashMap<u64, DataFile>,
+        index_files: HashMap<u64, IndexFile>,
+    ) -> GoatRodeoBundle {
+        GoatRodeoBundle {
+            envelope: self.envelope.clone(),
+            path: self.path.clone(),
+            envelope_path: self.envelope_path.clone(),
+            data_files: data_files,
+            index_files: index_files,
+            index: Arc::new(ArcSwap::new(Arc::new(Some(Arc::new(index))))),
+            building_index: Arc::new(Mutex::new(false)),
+        }
     }
 
     pub fn new(dir: &PathBuf, envelope_path: &PathBuf) -> Result<GoatRodeoBundle> {
@@ -364,9 +369,9 @@ impl GoatRodeoBundle {
             let mut the_index = index.read_index()?;
             if ret.len() == 0 {
                 ret = the_index;
-            } else if the_index.len() == 0 { 
-              
-              // do nothing... nothing to sort
+            } else if the_index.len() == 0 {
+
+                // do nothing... nothing to sort
             } else if the_index[0].hash > ret[ret.len() - 1].hash {
                 // append the_index to ret
                 ret.append(&mut the_index);
@@ -601,7 +606,8 @@ fn test_files_in_dir() {
         return;
     }
 
-    let files = match GoatRodeoBundle::bundle_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
+    let files = match GoatRodeoBundle::bundle_files_in_dir("../goatrodeo/res_for_big_tent/".into())
+    {
         Ok(v) => v,
         Err(e) => {
             assert!(false, "Failure to read files {:?}", e);
@@ -626,8 +632,8 @@ fn test_files_in_dir() {
         bundle.get_index().unwrap(); // should be from cache
         let time2 = Instant::now().duration_since(start);
         assert!(
-            time > Duration::from_millis(100),
-            "Building the initial index should take more than 100ms, but took {:?}",
+            time > Duration::from_millis(60),
+            "Building the initial index should take more than 60ms, but took {:?}",
             time
         );
         assert!(

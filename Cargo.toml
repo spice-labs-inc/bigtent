@@ -41,3 +41,8 @@ flume = "0.11.0"
 scopeguard = "1.2.0"
 
 rand = "0.8.5"
+
+[features]
+
+longtest = [] # feature has no explicit dependencies
+oldstuff = []

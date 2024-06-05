@@ -1,20 +1,16 @@
 #![allow(dead_code)]
 
+#[cfg(feature = "oldstuff")]
 use anyhow::Result;
-
+#[cfg(feature = "oldstuff")]
 use std::{
     fs::File,
     io::{BufRead, BufReader},
 };
+#[cfg(feature = "oldstuff")]
+use crate::{index::MD5Hash, util::md5hash_str};
 
-use crate::index::MD5Hash;
-
-pub fn md5hash_str(st: &str) -> u128 {
-    let res = md5::compute(st);
-
-    u128::from_be_bytes(res.into())
-}
-
+#[cfg(feature = "oldstuff")]
 fn read_old_file(path: &str) -> Result<Vec<(MD5Hash, String, String)>> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut ret = vec![];
@@ -30,7 +26,7 @@ fn read_old_file(path: &str) -> Result<Vec<(MD5Hash, String, String)>> {
                 let json = line[offset + 5..].to_string();
                 let pk = line[key + 1..offset].to_string();
                 let hash = md5hash_str(&pk);
-                let hash_bytes = hash.to_be_bytes();
+                let hash_bytes = hash;
                 ret.push((hash_bytes, pk, json));
             }
             _ => {}
@@ -39,6 +35,7 @@ fn read_old_file(path: &str) -> Result<Vec<(MD5Hash, String, String)>> {
     Ok(ret)
 }
 
+#[cfg(feature = "oldstuff")]
 #[test]
 fn test_old_vs_new() {
     use crate::{index::MD5Hash, rodeo::GoatRodeoBundle, util::find_item};

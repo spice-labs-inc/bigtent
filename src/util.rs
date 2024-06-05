@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     time::SystemTime,
 };
-const BYTE_BUFFER_SIZE: usize = 32768;
+const BYTE_BUFFER_SIZE: usize = 4096;
 
 pub fn hex_to_md5bytes(it: &str) -> Option<MD5Hash> {
     hex::decode(it)
@@ -100,6 +100,15 @@ pub fn md5hash_str(st: &str) -> MD5Hash {
     res.into()
 }
 
+pub fn sha256_for_slice(r: &[u8]) -> [u8; 32] {
+    // create a Sha256 object
+    let mut hasher = sha::Sha256::new();
+
+    hasher.update(r);
+
+    hasher.finish().into()
+}
+
 pub fn sha256_for_reader<R: Read>(r: &mut R) -> Result<[u8; 32]> {
     // create a Sha256 object
     let mut hasher = sha::Sha256::new();
@@ -122,7 +131,13 @@ fn test_sha256() {
     assert_eq!(
         res,
         hex!("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
-    )
+    );
+
+    let res = sha256_for_slice(b"hello world");
+    assert_eq!(
+        res,
+        hex!("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+    );
 }
 
 pub fn read_all<R: Read>(r: &mut R, max: usize) -> Result<Vec<u8>> {
