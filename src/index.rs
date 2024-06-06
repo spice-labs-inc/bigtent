@@ -16,11 +16,7 @@ use thousands::Separable;
 use toml::{map::Map, Table};
 // use num_traits::ops::bytes::ToBytes;
 use crate::{
-    config::Args,
-    envelopes::ItemEnvelope,
-    rodeo::GoatRodeoBundle,
-    structs::{EdgeType, Item},
-    util::cbor_to_json_str,
+    config::Args, envelopes::ItemEnvelope, live_merge::live_merge, rodeo::GoatRodeoBundle, structs::{EdgeType, Item}, util::cbor_to_json_str
 };
 
 pub type MD5Hash = [u8; 16];
@@ -235,26 +231,51 @@ impl Index {
     }
 
     fn info_from_config(file_name: PathBuf, conf: &Table) -> Result<GoatRodeoBundle> {
-        let index_name = match conf.get("bundle_path") {
-            Some(toml::Value::String(index)) => shellexpand::tilde(index).to_string(),
+      let bundle_path_key = conf.get("bundle_path") ;
+        let envelope_paths: Vec<PathBuf> = match bundle_path_key {
+            Some(toml::Value::Array(av)) => av
+                .iter()
+                .flat_map(|v| match v {
+                    toml::Value::String(index) => {
+                        Some(PathBuf::from(shellexpand::tilde(index).to_string()))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            Some(toml::Value::String(index)) => {
+                vec![PathBuf::from(shellexpand::tilde(index).to_string())]
+            }
             _ => bail!(format!(
                 "Could not find 'bundle_path' key in configuration file {:?}",
                 file_name
             )),
         };
 
-        let envelope_path = PathBuf::from(index_name.clone());
-        let envelope_dir = match envelope_path.parent() {
-            Some(path) => path.to_path_buf(),
-            None => bail!(
-                "Path Bundle '{}' does not have a parent directory",
-                index_name
-            ),
-        };
+        let mut envelope_dirs = vec![];
+        for p in envelope_paths {
+            envelope_dirs.push((p.clone(), match p.parent() {
+                Some(path) => path.to_path_buf(),
+                None => bail!("Path Bundle '{:?}' does not have a parent directory", p),
+            }));
+        }
 
-        let bundle = GoatRodeoBundle::new(&envelope_dir, &envelope_path);
+        let mut bundles = vec![];
+        
+        for (path, parent) in envelope_dirs {
+          bundles.push(GoatRodeoBundle::new(&parent, &path)?);
+        }
+        
+        if bundles.len() == 0 {
+          // this is weird... we should have gotten at least one item
+          bail!("No bundles were specified in {}", bundle_path_key.unwrap());
+        } else if bundles.len() == 1 {
+          return Ok(bundles.pop().unwrap()); // okay because just checked length
+        } else {
+          // turn the bundles into one
+          live_merge(bundles)
+        }
 
-        bundle
+       
     }
 
     pub fn rebuild(&self) -> Result<()> {

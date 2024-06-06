@@ -15,8 +15,7 @@ use crate::envelopes::ItemEnvelope;
 use crate::index::{IndexLoc, ItemOffset, MD5Hash};
 use crate::structs::Item;
 use crate::util::{
-    byte_slice_to_u63, find_item, hex_to_u64, md5hash_str, read_cbor, read_len_and_cbor, read_u16,
-    read_u32, sha256_for_reader,
+    byte_slice_to_u63, find_item, hex_to_u64, md5hash_str, millis_now, read_cbor, read_len_and_cbor, read_u16, read_u32, sha256_for_reader, sha256_for_slice
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -208,10 +207,13 @@ pub struct BundleFileEnvelope {
 #[derive(Debug, Clone)]
 pub struct GoatRodeoBundle {
     pub envelope: BundleFileEnvelope,
+    pub bundle_file_hash: u64,
     pub path: PathBuf,
     pub envelope_path: PathBuf,
     pub data_files: HashMap<u64, DataFile>,
     pub index_files: HashMap<u64, IndexFile>,
+    pub sub_bundles: HashMap<u64, GoatRodeoBundle>,
+    pub synthetic: bool,
     index: Arc<ArcSwap<Option<Arc<Vec<ItemOffset>>>>>,
     building_index: Arc<Mutex<bool>>,
 }
@@ -226,11 +228,17 @@ impl GoatRodeoBundle {
     #[allow(non_upper_case_globals)]
     pub const BundleFileMagicNumber: u32 = 0xba4a4a; // Banana
 
-    pub fn clone_with(
+    // Reset the index. Should be done with extreme care
+  pub fn reset_index(&self) -> () {
+    self.index.store(Arc::new(None));
+  }
+
+    pub fn create_synthetic_with(
         &self,
         index: Vec<ItemOffset>,
         data_files: HashMap<u64, DataFile>,
         index_files: HashMap<u64, IndexFile>,
+        sub_bundles: HashMap<u64, GoatRodeoBundle>
     ) -> GoatRodeoBundle {
         GoatRodeoBundle {
             envelope: self.envelope.clone(),
@@ -240,6 +248,9 @@ impl GoatRodeoBundle {
             index_files: index_files,
             index: Arc::new(ArcSwap::new(Arc::new(Some(Arc::new(index))))),
             building_index: Arc::new(Mutex::new(false)),
+            bundle_file_hash: byte_slice_to_u63(&sha256_for_slice(&millis_now().to_be_bytes())).unwrap(),
+            sub_bundles,
+            synthetic: true,
         }
     }
 
@@ -336,7 +347,25 @@ impl GoatRodeoBundle {
             index_files: index_files,
             index: Arc::new(ArcSwap::new(Arc::new(None))),
             building_index: Arc::new(Mutex::new(false)),
+            bundle_file_hash: sha_u64,
+            sub_bundles: HashMap::new(),
+            synthetic: false
         })
+    }
+
+    // All the non-synthetic sub-bundles
+    pub fn all_sub_bundles(&self) -> Vec<GoatRodeoBundle> {
+      let mut ret = vec![];
+
+      if !self.sub_bundles.is_empty() {
+        for (_, sub) in self.sub_bundles.iter() {
+          ret.append(&mut sub.all_sub_bundles());
+        }
+      } else {
+        ret.push(self.clone());
+      }
+
+      ret
     }
 
     pub fn get_index(&self) -> Result<Arc<Vec<ItemOffset>>> {

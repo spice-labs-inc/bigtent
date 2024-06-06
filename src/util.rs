@@ -1,7 +1,7 @@
 use crate::index::{ItemOffset, MD5Hash};
 use anyhow::{bail, Result};
 
-use boring::sha;
+// use boring::sha;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
 use std::{
@@ -102,16 +102,18 @@ pub fn md5hash_str(st: &str) -> MD5Hash {
 
 pub fn sha256_for_slice(r: &[u8]) -> [u8; 32] {
     // create a Sha256 object
-    let mut hasher = sha::Sha256::new();
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
 
     hasher.update(r);
 
-    hasher.finish().into()
+    hasher.finalize().into()
 }
 
 pub fn sha256_for_reader<R: Read>(r: &mut R) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
     // create a Sha256 object
-    let mut hasher = sha::Sha256::new();
+    let mut hasher = Sha256::new();
     let mut buffer = [0u8; BYTE_BUFFER_SIZE];
     loop {
         let read = r.read(&mut buffer)?;
@@ -120,7 +122,7 @@ pub fn sha256_for_reader<R: Read>(r: &mut R) -> Result<[u8; 32]> {
         }
         hasher.update(&buffer[0..read]);
     }
-    Ok(hasher.finish().into())
+    Ok(hasher.finalize().into())
 }
 
 #[test]

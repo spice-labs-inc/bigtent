@@ -33,6 +33,12 @@ pub fn live_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
         Instant::now().duration_since(start)
     );
 
+    // build submap 
+    let mut submap = HashMap::new();
+    for b in &bundles {
+      submap.insert(b.bundle_file_hash, b.clone());
+    }
+
     let mut new_index: Vec<ItemOffset> = Vec::with_capacity(max_size);
     let mut loop_cnt = 0usize;
 
@@ -105,7 +111,7 @@ pub fn live_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
 
     let b0 = &bundles[0];
     println!("Merge took {:?}", Instant::now().duration_since(start));
-    Ok(b0.clone_with(new_index, data_files, index_files))
+    Ok(b0.create_synthetic_with(new_index, data_files, index_files, submap))
 }
 
 #[cfg(feature = "longtest")]
