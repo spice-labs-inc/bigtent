@@ -69,9 +69,8 @@ pub struct Item {
     pub identifier: String,
     pub reference: LocationReference,
     pub connections: HashSet<Edge>,
-    pub previous_reference: Option<LocationReference>,
     pub metadata: Option<ItemMetaData>,
-    pub merged_from: Vec<Item>,
+    pub merged_from: Vec<LocationReference>,
     pub file_size: i64,
     pub _timestamp: i64,
     pub _version: u32,
@@ -83,10 +82,22 @@ impl Item {
 
     pub fn remove_references(&mut self) {
         self.reference = Item::NOOP;
-        self.previous_reference = None;
         self.merged_from = vec![];
     }
 
+    // tests two items... they are the same if they have the same
+    // `identifier`, `connections`, `metadata`, `file_size`, `version`,
+    // and `_type`
+    pub fn is_same(&self, other: &Item) -> bool {
+        self.file_size == other.file_size
+            && self._version == other._version
+            && self.identifier == other.identifier
+            && self.connections == other.connections
+            && self.metadata == other.metadata
+            && self._type == other._type
+    }
+
+    // merge to `Item`s
     pub fn merge(&self, other: Item) -> Item {
         Item {
             identifier: self.identifier.clone(),
@@ -96,7 +107,6 @@ impl Item {
                 it.extend(other.connections);
                 it
             },
-            previous_reference: self.previous_reference,
             metadata: match (&self.metadata, other.metadata) {
                 (None, None) => None,
                 (None, Some(a)) => Some(a),
@@ -110,4 +120,36 @@ impl Item {
             _type: self._type.clone(),
         }
     }
+
+    // merges this item and returns a new item with `merged_from` set
+    // correctly if there were changes
+    pub fn merge_vecs(items: Vec<Item>) -> ItemMergeResult {
+
+      let len = items.len();
+      if len <= 1 {
+        return ItemMergeResult::Same;
+      } 
+
+      let mut base = items[0].clone();
+      let mut mf = vec![base.reference];
+      for i in 1..len {
+        mf.push(items[i].reference);
+        base = items[i].merge(base);
+      }
+
+      for i in 0..len {
+        if base.is_same(&items[i]) {
+          return ItemMergeResult::ContainsAll(items[i].reference);
+        }
+      }
+
+      base.merged_from = mf;
+      return ItemMergeResult::New(base);
+    }
+}
+
+pub enum ItemMergeResult {
+  Same,
+  ContainsAll(LocationReference),
+  New(Item)
 }

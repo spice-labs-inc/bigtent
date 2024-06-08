@@ -6,7 +6,7 @@ use scopeguard::defer;
 use serde_json::Value as SJValue;
 
 use crate::{
-    index::Index,
+    rodeo_server::RodeoServer,
     util::{cbor_to_json_str, md5hash_str, read_all},
 };
 
@@ -52,7 +52,7 @@ fn value_to_string_array(pv: Result<SJValue>) -> Result<Vec<String>> {
     }
 }
 
-fn serve_bulk(index: &Index, bulk_data: Vec<String>) -> Result<Response> {
+fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
     let (rx, tx) = pipe::pipe();
     index.bulk_serve(bulk_data, tx)?;
     Ok(Response {
@@ -63,7 +63,7 @@ fn serve_bulk(index: &Index, bulk_data: Vec<String>) -> Result<Response> {
     })
 }
 
-fn basic_bulk_serve(index: &Index, request: &Request) -> Response {
+fn basic_bulk_serve(index: &RodeoServer, request: &Request) -> Response {
     let body = value_to_string_array(parse_body_to_json(request));
     match body {
         Ok(v) if v.len() <= 420 => match serve_bulk(index, v) {
@@ -75,7 +75,7 @@ fn basic_bulk_serve(index: &Index, request: &Request) -> Response {
     }
 }
 
-fn north_serve(index: &Index, _request: &Request, path: &str) -> Response {
+fn north_serve(index: &RodeoServer, _request: &Request, path: &str) -> Response {
     let hash = md5hash_str(path);
     match index.data_for_hash(hash) {
         Ok(line) => {
@@ -113,7 +113,7 @@ fn fix_path(p: String) -> String {
     p
 }
 
-fn line_serve(index: &Index, _request: &Request, path: String) -> Response {
+fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response {
   // FIXME -- deal with getting a raw MD5 hex string
     let hash = md5hash_str(&path);
     match index.data_for_hash(hash) {
@@ -135,7 +135,7 @@ fn line_serve(index: &Index, _request: &Request, path: String) -> Response {
     }
 }
 
-pub fn run_web_server(index: Arc<Index>) -> () {
+pub fn run_web_server(index: Arc<RodeoServer>) -> () {
     rouille::start_server(
         index.the_args().to_socket_addrs().as_slice(),
         move |request| {

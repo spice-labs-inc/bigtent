@@ -8,7 +8,7 @@ use std::{
     io::{BufRead, BufReader},
 };
 #[cfg(feature = "oldstuff")]
-use crate::{index::MD5Hash, util::md5hash_str};
+use crate::{rodeo_server::MD5Hash, util::md5hash_str};
 
 #[cfg(feature = "oldstuff")]
 fn read_old_file(path: &str) -> Result<Vec<(MD5Hash, String, String)>> {
@@ -38,7 +38,7 @@ fn read_old_file(path: &str) -> Result<Vec<(MD5Hash, String, String)>> {
 #[cfg(feature = "oldstuff")]
 #[test]
 fn test_old_vs_new() {
-    use crate::{index::MD5Hash, rodeo::GoatRodeoBundle, util::find_item};
+    use crate::{rodeo_server::MD5Hash, rodeo::GoatRodeoBundle, util::find_item};
     use serde_json::Value;
     use std::time::Instant;
 

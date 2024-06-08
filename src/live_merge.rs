@@ -1,13 +1,16 @@
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, fs, time::Instant};
 
 use crate::{
-    index::{IndexLoc, ItemOffset},
+    bundle_writer::BundleWriter,
+    index_file::{IndexLoc, ItemOffset},
     rodeo::GoatRodeoBundle,
+    structs::{Item, ItemMergeResult},
+    util::path_plus_timed,
 };
 use anyhow::{bail, Result};
 use thousands::Separable;
 
-pub fn live_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
+pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
     let start = Instant::now();
     if bundles.is_empty() {
         bail!("`live_merge` requires at least one bundle");
@@ -33,10 +36,10 @@ pub fn live_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
         Instant::now().duration_since(start)
     );
 
-    // build submap 
+    // build submap
     let mut submap = HashMap::new();
     for b in &bundles {
-      submap.insert(b.bundle_file_hash, b.clone());
+        submap.insert(b.bundle_file_hash, b.clone());
     }
 
     let mut new_index: Vec<ItemOffset> = Vec::with_capacity(max_size);
@@ -111,10 +114,10 @@ pub fn live_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
 
     let b0 = &bundles[0];
     println!("Merge took {:?}", Instant::now().duration_since(start));
-    Ok(b0.create_synthetic_with(new_index, data_files, index_files, submap))
+    b0.create_synthetic_with(new_index, data_files, index_files, submap)
 }
 
-#[cfg(feature = "longtest")]
+//#[cfg(feature = "longtest")]
 #[test]
 fn test_live_merge() {
     use std::{path::PathBuf, time::Instant};
@@ -162,55 +165,136 @@ fn test_live_merge() {
 
     let bundle_copy = test_bundles.clone();
 
-    let dest_bundle = live_merge(test_bundles).expect("The bundle should merge");
+    let dest_bundle = perform_merge(test_bundles).expect("The bundle should merge");
 
+    assert!(dest_bundle.synthetic, "Should be synthetic");
     println!("Merged {:?}", Instant::now().duration_since(start));
 
-    let mut loop_cnt = 0usize;
+    do_test(bundle_copy.clone(), &dest_bundle, "Synth", start);
 
-    for test_bundle in bundle_copy {
-        let index = test_bundle.get_index().unwrap();
-        for item in index.iter() {
-            let old = test_bundle.data_for_hash(item.hash).unwrap().1;
-            let new = dest_bundle.data_for_hash(item.hash).unwrap().1;
-            assert_eq!(
-                old.identifier, new.identifier,
-                "Expecting the same identifiers"
-            );
+    let persisted_bundle = persist_synthetic(dest_bundle)
+        .expect("We should be able to turn the synthetic bundle into a normal bundle");
 
-            for i in old.connections.iter() {
-                assert!(
-                    new.connections.contains(i),
-                    "Expecting {} to contain {:?}",
-                    new.identifier,
-                    i
-                );
-            }
+    do_test(bundle_copy, &persisted_bundle, "Pers", start);
 
-            match (&new.metadata, &old.metadata) {
-                (None, Some(omd)) => assert!(
-                    false,
-                    "for {} new did not contain metadata, old did {:?}",
-                    new.identifier, omd
-                ),
-                (Some(nmd), Some(omd)) => {
-                    for file_name in omd.file_names.iter() {
-                        assert!(nmd.file_names.contains(file_name), "Expected new to contain filenames id {} old filenames {:?} new filenames {:?}",
-              new.identifier, omd.file_names, nmd.file_names);
+    fn do_test(
+        bundle_copy: Vec<GoatRodeoBundle>,
+        persisted_bundle: &GoatRodeoBundle,
+        name: &str,
+        start: Instant,
+    ) {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut loop_cnt = 0usize;
+
+        for test_bundle in bundle_copy {
+            let index = test_bundle.get_index().unwrap();
+            for item in index.iter() {
+                if rng.gen_range(0..1000) == 42 {
+                    let old = test_bundle.data_for_hash(item.hash).unwrap().1;
+                    let new = persisted_bundle.data_for_hash(item.hash).unwrap().1;
+                    assert_eq!(
+                        old.identifier, new.identifier,
+                        "Expecting the same identifiers"
+                    );
+
+                    for i in old.connections.iter() {
+                        assert!(
+                            new.connections.contains(i),
+                            "Expecting {} to contain {:?}",
+                            new.identifier,
+                            i
+                        );
+                    }
+
+                    match (&new.metadata, &old.metadata) {
+                        (None, Some(omd)) => assert!(
+                            false,
+                            "for {} new did not contain metadata, old did {:?}",
+                            new.identifier, omd
+                        ),
+                        (Some(nmd), Some(omd)) => {
+                            for file_name in omd.file_names.iter() {
+                                assert!(nmd.file_names.contains(file_name), 
+                                  "Expected new to contain filenames id {} old filenames {:?} new filenames {:?}",
+                                  new.identifier, omd.file_names, nmd.file_names);
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
-            }
-
-            loop_cnt += 1;
-            if loop_cnt % 50_000 == 0 {
-                println!(
-                    "Testing Loop {} at {:?} bundle {:?}",
-                    loop_cnt.separate_with_commas(),
-                    std::time::Instant::now().duration_since(start),
-                    test_bundle.envelope_path,
-                );
+                loop_cnt += 1;
+                if loop_cnt % 500_000 == 0 {
+                    println!(
+                        "{} Testing Loop {} at {:?} bundle {:?}",name,
+                        loop_cnt.separate_with_commas(),
+                        std::time::Instant::now().duration_since(start),
+                        test_bundle.bundle_path,
+                    );
+                }
             }
         }
     }
+}
+
+pub fn persist_synthetic(bundle: GoatRodeoBundle) -> Result<GoatRodeoBundle> {
+    // if it's not synthetic, just return it
+    if !bundle.synthetic {
+        return Ok(bundle);
+    }
+
+    let enclosed = bundle.all_sub_bundles();
+    let root_path = GoatRodeoBundle::common_parent_dir(enclosed.as_slice())?;
+    let target_dir = path_plus_timed(&root_path, "synthetic_bundle");
+    fs::create_dir_all(&target_dir)?;
+    let mut loop_cnt = 0usize;
+    let mut merge_cnt = 0usize;
+    let start = Instant::now();
+
+    let mut writer = BundleWriter::new(&target_dir)?;
+
+    for idx in bundle.get_index()?.iter() {
+        match idx.loc {
+            IndexLoc::Loc { offset, file_hash } => writer.add_index(idx.hash, file_hash, offset)?,
+            IndexLoc::Chain(_) => {
+                let found = bundle.vec_for_entry_offset(&idx.loc)?;
+                if found.len() == 0 {
+                    // weird, but do nothing... don't add the index
+                } else if found.len() == 1 {
+                    // if we only find one, then just write the index for that item
+                    writer.add_index(idx.hash, found[0].1.reference.0, found[0].1.reference.1)?;
+                } else {
+                    let the_ref = found[0].1.reference;
+                    match Item::merge_vecs(found.into_iter().map(|v| v.1).collect()) {
+                        ItemMergeResult::Same => {
+                            // just add the index
+                            writer.add_index(idx.hash, the_ref.0, the_ref.1)?
+                        }
+                        ItemMergeResult::ContainsAll(loc_ref) => {
+                            // just add the index
+                            writer.add_index(idx.hash, loc_ref.0, loc_ref.1)?
+                        }
+                        ItemMergeResult::New(item) => {
+                            // need a real new item
+                            merge_cnt += 1;
+                            writer.write_item(item)?
+                        }
+                    }
+                }
+            }
+        }
+
+        loop_cnt += 1;
+        if loop_cnt % 1_000_000 == 0 {
+            println!(
+                "Persist synthetic loop {} merged {} at {:?}",
+                loop_cnt.separate_with_commas(),
+                merge_cnt.separate_with_commas(),
+                Instant::now().duration_since(start)
+            );
+        }
+    }
+
+    let new_bundle_path = writer.finalize_bundle()?;
+    GoatRodeoBundle::new(&root_path, &new_bundle_path)
 }

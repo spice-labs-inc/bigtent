@@ -2,196 +2,27 @@ use anyhow::{anyhow, bail, Result};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::BufReader;
 use std::ops::Deref;
+use std::path::Path;
 use std::{
     collections::HashMap,
     fs::{read_dir, File},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+use toml::Table;
 
+use crate::data_file::DataFile;
 use crate::envelopes::ItemEnvelope;
-use crate::index::{IndexLoc, ItemOffset, MD5Hash};
+use crate::index_file::{IndexFile, IndexLoc, ItemOffset};
+use crate::live_merge::perform_merge;
+use crate::rodeo_server::MD5Hash;
 use crate::structs::Item;
 use crate::util::{
-    byte_slice_to_u63, find_item, hex_to_u64, md5hash_str, millis_now, read_cbor, read_len_and_cbor, read_u16, read_u32, sha256_for_reader, sha256_for_slice
+    byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
+    read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
 };
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct IndexEnvelope {
-    pub version: u32,
-    pub magic: u32,
-    pub the_type: String,
-    pub size: u32,
-    pub data_files: Vec<u64>,
-    pub encoding: String,
-    pub timestamp: i64,
-    pub info: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexFile {
-    pub envelope: IndexEnvelope,
-    pub file: Arc<Mutex<BufReader<File>>>,
-    pub data_offset: u64,
-}
-
-impl IndexFile {
-    pub fn new(dir: &PathBuf, hash: u64) -> Result<IndexFile> {
-        // ensure we close `file` after computing the hash
-        {
-            let mut file = GoatRodeoBundle::find_file(&dir, hash, "gri")?;
-
-            let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file)?)?;
-            if tested_hash != hash {
-                bail!(
-                    "Index file for {:016x} does not match {:016x}",
-                    hash,
-                    tested_hash
-                );
-            }
-        }
-
-        let mut file = GoatRodeoBundle::find_file(&dir, hash, "gri")?;
-
-        let ifp = &mut file;
-        let magic = read_u32(ifp)?;
-        if magic != GoatRodeoBundle::IndexFileMagicNumber {
-            bail!(
-                "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.gri",
-                magic,
-                GoatRodeoBundle::IndexFileMagicNumber,
-                hash
-            );
-        }
-
-        let idx_env: IndexEnvelope = read_len_and_cbor(ifp)?;
-
-        let idx_pos: u64 = file.seek(SeekFrom::Current(0))?;
-
-        Ok(IndexFile {
-            envelope: idx_env,
-            file: Arc::new(Mutex::new(BufReader::new(file))),
-            data_offset: idx_pos,
-        })
-    }
-
-    pub fn read_index(&self) -> Result<Vec<ItemOffset>> {
-        let mut ret = Vec::with_capacity(self.envelope.size as usize);
-        let mut last = [0u8; 16];
-        // let mut not_sorted = false;
-
-        let mut my_file = self
-            .file
-            .lock()
-            .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
-        let fp: &mut BufReader<File> = &mut my_file;
-        fp.seek(SeekFrom::Start(self.data_offset))?;
-        let mut buf = vec![];
-        fp.read_to_end(&mut buf)?;
-
-        let mut info: &[u8] = &buf;
-        for _ in 0..self.envelope.size {
-            let eo = ItemOffset::read(&mut info)?;
-            if eo.hash < last {
-                // not_sorted = true;
-                bail!("Not sorted!!! last {:?} eo.hash {:?}", last, eo.hash);
-            }
-            last = eo.hash;
-            ret.push(eo);
-        }
-
-        // if not_sorted {
-        //     ret.sort_by(|a, b| a.hash.cmp(&b.hash))
-        // }
-
-        Ok(ret)
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct DataFileEnvelope {
-    pub version: u32,
-    pub magic: u32,
-    pub the_type: String,
-    pub previous: u64,
-    pub depends_on: Vec<u64>,
-    pub timestamp: i64,
-    pub built_from_merge: bool,
-    pub info: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DataFile {
-    pub envelope: DataFileEnvelope,
-    pub file: Arc<Mutex<BufReader<File>>>,
-    pub data_offset: u64,
-}
-
-impl DataFile {
-    pub fn new(dir: &PathBuf, hash: u64) -> Result<DataFile> {
-        let mut data_file = GoatRodeoBundle::find_file(dir, hash, "grd")?;
-        let dfp: &mut File = &mut data_file;
-        let magic = read_u32(dfp)?;
-        if magic != GoatRodeoBundle::DataFileMagicNumber {
-            bail!(
-                "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.grd",
-                magic,
-                GoatRodeoBundle::DataFileMagicNumber,
-                hash
-            );
-        }
-
-        let env: DataFileEnvelope = read_len_and_cbor(dfp)?;
-
-        let cur_pos: u64 = data_file.stream_position()?;
-        // FIXME do additional validation of the envelope
-        Ok(DataFile {
-            envelope: env,
-            file: Arc::new(Mutex::new(BufReader::with_capacity(4096, data_file))),
-            data_offset: cur_pos,
-        })
-    }
-
-    fn seek_to(file: &mut BufReader<File>, desired_pos: u64) -> Result<()> {
-        let pos = file.stream_position()?;
-        if pos == desired_pos {
-            return Ok(());
-        }
-
-        let rel_seek = (desired_pos as i64) - (pos as i64);
-
-        file.seek_relative(rel_seek)?;
-        Ok(())
-    }
-
-    pub fn read_envelope_at(&self, pos: u64) -> Result<ItemEnvelope> {
-        let mut my_file = self
-            .file
-            .lock()
-            .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
-        DataFile::seek_to(&mut my_file, pos)?;
-        let my_reader: &mut BufReader<File> = &mut my_file;
-        let len = read_u16(my_reader)?;
-        let _ = read_u32(my_reader)?;
-        read_cbor(my_reader, len as usize)
-    }
-
-    pub fn read_envelope_and_item_at(&self, pos: u64) -> Result<(ItemEnvelope, Item)> {
-        let mut my_file = self
-            .file
-            .lock()
-            .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
-        DataFile::seek_to(&mut my_file, pos)?;
-        let my_reader: &mut BufReader<File> = &mut my_file;
-        let env_len = read_u16(my_reader)?;
-        let item_len = read_u32(my_reader)?;
-        let env = read_cbor(my_reader, env_len as usize)?;
-        let item = read_cbor(&mut *my_file, item_len as usize)?;
-        Ok((env, item))
-    }
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BundleFileEnvelope {
@@ -209,7 +40,7 @@ pub struct GoatRodeoBundle {
     pub envelope: BundleFileEnvelope,
     pub bundle_file_hash: u64,
     pub path: PathBuf,
-    pub envelope_path: PathBuf,
+    pub bundle_path: PathBuf,
     pub data_files: HashMap<u64, DataFile>,
     pub index_files: HashMap<u64, IndexFile>,
     pub sub_bundles: HashMap<u64, GoatRodeoBundle>,
@@ -229,33 +60,59 @@ impl GoatRodeoBundle {
     pub const BundleFileMagicNumber: u32 = 0xba4a4a; // Banana
 
     // Reset the index. Should be done with extreme care
-  pub fn reset_index(&self) -> () {
-    self.index.store(Arc::new(None));
-  }
+    pub fn reset_index(&self) -> () {
+        self.index.store(Arc::new(None));
+    }
 
     pub fn create_synthetic_with(
         &self,
         index: Vec<ItemOffset>,
         data_files: HashMap<u64, DataFile>,
         index_files: HashMap<u64, IndexFile>,
-        sub_bundles: HashMap<u64, GoatRodeoBundle>
-    ) -> GoatRodeoBundle {
-        GoatRodeoBundle {
+        sub_bundles: HashMap<u64, GoatRodeoBundle>,
+    ) -> Result<GoatRodeoBundle> {
+        if sub_bundles.len() == 0 {
+            bail!("A synthetic bundle must have at least one underlying real bundle")
+        }
+
+        let my_hash = {
+            let mut keys = sub_bundles
+                .keys()
+                .into_iter()
+                .map(|v| *v)
+                .collect::<Vec<u64>>();
+
+            keys.sort();
+            let mut merkle = vec![];
+            for k in keys {
+                merkle.append(&mut k.to_be_bytes().into_iter().collect());
+            }
+            byte_slice_to_u63(&sha256_for_slice(&mut merkle)).unwrap()
+        };
+
+        Ok(GoatRodeoBundle {
             envelope: self.envelope.clone(),
             path: self.path.clone(),
-            envelope_path: self.envelope_path.clone(),
+            bundle_path: self.bundle_path.clone(),
             data_files: data_files,
             index_files: index_files,
             index: Arc::new(ArcSwap::new(Arc::new(Some(Arc::new(index))))),
             building_index: Arc::new(Mutex::new(false)),
-            bundle_file_hash: byte_slice_to_u63(&sha256_for_slice(&millis_now().to_be_bytes())).unwrap(),
+            bundle_file_hash: my_hash,
             sub_bundles,
             synthetic: true,
-        }
+        })
     }
 
-    pub fn new(dir: &PathBuf, envelope_path: &PathBuf) -> Result<GoatRodeoBundle> {
-        let file_path = envelope_path.clone();
+    pub fn new(root_dir: &PathBuf, bundle_path: &PathBuf) -> Result<GoatRodeoBundle> {
+        if !is_child_dir(root_dir, bundle_path)? {
+            bail!(
+                "The bundle path {:?} must be in the root dir {:?}",
+                bundle_path,
+                root_dir
+            );
+        }
+        let file_path = bundle_path.clone();
         let file_name = match file_path.file_name().map(|e| e.to_str()).flatten() {
             Some(n) => n.to_string(),
             _ => bail!("Unable to get filename for {:?}", file_path),
@@ -303,7 +160,7 @@ impl GoatRodeoBundle {
         let mut indexed_hashes: HashSet<u64> = HashSet::new();
 
         for index_file in &env.index_files {
-            let the_file = IndexFile::new(&dir, *index_file)?;
+            let the_file = IndexFile::new(&root_dir, *index_file)?;
 
             for data_hash in &the_file.envelope.data_files {
                 indexed_hashes.insert(*data_hash);
@@ -314,7 +171,7 @@ impl GoatRodeoBundle {
 
         let mut data_files = HashMap::new();
         for data_file in &env.data_files {
-            let the_file = DataFile::new(&dir, *data_file)?;
+            let the_file = DataFile::new(&root_dir, *data_file)?;
             data_files.insert(*data_file, the_file);
         }
 
@@ -341,31 +198,92 @@ impl GoatRodeoBundle {
 
         Ok(GoatRodeoBundle {
             envelope: env,
-            path: dir.clone(),
-            envelope_path: envelope_path.clone(),
+            path: root_dir.clone(),
+            bundle_path: bundle_path.clone(),
             data_files: data_files,
             index_files: index_files,
             index: Arc::new(ArcSwap::new(Arc::new(None))),
             building_index: Arc::new(Mutex::new(false)),
             bundle_file_hash: sha_u64,
             sub_bundles: HashMap::new(),
-            synthetic: false
+            synthetic: false,
         })
+    }
+
+    pub fn common_parent_dir(bundles: &[GoatRodeoBundle]) -> Result<PathBuf> {
+        let paths = bundles.into_iter().map(|b| b.bundle_path.clone()).collect();
+        find_common_root_dir(paths)
+    }
+
+    pub fn bundle_from_config(file_name: PathBuf, conf: &Table) -> Result<GoatRodeoBundle> {
+        let root_dir_key = conf.get("root_dir");
+        let root_dir: PathBuf = match root_dir_key {
+            Some(toml::Value::String(s)) => {
+                let rd = PathBuf::from(shellexpand::tilde(s).to_string());
+                if !rd.exists() || !rd.is_dir() {
+                    bail!("The supplied root directory {:?} is not a directory", rd);
+                };
+
+                rd
+            }
+            _ => bail!("Must supply a `root_dir` entry in the configuration file"),
+        };
+
+        let bundle_path_key = conf.get("bundle_path");
+        let envelope_paths: Vec<PathBuf> = match bundle_path_key {
+            Some(toml::Value::Array(av)) => av
+                .iter()
+                .flat_map(|v| match v {
+                    toml::Value::String(index) => {
+                        Some(PathBuf::from(shellexpand::tilde(index).to_string()))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            Some(toml::Value::String(index)) => {
+                vec![PathBuf::from(shellexpand::tilde(index).to_string())]
+            }
+            _ => bail!(format!(
+                "Could not find 'bundle_path' key in configuration file {:?}",
+                file_name
+            )),
+        };
+
+        let mut envelope_dirs = vec![];
+        for p in envelope_paths {
+            envelope_dirs.push(p.clone());
+        }
+
+        let mut bundles = vec![];
+
+        for path in envelope_dirs {
+            bundles.push(GoatRodeoBundle::new(&root_dir, &path)?);
+        }
+
+        if bundles.len() == 0 {
+            // this is weird... we should have gotten at least one item
+            bail!("No bundles were specified in {}", bundle_path_key.unwrap());
+        } else if bundles.len() == 1 {
+            return Ok(bundles.pop().unwrap()); // okay because just checked length
+        } else {
+            // turn the bundles into one
+            perform_merge(bundles)
+        }
     }
 
     // All the non-synthetic sub-bundles
     pub fn all_sub_bundles(&self) -> Vec<GoatRodeoBundle> {
-      let mut ret = vec![];
+        let mut ret = vec![];
 
-      if !self.sub_bundles.is_empty() {
-        for (_, sub) in self.sub_bundles.iter() {
-          ret.append(&mut sub.all_sub_bundles());
+        if !self.sub_bundles.is_empty() {
+            for (_, sub) in self.sub_bundles.iter() {
+                ret.append(&mut sub.all_sub_bundles());
+            }
+        } else {
+            ret.push(self.clone());
         }
-      } else {
-        ret.push(self.clone());
-      }
 
-      ret
+        ret
     }
 
     pub fn get_index(&self) -> Result<Arc<Vec<ItemOffset>>> {
@@ -461,11 +379,33 @@ impl GoatRodeoBundle {
         }
     }
 
-    fn find_file(path: &PathBuf, hash: u64, suffix: &str) -> Result<File> {
-        let mut path = path.clone();
-        path.push(format!("{:016x}", hash));
-        path.set_extension(suffix);
-        Ok(File::open(path)?)
+    pub fn find_file(path: &PathBuf, hash: u64, suffix: &str) -> Result<File> {
+        fn find(name: &str, dir: &Path) -> Result<Option<PathBuf>> {
+            for entry in dir.read_dir()?.into_iter() {
+                let entry = entry?;
+
+                if match entry.file_name().into_string() {
+                    Ok(s) => s,
+                    _ => bail!("Couldn't convert {:?} to a string", entry),
+                } == name
+                {
+                    return Ok(Some(entry.path()));
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    match find(name, &path)? {
+                        Some(s) => return Ok(Some(s)),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(None)
+        }
+        let file_name = format!("{:016x}.{}", hash, suffix);
+        match find(&file_name, path)? {
+            Some(f) => Ok(File::open(f)?),
+            _ => bail!("Couldn't find {} in {:?}", file_name, path),
+        }
     }
 
     pub fn bundle_files_in_dir(path: PathBuf) -> Result<Vec<GoatRodeoBundle>> {
@@ -525,7 +465,7 @@ impl GoatRodeoBundle {
 
     pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<(ItemEnvelope, Item)> {
         match index_loc {
-            IndexLoc::Loc { offset, file_hash } => Ok(self.entry_for(*file_hash, *offset)?),
+            loc @ IndexLoc::Loc { file_hash, .. } => Ok(self.entry_for(*file_hash, loc.offset())?),
             IndexLoc::Chain(offsets) => {
                 let mut ret = vec![];
                 for offset in offsets {
@@ -549,6 +489,22 @@ impl GoatRodeoBundle {
                     }
                     Ok((env, final_base))
                 }
+            }
+        }
+    }
+
+    pub fn vec_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<(ItemEnvelope, Item)>> {
+        match index_loc {
+            loc @ IndexLoc::Loc { file_hash, .. } => {
+                Ok(vec![self.entry_for(*file_hash, loc.offset())?])
+            }
+            IndexLoc::Chain(offsets) => {
+                let mut ret = vec![];
+                for offset in offsets {
+                    let mut some = self.vec_for_entry_offset(&offset)?;
+                    ret.append(&mut some);
+                }
+                Ok(ret)
             }
         }
     }

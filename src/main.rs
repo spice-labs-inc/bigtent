@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use bigtent::{config::Args, index::Index, merger::merge_no_history, rodeo::GoatRodeoBundle, server::run_web_server};
+use bigtent::{config::Args, rodeo_server::RodeoServer, merger::merge_no_history, rodeo::GoatRodeoBundle, server::run_web_server};
 use clap::{CommandFactory, Parser};
 use signal_hook::{consts::SIGHUP, iterator::Signals};
 use std::{path::PathBuf, thread, time::Instant};
@@ -11,7 +11,7 @@ fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
         let index_build_start = Instant::now();
         let bundle = GoatRodeoBundle::new(&dir_path, &whole_path)?;
 
-        let index = Index::new(bundle, args.num_threads(), Some(args.clone()));
+        let index = RodeoServer::new_from_bundle(bundle, args.num_threads(), Some(args.clone()))?;
 
         println!(
             "Initial index build in {:?}",
@@ -27,7 +27,7 @@ fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
 
 fn run_full_server(args: Args) -> Result<()> {
     let index_build_start = Instant::now();
-    let index = Index::new_arc(args)?;
+    let index = RodeoServer::new(args)?;
 
     println!(
         "Initial index build in {:?}",

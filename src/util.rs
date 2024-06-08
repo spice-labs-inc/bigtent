@@ -1,12 +1,12 @@
-use crate::index::{ItemOffset, MD5Hash};
+use crate::{index_file::ItemOffset, rodeo_server::MD5Hash};
 use anyhow::{bail, Result};
-
-// use boring::sha;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
+    ffi::OsStr,
     io::{Read, Write},
+    path::PathBuf,
     time::SystemTime,
 };
 const BYTE_BUFFER_SIZE: usize = 4096;
@@ -110,6 +110,21 @@ pub fn sha256_for_slice(r: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[test]
+fn test_big_sha() {
+    use rand::Rng;
+
+    let mut rng = rand::rngs::ThreadRng::default();
+    let mut buf = [0u8; 4096];
+    let mut v: Vec<u8> = vec![];
+    for _ in 1..1_000 {
+        rng.fill(&mut buf);
+        v.extend_from_slice(&buf);
+    }
+
+    sha256_for_slice(v.as_slice());
+}
+
 pub fn sha256_for_reader<R: Read>(r: &mut R) -> Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     // create a Sha256 object
@@ -140,6 +155,137 @@ fn test_sha256() {
         res,
         hex!("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
     );
+}
+
+pub fn is_child_dir(root: &PathBuf, potential_child: &PathBuf) -> Result<bool> {
+    let full_root = root.canonicalize()?;
+
+    let full_kid = potential_child.canonicalize()?;
+
+    let mut kid_parts = HashSet::new();
+    for i in full_kid.iter() {
+        kid_parts.insert(i);
+    }
+
+    for i in full_root.iter() {
+        if !kid_parts.contains(i) {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+#[test]
+fn test_child_dir() {
+    let root = PathBuf::from(".");
+
+    assert!(is_child_dir(&root, &PathBuf::from("./src")).unwrap());
+
+    assert!(!is_child_dir(&root, &PathBuf::from("/tmp")).unwrap());
+}
+
+pub fn find_common_root_dir(from: Vec<PathBuf>) -> Result<PathBuf> {
+    let len = from.len();
+    if len == 0 {
+        bail!("Must have at least 1 directory to find common");
+    } else if len == 1 {
+        let ret = from[0].canonicalize()?;
+        if ret.is_dir() {
+            return Ok(ret);
+        } else {
+            return Ok(match ret.parent() {
+                Some(p) => p.to_path_buf(),
+                _ => bail!("{:?} is not a directory and does not have a parent", ret),
+            });
+        }
+    }
+
+    let mut all = vec![];
+
+    for p in &from {
+        all.push(p.canonicalize()?);
+    }
+
+    let mut with_parents = vec![];
+    for p in &all {
+        let mut parents = HashSet::new();
+        for j in p.clone().iter() {
+            parents.insert(os_str_to_string(j)?);
+        }
+        with_parents.push((p, parents));
+    }
+
+    let mut root = with_parents[0].1.clone();
+    for j in &with_parents {
+        root = root.intersection(&j.1).map(|v| v.clone()).collect();
+    }
+
+    if root.len() <= 1 {
+        bail!("Couldn't find a common root");
+    }
+
+    let mut thing = all[0].clone();
+    loop {
+        let mut bad = false;
+        for j in &thing {
+            if !root.contains(&os_str_to_string(j)?) {
+                thing = match thing.parent() {
+                    Some(v) => v.to_path_buf(),
+                    None => bail!("Couldn't get parent for {:?}", thing),
+                };
+                bad = true;
+                break;
+            }
+        }
+
+        if !bad {
+            return Ok(thing);
+        }
+    }
+}
+
+#[test]
+fn test_parents() {
+    assert_eq!(
+        find_common_root_dir(vec![PathBuf::from("."), PathBuf::from("./..")]).unwrap(),
+        PathBuf::from("./..").canonicalize().unwrap()
+    );
+    assert_eq!(
+        find_common_root_dir(vec![PathBuf::from("."), PathBuf::from("./../..")]).unwrap(),
+        PathBuf::from("./../..").canonicalize().unwrap()
+    );
+    assert!(find_common_root_dir(vec![PathBuf::from("."), PathBuf::from("/tmp")]).is_err());
+}
+
+pub fn os_str_to_string(oss: &OsStr) -> Result<String> {
+    match oss.to_str() {
+        Some(s) => Ok(s.to_string()),
+        None => bail!("Unable to convert {:?} to a String", oss),
+    }
+}
+
+pub fn path_plus_timed(root: &PathBuf, suffix: &str) -> PathBuf {
+  let mut ret = root.clone();
+  ret.push(timed_filename(suffix));
+  ret
+}
+
+pub fn timed_filename(suffix: &str) -> String {
+    use chrono::prelude::*;
+
+    let now: DateTime<Utc> = Utc::now();
+
+    format!(
+        "{:04}_{:02}_{:02}_{:02}_{:02}_{:02}_{}",
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        suffix
+    )
 }
 
 pub fn read_all<R: Read>(r: &mut R, max: usize) -> Result<Vec<u8>> {
@@ -222,29 +368,29 @@ pub fn read_cbor<T: DeserializeOwned, R: Read>(file: &mut R, len: usize) -> Resu
 }
 
 pub fn write_int<W: Write>(target: &mut W, val: u32) -> Result<()> {
-    target.write(&val.to_be_bytes())?;
+    target.write_all(&val.to_be_bytes())?;
     Ok(())
 }
 
 pub fn write_short<W: Write>(target: &mut W, val: u16) -> Result<()> {
-    target.write(&val.to_be_bytes())?;
+    target.write_all(&val.to_be_bytes())?;
     Ok(())
 }
 
 pub fn write_short_signed<W: Write>(target: &mut W, val: i16) -> Result<()> {
-    target.write(&val.to_be_bytes())?;
+    target.write_all(&val.to_be_bytes())?;
     Ok(())
 }
 
 pub fn write_long<W: Write>(target: &mut W, val: u64) -> Result<()> {
-    target.write(&val.to_be_bytes())?;
+    target.write_all(&val.to_be_bytes())?;
     Ok(())
 }
 
 pub fn write_envelope<W: Write, T: Serialize>(target: &mut W, envelope: &T) -> Result<()> {
     let bytes = serde_cbor::to_vec(envelope)?;
     write_short(target, bytes.len() as u16)?;
-    target.write(&bytes)?;
+    target.write_all(&bytes)?;
     Ok(())
 }
 
@@ -257,8 +403,8 @@ pub fn write_envelope_and_payload<W: Write, T: Serialize, T2: Serialize>(
     let payload_bytes = serde_cbor::to_vec(payload)?;
     write_short(target, env_bytes.len() as u16)?;
     write_int(target, payload_bytes.len() as u32)?;
-    target.write(&env_bytes)?;
-    target.write(&payload_bytes)?;
+    target.write_all(&env_bytes)?;
+    target.write_all(&payload_bytes)?;
     Ok(())
 }
 

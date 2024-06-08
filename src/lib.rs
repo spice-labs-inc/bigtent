@@ -1,5 +1,5 @@
 pub mod util;
-pub mod index;
+pub mod rodeo_server;
 pub mod config;
 pub mod server;
 pub mod envelopes;
@@ -8,3 +8,7 @@ pub mod structs;
 mod old_format;
 pub mod merger;
 pub mod live_merge;
+pub mod index_file;
+pub mod data_file;
+pub mod bundle_writer;
+pub mod sha_writer;

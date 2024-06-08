@@ -144,30 +144,15 @@ pub struct ItemEnvelope {
     #[serde(alias = "p")]
     #[serde(rename(serialize = "p"))]
     pub position: Position,
-    #[serde(alias = "t")]
-    #[serde(rename(serialize = "t"))]
-    pub timestamp: i64,
-    #[serde(alias = "pv")]
-    #[serde(rename(serialize = "pv"))]
-    pub previous_version: MultifilePosition,
     #[serde(alias = "bp")]
     #[serde(rename(serialize = "bp"))]
     pub backpointer: u64,
     #[serde(alias = "l")]
     #[serde(rename(serialize = "l"))]
     pub data_len: u32,
-    #[serde(alias = "f")]
-    #[serde(rename(serialize = "f"))]
-    pub data_format: PayloadFormat,
     #[serde(alias = "pt")]
     #[serde(rename(serialize = "pt"))]
     pub data_type: PayloadType,
-    #[serde(alias = "c")]
-    #[serde(rename(serialize = "c"))]
-    pub compression: PayloadCompression,
-    #[serde(alias = "m")]
-    #[serde(rename(serialize = "m"))]
-    pub merged_with_previous: bool,
 }
 
 impl ItemEnvelope {
@@ -180,14 +165,9 @@ impl ItemEnvelope {
         ItemEnvelope {
             key_md5: MD5::random(&mut rng),
             position: random_position(&mut rng),
-            timestamp: rng.gen(),
-            previous_version: multifile_position_rand(&mut rng),
             backpointer: rng.gen(),
             data_len: rng.gen::<u32>() & 0x7ffffff,
-            data_format: PayloadFormat::random(&mut rng),
             data_type: PayloadType::random(&mut rng),
-            compression: PayloadCompression::random(&mut rng),
-            merged_with_previous: rng.gen(),
         }
     }
 
