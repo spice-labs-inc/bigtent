@@ -117,7 +117,7 @@ pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
     b0.create_synthetic_with(new_index, data_files, index_files, submap)
 }
 
-//#[cfg(feature = "longtest")]
+#[cfg(feature = "longtest")]
 #[test]
 fn test_live_merge() {
     use std::{path::PathBuf, time::Instant};
