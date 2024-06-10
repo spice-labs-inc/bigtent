@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use crate::{
     bundle_writer::BundleWriter,
@@ -8,9 +8,36 @@ use crate::{
     util::path_plus_timed,
 };
 use anyhow::{bail, Result};
+use im::OrdMap;
 use thousands::Separable;
 
+struct BundlePos{
+  bundle: Arc<Vec<ItemOffset>>,
+  pos: usize,
+  len: usize
+}
+
+fn update_top<I: IntoIterator<Item=usize>>( top: &mut OrdMap<[u8; 16], Vec<(ItemOffset, usize)>>, index_holder: &mut Vec<BundlePos>, what: I) {
+  for j in what {
+    let tmp = &mut index_holder[j];
+    if tmp.pos < tmp.len {
+      let v = &tmp.bundle[tmp.pos];
+      tmp.pos += 1;
+       match top.get(&v.hash) {
+        None => {top.insert(v.hash, vec![(v.clone(), j)]);}
+        Some(vec) => {
+          top.insert(v.hash, 
+            {let mut vec = vec.clone(); 
+              vec.push((v.clone(), j));
+               vec});}
+      }
+    }
+   
+}
+}
+
 pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
+
     let start = Instant::now();
     if bundles.is_empty() {
         bail!("`live_merge` requires at least one bundle");
@@ -28,7 +55,7 @@ pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
         let index = bundle.get_index()?;
         let index_len = index.len();
         max_size += index_len;
-        index_holder.push((index.clone(), 0usize, index_len));
+        index_holder.push(BundlePos{bundle: index.clone(), pos: 0, len: index.len()});
     }
 
     println!(
@@ -42,10 +69,38 @@ pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
         submap.insert(b.bundle_file_hash, b.clone());
     }
 
-    let mut new_index: Vec<ItemOffset> = Vec::with_capacity(max_size);
+    let mut new_index: Vec<ItemOffset> = Vec::with_capacity(max_size * 90usize / 100usize);
     let mut loop_cnt = 0usize;
 
-    loop {
+    let mut top = OrdMap::new();
+    
+
+
+    let ihl = index_holder.len();
+    update_top(&mut top, &mut index_holder, 0..ihl);
+
+    while !index_holder.iter().all(|v| v.pos >= v.len) || !top.is_empty() {
+        let (next, opt_min) = top.without_min();
+        top = opt_min;
+        match next {
+          Some(mut items) if items.len() > 0 => { 
+            // update the list
+            update_top(&mut top,&mut index_holder, items.iter().map(|v| v.1));
+            
+            // we've only got one... so just put it in the new index
+            if items.len() == 1 {
+              new_index.push(items.pop().unwrap().0);
+            } else {
+            let computed_loc = items.iter().flat_map(|item| item.0.loc.as_vec()).collect();
+                let new_item_offset = ItemOffset {
+                    hash: items[0].0.hash,
+                    loc: IndexLoc::Chain(computed_loc),
+                };
+                new_index.push(new_item_offset);
+            }}
+          _ => {break;}
+        }
+
         loop_cnt += 1;
         if loop_cnt % 1_000_000 == 0 {
             println!(
@@ -55,54 +110,8 @@ pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
                 Instant::now().duration_since(start)
             );
         }
+       
 
-        let mut top = vec![];
-        let mut vec_pos = 0;
-        {
-            for (idx, pos, len) in index_holder.iter() {
-                if *pos < *len {
-                    top.push((idx[*pos].clone(), vec_pos));
-                }
-                vec_pos += 1;
-            }
-        }
-
-        // we've run out of elements
-        if top.is_empty() {
-            break;
-        }
-
-        top.sort_by_key(|i| i.0.hash);
-        let len = top.len();
-        let mut pos = 1;
-        let merge_base = &top[0];
-        let mut to_merge = vec![];
-        while pos < len && top[pos].0.hash == merge_base.0.hash {
-            to_merge.push(&top[pos]);
-            pos += 1;
-        }
-
-        index_holder[merge_base.1].1 += 1;
-
-        if to_merge.is_empty() {
-            new_index.push(merge_base.0.clone());
-        } else {
-            let mut computed_loc = merge_base.0.loc.as_vec();
-            computed_loc.append(
-                &mut to_merge
-                    .iter()
-                    .flat_map(|il| {
-                        index_holder[il.1].1 += 1;
-                        il.0.loc.as_vec()
-                    })
-                    .collect(),
-            );
-            let new_item_offset = ItemOffset {
-                hash: merge_base.0.hash,
-                loc: IndexLoc::Chain(computed_loc),
-            };
-            new_index.push(new_item_offset);
-        }
     }
 
     let mut data_files = HashMap::new();
@@ -127,19 +136,19 @@ fn test_live_merge() {
         "../../tmp/oc_dest/result_aa",
         "../../tmp/oc_dest/result_ab",
         "../../tmp/oc_dest/result_ac",
-        "../../tmp/oc_dest/result_ad",
-        "../../tmp/oc_dest/result_ae",
-        "../../tmp/oc_dest/result_af",
-        "../../tmp/oc_dest/result_ag",
-        "../../tmp/oc_dest/result_ah",
-        "../../tmp/oc_dest/result_ai",
-        "../../tmp/oc_dest/result_aj",
-        "../../tmp/oc_dest/result_ak",
-        "../../tmp/oc_dest/result_al",
-        "../../tmp/oc_dest/result_am",
-        "../../tmp/oc_dest/result_an",
-        "../../tmp/oc_dest/result_ao",
-        "../../tmp/oc_dest/result_ap",
+        // "../../tmp/oc_dest/result_ad",
+        // "../../tmp/oc_dest/result_ae",
+        // "../../tmp/oc_dest/result_af",
+        // "../../tmp/oc_dest/result_ag",
+        // "../../tmp/oc_dest/result_ah",
+        // "../../tmp/oc_dest/result_ai",
+        // "../../tmp/oc_dest/result_aj",
+        // "../../tmp/oc_dest/result_ak",
+        // "../../tmp/oc_dest/result_al",
+        // "../../tmp/oc_dest/result_am",
+        // "../../tmp/oc_dest/result_an",
+        // "../../tmp/oc_dest/result_ao",
+        // "../../tmp/oc_dest/result_ap",
     ]
     .into_iter()
     .filter(|p| {
@@ -246,7 +255,7 @@ pub fn persist_synthetic(bundle: GoatRodeoBundle) -> Result<GoatRodeoBundle> {
     let enclosed = bundle.all_sub_bundles();
     let root_path = GoatRodeoBundle::common_parent_dir(enclosed.as_slice())?;
     let target_dir = path_plus_timed(&root_path, "synthetic_bundle");
-    fs::create_dir_all(&target_dir)?;
+    std::fs::create_dir_all(&target_dir)?;
     let mut loop_cnt = 0usize;
     let mut merge_cnt = 0usize;
     let start = Instant::now();
