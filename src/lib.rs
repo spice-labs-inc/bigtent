@@ -6,6 +6,7 @@ pub mod envelopes;
 pub mod rodeo;
 pub mod structs;
 mod old_format;
+mod mod_share;
 pub mod merger;
 pub mod live_merge;
 pub mod index_file;

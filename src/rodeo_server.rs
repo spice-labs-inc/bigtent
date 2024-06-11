@@ -10,6 +10,11 @@ use std::{
     thread::{self, JoinHandle},
     time::Instant,
 };
+#[cfg(not(test))] 
+use log::{error, info}; // Use log crate when building application
+ 
+#[cfg(test)]
+use std::{println as error, println as info};
 use thousands::Separable;
 use toml::{map::Map, Table};
 // use num_traits::ops::bytes::ToBytes;
@@ -113,7 +118,7 @@ impl RodeoServer {
         let cnt = AtomicU32::new(0);
 
         defer! {
-          println!("Sent {} in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
+          info!("Sent {} in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
           Instant::now().duration_since(start));
         }
         fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
@@ -189,12 +194,12 @@ impl RodeoServer {
                     match index.bulk_send(data, dest) {
                         Ok(_) => {}
                         Err(e) =>
-                        // FIXME log
+                       
                         {
-                            println!("Bulk failure {:?}", e);
+                            error!("Bulk failure {:?}", e);
                         }
                     }
-                    println!(
+                    info!(
                         "Bulk send of {} items took {:?}",
                         data_len,
                         Instant::now().duration_since(start)
@@ -211,12 +216,12 @@ impl RodeoServer {
                     match index.north_send(gitoid.clone(), initial_body, tx) {
                         Ok(_) => {}
                         Err(e) =>
-                        // FIXME log
+            
                         {
-                            println!("Bulk failure {:?}", e);
+                            error!("Bulk failure {:?}", e);
                         }
                     }
-                    println!(
+                    info!(
                         "North of {} took {:?}",
                         gitoid,
                         Instant::now().duration_since(start)

@@ -47,21 +47,21 @@ fn test_old_vs_new() {
         let dir_path = "/home/dpp/tmp/result_aa/".into();
         let env_path =
             "/home/dpp/tmp/result_aa/2024_05_31_17_17_35_7cc0059908ab1ed6.grb".into();
-        println!("About to load bundle");
+        info!("About to load bundle");
         let grb = GoatRodeoBundle::new(&dir_path, &env_path).unwrap();
-        println!(
+        info!(
             "Loaded bundle at {:?}",
             Instant::now().duration_since(start)
         );
         let mut good = true;
 
         let new_index = grb.get_index().unwrap();
-        println!(
+        info!(
             "Got new index at {:?}",
             Instant::now().duration_since(start)
         );
         let index = read_old_file("/data/dpp_stuff/to_analyze/done/aa.txt".into()).unwrap();
-        println!(
+        info!(
             "Got old index at {:?}",
             Instant::now().duration_since(start)
         );
@@ -107,7 +107,7 @@ fn test_old_vs_new() {
                         .into_iter()
                         .map(|v| v.as_str().unwrap().to_string());
 
-                    println!(
+                    info!(
                         "failed for {} with id {} contained by {:?}",
                         filename, id, contained_by
                     );
@@ -121,7 +121,7 @@ fn test_old_vs_new() {
                                     .filter(|v| v.1 == s)
                                     .map(|v| v.2.clone())
                                     .collect();
-                                println!("Failed for {} and {}. filename {} and couldn't find containing hash {}... contained by {:?}", e.1, cnt, filename, s, containing);
+                                info!("Failed for {} and {}. filename {} and couldn't find containing hash {}... contained by {:?}", e.1, cnt, filename, s, containing);
                             }
                         }
                     }
@@ -132,7 +132,7 @@ fn test_old_vs_new() {
             }
             cnt += 1;
             if cnt % 100_000 == 0 {
-                println!("Loop {} failed {}", cnt, fail_cnt);
+                info!("Loop {} failed {}", cnt, fail_cnt);
             }
         }
         assert!(good, "Failed!");

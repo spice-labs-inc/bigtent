@@ -1,226 +1,374 @@
-use std::{
-    fs::{self},
-    path::PathBuf,
-    time::Instant,
-};
+use flume::Receiver;
+use im::OrdMap;
 
-use crate::{bundle_writer::BundleWriter, rodeo::GoatRodeoBundle};
-use anyhow::Result;
+use log::error;
+#[cfg(not(test))]
+use log::info;
+use std::{
+  fs::{self, File},
+  io::{BufWriter, Write},
+  path::PathBuf,
+  time::Instant,
+}; // Use log crate when building application
+
+#[cfg(test)]
+use std::println as info;
+
+use crate::{
+  bundle_writer::BundleWriter,
+  envelopes::ItemEnvelope,
+  mod_share::{update_top, BundlePos},
+  rodeo::GoatRodeoBundle,
+  rodeo_server::MD5Hash,
+  structs::{EdgeType, Item},
+  util::NiceDurationDisplay,
+};
+use anyhow::{bail, Result};
 use thousands::Separable;
 
-pub fn merge_no_history<PB: Into<PathBuf>>(
-    bundles: Vec<GoatRodeoBundle>,
-    dest_directory: PB,
+pub fn merge_fresh<PB: Into<PathBuf>>(
+  bundles: Vec<GoatRodeoBundle>,
+  use_threads: bool,
+  dest_directory: PB,
 ) -> Result<()> {
-    let start = Instant::now();
-    let dest: PathBuf = dest_directory.into();
+  let start = Instant::now();
+  let dest: PathBuf = dest_directory.into();
 
-    fs::create_dir_all(dest.clone())?;
+  fs::create_dir_all(dest.clone())?;
 
-    println!(
-        "Created target dir at {:?}",
-        Instant::now().duration_since(start)
-    );
+  let mut purl_file = BufWriter::new(File::create({
+    let mut dest = dest.clone();
 
-    let mut item_cnt = 0usize;
-    let mut merge_cnt = 0usize;
+    dest.push("purls.txt");
+    dest
+  })?);
 
-    let mut index_holder = vec![];
+  info!(
+    "Created target dir at {:?}",
+    Instant::now().duration_since(start)
+  );
 
-    for bundle in &bundles {
-        let index = bundle.get_index()?;
-        let index_len = index.len();
-        index_holder.push((index, 0usize, index_len));
+  let mut loop_cnt = 0usize;
+  let mut merge_cnt = 0usize;
+  let mut max_merge_len = 0usize;
+
+  let mut index_holder = vec![];
+
+  for bundle in &bundles {
+    let index = bundle.get_index()?;
+    let index_len = index.len();
+
+    let (tx, rx) = flume::bounded(32);
+
+    if use_threads {
+      let index_shadow = index.clone();
+      let bundle_shadow = bundle.clone();
+
+      std::thread::spawn(move || {
+        let mut loop_cnt = 0usize;
+        let start = Instant::now();
+        let index_len = index_shadow.len();
+        for io in index_shadow.iter() {
+          let (env, item) = bundle_shadow
+            .data_for_entry_offset(&io.loc)
+            .expect("Expected to load data");
+          if io.hash != env.key_md5.hash {
+            panic!(
+              "Loop {} expected hash {:032x} but got {:032x}",
+              loop_cnt.separate_with_commas(),
+              u128::from_be_bytes(io.hash),
+              u128::from_be_bytes(env.key_md5.hash)
+            )
+          }
+
+          match tx.send((env, item, loop_cnt)) {
+            Ok(_) => {}
+            Err(e) => {
+              error!(
+                "On {:016x} failed to send {} of {} error {}",
+                bundle_shadow.bundle_file_hash,
+                loop_cnt.separate_with_commas(),
+                index_len.separate_with_commas(),
+                e
+              );
+              panic!(
+                "On {:016x} failed to send {} of {} error {}",
+                bundle_shadow.bundle_file_hash,
+                loop_cnt.separate_with_commas(),
+                index_len.separate_with_commas(),
+                e
+              );
+            }
+          };
+          loop_cnt += 1;
+          if false && loop_cnt % 2_500_000 == 0 {
+            info!(
+              "Bundle fetcher {:016x} loop {} of {} at {:?}",
+              bundle_shadow.bundle_file_hash,
+              loop_cnt.separate_with_commas(),
+              index_len.separate_with_commas(),
+              start.elapsed()
+            );
+          }
+        }
+      });
     }
 
-    println!(
-        "Read indicies at {:?}",
-        Instant::now().duration_since(start)
-    );
+    index_holder.push(BundlePos {
+      bundle: index.clone(),
+      pos: 0,
+      len: index.len(),
+      thing: if use_threads { Some(rx) } else { None },
+    });
 
-    let mut loop_cnt = 0usize;
+    max_merge_len += index_len;
+  }
 
-    let mut bundle_writer = BundleWriter::new(&dest)?;
+  info!(
+    "Read indicies at {:?}",
+    Instant::now().duration_since(start)
+  );
 
-    loop {
-        loop_cnt += 1;
+  let mut bundle_writer = BundleWriter::new(&dest)?;
+  let merge_start = Instant::now();
 
-        let mut top = vec![];
-        let mut vec_pos = 0;
-        for (idx, pos, len) in &mut index_holder {
-            if *pos < *len {
-                top.push((idx[*pos].clone(), vec_pos));
-            }
-            vec_pos += 1;
-        }
+  let mut top = OrdMap::new();
 
-        // we've run out of elements
-        if top.is_empty() {
-            break;
-        }
+  let ihl = index_holder.len();
+  update_top(&mut top, &mut index_holder, 0..ihl);
 
-        top.sort_by_key(|i| i.0.hash);
-        let len = top.len();
-        let mut pos = 1;
-        let merge_base = &top[0];
+  while !index_holder.iter().all(|v| v.pos >= v.len) || !top.is_empty() {
+    let (next, opt_min) = top.without_min();
+    top = opt_min;
+
+    fn get_item_and_pos(
+      hash: MD5Hash,
+      which: usize,
+      index_holder: &mut Vec<BundlePos<Option<Receiver<(ItemEnvelope, Item, usize)>>>>,
+      bundles: &Vec<GoatRodeoBundle>,
+    ) -> Result<(ItemEnvelope, Item, usize)> {
+      match &index_holder[which].thing {
+        Some(rx) => rx.recv().map_err(|e| e.into()),
+        _ => match bundles[which].data_for_hash(hash) {
+          Ok((e, i)) => Ok((e, i, 0)),
+          Err(e) => Err(e),
+        },
+      }
+    }
+
+    match next {
+      Some(items) if items.len() > 0 => {
+        // update the list
+        update_top(&mut top, &mut index_holder, items.iter().map(|v| v.which));
+
         let mut to_merge = vec![];
-        while pos < len && top[pos].0.hash == merge_base.0.hash {
-            to_merge.push(&top[pos]);
-            pos += 1;
+
+        for merge_base in items {
+          let (envelope, mut merge_final, the_pos) = get_item_and_pos(
+            merge_base.item_offset.hash,
+            merge_base.which,
+            &mut index_holder,
+            &bundles,
+          )?;
+          if envelope.key_md5.hash != merge_base.item_offset.hash {
+            bail!(
+              "Failed to match hash for {} loop {}. offset {}. pos {} vs {}. Expected hash {:032x} got {:032x}",
+              merge_final.identifier,
+              loop_cnt.separate_with_commas(),
+              merge_base.which,
+              the_pos.separate_with_commas(),
+              index_holder[merge_base.which].pos.separate_with_commas(),
+              u128::from_be_bytes(merge_base.item_offset.hash),
+              u128::from_be_bytes(envelope.key_md5.hash)
+            );
+          }
+          merge_final.remove_references();
+          match merge_final
+            .connections
+            .iter()
+            .filter(|v| v.0.starts_with("pkg:"))
+            .collect::<Vec<&(String, EdgeType, Option<String>)>>()
+          {
+            v if !v.is_empty() => {
+              for (purl, _, _) in v {
+                purl_file.write(format!("{}\n", purl).as_bytes())?;
+              }
+            }
+            _ => {}
+          }
+          to_merge.push(merge_final);
         }
 
-        let mut merge_to = bundles[merge_base.1]
-            .data_for_entry_offset(&merge_base.0.loc)?
-            .1;
-        merge_to.remove_references();
-        index_holder[merge_base.1].1 += 1;
-
-        let mut merge_from = vec![];
-        for m in to_merge {
-            let mut tmp_item = bundles[m.1].data_for_entry_offset(&m.0.loc)?.1;
-            tmp_item.remove_references();
-            merge_from.push(tmp_item);
-
-            index_holder[m.1].1 += 1;
-        }
-
-        let mut merge_final = merge_to.clone();
-        merge_cnt += merge_from.len();
-
-        for m2 in merge_from {
-            merge_final = merge_final.merge(m2);
+        let mut top = to_merge.pop().unwrap();
+        merge_cnt += to_merge.len();
+        top.remove_references();
+        for mut i in to_merge {
+          i.remove_references();
+          top = top.merge(i);
         }
         let cur_pos = bundle_writer.cur_pos() as u64;
-        merge_final.reference.1 = cur_pos;
+        top.reference.1 = cur_pos;
 
-        bundle_writer.write_item(merge_final)?;
+        bundle_writer.write_item(top)?;
 
-        item_cnt += 1;
+        loop_cnt += 1;
 
-        if item_cnt % 250_000 == 0 {
-            println!(
-                "Item cnt {} merge cnt {} position {} at {:?}",
-                item_cnt.separate_with_commas(),
-                merge_cnt.separate_with_commas(),
-                cur_pos.separate_with_commas(),
-                Instant::now().duration_since(start)
-            );
+        if loop_cnt % 2_500_000 == 0 {
+          let diff = merge_start.elapsed();
+          let items_per_second = (loop_cnt as f64) / diff.as_secs_f64();
+          let remaining = (((max_merge_len - merge_cnt) - loop_cnt) as f64) / items_per_second;
+
+          let nd: NiceDurationDisplay = remaining.into();
+          let td: NiceDurationDisplay = merge_start.elapsed().into();
+          info!(
+            "{} cnt {}m of {}m merge cnt {} position {}M at {} estimated end {}",
+            if use_threads { "T-Merge" } else { "Merge" },
+            (loop_cnt / 1_000_000).separate_with_commas(),
+            ((max_merge_len - merge_cnt) / 1_000_000).separate_with_commas(),
+            merge_cnt.separate_with_commas(),
+            (cur_pos >> 20).separate_with_commas(),
+            td,
+            nd
+          );
         }
+      }
+      _ => {
+        break;
+      }
     }
+  }
 
-    bundle_writer.finalize_bundle()?;
-    println!(
-        "Finished {} loops at {:?}",
-        loop_cnt.separate_with_commas(),
-        Instant::now().duration_since(start)
-    );
-    Ok(())
+  bundle_writer.finalize_bundle()?;
+  info!(
+    "Finished {} loops at {:?}",
+    loop_cnt.separate_with_commas(),
+    start.elapsed()
+  );
+  Ok(())
 }
 
 #[cfg(feature = "longtest")]
 #[test]
 fn test_merge() {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+  use rand::Rng;
+  let mut rng = rand::thread_rng();
 
-    let target_path = "/tmp/bt_merge_test";
-    // delete the dest dir
-    let _ = fs::remove_dir_all(target_path);
+  let target_path = "/tmp/bt_merge_test";
+  // delete the dest dir
+  let _ = fs::remove_dir_all(target_path);
 
-    println!("Removed directory");
+  info!("Removed directory");
 
-    let test_paths: Vec<String> = vec![
-        "../../tmp/oc_dest/result_aa",
-        "../../tmp/oc_dest/result_ab",
-        "../../tmp/oc_dest/result_ac",
-        // "../../tmp/oc_dest/result_ad",
-        // "../../tmp/oc_dest/result_ae",
-        // "../../tmp/oc_dest/result_af",
-        // "../../tmp/oc_dest/result_ag",
-        // "../../tmp/oc_dest/result_ah",
-        // "../../tmp/oc_dest/result_ai",
-        // "../../tmp/oc_dest/result_aj",
-        // "../../tmp/oc_dest/result_ak",
-        // "../../tmp/oc_dest/result_al",
-        // "../../tmp/oc_dest/result_am",
-        // "../../tmp/oc_dest/result_an",
-        // "../../tmp/oc_dest/result_ao",
-        // "../../tmp/oc_dest/result_ap",
-    ]
-    .into_iter()
-    .filter(|p| {
-        let pb: PathBuf = p.into();
-        pb.exists() && pb.is_dir()
-    })
-    .map(|v| v.to_string())
+  let test_paths: Vec<String> = vec![
+    "../../tmp/oc_dest/result_aa",
+    "../../tmp/oc_dest/result_ab",
+    // "../../tmp/oc_dest/result_ac",
+    // "../../tmp/oc_dest/result_ad",
+    // "../../tmp/oc_dest/result_ae",
+    // "../../tmp/oc_dest/result_af",
+    // "../../tmp/oc_dest/result_ag",
+    // "../../tmp/oc_dest/result_ah",
+    // "../../tmp/oc_dest/result_ai",
+    // "../../tmp/oc_dest/result_aj",
+    // "../../tmp/oc_dest/result_ak",
+    // "../../tmp/oc_dest/result_al",
+    // "../../tmp/oc_dest/result_am",
+    // "../../tmp/oc_dest/result_an",
+    // "../../tmp/oc_dest/result_ao",
+    // "../../tmp/oc_dest/result_ap",
+  ]
+  .into_iter()
+  .filter(|p| {
+    let pb: PathBuf = p.into();
+    pb.exists() && pb.is_dir()
+  })
+  .map(|v| v.to_string())
+  .collect();
+
+  if test_paths.len() < 2 {
+    return;
+  }
+  let test_bundles: Vec<GoatRodeoBundle> = test_paths
+    .iter()
+    .flat_map(|v| GoatRodeoBundle::bundle_files_in_dir(v.into()).unwrap())
     .collect();
 
-    if test_paths.len() < 2 {
-        return;
-    }
-    let test_bundles: Vec<GoatRodeoBundle> = test_paths
-        .iter()
-        .flat_map(|v| GoatRodeoBundle::bundle_files_in_dir(v.into()).unwrap())
-        .collect();
+  info!("Got test bundles");
 
-    println!("Got test bundles");
-
+  for should_thread in vec![true, false] {
     let bundle_copy = test_bundles.clone();
 
-    merge_no_history(test_bundles, &target_path).expect("Should merge correctly");
+    merge_fresh(test_bundles.clone(), should_thread, &target_path).expect("Should merge correctly");
+
+    // a block so the file gets closed
+    {
+      let mut purl_path = PathBuf::from(target_path);
+      purl_path.push("purls.txt");
+      let mut purl_file = BufReader::new(File::open(purl_path).expect("Should have purls"));
+      let mut read = String::new();
+      purl_file.read_line(&mut read).expect("Must read a line");
+      assert!(read.len() > 4, "Expected to read a pURL");
+    }
 
     let dest_bundle = GoatRodeoBundle::bundle_files_in_dir(target_path.into())
-        .expect("Got a valid bundle in test directory")
-        .pop()
-        .expect("And it should have at least 1 element");
+      .expect("Got a valid bundle in test directory")
+      .pop()
+      .expect("And it should have at least 1 element");
 
     let mut loop_cnt = 0usize;
     let start = Instant::now();
     for test_bundle in bundle_copy {
-        let index = test_bundle.get_index().unwrap();
-        for item in index.iter() {
-            if rng.gen_range(0..1000) == 42 {
-                let old = test_bundle.data_for_hash(item.hash).unwrap().1;
-                let new = dest_bundle.data_for_hash(item.hash).unwrap().1;
-                assert_eq!(
-                    old.identifier, new.identifier,
-                    "Expecting the same identifiers"
+      let index = test_bundle.get_index().unwrap();
+      for item in index.iter() {
+        if rng.gen_range(0..1000) == 42 {
+          let old = test_bundle.data_for_hash(item.hash).unwrap().1;
+          let new = dest_bundle.data_for_hash(item.hash).unwrap().1;
+          assert_eq!(
+            old.identifier, new.identifier,
+            "Expecting the same identifiers"
+          );
+
+          for i in old.connections.iter() {
+            assert!(
+              new.connections.contains(i),
+              "Expecting {} to contain {:?}",
+              new.identifier,
+              i
+            );
+          }
+
+          match (&new.metadata, &old.metadata) {
+            (None, Some(omd)) => assert!(
+              false,
+              "for {} new did not contain metadata, old did {:?}",
+              new.identifier, omd
+            ),
+            (Some(nmd), Some(omd)) => {
+              for file_name in omd.file_names.iter() {
+                assert!(
+                  nmd.file_names.contains(file_name),
+                  "Expected new to contain filenames id {} old filenames {:?} new filenames {:?}",
+                  new.identifier,
+                  omd.file_names,
+                  nmd.file_names
                 );
-
-                for i in old.connections.iter() {
-                    assert!(
-                        new.connections.contains(i),
-                        "Expecting {} to contain {:?}",
-                        new.identifier,
-                        i
-                    );
-                }
-
-                match (&new.metadata, &old.metadata) {
-                    (None, Some(omd)) => assert!(
-                        false,
-                        "for {} new did not contain metadata, old did {:?}",
-                        new.identifier, omd
-                    ),
-                    (Some(nmd), Some(omd)) => {
-                        for file_name in omd.file_names.iter() {
-                            assert!(nmd.file_names.contains(file_name), "Expected new to contain filenames id {} old filenames {:?} new filenames {:?}",
-                new.identifier, omd.file_names, nmd.file_names);
-                        }
-                    }
-                    _ => {}
-                }
+              }
             }
-
-            loop_cnt += 1;
-            if loop_cnt % 500_000 == 0 {
-                println!(
-                    "MTesting Loop {} at {:?} bundle {:?}",
-                    loop_cnt,
-                    Instant::now().duration_since(start),
-                    test_bundle.bundle_path,
-                );
-            }
+            _ => {}
+          }
         }
+
+        loop_cnt += 1;
+        if loop_cnt % 500_000 == 0 {
+          info!(
+            "MTesting Loop {} at {:?} bundle {:?} threaded {}",
+            loop_cnt,
+            Instant::now().duration_since(start),
+            test_bundle.bundle_path,
+            should_thread
+          );
+        }
+      }
     }
+  }
 }
