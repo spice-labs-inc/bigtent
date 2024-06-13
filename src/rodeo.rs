@@ -339,8 +339,28 @@ impl GoatRodeoBundle {
 
     let mut ret = vec![];
 
-    for index in self.index_files.values() {
-      let mut the_index = index.read_index()?;
+    let mut vecs = vec![];
+
+    for index_hash in self.envelope.index_files.iter().rev() {
+      let index = match self.index_files.get(index_hash) {
+        Some(f) => f,
+        None => bail!("Couldn't find index {:016x}.gri", index_hash),
+      };
+      info!("Reading index {:016x}.gri", index_hash);
+      let the_index = index.read_index()?;
+      if the_index.len() > 0 {
+        vecs.push(the_index);
+      }
+    }
+
+    info!("Read all indexes");
+    vecs.sort_by(|a, b| b[0].hash.cmp(&a[0].hash));
+    info!("Sorted Index of indexes");
+    for _ in 0..vecs.len() {
+      let mut the_index = match vecs.pop() {
+        Some(v) => v,
+        _ => bail!("Popped and failed!"),
+      };
       if ret.len() == 0 {
         ret = the_index;
       } else if the_index.len() == 0 {
@@ -350,10 +370,12 @@ impl GoatRodeoBundle {
         // append the_index to ret
         ret.append(&mut the_index);
       } else if the_index[the_index.len() - 1].hash < ret[0].hash {
+        info!("Prepending!");
         // append ret to the_index
         the_index.append(&mut ret);
         ret = the_index;
       } else {
+        info!("Intermixing!!!!");
         let rl = ret.len();
         let il = the_index.len();
         let mut dest = Vec::with_capacity(rl + il);
