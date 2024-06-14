@@ -11,6 +11,7 @@ use std::{
   path::PathBuf,
   sync::{Arc, Mutex},
 };
+use thousands::Separable;
 use toml::Table; // Use log crate when building application
 
 use crate::data_file::DataFile;
@@ -18,7 +19,7 @@ use crate::envelopes::ItemEnvelope;
 use crate::index_file::{IndexFile, IndexLoc, ItemOffset};
 use crate::live_merge::perform_merge;
 use crate::rodeo_server::MD5Hash;
-use crate::structs::Item;
+use crate::structs::{EdgeType, Item};
 use crate::util::{
   byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
   read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
@@ -364,7 +365,7 @@ impl GoatRodeoBundle {
       };
 
       info!("Appending {} of {} index components", pos, index_cnt);
-      
+
       if ret.len() == 0 {
         ret = the_index;
       } else if the_index.len() == 0 {
@@ -416,6 +417,11 @@ impl GoatRodeoBundle {
         ret = dest;
       }
     }
+
+    info!(
+      "Created index with {} items",
+      ret.len().separate_with_commas()
+    );
 
     let ret_arc = Arc::new(ret);
     self.index.store(Arc::new(Some(ret_arc.clone())));
@@ -521,6 +527,22 @@ impl GoatRodeoBundle {
     }
   }
 
+  pub fn antialias_for(&self, data: &str) -> Result<Item> {
+    let mut ret = self.data_for_key(data)?;
+    while ret.is_alias() {
+      match ret.connections.iter().find(|x| x.1 == EdgeType::AliasTo) {
+        Some(v) => {
+          ret = self.data_for_key(&v.0)?;
+        }
+        None => {
+          bail!("Unexpected situation");
+        }
+      }
+    }
+
+    Ok(ret)
+  }
+
   pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<(ItemEnvelope, Item)> {
     match index_loc {
       loc @ IndexLoc::Loc { file_hash, .. } => Ok(self.entry_for(*file_hash, loc.offset())?),
@@ -578,6 +600,61 @@ impl GoatRodeoBundle {
     let md5_hash = md5hash_str(data);
     self.data_for_hash(md5_hash).map(|v| v.1)
   }
+}
+
+#[test]
+fn test_antialias() {
+  use std::{path::PathBuf, time::Instant};
+  let start = Instant::now();
+  let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
+  // punt test is the files don't exist
+  if !goat_rodeo_test_data.is_dir() {
+    return;
+  }
+
+  let mut files =
+    match GoatRodeoBundle::bundle_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
+      Ok(v) => v,
+      Err(e) => {
+        assert!(false, "Failure to read files {:?}", e);
+        return;
+      }
+    };
+  println!("Read bundle at {:?}", start.elapsed());
+
+  assert!(files.len() > 0, "Need a bundle");
+  let bundle = files.pop().expect("Expect a bundle");
+  let index = bundle.get_index().expect("To be able to get the index");
+
+  let mut aliases = vec![];
+  for v in index.iter() {
+    let (_, item) = bundle.data_for_hash(v.hash).expect("Should get an item");
+    if item.is_alias() {
+      aliases.push(item);
+    }
+  }
+
+  println!("Got aliases at {:?}", start.elapsed());
+
+  for ai in aliases.iter().take(20) {
+    println!("Antialias for {}", ai.identifier);
+    let new_item = bundle
+      .antialias_for(&ai.identifier)
+      .expect("Expect to get the antialiased thing");
+    assert!(!new_item.is_alias(), "Expecting a non-aliased thing");
+    assert!(
+      new_item
+        .connections
+        .iter()
+        .filter(|x| x.0 == ai.identifier)
+        .count()
+        > 0,
+      "Expecting a match for {}",
+      ai.identifier
+    );
+  }
+
+  println!("Tested aliases at {:?}", start.elapsed());
 }
 
 #[test]

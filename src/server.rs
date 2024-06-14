@@ -103,6 +103,27 @@ fn north_serve(index: &RodeoServer, _request: &Request, path: &str) -> Response 
   }
 }
 
+fn serve_antialias(index: &RodeoServer, _request: &Request, path: &str) -> Response {
+  
+  match index.antialias_for(path) {
+    Ok(line) => match cbor_to_json_str(&line) {
+      Ok(line) => Response {
+        status_code: 200,
+        headers: vec![("Content-Type".into(), "application/json".into())],
+        data: ResponseBody::from_string(line),
+        upgrade: None,
+      },
+      Err(_e) => Response {
+        status_code: 500,
+        headers: vec![],
+        data: ResponseBody::from_string("Error"),
+        upgrade: None,
+      },
+    },
+    _ => rouille::Response::empty_404(),
+  }
+}
+
 fn fix_path(p: String) -> String {
   if p.starts_with("/omnibor") {
     return fix_path(p[8..].to_string());
@@ -154,8 +175,10 @@ pub fn run_web_server(index: Arc<RodeoServer>) -> () {
       let path = fix_path(path);
       let path_str: &str = &path;
       match (request.method(), path_str) {
+        
         ("POST", "bulk") => basic_bulk_serve(&index, request),
         ("GET", url) if url.starts_with("north/") => north_serve(&index, request, &url[6..]),
+        ("GET", url) if url.starts_with("aa/") => serve_antialias(&index, request, &url[3..]),
         ("GET", _url) => line_serve(&index, request, path),
         _ => rouille::Response::empty_404(),
       }

@@ -80,6 +80,9 @@ pub struct Item {
 impl Item {
     pub const NOOP: LocationReference = (0u64, 0u64);
 
+    pub fn is_alias(&self) -> bool {
+      self.connections.iter().any(|v| v.1 == EdgeType::AliasTo)
+    }
     pub fn remove_references(&mut self) {
         self.reference = Item::NOOP;
         self.merged_from = vec![];
