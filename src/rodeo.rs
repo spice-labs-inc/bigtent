@@ -356,11 +356,15 @@ impl GoatRodeoBundle {
     info!("Read all indexes");
     vecs.sort_by(|a, b| b[0].hash.cmp(&a[0].hash));
     info!("Sorted Index of indexes");
-    for _ in 0..vecs.len() {
+    let index_cnt = vecs.len();
+    for pos in 0..vecs.len() {
       let mut the_index = match vecs.pop() {
         Some(v) => v,
         _ => bail!("Popped and failed!"),
       };
+
+      info!("Appending {} of {} index components", pos, index_cnt);
+      
       if ret.len() == 0 {
         ret = the_index;
       } else if the_index.len() == 0 {
