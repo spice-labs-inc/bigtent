@@ -64,10 +64,10 @@ impl RodeoServer {
     self.bundle.load().antialias_for(data)
   }
 
-  pub fn bulk_serve(&self, data: Vec<String>, dest: PipeWriter) -> Result<()> {
+  pub fn bulk_serve(&self, data: Vec<String>, dest: PipeWriter, start: Instant) -> Result<()> {
     self
       .sender
-      .send(IndexMsg::Bulk(data, dest))
+      .send(IndexMsg::Bulk(data, dest, start))
       .map_err(|e| e.into())
   }
 
@@ -77,6 +77,7 @@ impl RodeoServer {
     gitoid: String,
     hash: MD5Hash,
     dest: PipeWriter,
+    start: Instant,
   ) -> Result<()> {
     self
       .sender
@@ -85,6 +86,7 @@ impl RodeoServer {
         gitoid: gitoid,
         initial_body: data,
         tx: dest,
+        start: start,
       })
       .map_err(|e| e.into())
   }
@@ -106,7 +108,7 @@ impl RodeoServer {
   fn contained_by(data: &Item) -> HashSet<String> {
     let mut ret = HashSet::new();
     for edge in data.connections.iter() {
-      if edge.1 == EdgeType::ContainedBy {
+      if edge.1 == EdgeType::ContainedBy || edge.1 == EdgeType::AliasTo {
         ret.insert(edge.0.clone());
       }
     }
@@ -114,18 +116,27 @@ impl RodeoServer {
     ret
   }
 
-  fn north_send(&self, gitoid: String, initial_body: Item, tx: PipeWriter) -> Result<()> {
-    let start = Instant::now();
+  fn north_send(
+    &self,
+    gitoid: String,
+    initial_body: Item,
+    tx: PipeWriter,
+    start: Instant,
+  ) -> Result<()> {
     let mut br = BufWriter::new(tx);
     let mut found = HashSet::new();
     let mut to_find = RodeoServer::contained_by(&initial_body);
     found.insert(gitoid.clone());
-    br.write_fmt(format_args!("{{ \"{}\": {:?}\n", gitoid, initial_body))?;
+    br.write_fmt(format_args!(
+      "{{ \"{}\": {}\n",
+      gitoid,
+      cbor_to_json_str(&initial_body)?
+    ))?;
     let cnt = AtomicU32::new(0);
 
     defer! {
-      info!("Sent {} in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
-      Instant::now().duration_since(start));
+      info!("North: Sent {} items in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
+      start.elapsed());
     }
     fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
       let mut ret = a.clone();
@@ -194,8 +205,7 @@ impl RodeoServer {
         IndexMsg::End => {
           break;
         }
-        IndexMsg::Bulk(data, dest) => {
-          let start = Instant::now();
+        IndexMsg::Bulk(data, dest, start) => {
           let data_len = data.len();
           match index.bulk_send(data, dest) {
             Ok(_) => {}
@@ -203,31 +213,22 @@ impl RodeoServer {
               error!("Bulk failure {:?}", e);
             }
           }
-          info!(
-            "Bulk send of {} items took {:?}",
-            data_len,
-            Instant::now().duration_since(start)
-          );
+          info!("Bulk send of {} items took {:?}", data_len, start.elapsed());
         }
         IndexMsg::North {
           hash: _,
           gitoid,
           initial_body,
           tx,
+          start,
         } => {
-          let start = Instant::now();
-
-          match index.north_send(gitoid.clone(), initial_body, tx) {
+          match index.north_send(gitoid.clone(), initial_body, tx, start) {
             Ok(_) => {}
             Err(e) => {
               error!("Bulk failure {:?}", e);
             }
           }
-          info!(
-            "North of {} took {:?}",
-            gitoid,
-            Instant::now().duration_since(start)
-          );
+          info!("North of {} took {:?}", gitoid, start.elapsed());
         }
       }
     }
@@ -300,12 +301,13 @@ impl RodeoServer {
 #[derive(Clone)]
 enum IndexMsg {
   End,
-  Bulk(Vec<String>, PipeWriter),
+  Bulk(Vec<String>, PipeWriter, Instant),
   North {
     #[allow(dead_code)]
     hash: MD5Hash,
     gitoid: String,
     initial_body: Item,
     tx: PipeWriter,
+    start: Instant,
   },
 }

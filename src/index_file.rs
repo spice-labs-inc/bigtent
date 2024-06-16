@@ -32,9 +32,9 @@ pub struct IndexFile {
 }
 
 impl IndexFile {
-    pub fn new(dir: &PathBuf, hash: u64) -> Result<IndexFile> {
+    pub fn new(dir: &PathBuf, hash: u64, check_hash: bool) -> Result<IndexFile> {
         // ensure we close `file` after computing the hash
-        {
+        if check_hash {
             let mut file = GoatRodeoBundle::find_file(&dir, hash, "gri")?;
 
             let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file)?)?;

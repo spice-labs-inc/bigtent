@@ -58,7 +58,7 @@ fn value_to_string_array(pv: Result<SJValue>) -> Result<Vec<String>> {
 
 fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
   let (rx, tx) = pipe::pipe();
-  index.bulk_serve(bulk_data, tx)?;
+  index.bulk_serve(bulk_data, tx, Instant::now())?;
   Ok(Response {
     status_code: 200,
     headers: vec![("Content-Type".into(), "application/json".into())],
@@ -67,8 +67,19 @@ fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
   })
 }
 
-fn basic_bulk_serve(index: &RodeoServer, request: &Request) -> Response {
+fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> Response {
   let body = value_to_string_array(parse_body_to_json(request));
+
+  let cnt_string = body
+    .as_ref()
+    .map(|b| b.len().to_string())
+    .unwrap_or("Failed to parse bosy".into());
+
+  defer! {
+    info!("Served bulk for {} items in {:?}",cnt_string,
+    start.elapsed());
+  }
+
   match body {
     Ok(v) if v.len() <= 420 => match serve_bulk(index, v) {
       Ok(r) => r,
@@ -79,12 +90,16 @@ fn basic_bulk_serve(index: &RodeoServer, request: &Request) -> Response {
   }
 }
 
-fn north_serve(index: &RodeoServer, _request: &Request, path: &str) -> Response {
+fn north_serve(index: &RodeoServer, _request: &Request, path: &str, start: Instant) -> Response {
+  defer! {
+    info!("Served North for {} in {:?}", path,
+    start.elapsed());
+  }
   let hash = md5hash_str(path);
   match index.data_for_hash(hash) {
     Ok(line) => {
       let (rx, tx) = pipe::pipe();
-      match index.do_north_serve(line.1, path.to_string(), hash, tx) {
+      match index.do_north_serve(line.1, path.to_string(), hash, tx, Instant::now()) {
         Ok(_) => Response {
           status_code: 200,
           headers: vec![("Content-Type".into(), "application/json".into())],
@@ -103,8 +118,16 @@ fn north_serve(index: &RodeoServer, _request: &Request, path: &str) -> Response 
   }
 }
 
-fn serve_antialias(index: &RodeoServer, _request: &Request, path: &str) -> Response {
-  
+fn serve_antialias(
+  index: &RodeoServer,
+  _request: &Request,
+  path: &str,
+  start: Instant,
+) -> Response {
+  defer! {
+    info!("Served Antialias for {} in {:?}", path,
+    start.elapsed());
+  }
   match index.antialias_for(path) {
     Ok(line) => match cbor_to_json_str(&line) {
       Ok(line) => Response {
@@ -167,7 +190,7 @@ pub fn run_web_server(index: Arc<RodeoServer>) -> () {
       let start = Instant::now();
       let url = request.url();
       defer! {
-        info!("Serving {} took {:?}", url,  Instant::now().duration_since(start));
+        info!("Serving {} took {:?}", url,  start.elapsed());
       }
 
       let path = request.url();
@@ -175,10 +198,11 @@ pub fn run_web_server(index: Arc<RodeoServer>) -> () {
       let path = fix_path(path);
       let path_str: &str = &path;
       match (request.method(), path_str) {
-        
-        ("POST", "bulk") => basic_bulk_serve(&index, request),
-        ("GET", url) if url.starts_with("north/") => north_serve(&index, request, &url[6..]),
-        ("GET", url) if url.starts_with("aa/") => serve_antialias(&index, request, &url[3..]),
+        ("POST", "bulk") => basic_bulk_serve(&index, request, start),
+        ("GET", url) if url.starts_with("north/") => north_serve(&index, request, &url[6..], start),
+        ("GET", url) if url.starts_with("aa/") => {
+          serve_antialias(&index, request, &url[3..], start)
+        }
         ("GET", _url) => line_serve(&index, request, path),
         _ => rouille::Response::empty_404(),
       }

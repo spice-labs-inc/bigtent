@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::io::BufReader;
 use std::ops::Deref;
 use std::path::Path;
+use std::time::Instant;
 use std::{
   collections::HashMap,
   fs::{read_dir, File},
@@ -132,6 +133,7 @@ impl GoatRodeoBundle {
   }
 
   pub fn new(root_dir: &PathBuf, bundle_path: &PathBuf) -> Result<GoatRodeoBundle> {
+    let start = Instant::now();
     if !is_child_dir(root_dir, bundle_path)? {
       bail!(
         "The bundle path {:?} must be in the root dir {:?}",
@@ -182,13 +184,22 @@ impl GoatRodeoBundle {
       bail!("Loaded a bundle with an invalid magic number: {:?}", env);
     }
 
-    info!("Loaded bundle {:?} {}", bundle_path.file_name(), env);
+    info!(
+      "Loaded bundle {:?} {} at {:?}",
+      bundle_path,
+      env,
+      start.elapsed()
+    );
 
     let mut index_files = HashMap::new();
     let mut indexed_hashes: HashSet<u64> = HashSet::new();
 
     for index_file in &env.index_files {
-      let the_file = IndexFile::new(&root_dir, *index_file)?;
+      let the_file = IndexFile::new(
+        &root_dir,
+        *index_file,
+        false, /*TODO -- optional testing of index hash */
+      )?;
 
       for data_hash in &the_file.envelope.data_files {
         indexed_hashes.insert(*data_hash);
@@ -225,6 +236,8 @@ impl GoatRodeoBundle {
         files.join(",")
       });
     }
+
+    info!("New bundle load time {:?}", start.elapsed());
 
     Ok(GoatRodeoBundle {
       envelope: env,
@@ -323,6 +336,8 @@ impl GoatRodeoBundle {
       None => {}
     }
 
+    let start = Instant::now();
+
     let mut my_lock = self
       .building_index
       .lock()
@@ -347,16 +362,20 @@ impl GoatRodeoBundle {
         Some(f) => f,
         None => bail!("Couldn't find index {:016x}.gri", index_hash),
       };
-      info!("Reading index {:016x}.gri", index_hash);
+      info!(
+        "Reading index {:016x}.gri at {:?}",
+        index_hash,
+        start.elapsed()
+      );
       let the_index = index.read_index()?;
       if the_index.len() > 0 {
         vecs.push(the_index);
       }
     }
 
-    info!("Read all indexes");
+    info!("Read all indexes at {:?}", start.elapsed());
     vecs.sort_by(|a, b| b[0].hash.cmp(&a[0].hash));
-    info!("Sorted Index of indexes");
+    info!("Sorted Index of indexes at {:?}", start.elapsed());
     let index_cnt = vecs.len();
     for pos in 0..vecs.len() {
       let mut the_index = match vecs.pop() {
@@ -364,7 +383,12 @@ impl GoatRodeoBundle {
         _ => bail!("Popped and failed!"),
       };
 
-      info!("Appending {} of {} index components", pos, index_cnt);
+      info!(
+        "Appending {} of {} index components at {:?}",
+        pos + 1,
+        index_cnt,
+        start.elapsed()
+      );
 
       if ret.len() == 0 {
         ret = the_index;
@@ -419,8 +443,9 @@ impl GoatRodeoBundle {
     }
 
     info!(
-      "Created index with {} items",
-      ret.len().separate_with_commas()
+      "Created index with {} items at {:?}",
+      ret.len().separate_with_commas(),
+      start.elapsed()
     );
 
     let ret_arc = Arc::new(ret);
