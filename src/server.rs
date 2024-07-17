@@ -94,6 +94,7 @@ fn north_serve(
   index: &RodeoServer,
   request: &Request,
   path: Option<&str>,
+  purls_only: bool,
   start: Instant,
 ) -> Response {
   let to_serve: Vec<String> = if request.method() == "POST" {
@@ -119,7 +120,7 @@ fn north_serve(
   }
 
   let (rx, tx) = pipe::pipe();
-  match index.do_north_serve(to_serve, tx, Instant::now()) {
+  match index.do_north_serve(to_serve, purls_only, tx, Instant::now()) {
     Ok(_) => Response {
       status_code: 200,
       headers: vec![("Content-Type".into(), "application/json".into())],
@@ -216,9 +217,13 @@ pub fn run_web_server(index: Arc<RodeoServer>) -> () {
       let path_str: &str = &path;
       match (request.method(), path_str) {
         ("POST", "bulk") => basic_bulk_serve(&index, request, start),
-        ("POST", "north") => north_serve(&index, request, None, start),
+        ("POST", "north") => north_serve(&index, request, None, false, start),
+        ("POST", "north_purls") => north_serve(&index, request, None, true, start),
         ("GET", url) if url.starts_with("north/") => {
-          north_serve(&index, request, Some(&url[6..]), start)
+          north_serve(&index, request, Some(&url[6..]), false,start)
+        }
+        ("GET", url) if url.starts_with("north_purls/") => {
+          north_serve(&index, request, Some(&url[12..]),true, start)
         }
         ("GET", url) if url.starts_with("aa/") => {
           serve_antialias(&index, request, &url[3..], start)

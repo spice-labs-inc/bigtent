@@ -88,6 +88,22 @@ impl Item {
         self.merged_from = vec![];
     }
 
+    /// Returns all the pURL (package URLs) in this item
+    pub fn find_purls(&self) -> Vec<String> {
+        match &self.metadata {
+            Some(md) => {
+                let mut ret = vec![];
+                for name in &md.file_names{
+                    if name.starts_with("pkg:") {
+                        ret.push(name.clone());
+                    }
+                }
+                ret
+            }
+            None => vec![]
+        }
+    }
+
     // tests two items... they are the same if they have the same
     // `identifier`, `connections`, `metadata`, `file_size`, `version`,
     // and `_type`
