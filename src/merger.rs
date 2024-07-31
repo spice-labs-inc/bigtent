@@ -15,19 +15,18 @@ use std::{
 use std::println as info;
 
 use crate::{
-  bundle_writer::BundleWriter,
-  envelopes::ItemEnvelope,
-  mod_share::{update_top, BundlePos},
-  rodeo::GoatRodeoBundle,
+  cluster_writer::ClusterWriter,
+  mod_share::{update_top, ClusterPos},
+  rodeo::GoatRodeoCluster,
   rodeo_server::MD5Hash,
   structs::{EdgeType, Item},
   util::NiceDurationDisplay,
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
 use thousands::Separable;
 
 pub fn merge_fresh<PB: Into<PathBuf>>(
-  bundles: Vec<GoatRodeoBundle>,
+  clusters: Vec<GoatRodeoCluster>,
   use_threads: bool,
   dest_directory: PB,
 ) -> Result<()> {
@@ -54,46 +53,38 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
 
   let mut index_holder = vec![];
 
-  for bundle in &bundles {
-    let index = bundle.get_index()?;
+  for cluster in &clusters {
+    let index = cluster.get_index()?;
     let index_len = index.len();
 
     let (tx, rx) = flume::bounded(32);
 
     if use_threads {
       let index_shadow = index.clone();
-      let bundle_shadow = bundle.clone();
+      let cluster_shadow = cluster.clone();
 
       std::thread::spawn(move || {
         let mut loop_cnt = 0usize;
         let start = Instant::now();
         let index_len = index_shadow.len();
         for io in index_shadow.iter() {
-          let (env, item) = bundle_shadow
+          let item = cluster_shadow
             .data_for_entry_offset(&io.loc)
             .expect("Expected to load data");
-          if io.hash != env.key_md5.hash {
-            panic!(
-              "Loop {} expected hash {:032x} but got {:032x}",
-              loop_cnt.separate_with_commas(),
-              u128::from_be_bytes(io.hash),
-              u128::from_be_bytes(env.key_md5.hash)
-            )
-          }
 
-          match tx.send((env, item, loop_cnt)) {
+          match tx.send((item, loop_cnt)) {
             Ok(_) => {}
             Err(e) => {
               error!(
                 "On {:016x} failed to send {} of {} error {}",
-                bundle_shadow.bundle_file_hash,
+                cluster_shadow.cluster_file_hash,
                 loop_cnt.separate_with_commas(),
                 index_len.separate_with_commas(),
                 e
               );
               panic!(
                 "On {:016x} failed to send {} of {} error {}",
-                bundle_shadow.bundle_file_hash,
+                cluster_shadow.cluster_file_hash,
                 loop_cnt.separate_with_commas(),
                 index_len.separate_with_commas(),
                 e
@@ -103,8 +94,8 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
           loop_cnt += 1;
           if false && loop_cnt % 2_500_000 == 0 {
             info!(
-              "Bundle fetcher {:016x} loop {} of {} at {:?}",
-              bundle_shadow.bundle_file_hash,
+              "Cluster fetcher {:016x} loop {} of {} at {:?}",
+              cluster_shadow.cluster_file_hash,
               loop_cnt.separate_with_commas(),
               index_len.separate_with_commas(),
               start.elapsed()
@@ -114,8 +105,8 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
       });
     }
 
-    index_holder.push(BundlePos {
-      bundle: index.clone(),
+    index_holder.push(ClusterPos {
+      cluster: index.clone(),
       pos: 0,
       len: index.len(),
       thing: if use_threads { Some(rx) } else { None },
@@ -129,7 +120,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     Instant::now().duration_since(start)
   );
 
-  let mut bundle_writer = BundleWriter::new(&dest)?;
+  let mut cluster_writer = ClusterWriter::new(&dest)?;
   let merge_start = Instant::now();
 
   let mut top = OrdMap::new();
@@ -144,13 +135,13 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     fn get_item_and_pos(
       hash: MD5Hash,
       which: usize,
-      index_holder: &mut Vec<BundlePos<Option<Receiver<(ItemEnvelope, Item, usize)>>>>,
-      bundles: &Vec<GoatRodeoBundle>,
-    ) -> Result<(ItemEnvelope, Item, usize)> {
+      index_holder: &mut Vec<ClusterPos<Option<Receiver<(Item, usize)>>>>,
+      clusters: &Vec<GoatRodeoCluster>,
+    ) -> Result<(Item, usize)> {
       match &index_holder[which].thing {
         Some(rx) => rx.recv().map_err(|e| e.into()),
-        _ => match bundles[which].data_for_hash(hash) {
-          Ok((e, i)) => Ok((e, i, 0)),
+        _ => match clusters[which].data_for_hash(hash) {
+          Ok(i) => Ok((i, 0)),
           Err(e) => Err(e),
         },
       }
@@ -164,33 +155,22 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
         let mut to_merge = vec![];
 
         for merge_base in items {
-          let (envelope, mut merge_final, the_pos) = get_item_and_pos(
+          let (mut merge_final, _the_pos) = get_item_and_pos(
             merge_base.item_offset.hash,
             merge_base.which,
             &mut index_holder,
-            &bundles,
+            &clusters,
           )?;
-          if envelope.key_md5.hash != merge_base.item_offset.hash {
-            bail!(
-              "Failed to match hash for {} loop {}. offset {}. pos {} vs {}. Expected hash {:032x} got {:032x}",
-              merge_final.identifier,
-              loop_cnt.separate_with_commas(),
-              merge_base.which,
-              the_pos.separate_with_commas(),
-              index_holder[merge_base.which].pos.separate_with_commas(),
-              u128::from_be_bytes(merge_base.item_offset.hash),
-              u128::from_be_bytes(envelope.key_md5.hash)
-            );
-          }
+
           merge_final.remove_references();
           match merge_final
             .connections
             .iter()
-            .filter(|v| v.0.starts_with("pkg:"))
-            .collect::<Vec<&(String, EdgeType, Option<String>)>>()
+            .filter(|v| v.1.starts_with("pkg:"))
+            .collect::<Vec<&(EdgeType, String)>>()
           {
             v if !v.is_empty() => {
-              for (purl, _, _) in v {
+              for (_, purl) in v {
                 purl_file.write(format!("{}\n", purl).as_bytes())?;
               }
             }
@@ -206,10 +186,10 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
           i.remove_references();
           top = top.merge(i);
         }
-        let cur_pos = bundle_writer.cur_pos() as u64;
+        let cur_pos = cluster_writer.cur_pos() as u64;
         top.reference.1 = cur_pos;
 
-        bundle_writer.write_item(top)?;
+        cluster_writer.write_item(top)?;
 
         loop_cnt += 1;
 
@@ -238,7 +218,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     }
   }
 
-  bundle_writer.finalize_bundle()?;
+  cluster_writer.finalize_cluster()?;
   info!(
     "Finished {} loops at {:?}",
     loop_cnt.separate_with_commas(),
@@ -288,17 +268,18 @@ fn test_merge() {
   if test_paths.len() < 2 {
     return;
   }
-  let test_bundles: Vec<GoatRodeoBundle> = test_paths
+  let test_clusters: Vec<GoatRodeoCluster> = test_paths
     .iter()
-    .flat_map(|v| GoatRodeoBundle::bundle_files_in_dir(v.into()).unwrap())
+    .flat_map(|v| GoatRodeoCluster::cluster_files_in_dir(v.into()).unwrap())
     .collect();
 
-  info!("Got test bundles");
+  info!("Got test clusters");
 
   for should_thread in vec![true, false] {
-    let bundle_copy = test_bundles.clone();
+    let cluster_copy = test_clusters.clone();
 
-    merge_fresh(test_bundles.clone(), should_thread, &target_path).expect("Should merge correctly");
+    merge_fresh(test_clusters.clone(), should_thread, &target_path)
+      .expect("Should merge correctly");
 
     // a block so the file gets closed
     {
@@ -310,19 +291,19 @@ fn test_merge() {
       assert!(read.len() > 4, "Expected to read a pURL");
     }
 
-    let dest_bundle = GoatRodeoBundle::bundle_files_in_dir(target_path.into())
-      .expect("Got a valid bundle in test directory")
+    let dest_cluster = GoatRodeoCluster::cluster_files_in_dir(target_path.into())
+      .expect("Got a valid cluster in test directory")
       .pop()
       .expect("And it should have at least 1 element");
 
     let mut loop_cnt = 0usize;
     let start = Instant::now();
-    for test_bundle in bundle_copy {
-      let index = test_bundle.get_index().unwrap();
+    for test_cluster in cluster_copy {
+      let index = test_cluster.get_index().unwrap();
       for item in index.iter() {
         if rng.gen_range(0..1000) == 42 {
-          let old = test_bundle.data_for_hash(item.hash).unwrap().1;
-          let new = dest_bundle.data_for_hash(item.hash).unwrap().1;
+          let old = test_cluster.data_for_hash(item.hash).unwrap().1;
+          let new = dest_cluster.data_for_hash(item.hash).unwrap().1;
           assert_eq!(
             old.identifier, new.identifier,
             "Expecting the same identifiers"
@@ -361,10 +342,10 @@ fn test_merge() {
         loop_cnt += 1;
         if loop_cnt % 500_000 == 0 {
           info!(
-            "MTesting Loop {} at {:?} bundle {:?} threaded {}",
+            "MTesting Loop {} at {:?} cluster {:?} threaded {}",
             loop_cnt,
             Instant::now().duration_since(start),
-            test_bundle.bundle_path,
+            test_cluster.cluster_path,
             should_thread
           );
         }

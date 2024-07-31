@@ -183,7 +183,7 @@ fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response
   // FIXME -- deal with getting a raw MD5 hex string
   let hash = md5hash_str(&path);
   match index.data_for_hash(hash) {
-    Ok(line) => match cbor_to_json_str(&line.1) {
+    Ok(line) => match cbor_to_json_str(&line) {
       Ok(line) => Response {
         status_code: 200,
         headers: vec![("Content-Type".into(), "application/json".into())],

@@ -1,13 +1,12 @@
 use anyhow::{anyhow, bail, Result};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufReader;
 use std::ops::Deref;
 use std::path::Path;
 use std::time::Instant;
 use std::{
-  collections::HashMap,
   fs::{read_dir, File},
   path::PathBuf,
   sync::{Arc, Mutex},
@@ -16,7 +15,6 @@ use thousands::Separable;
 use toml::Table; // Use log crate when building application
 
 use crate::data_file::DataFile;
-use crate::envelopes::ItemEnvelope;
 use crate::index_file::{IndexFile, IndexLoc, ItemOffset};
 use crate::live_merge::perform_merge;
 use crate::rodeo_server::MD5Hash;
@@ -32,21 +30,19 @@ use log::info;
 use std::println as info;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BundleFileEnvelope {
+pub struct ClusterFileEnvelope {
   pub version: u32,
   pub magic: u32,
-  pub the_type: String,
   pub data_files: Vec<u64>,
   pub index_files: Vec<u64>,
-  pub timestamp: i64,
-  pub info: HashMap<String, String>,
+  pub info: BTreeMap<String, String>,
 }
 
-impl std::fmt::Display for BundleFileEnvelope {
+impl std::fmt::Display for ClusterFileEnvelope {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     write!(
       f,
-      "BundleFileEnvelope {{v: {}, data_files: {:?}, index_files: {:?}, info: {:?}}}",
+      "ClusterFileEnvelope {{v: {}, data_files: {:?}, index_files: {:?}, info: {:?}}}",
       self.version,
       self
         .data_files
@@ -64,20 +60,20 @@ impl std::fmt::Display for BundleFileEnvelope {
 }
 
 #[derive(Debug, Clone)]
-pub struct GoatRodeoBundle {
-  pub envelope: BundleFileEnvelope,
-  pub bundle_file_hash: u64,
+pub struct GoatRodeoCluster {
+  pub envelope: ClusterFileEnvelope,
+  pub cluster_file_hash: u64,
   pub path: PathBuf,
-  pub bundle_path: PathBuf,
+  pub cluster_path: PathBuf,
   pub data_files: HashMap<u64, DataFile>,
   pub index_files: HashMap<u64, IndexFile>,
-  pub sub_bundles: HashMap<u64, GoatRodeoBundle>,
+  pub sub_clusters: HashMap<u64, GoatRodeoCluster>,
   pub synthetic: bool,
   index: Arc<ArcSwap<Option<Arc<Vec<ItemOffset>>>>>,
   building_index: Arc<Mutex<bool>>,
 }
 
-impl GoatRodeoBundle {
+impl GoatRodeoCluster {
   #[allow(non_upper_case_globals)]
   pub const DataFileMagicNumber: u32 = 0x00be1100; // Bell
 
@@ -85,7 +81,7 @@ impl GoatRodeoBundle {
   pub const IndexFileMagicNumber: u32 = 0x54154170; // Shishitō
 
   #[allow(non_upper_case_globals)]
-  pub const BundleFileMagicNumber: u32 = 0xba4a4a; // Banana
+  pub const ClusterFileMagicNumber: u32 = 0xba4a4a; // Banana
 
   // Reset the index. Should be done with extreme care
   pub fn reset_index(&self) -> () {
@@ -97,14 +93,14 @@ impl GoatRodeoBundle {
     index: Vec<ItemOffset>,
     data_files: HashMap<u64, DataFile>,
     index_files: HashMap<u64, IndexFile>,
-    sub_bundles: HashMap<u64, GoatRodeoBundle>,
-  ) -> Result<GoatRodeoBundle> {
-    if sub_bundles.len() == 0 {
-      bail!("A synthetic bundle must have at least one underlying real bundle")
+    sub_clusters: HashMap<u64, GoatRodeoCluster>,
+  ) -> Result<GoatRodeoCluster> {
+    if sub_clusters.len() == 0 {
+      bail!("A synthetic cluster must have at least one underlying real cluster")
     }
 
     let my_hash = {
-      let mut keys = sub_bundles
+      let mut keys = sub_clusters
         .keys()
         .into_iter()
         .map(|v| *v)
@@ -118,30 +114,30 @@ impl GoatRodeoBundle {
       byte_slice_to_u63(&sha256_for_slice(&mut merkle)).unwrap()
     };
 
-    Ok(GoatRodeoBundle {
+    Ok(GoatRodeoCluster {
       envelope: self.envelope.clone(),
       path: self.path.clone(),
-      bundle_path: self.bundle_path.clone(),
+      cluster_path: self.cluster_path.clone(),
       data_files: data_files,
       index_files: index_files,
       index: Arc::new(ArcSwap::new(Arc::new(Some(Arc::new(index))))),
       building_index: Arc::new(Mutex::new(false)),
-      bundle_file_hash: my_hash,
-      sub_bundles,
+      cluster_file_hash: my_hash,
+      sub_clusters,
       synthetic: true,
     })
   }
 
-  pub fn new(root_dir: &PathBuf, bundle_path: &PathBuf) -> Result<GoatRodeoBundle> {
+  pub fn new(root_dir: &PathBuf, cluster_path: &PathBuf) -> Result<GoatRodeoCluster> {
     let start = Instant::now();
-    if !is_child_dir(root_dir, bundle_path)? {
+    if !is_child_dir(root_dir, cluster_path)? {
       bail!(
-        "The bundle path {:?} must be in the root dir {:?}",
-        bundle_path,
+        "The cluster path {:?} must be in the root dir {:?}",
+        cluster_path,
         root_dir
       );
     }
-    let file_path = bundle_path.clone();
+    let file_path = cluster_path.clone();
     let file_name = match file_path.file_name().map(|e| e.to_str()).flatten() {
       Some(n) => n.to_string(),
       _ => bail!("Unable to get filename for {:?}", file_path),
@@ -153,40 +149,40 @@ impl GoatRodeoBundle {
     };
 
     // open and get info from the data file
-    let mut bundle_file = File::open(file_path.clone())?;
+    let mut cluster_file = File::open(file_path.clone())?;
 
-    let sha_u64 = byte_slice_to_u63(&sha256_for_reader(&mut bundle_file)?)?;
+    let sha_u64 = byte_slice_to_u63(&sha256_for_reader(&mut cluster_file)?)?;
 
     if sha_u64 != hash {
       bail!(
-        "Bundle {:?}: expected the sha256 of '{:016x}.grb' to match the hash, but got hash {:016x}",
+        "Cluster {:?}: expected the sha256 of '{:016x}.grc' to match the hash, but got hash {:016x}",
         file_path,
         hash,
         sha_u64
       );
     }
 
-    let mut bundle_file = BufReader::new(File::open(file_path.clone())?);
-    let dfp: &mut BufReader<File> = &mut bundle_file;
+    let mut cluster_file = BufReader::new(File::open(file_path.clone())?);
+    let dfp: &mut BufReader<File> = &mut cluster_file;
     let magic = read_u32(dfp)?;
-    if magic != GoatRodeoBundle::BundleFileMagicNumber {
+    if magic != GoatRodeoCluster::ClusterFileMagicNumber {
       bail!(
         "Unexpected magic number {:x}, expecting {:x} for data file {:?}",
         magic,
-        GoatRodeoBundle::BundleFileMagicNumber,
+        GoatRodeoCluster::ClusterFileMagicNumber,
         file_path
       );
     }
 
-    let env: BundleFileEnvelope = read_len_and_cbor(dfp)?;
+    let env: ClusterFileEnvelope = read_len_and_cbor(dfp)?;
 
-    if env.magic != GoatRodeoBundle::BundleFileMagicNumber {
-      bail!("Loaded a bundle with an invalid magic number: {:?}", env);
+    if env.magic != GoatRodeoCluster::ClusterFileMagicNumber {
+      bail!("Loaded a cluster with an invalid magic number: {:?}", env);
     }
 
     info!(
-      "Loaded bundle {:?} {} at {:?}",
-      bundle_path,
+      "Loaded cluster {:?} {} at {:?}",
+      cluster_path,
       env,
       start.elapsed()
     );
@@ -237,28 +233,28 @@ impl GoatRodeoBundle {
       });
     }
 
-    info!("New bundle load time {:?}", start.elapsed());
+    info!("New cluster load time {:?}", start.elapsed());
 
-    Ok(GoatRodeoBundle {
+    Ok(GoatRodeoCluster {
       envelope: env,
       path: root_dir.clone(),
-      bundle_path: bundle_path.clone(),
+      cluster_path: cluster_path.clone(),
       data_files: data_files,
       index_files: index_files,
       index: Arc::new(ArcSwap::new(Arc::new(None))),
       building_index: Arc::new(Mutex::new(false)),
-      bundle_file_hash: sha_u64,
-      sub_bundles: HashMap::new(),
+      cluster_file_hash: sha_u64,
+      sub_clusters: HashMap::new(),
       synthetic: false,
     })
   }
 
-  pub fn common_parent_dir(bundles: &[GoatRodeoBundle]) -> Result<PathBuf> {
-    let paths = bundles.into_iter().map(|b| b.bundle_path.clone()).collect();
+  pub fn common_parent_dir(clusters: &[GoatRodeoCluster]) -> Result<PathBuf> {
+    let paths = clusters.into_iter().map(|b| b.cluster_path.clone()).collect();
     find_common_root_dir(paths)
   }
 
-  pub fn bundle_from_config(file_name: PathBuf, conf: &Table) -> Result<GoatRodeoBundle> {
+  pub fn cluster_from_config(file_name: PathBuf, conf: &Table) -> Result<GoatRodeoCluster> {
     let root_dir_key = conf.get("root_dir");
     let root_dir: PathBuf = match root_dir_key {
       Some(toml::Value::String(s)) => {
@@ -272,8 +268,8 @@ impl GoatRodeoBundle {
       _ => bail!("Must supply a `root_dir` entry in the configuration file"),
     };
 
-    let bundle_path_key = conf.get("bundle_path");
-    let envelope_paths: Vec<PathBuf> = match bundle_path_key {
+    let cluster_path_key = conf.get("cluster_path");
+    let envelope_paths: Vec<PathBuf> = match cluster_path_key {
       Some(toml::Value::Array(av)) => av
         .iter()
         .flat_map(|v| match v {
@@ -285,7 +281,7 @@ impl GoatRodeoBundle {
         vec![PathBuf::from(shellexpand::tilde(index).to_string())]
       }
       _ => bail!(format!(
-        "Could not find 'bundle_path' key in configuration file {:?}",
+        "Could not find 'cluster_path' key in configuration file {:?}",
         file_name
       )),
     };
@@ -295,30 +291,30 @@ impl GoatRodeoBundle {
       envelope_dirs.push(p.clone());
     }
 
-    let mut bundles = vec![];
+    let mut clusters = vec![];
 
     for path in envelope_dirs {
-      bundles.push(GoatRodeoBundle::new(&root_dir, &path)?);
+      clusters.push(GoatRodeoCluster::new(&root_dir, &path)?);
     }
 
-    if bundles.len() == 0 {
+    if clusters.len() == 0 {
       // this is weird... we should have gotten at least one item
-      bail!("No bundles were specified in {}", bundle_path_key.unwrap());
-    } else if bundles.len() == 1 {
-      return Ok(bundles.pop().unwrap()); // okay because just checked length
+      bail!("No clusters were specified in {}", cluster_path_key.unwrap());
+    } else if clusters.len() == 1 {
+      return Ok(clusters.pop().unwrap()); // okay because just checked length
     } else {
-      // turn the bundles into one
-      perform_merge(bundles)
+      // turn the clusters into one
+      perform_merge(clusters)
     }
   }
 
-  // All the non-synthetic sub-bundles
-  pub fn all_sub_bundles(&self) -> Vec<GoatRodeoBundle> {
+  // All the non-synthetic sub-clusters
+  pub fn all_sub_clusters(&self) -> Vec<GoatRodeoCluster> {
     let mut ret = vec![];
 
-    if !self.sub_bundles.is_empty() {
-      for (_, sub) in self.sub_bundles.iter() {
-        ret.append(&mut sub.all_sub_bundles());
+    if !self.sub_clusters.is_empty() {
+      for (_, sub) in self.sub_clusters.iter() {
+        ret.append(&mut sub.all_sub_clusters());
       }
     } else {
       ret.push(self.clone());
@@ -492,7 +488,7 @@ impl GoatRodeoBundle {
     }
   }
 
-  pub fn bundle_files_in_dir(path: PathBuf) -> Result<Vec<GoatRodeoBundle>> {
+  pub fn cluster_files_in_dir(path: PathBuf) -> Result<Vec<GoatRodeoCluster>> {
     let the_dir = read_dir(path.clone())?;
     let mut ret = vec![];
     for f in the_dir {
@@ -504,8 +500,8 @@ impl GoatRodeoBundle {
         .flatten()
         .map(|s| s.to_owned());
 
-      if file.file_type()?.is_file() && file_extn == Some("grb".into()) {
-        let walker = GoatRodeoBundle::new(&path, &file.path())?;
+      if file.file_type()?.is_file() && file_extn == Some("grc".into()) {
+        let walker = GoatRodeoCluster::new(&path, &file.path())?;
         ret.push(walker)
       }
     }
@@ -518,12 +514,12 @@ impl GoatRodeoBundle {
     Ok(find_item(hash, &index))
   }
 
-  pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<(ItemEnvelope, Item)> {
+  pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item> {
     let data_files = &self.data_files;
     let data_file = data_files.get(&file_hash);
     match data_file {
       Some(df) => {
-        let (env, mut item) = df.read_envelope_and_item_at(offset)?;
+        let mut item = df.read_item_at(offset)?;
         match item.reference.0 {
           0 => item.reference.0 = file_hash,
           v if v != file_hash => {
@@ -546,7 +542,7 @@ impl GoatRodeoBundle {
           )
         }
 
-        Ok((env, item))
+        Ok(item)
       }
       None => bail!("Couldn't find file for hash {:x}", file_hash),
     }
@@ -555,9 +551,9 @@ impl GoatRodeoBundle {
   pub fn antialias_for(&self, data: &str) -> Result<Item> {
     let mut ret = self.data_for_key(data)?;
     while ret.is_alias() {
-      match ret.connections.iter().find(|x| x.1 == EdgeType::AliasTo) {
+      match ret.connections.iter().find(|x| x.0 == EdgeType::AliasTo) {
         Some(v) => {
-          ret = self.data_for_key(&v.0)?;
+          ret = self.data_for_key(&v.1)?;
         }
         None => {
           bail!("Unexpected situation");
@@ -568,7 +564,7 @@ impl GoatRodeoBundle {
     Ok(ret)
   }
 
-  pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<(ItemEnvelope, Item)> {
+  pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Item> {
     match index_loc {
       loc @ IndexLoc::Loc { file_hash, .. } => Ok(self.entry_for(*file_hash, loc.offset())?),
       IndexLoc::Chain(offsets) => {
@@ -582,9 +578,9 @@ impl GoatRodeoBundle {
         } else if ret.len() == 1 {
           Ok(ret.pop().unwrap()) // we know this is okay because we just tested length
         } else {
-          let (env, base) = ret.pop().unwrap(); // we know this is okay because ret has more than 1 element
+          let base = ret.pop().unwrap(); // we know this is okay because ret has more than 1 element
           let mut to_merge = vec![];
-          for (_, item) in ret {
+          for item in ret {
             to_merge.push(item);
           }
           let mut final_base = base.clone();
@@ -592,13 +588,13 @@ impl GoatRodeoBundle {
           for m2 in to_merge {
             final_base = final_base.merge(m2);
           }
-          Ok((env, final_base))
+          Ok(final_base)
         }
       }
     }
   }
 
-  pub fn vec_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<(ItemEnvelope, Item)>> {
+  pub fn vec_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<Item>> {
     match index_loc {
       loc @ IndexLoc::Loc { file_hash, .. } => Ok(vec![self.entry_for(*file_hash, loc.offset())?]),
       IndexLoc::Chain(offsets) => {
@@ -612,7 +608,7 @@ impl GoatRodeoBundle {
     }
   }
 
-  pub fn data_for_hash(&self, hash: MD5Hash) -> Result<(ItemEnvelope, Item)> {
+  pub fn data_for_hash(&self, hash: MD5Hash) -> Result<Item> {
     let entry_offset = match self.find(hash)? {
       Some(eo) => eo,
       _ => bail!(format!("Could not find entry for hash {:x?}", hash)),
@@ -623,7 +619,7 @@ impl GoatRodeoBundle {
 
   pub fn data_for_key(&self, data: &str) -> Result<Item> {
     let md5_hash = md5hash_str(data);
-    self.data_for_hash(md5_hash).map(|v| v.1)
+    self.data_for_hash(md5_hash)
   }
 }
 
@@ -638,22 +634,22 @@ fn test_antialias() {
   }
 
   let mut files =
-    match GoatRodeoBundle::bundle_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
+    match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
       Ok(v) => v,
       Err(e) => {
         assert!(false, "Failure to read files {:?}", e);
         return;
       }
     };
-  println!("Read bundle at {:?}", start.elapsed());
+  println!("Read cluster at {:?}", start.elapsed());
 
-  assert!(files.len() > 0, "Need a bundle");
-  let bundle = files.pop().expect("Expect a bundle");
-  let index = bundle.get_index().expect("To be able to get the index");
+  assert!(files.len() > 0, "Need a cluster");
+  let cluster = files.pop().expect("Expect a cluster");
+  let index = cluster.get_index().expect("To be able to get the index");
 
   let mut aliases = vec![];
   for v in index.iter() {
-    let (_, item) = bundle.data_for_hash(v.hash).expect("Should get an item");
+    let item = cluster.data_for_hash(v.hash).expect("Should get an item");
     if item.is_alias() {
       aliases.push(item);
     }
@@ -663,7 +659,7 @@ fn test_antialias() {
 
   for ai in aliases.iter().take(20) {
     println!("Antialias for {}", ai.identifier);
-    let new_item = bundle
+    let new_item = cluster
       .antialias_for(&ai.identifier)
       .expect("Expect to get the antialiased thing");
     assert!(!new_item.is_alias(), "Expecting a non-aliased thing");
@@ -671,7 +667,7 @@ fn test_antialias() {
       new_item
         .connections
         .iter()
-        .filter(|x| x.0 == ai.identifier)
+        .filter(|x| x.1 == ai.identifier)
         .count()
         > 0,
       "Expecting a match for {}",
@@ -683,7 +679,7 @@ fn test_antialias() {
 }
 
 #[test]
-fn test_generated_bundle() {
+fn test_generated_cluster() {
   use std::time::Instant;
 
   let test_paths: Vec<String> = vec![
@@ -701,7 +697,7 @@ fn test_generated_bundle() {
     }
 
     let start = Instant::now();
-    let files = match GoatRodeoBundle::bundle_files_in_dir(test_path.into()) {
+    let files = match GoatRodeoCluster::cluster_files_in_dir(test_path.into()) {
       Ok(v) => v,
       Err(e) => {
         assert!(false, "Failure to read files {:?}", e);
@@ -715,9 +711,9 @@ fn test_generated_bundle() {
     );
     assert!(files.len() > 0, "We should find some files");
     let mut pass_num = 0;
-    for bundle in files {
+    for cluster in files {
       pass_num += 1;
-      let complete_index = bundle.get_index().unwrap();
+      let complete_index = cluster.get_index().unwrap();
 
       info!(
         "Loaded index for pass {} at {:?}",
@@ -733,7 +729,7 @@ fn test_generated_bundle() {
       info!("Index size {}", complete_index.len());
 
       for i in complete_index.deref() {
-        bundle.find(i.hash).unwrap().unwrap();
+        cluster.find(i.hash).unwrap().unwrap();
       }
     }
   }
@@ -749,7 +745,7 @@ fn test_files_in_dir() {
     return;
   }
 
-  let files = match GoatRodeoBundle::bundle_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
+  let files = match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
     Ok(v) => v,
     Err(e) => {
       assert!(false, "Failure to read files {:?}", e);
@@ -759,19 +755,19 @@ fn test_files_in_dir() {
 
   assert!(files.len() > 0, "We should find some files");
   let mut total_index_size = 0;
-  for bundle in &files {
-    assert!(bundle.data_files.len() > 0);
-    assert!(bundle.index_files.len() > 0);
+  for cluster in &files {
+    assert!(cluster.data_files.len() > 0);
+    assert!(cluster.index_files.len() > 0);
 
     let start = Instant::now();
-    let complete_index = bundle.get_index().unwrap();
+    let complete_index = cluster.get_index().unwrap();
 
     total_index_size += complete_index.len();
 
     assert!(complete_index.len() > 100_000, "the index should be large");
     let time = Instant::now().duration_since(start);
     let start = Instant::now();
-    bundle.get_index().unwrap(); // should be from cache
+    cluster.get_index().unwrap(); // should be from cache
     let time2 = Instant::now().duration_since(start);
     assert!(
       time > Duration::from_millis(60),

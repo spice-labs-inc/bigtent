@@ -1,10 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::millis_now;
-
-#[derive(Debug, Eq, PartialEq, PartialOrd, Deserialize, Serialize, Clone, Copy, Hash)]
+#[derive(Debug, Eq, PartialEq, PartialOrd, Deserialize, Serialize, Clone, Copy, Hash, Ord)]
 pub enum EdgeType {
     AliasTo,
     AliasFrom,
@@ -16,10 +14,10 @@ pub enum EdgeType {
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
 pub struct ItemMetaData {
-    pub file_names: HashSet<String>,
-    pub file_type: HashSet<String>,
-    pub file_sub_type: HashSet<String>,
-    pub extra: HashMap<String, HashSet<String>>,
+    pub file_names: BTreeSet<String>,
+    pub file_type: BTreeSet<String>,
+    pub file_sub_type: BTreeSet<String>,
+    pub extra: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl ItemMetaData {
@@ -62,30 +60,29 @@ impl ItemMetaData {
 }
 
 pub type LocationReference = (u64, u64);
-pub type Edge = (String, EdgeType, Option<String>);
+
+
+pub type Edge = (EdgeType,String);
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Item {
     pub identifier: String,
     pub reference: LocationReference,
-    pub connections: HashSet<Edge>,
+    pub connections: BTreeSet<Edge>,
     pub metadata: Option<ItemMetaData>,
-    pub merged_from: Vec<LocationReference>,
+    pub merged_from: BTreeSet<LocationReference>,
     pub file_size: i64,
-    pub _timestamp: i64,
-    pub _version: u32,
-    pub _type: String,
 }
 
 impl Item {
     pub const NOOP: LocationReference = (0u64, 0u64);
 
     pub fn is_alias(&self) -> bool {
-      self.connections.iter().any(|v| v.1 == EdgeType::AliasTo)
+      self.connections.iter().any(|v| v.0 == EdgeType::AliasTo)
     }
     pub fn remove_references(&mut self) {
         self.reference = Item::NOOP;
-        self.merged_from = vec![];
+        self.merged_from = BTreeSet::new();
     }
 
     /// Returns all the pURL (package URLs) in this item
@@ -109,11 +106,9 @@ impl Item {
     // and `_type`
     pub fn is_same(&self, other: &Item) -> bool {
         self.file_size == other.file_size
-            && self._version == other._version
             && self.identifier == other.identifier
             && self.connections == other.connections
             && self.metadata == other.metadata
-            && self._type == other._type
     }
 
     // merge to `Item`s
@@ -134,9 +129,6 @@ impl Item {
             },
             merged_from: self.merged_from.clone(),
             file_size: self.file_size,
-            _timestamp: millis_now(),
-            _version: self._version,
-            _type: self._type.clone(),
         }
     }
 
@@ -150,9 +142,11 @@ impl Item {
       } 
 
       let mut base = items[0].clone();
-      let mut mf = vec![base.reference];
+      let mut mf = BTreeSet::new();
+      
+      mf.insert(base.reference);
       for i in 1..len {
-        mf.push(items[i].reference);
+        mf.insert(items[i].reference);
         base = items[i].merge(base);
       }
 

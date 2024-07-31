@@ -1,13 +1,12 @@
 use crate::{
-  envelopes::ItemEnvelope,
-  rodeo::GoatRodeoBundle,
+  rodeo::GoatRodeoCluster,
   structs::Item,
-  util::{read_cbor, read_len_and_cbor, read_u16, read_u32},
+  util::{read_cbor, read_len_and_cbor, read_u32},
 };
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-  collections::{HashMap, HashSet},
+  collections::{BTreeMap, BTreeSet},
   fs::File,
   io::{BufReader, Seek},
   path::PathBuf,
@@ -18,12 +17,10 @@ use std::{
 pub struct DataFileEnvelope {
   pub version: u32,
   pub magic: u32,
-  pub the_type: String,
   pub previous: u64,
-  pub depends_on: HashSet<u64>,
-  pub timestamp: i64,
+  pub depends_on: BTreeSet<u64>,
   pub built_from_merge: bool,
-  pub info: HashMap<String, String>,
+  pub info: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,14 +32,14 @@ pub struct DataFile {
 
 impl DataFile {
   pub fn new(dir: &PathBuf, hash: u64) -> Result<DataFile> {
-    let mut data_file = GoatRodeoBundle::find_file(dir, hash, "grd")?;
+    let mut data_file = GoatRodeoCluster::find_file(dir, hash, "grd")?;
     let dfp: &mut File = &mut data_file;
     let magic = read_u32(dfp)?;
-    if magic != GoatRodeoBundle::DataFileMagicNumber {
+    if magic != GoatRodeoCluster::DataFileMagicNumber {
       bail!(
         "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.grd",
         magic,
-        GoatRodeoBundle::DataFileMagicNumber,
+        GoatRodeoCluster::DataFileMagicNumber,
         hash
       );
     }
@@ -70,29 +67,15 @@ impl DataFile {
     Ok(())
   }
 
-  pub fn read_envelope_at(&self, pos: u64) -> Result<ItemEnvelope> {
+  pub fn read_item_at(&self, pos: u64) -> Result<Item> {
     let mut my_file = self
       .file
       .lock()
       .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
     DataFile::seek_to(&mut my_file, pos)?;
     let my_reader: &mut BufReader<File> = &mut my_file;
-    let len = read_u16(my_reader)?;
-    let _ = read_u32(my_reader)?;
-    read_cbor(my_reader, len as usize)
-  }
-
-  pub fn read_envelope_and_item_at(&self, pos: u64) -> Result<(ItemEnvelope, Item)> {
-    let mut my_file = self
-      .file
-      .lock()
-      .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
-    DataFile::seek_to(&mut my_file, pos)?;
-    let my_reader: &mut BufReader<File> = &mut my_file;
-    let env_len = read_u16(my_reader)?;
     let item_len = read_u32(my_reader)?;
-    let env = read_cbor(my_reader, env_len as usize)?;
     let item = read_cbor(&mut *my_file, item_len as usize)?;
-    Ok((env, item))
+    Ok(item)
   }
 }
