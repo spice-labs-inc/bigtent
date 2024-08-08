@@ -73,20 +73,18 @@ impl RodeoServer {
 
   pub fn do_north_serve(
     &self,
-    data: Item,
-    gitoid: String,
-    hash: MD5Hash,
+    gitoids: Vec<String>,
+    purls_only: bool,
     dest: PipeWriter,
     start: Instant,
   ) -> Result<()> {
     self
       .sender
       .send(IndexMsg::North {
-        hash: hash,
-        gitoid: gitoid,
-        initial_body: data,
+        gitoids,
+        purls_only,
         tx: dest,
-        start: start,
+        start,
       })
       .map_err(|e| e.into())
   }
@@ -108,7 +106,10 @@ impl RodeoServer {
   fn contained_by(data: &Item) -> HashSet<String> {
     let mut ret = HashSet::new();
     for edge in data.connections.iter() {
-      if edge.1 == EdgeType::ContainedBy || edge.1 == EdgeType::AliasTo {
+      if edge.1 == EdgeType::ContainedBy
+        || edge.1 == EdgeType::AliasTo
+        || edge.1 == EdgeType::BuildsTo
+      {
         ret.insert(edge.0.clone());
       }
     }
@@ -118,20 +119,20 @@ impl RodeoServer {
 
   fn north_send(
     &self,
-    gitoid: String,
-    initial_body: Item,
+    gitoids: Vec<String>,
+    purls_only: bool,
     tx: PipeWriter,
     start: Instant,
   ) -> Result<()> {
     let mut br = BufWriter::new(tx);
     let mut found = HashSet::new();
-    let mut to_find = RodeoServer::contained_by(&initial_body);
-    found.insert(gitoid.clone());
-    br.write_fmt(format_args!(
-      "{{ \"{}\": {}\n",
-      gitoid,
-      cbor_to_json_str(&initial_body)?
-    ))?;
+    let mut to_find = HashSet::new();
+    let mut found_purls = HashSet::<String>::new();
+    to_find.extend(gitoids);
+    let mut first = true;
+
+    br.write_all(if purls_only { b"[" } else { b"{" })?;
+
     let cnt = AtomicU32::new(0);
 
     defer! {
@@ -156,23 +157,48 @@ impl RodeoServer {
         found.insert(this_oid.clone());
         match self.data_for_key(&this_oid) {
           Ok(item) => {
-            br.write_fmt(format_args!(
-              ",\n \"{}\": [{}]\n",
-              this_oid,
-              cbor_to_json_str(&item)?
-            ))?;
+            if purls_only {
+              for purl in item.find_purls() {
+                if !found_purls.contains(&purl) {
+                  let json_str = serde_json::to_string(&purl)?;
+                  br.write_fmt(format_args!(
+                    "{}{}",
+                    if !first { ",\n" } else { "" },
+                    json_str
+                  ))?;
+                  found_purls.insert(purl);
+                  first = false;
+                }
+              }
+            } else {
+              br.write_fmt(format_args!(
+                "{}\n \"{}\": {}\n",
+                if !first { "," } else { "" },
+                this_oid,
+                cbor_to_json_str(&item)?
+              ))?;
+              first = false;
+            }
             let and_then = RodeoServer::contained_by(&item);
             to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
           }
           _ => {
-            br.write_fmt(format_args!(",\n \"{}\": []\n", this_oid,))?;
+            // don't write "not found" items if we're just writing pURLs
+            if !purls_only {
+              br.write_fmt(format_args!(
+                "{}\n \"{}\": null\n",
+                if !first { "," } else { "" },
+                this_oid,
+              ))?;
+            }
           }
         }
+        
         cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       }
     }
 
-    br.write_all(b"}\n")?;
+    br.write_all(if purls_only { b"]" } else { b"}\n" })?;
     Ok(())
   }
 
@@ -216,19 +242,18 @@ impl RodeoServer {
           info!("Bulk send of {} items took {:?}", data_len, start.elapsed());
         }
         IndexMsg::North {
-          hash: _,
-          gitoid,
-          initial_body,
+          gitoids,
           tx,
           start,
+          purls_only,
         } => {
-          match index.north_send(gitoid.clone(), initial_body, tx, start) {
+          match index.north_send(gitoids.clone(), purls_only, tx, start) {
             Ok(_) => {}
             Err(e) => {
               error!("Bulk failure {:?}", e);
             }
           }
-          info!("North of {} took {:?}", gitoid, start.elapsed());
+          info!("North of {:?} took {:?}", gitoids, start.elapsed());
         }
       }
     }
@@ -259,6 +284,14 @@ impl RodeoServer {
     args_opt: Option<Args>,
   ) -> Result<Arc<RodeoServer>> {
     let (tx, rx) = flume::unbounded();
+
+    // do this in a block so the index is released at the end of the block
+    if false {
+      // dunno if this is a good idea...
+      info!("Loading full index...");
+      bundle.get_index()?;
+      info!("Loaded index")
+    }
 
     let args = args_opt.unwrap_or_default();
     let config_table = args.read_conf_file().unwrap_or_default();
@@ -304,9 +337,8 @@ enum IndexMsg {
   Bulk(Vec<String>, PipeWriter, Instant),
   North {
     #[allow(dead_code)]
-    hash: MD5Hash,
-    gitoid: String,
-    initial_body: Item,
+    gitoids: Vec<String>,
+    purls_only: bool,
     tx: PipeWriter,
     start: Instant,
   },
