@@ -19,4 +19,4 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      run: cargo test --verbose --lib
+      run: RUST_BACKTRACE=1 cargo test --verbose --lib
