@@ -73,7 +73,7 @@ fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> R
   let cnt_string = body
     .as_ref()
     .map(|b| b.len().to_string())
-    .unwrap_or("Failed to parse bosy".into());
+    .unwrap_or("Failed to parse body".into());
 
   defer! {
     info!("Served bulk for {} items in {:?}",cnt_string,
@@ -90,31 +90,49 @@ fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> R
   }
 }
 
-fn north_serve(index: &RodeoServer, _request: &Request, path: &str, start: Instant) -> Response {
+fn north_serve(
+  index: &RodeoServer,
+  request: &Request,
+  path: Option<&str>,
+  purls_only: bool,
+  start: Instant,
+) -> Response {
+  let to_serve: Vec<String> = if request.method() == "POST" {
+    let body = value_to_string_array(parse_body_to_json(request));
+
+    match body {
+      Ok(v) if v.len() <= 6000 => v,
+      Ok(_) => return Response::empty_400(),
+      Err(_) => return rouille::Response::empty_404(),
+    }
+  } else {
+    match path {
+      Some(p) => vec![p.into()],
+      _ => return rouille::Response::empty_404(),
+    }
+  };
+
+  let serve_clone = to_serve.clone();
+
   defer! {
-    info!("Served North for {} in {:?}", path,
+    info!("Served North for {:?} in {:?}", serve_clone,
     start.elapsed());
   }
-  let hash = md5hash_str(path);
-  match index.data_for_hash(hash) {
-    Ok(line) => {
-      let (rx, tx) = pipe::pipe();
-      match index.do_north_serve(line.1, path.to_string(), hash, tx, Instant::now()) {
-        Ok(_) => Response {
-          status_code: 200,
-          headers: vec![("Content-Type".into(), "application/json".into())],
-          data: ResponseBody::from_reader(rx),
-          upgrade: None,
-        },
-        _ => Response {
-          status_code: 500,
-          headers: vec![],
-          data: ResponseBody::from_string("Failed to serve north"),
-          upgrade: None,
-        },
-      }
-    }
-    _ => rouille::Response::empty_404(),
+
+  let (rx, tx) = pipe::pipe();
+  match index.do_north_serve(to_serve, purls_only, tx, Instant::now()) {
+    Ok(_) => Response {
+      status_code: 200,
+      headers: vec![("Content-Type".into(), "application/json".into())],
+      data: ResponseBody::from_reader(rx),
+      upgrade: None,
+    },
+    _ => Response {
+      status_code: 500,
+      headers: vec![],
+      data: ResponseBody::from_string("Failed to serve north"),
+      upgrade: None,
+    },
   }
 }
 
@@ -199,7 +217,14 @@ pub fn run_web_server(index: Arc<RodeoServer>) -> () {
       let path_str: &str = &path;
       match (request.method(), path_str) {
         ("POST", "bulk") => basic_bulk_serve(&index, request, start),
-        ("GET", url) if url.starts_with("north/") => north_serve(&index, request, &url[6..], start),
+        ("POST", "north") => north_serve(&index, request, None, false, start),
+        ("POST", "north_purls") => north_serve(&index, request, None, true, start),
+        ("GET", url) if url.starts_with("north/") => {
+          north_serve(&index, request, Some(&url[6..]), false,start)
+        }
+        ("GET", url) if url.starts_with("north_purls/") => {
+          north_serve(&index, request, Some(&url[12..]),true, start)
+        }
         ("GET", url) if url.starts_with("aa/") => {
           serve_antialias(&index, request, &url[3..], start)
         }
