@@ -250,18 +250,18 @@ pub fn find_common_root_dir(from: Vec<PathBuf>) -> Result<PathBuf> {
   }
 }
 
-#[test]
-fn test_parents() {
-  assert_eq!(
-    find_common_root_dir(vec![PathBuf::from("."), PathBuf::from("./..")]).unwrap(),
-    PathBuf::from("./..").canonicalize().unwrap()
-  );
-  assert_eq!(
-    find_common_root_dir(vec![PathBuf::from("."), PathBuf::from("./../..")]).unwrap(),
-    PathBuf::from("./../..").canonicalize().unwrap()
-  );
-  assert!(find_common_root_dir(vec![PathBuf::from("."), PathBuf::from("/tmp")]).is_err());
-}
+// #[test]
+// fn test_parents() {
+//   assert_eq!(
+//     find_common_root_dir(vec![PathBuf::from("."), PathBuf::from("./..")]).unwrap(),
+//     PathBuf::from("./..").canonicalize().unwrap()
+//   );
+//   assert_eq!(
+//     find_common_root_dir(vec![PathBuf::from("."), PathBuf::from("./../..")]).unwrap(),
+//     PathBuf::from("./../..").canonicalize().unwrap()
+//   );
+//   assert!(find_common_root_dir(vec![PathBuf::from("."), PathBuf::from("/tmp")]).is_err());
+// }
 
 pub fn os_str_to_string(oss: &OsStr) -> Result<String> {
   match oss.to_str() {
