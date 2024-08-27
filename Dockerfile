@@ -1,6 +1,6 @@
 FROM messense/rust-musl-cross:x86_64-musl AS build
 
-LABEL MAINTAINER="engineering@spicelabs.io"
+LABEL MAINTAINER="ext-engineering@spicelabs.io"
 
 
 # Create a new empty shell project
