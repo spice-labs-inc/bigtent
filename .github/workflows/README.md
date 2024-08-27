@@ -2,7 +2,7 @@
 
 This folder contains Github Actions workflows
 
-- `rust-ci.yml` uses sbt to run a build & test job 
+- `rust-ci.yml` uses cargo to run a build & test job 
   - This automatically triggers on the following events:
     1. Push to any branch (`**`)
     2. Pull requests to `main` branch
