@@ -110,6 +110,7 @@ impl RodeoServer {
         || edge.0 == EdgeType::BuildsTo
       {
         ret.insert(edge.1.clone());
+
       }
     }
 
@@ -192,7 +193,6 @@ impl RodeoServer {
             }
           }
         }
-
         cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       }
     }
