@@ -1,9 +1,14 @@
 #[cfg(not(test))]
 use log::info;
-use std::{collections::HashMap,  time::Instant}; // Use log crate when building application
+use std::{collections::{ HashMap}, time::Instant}; // Use log crate when building application
 
 use crate::{
-  bundle_writer::BundleWriter, index_file::{IndexLoc, ItemOffset}, mod_share::{update_top, BundlePos}, rodeo::GoatRodeoBundle, structs::{Item, ItemMergeResult}, util::path_plus_timed
+  cluster_writer::ClusterWriter,
+  index_file::{IndexLoc, ItemOffset},
+  mod_share::{update_top, ClusterPos},
+  rodeo::GoatRodeoCluster,
+  structs::{Item, ItemMergeResult},
+  util::path_plus_timed,
 };
 use anyhow::{bail, Result};
 use im::OrdMap;
@@ -11,31 +16,29 @@ use im::OrdMap;
 use std::println as info;
 use thousands::Separable;
 
-
-
-pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
+pub fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoCluster> {
   let start = Instant::now();
-  if bundles.is_empty() {
-    bail!("`live_merge` requires at least one bundle");
+  if clusters.is_empty() {
+    bail!("`live_merge` requires at least one cluster");
   }
 
-  if bundles.len() == 1 {
-    return Ok(bundles[0].clone());
+  if clusters.len() == 1 {
+    return Ok(clusters[0].clone());
   }
 
   let mut index_holder = vec![];
 
   let mut max_size = 0usize;
 
-  for bundle in &bundles {
-    let index = bundle.get_index()?;
+  for cluster in &clusters {
+    let index = cluster.get_index()?;
     let index_len = index.len();
     max_size += index_len;
-    index_holder.push(BundlePos {
-      bundle: index.clone(),
+    index_holder.push(ClusterPos {
+      cluster: index.clone(),
       pos: 0,
       len: index.len(),
-      thing: 0
+      thing: 0,
     });
   }
 
@@ -46,11 +49,11 @@ pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
 
   // build submap
   let mut submap = HashMap::new();
-  for b in &bundles {
-    submap.insert(b.bundle_file_hash, b.clone());
+  for b in &clusters {
+    submap.insert(b.cluster_file_hash, b.clone());
   }
 
-  let mut new_index: Vec<ItemOffset> = Vec::with_capacity(max_size * 90usize / 100usize);
+  let mut new_index = Vec::with_capacity(max_size * 90usize / 100usize);
   let mut loop_cnt = 0usize;
 
   let mut top = OrdMap::new();
@@ -70,7 +73,10 @@ pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
         if items.len() == 1 {
           new_index.push(items.pop().unwrap().item_offset);
         } else {
-          let computed_loc = items.iter().flat_map(|item| item.item_offset.loc.as_vec()).collect();
+          let computed_loc = items
+            .iter()
+            .flat_map(|item| item.item_offset.loc.as_vec())
+            .collect();
           let new_item_offset = ItemOffset {
             hash: items[0].item_offset.hash,
             loc: IndexLoc::Chain(computed_loc),
@@ -96,12 +102,12 @@ pub fn perform_merge(bundles: Vec<GoatRodeoBundle>) -> Result<GoatRodeoBundle> {
 
   let mut data_files = HashMap::new();
   let mut index_files = HashMap::new();
-  for b in bundles.iter() {
+  for b in clusters.iter() {
     data_files.extend(b.data_files.clone());
     index_files.extend(b.index_files.clone());
   }
 
-  let b0 = &bundles[0];
+  let b0 = &clusters[0];
   info!("Merge took {:?}", Instant::now().duration_since(start));
   b0.create_synthetic_with(new_index, data_files, index_files, submap)
 }
@@ -142,33 +148,33 @@ fn test_live_merge() {
     return;
   }
 
-  let test_bundles: Vec<GoatRodeoBundle> = test_paths
+  let test_clusters: Vec<GoatRodeoCluster> = test_paths
     .iter()
-    .flat_map(|v| GoatRodeoBundle::bundle_files_in_dir(v.into()).unwrap())
+    .flat_map(|v| GoatRodeoCluster::cluster_files_in_dir(v.into()).unwrap())
     .collect();
 
   info!(
-    "Got test bundles {:?}",
+    "Got test clusters {:?}",
     Instant::now().duration_since(start)
   );
 
-  let bundle_copy = test_bundles.clone();
+  let cluster_copy = test_clusters.clone();
 
-  let dest_bundle = perform_merge(test_bundles).expect("The bundle should merge");
+  let dest_cluster = perform_merge(test_clusters).expect("The cluster should merge");
 
-  assert!(dest_bundle.synthetic, "Should be synthetic");
+  assert!(dest_cluster.synthetic, "Should be synthetic");
   info!("Merged {:?}", Instant::now().duration_since(start));
 
-  do_test(bundle_copy.clone(), &dest_bundle, "Synth", start);
+  do_test(cluster_copy.clone(), &dest_cluster, "Synth", start);
 
-  let persisted_bundle = persist_synthetic(dest_bundle)
-    .expect("We should be able to turn the synthetic bundle into a normal bundle");
+  let persisted_cluster = persist_synthetic(dest_cluster)
+    .expect("We should be able to turn the synthetic cluster into a normal cluster");
 
-  do_test(bundle_copy, &persisted_bundle, "Pers", start);
+  do_test(cluster_copy, &persisted_cluster, "Pers", start);
 
   fn do_test(
-    bundle_copy: Vec<GoatRodeoBundle>,
-    persisted_bundle: &GoatRodeoBundle,
+    cluster_copy: Vec<GoatRodeoCluster>,
+    persisted_cluster: &GoatRodeoCluster,
     name: &str,
     start: Instant,
   ) {
@@ -176,12 +182,12 @@ fn test_live_merge() {
     let mut rng = rand::thread_rng();
     let mut loop_cnt = 0usize;
 
-    for test_bundle in bundle_copy {
-      let index = test_bundle.get_index().unwrap();
+    for test_cluster in cluster_copy {
+      let index = test_cluster.get_index().unwrap();
       for item in index.iter() {
         if rng.gen_range(0..1000) == 42 {
-          let old = test_bundle.data_for_hash(item.hash).unwrap().1;
-          let new = persisted_bundle.data_for_hash(item.hash).unwrap().1;
+          let old = test_cluster.data_for_hash(item.hash).unwrap().1;
+          let new = persisted_cluster.data_for_hash(item.hash).unwrap().1;
           assert_eq!(
             old.identifier, new.identifier,
             "Expecting the same identifiers"
@@ -219,11 +225,11 @@ fn test_live_merge() {
         loop_cnt += 1;
         if loop_cnt % 500_000 == 0 {
           info!(
-            "{} Testing Loop {} at {:?} bundle {:?}",
+            "{} Testing Loop {} at {:?} cluster {:?}",
             name,
             loop_cnt.separate_with_commas(),
             std::time::Instant::now().duration_since(start),
-            test_bundle.bundle_path,
+            test_cluster.cluster_path,
           );
         }
       }
@@ -231,35 +237,35 @@ fn test_live_merge() {
   }
 }
 
-pub fn persist_synthetic(bundle: GoatRodeoBundle) -> Result<GoatRodeoBundle> {
+pub fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster> {
   // if it's not synthetic, just return it
-  if !bundle.synthetic {
-    return Ok(bundle);
+  if !cluster.synthetic {
+    return Ok(cluster);
   }
 
-  let enclosed = bundle.all_sub_bundles();
-  let root_path = GoatRodeoBundle::common_parent_dir(enclosed.as_slice())?;
-  let target_dir = path_plus_timed(&root_path, "synthetic_bundle");
+  let enclosed = cluster.all_sub_clusters();
+  let root_path = GoatRodeoCluster::common_parent_dir(enclosed.as_slice())?;
+  let target_dir = path_plus_timed(&root_path, "synthetic_cluster");
   std::fs::create_dir_all(&target_dir)?;
   let mut loop_cnt = 0usize;
   let mut merge_cnt = 0usize;
   let start = Instant::now();
 
-  let mut writer = BundleWriter::new(&target_dir)?;
+  let mut writer = ClusterWriter::new(&target_dir)?;
 
-  for idx in bundle.get_index()?.iter() {
+  for idx in cluster.get_index()?.iter() {
     match idx.loc {
       IndexLoc::Loc { offset, file_hash } => writer.add_index(idx.hash, file_hash, offset)?,
       IndexLoc::Chain(_) => {
-        let found = bundle.vec_for_entry_offset(&idx.loc)?;
+        let found = cluster.vec_for_entry_offset(&idx.loc)?;
         if found.len() == 0 {
           // weird, but do nothing... don't add the index
         } else if found.len() == 1 {
           // if we only find one, then just write the index for that item
-          writer.add_index(idx.hash, found[0].1.reference.0, found[0].1.reference.1)?;
+          writer.add_index(idx.hash, found[0].reference.0, found[0].reference.1)?;
         } else {
-          let the_ref = found[0].1.reference;
-          match Item::merge_vecs(found.into_iter().map(|v| v.1).collect()) {
+          let the_ref = found[0].reference;
+          match Item::merge_vecs(found) {
             ItemMergeResult::Same => {
               // just add the index
               writer.add_index(idx.hash, the_ref.0, the_ref.1)?
@@ -289,6 +295,6 @@ pub fn persist_synthetic(bundle: GoatRodeoBundle) -> Result<GoatRodeoBundle> {
     }
   }
 
-  let new_bundle_path = writer.finalize_bundle()?;
-  GoatRodeoBundle::new(&root_path, &new_bundle_path)
+  let new_cluster_path = writer.finalize_cluster()?;
+  GoatRodeoCluster::new(&root_path, &new_cluster_path)
 }

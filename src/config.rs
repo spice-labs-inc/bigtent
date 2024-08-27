@@ -29,12 +29,12 @@ pub struct Args {
   #[arg(long, short)]
   pub port: Option<u16>,
 
-  /// if there's just a single Goat Rodeo Bundle `.grb` file to serve, use this option
+  /// if there's just a single Goat Rodeo Cluster `.grc` file to serve, use this option
   #[arg(long, short)]
   pub rodeo: Option<PathBuf>,
 
-  /// to merge many directories containing `.grb` files into
-  /// an entirely new bundle without preserving history
+  /// to merge many directories containing `.grc` files into
+  /// an entirely new cluster without preserving history
   #[arg(long, num_args=1..)]
   pub fresh_merge: Vec<PathBuf>,
 

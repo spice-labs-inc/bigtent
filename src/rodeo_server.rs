@@ -20,9 +20,8 @@ use toml::{map::Map, Table};
 // use num_traits::ops::bytes::ToBytes;
 use crate::{
   config::Args,
-  envelopes::ItemEnvelope,
   index_file::{IndexLoc, ItemOffset},
-  rodeo::GoatRodeoBundle,
+  rodeo::GoatRodeoCluster,
   structs::{EdgeType, Item},
   util::cbor_to_json_str,
 };
@@ -32,7 +31,7 @@ pub type MD5Hash = [u8; 16];
 #[derive(Debug)]
 pub struct RodeoServer {
   threads: Mutex<Vec<JoinHandle<()>>>,
-  bundle: ArcSwap<GoatRodeoBundle>,
+  cluster: ArcSwap<GoatRodeoCluster>,
   args: Args,
   config_table: ArcSwap<Table>,
   sender: Sender<IndexMsg>,
@@ -41,27 +40,27 @@ pub struct RodeoServer {
 
 impl RodeoServer {
   pub fn find(&self, hash: MD5Hash) -> Result<Option<ItemOffset>> {
-    self.bundle.load().find(hash)
+    self.cluster.load().find(hash)
   }
 
-  pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<(ItemEnvelope, Item)> {
-    self.bundle.load().entry_for(file_hash, offset)
+  pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item> {
+    self.cluster.load().entry_for(file_hash, offset)
   }
 
-  pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<(ItemEnvelope, Item)> {
-    self.bundle.load().data_for_entry_offset(index_loc)
+  pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Item> {
+    self.cluster.load().data_for_entry_offset(index_loc)
   }
 
-  pub fn data_for_hash(&self, hash: MD5Hash) -> Result<(ItemEnvelope, Item)> {
-    self.bundle.load().data_for_hash(hash)
+  pub fn data_for_hash(&self, hash: MD5Hash) -> Result<Item> {
+    self.cluster.load().data_for_hash(hash)
   }
 
   pub fn data_for_key(&self, data: &str) -> Result<Item> {
-    self.bundle.load().data_for_key(data)
+    self.cluster.load().data_for_key(data)
   }
 
   pub fn antialias_for(&self, data: &str) -> Result<Item> {
-    self.bundle.load().antialias_for(data)
+    self.cluster.load().antialias_for(data)
   }
 
   pub fn bulk_serve(&self, data: Vec<String>, dest: PipeWriter, start: Instant) -> Result<()> {
@@ -73,20 +72,18 @@ impl RodeoServer {
 
   pub fn do_north_serve(
     &self,
-    data: Item,
-    gitoid: String,
-    hash: MD5Hash,
+    gitoids: Vec<String>,
+    purls_only: bool,
     dest: PipeWriter,
     start: Instant,
   ) -> Result<()> {
     self
       .sender
       .send(IndexMsg::North {
-        hash: hash,
-        gitoid: gitoid,
-        initial_body: data,
+        gitoids,
+        purls_only,
         tx: dest,
-        start: start,
+        start,
       })
       .map_err(|e| e.into())
   }
@@ -108,8 +105,12 @@ impl RodeoServer {
   fn contained_by(data: &Item) -> HashSet<String> {
     let mut ret = HashSet::new();
     for edge in data.connections.iter() {
-      if edge.1 == EdgeType::ContainedBy || edge.1 == EdgeType::AliasTo {
-        ret.insert(edge.0.clone());
+      if edge.0 == EdgeType::ContainedBy
+        || edge.0 == EdgeType::AliasTo
+        || edge.0 == EdgeType::BuildsTo
+      {
+        ret.insert(edge.1.clone());
+
       }
     }
 
@@ -118,20 +119,20 @@ impl RodeoServer {
 
   fn north_send(
     &self,
-    gitoid: String,
-    initial_body: Item,
+    gitoids: Vec<String>,
+    purls_only: bool,
     tx: PipeWriter,
     start: Instant,
   ) -> Result<()> {
     let mut br = BufWriter::new(tx);
     let mut found = HashSet::new();
-    let mut to_find = RodeoServer::contained_by(&initial_body);
-    found.insert(gitoid.clone());
-    br.write_fmt(format_args!(
-      "{{ \"{}\": {}\n",
-      gitoid,
-      cbor_to_json_str(&initial_body)?
-    ))?;
+    let mut to_find = HashSet::new();
+    let mut found_purls = HashSet::<String>::new();
+    to_find.extend(gitoids);
+    let mut first = true;
+
+    br.write_all(if purls_only { b"[" } else { b"{" })?;
+
     let cnt = AtomicU32::new(0);
 
     defer! {
@@ -156,23 +157,47 @@ impl RodeoServer {
         found.insert(this_oid.clone());
         match self.data_for_key(&this_oid) {
           Ok(item) => {
-            br.write_fmt(format_args!(
-              ",\n \"{}\": [{}]\n",
-              this_oid,
-              cbor_to_json_str(&item)?
-            ))?;
+            if purls_only {
+              for purl in item.find_purls() {
+                if !found_purls.contains(&purl) {
+                  let json_str = serde_json::to_string(&purl)?;
+                  br.write_fmt(format_args!(
+                    "{}{}",
+                    if !first { ",\n" } else { "" },
+                    json_str
+                  ))?;
+                  found_purls.insert(purl);
+                  first = false;
+                }
+              }
+            } else {
+              br.write_fmt(format_args!(
+                "{}\n \"{}\": {}\n",
+                if !first { "," } else { "" },
+                this_oid,
+                cbor_to_json_str(&item)?
+              ))?;
+              first = false;
+            }
             let and_then = RodeoServer::contained_by(&item);
             to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
           }
           _ => {
-            br.write_fmt(format_args!(",\n \"{}\": []\n", this_oid,))?;
+            // don't write "not found" items if we're just writing pURLs
+            if !purls_only {
+              br.write_fmt(format_args!(
+                "{}\n \"{}\": null\n",
+                if !first { "," } else { "" },
+                this_oid,
+              ))?;
+            }
           }
         }
         cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       }
     }
 
-    br.write_all(b"}\n")?;
+    br.write_all(if purls_only { b"]" } else { b"}\n" })?;
     Ok(())
   }
 
@@ -216,19 +241,18 @@ impl RodeoServer {
           info!("Bulk send of {} items took {:?}", data_len, start.elapsed());
         }
         IndexMsg::North {
-          hash: _,
-          gitoid,
-          initial_body,
+          gitoids,
           tx,
           start,
+          purls_only,
         } => {
-          match index.north_send(gitoid.clone(), initial_body, tx, start) {
+          match index.north_send(gitoids.clone(), purls_only, tx, start) {
             Ok(_) => {}
             Err(e) => {
               error!("Bulk failure {:?}", e);
             }
           }
-          info!("North of {} took {:?}", gitoid, start.elapsed());
+          info!("North of {:?} took {:?}", gitoids, start.elapsed());
         }
       }
     }
@@ -241,8 +265,8 @@ impl RodeoServer {
 
   pub fn rebuild(&self) -> Result<()> {
     let config_table = self.args.read_conf_file()?;
-    let new_bundle = GoatRodeoBundle::bundle_from_config(self.args.conf_file()?, &config_table)?;
-    self.bundle.store(Arc::new(new_bundle));
+    let new_cluster = GoatRodeoCluster::cluster_from_config(self.args.conf_file()?, &config_table)?;
+    self.cluster.store(Arc::new(new_cluster));
     Ok(())
   }
 
@@ -253,12 +277,20 @@ impl RodeoServer {
   /// Create a new Index based on an existing GoatRodeo instance with the number of threads
   /// and an optional set of args. This is meant to be used to create an Index without
   /// a well defined set of Args
-  pub fn new_from_bundle(
-    bundle: GoatRodeoBundle,
+  pub fn new_from_cluster(
+    cluster: GoatRodeoCluster,
     num_threads: u16,
     args_opt: Option<Args>,
   ) -> Result<Arc<RodeoServer>> {
     let (tx, rx) = flume::unbounded();
+
+    // do this in a block so the index is released at the end of the block
+    if false {
+      // dunno if this is a good idea...
+      info!("Loading full index...");
+      cluster.get_index()?;
+      info!("Loaded index")
+    }
 
     let args = args_opt.unwrap_or_default();
     let config_table = args.read_conf_file().unwrap_or_default();
@@ -266,7 +298,7 @@ impl RodeoServer {
     let ret = Arc::new(RodeoServer {
       threads: Mutex::new(vec![]),
       config_table: ArcSwap::new(Arc::new(config_table)),
-      bundle: ArcSwap::new(Arc::new(bundle)),
+      cluster: ArcSwap::new(Arc::new(cluster)),
       args: args,
       receiver: rx.clone(),
       sender: tx.clone(),
@@ -293,9 +325,9 @@ impl RodeoServer {
   pub fn new(args: Args) -> Result<Arc<RodeoServer>> {
     let config_table = args.read_conf_file()?;
 
-    let bundle = GoatRodeoBundle::bundle_from_config(args.conf_file()?, &config_table)?;
+    let cluster = GoatRodeoCluster::cluster_from_config(args.conf_file()?, &config_table)?;
 
-    RodeoServer::new_from_bundle(bundle, args.num_threads(), Some(args))
+    RodeoServer::new_from_cluster(cluster, args.num_threads(), Some(args))
   }
 }
 #[derive(Clone)]
@@ -304,9 +336,8 @@ enum IndexMsg {
   Bulk(Vec<String>, PipeWriter, Instant),
   North {
     #[allow(dead_code)]
-    hash: MD5Hash,
-    gitoid: String,
-    initial_body: Item,
+    gitoids: Vec<String>,
+    purls_only: bool,
     tx: PipeWriter,
     start: Instant,
   },

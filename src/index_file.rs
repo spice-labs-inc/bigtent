@@ -1,11 +1,11 @@
 use crate::{
-    rodeo::GoatRodeoBundle,
+    rodeo::GoatRodeoCluster,
     util::{byte_slice_to_u63, read_len_and_cbor, read_u32, sha256_for_reader},
 };
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{ BTreeMap, HashSet},
     fs::File,
     io::{BufReader, Read, Seek, SeekFrom},
     path::PathBuf,
@@ -16,12 +16,10 @@ use std::{
 pub struct IndexEnvelope {
     pub version: u32,
     pub magic: u32,
-    pub the_type: String,
     pub size: u32,
     pub data_files: HashSet<u64>,
     pub encoding: String,
-    pub timestamp: i64,
-    pub info: HashMap<String, String>,
+    pub info: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +33,7 @@ impl IndexFile {
     pub fn new(dir: &PathBuf, hash: u64, check_hash: bool) -> Result<IndexFile> {
         // ensure we close `file` after computing the hash
         if check_hash {
-            let mut file = GoatRodeoBundle::find_file(&dir, hash, "gri")?;
+            let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri")?;
 
             let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file)?)?;
             if tested_hash != hash {
@@ -47,15 +45,15 @@ impl IndexFile {
             }
         }
 
-        let mut file = GoatRodeoBundle::find_file(&dir, hash, "gri")?;
+        let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri")?;
 
         let ifp = &mut file;
         let magic = read_u32(ifp)?;
-        if magic != GoatRodeoBundle::IndexFileMagicNumber {
+        if magic != GoatRodeoCluster::IndexFileMagicNumber {
             bail!(
                 "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.gri",
                 magic,
-                GoatRodeoBundle::IndexFileMagicNumber,
+                GoatRodeoCluster::IndexFileMagicNumber,
                 hash
             );
         }
