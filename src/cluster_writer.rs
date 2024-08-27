@@ -1,28 +1,27 @@
-#[cfg(not(test))] 
+#[cfg(not(test))]
 use log::{info, trace}; // Use log crate when building application
- 
-#[cfg(test)]
-use std::{println as info, println as trace};
+
 use std::{
-  collections::{HashMap, HashSet},
+  collections::{BTreeMap, BTreeSet, HashSet},
   fs::{self, File},
   path::PathBuf,
   time::Instant,
 };
+#[cfg(test)]
+use std::{println as info, println as trace};
 
 use anyhow::{bail, Result};
 
 use crate::{
   data_file::DataFileEnvelope,
-  envelopes::{ItemEnvelope, MD5},
   index_file::IndexEnvelope,
-  rodeo::{BundleFileEnvelope, GoatRodeoBundle},
+  rodeo::{ClusterFileEnvelope, GoatRodeoCluster},
   rodeo_server::MD5Hash,
   sha_writer::ShaWriter,
   structs::Item,
   util::{
-    byte_slice_to_u63, md5hash_str, millis_now, path_plus_timed, sha256_for_slice, write_envelope,
-    write_int, write_long, write_short, write_short_signed,
+    byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope, write_int,
+    write_long, write_short_signed,
   },
 };
 
@@ -32,19 +31,19 @@ struct IndexInfo {
   offset: u64,
 }
 
-pub struct BundleWriter {
+pub struct ClusterWriter {
   dir: PathBuf,
   dest_data: ShaWriter,
   index_info: Vec<IndexInfo>,
   previous_hash: u64,
   previous_position: u64,
-  seen_data_files: HashSet<u64>,
-  index_files: HashSet<u64>,
+  seen_data_files: BTreeSet<u64>,
+  index_files: BTreeSet<u64>,
   start: Instant,
   items_written: usize,
 }
 
-impl BundleWriter {
+impl ClusterWriter {
   const MAX_INDEX_CNT: usize = 25 * 1024 * 1024; // 25M
   const MAX_DATA_FILE_SIZE: u64 = 15 * 1024 * 1024 * 1024; // 15GB
   #[inline]
@@ -57,23 +56,26 @@ impl BundleWriter {
     Vec::with_capacity(10_000)
   }
 
-  pub fn new<I: Into<PathBuf>>(dir: I) -> Result<BundleWriter> {
+  pub fn new<I: Into<PathBuf>>(dir: I) -> Result<ClusterWriter> {
     let dir_path: PathBuf = dir.into();
     if !dir_path.exists() {
       fs::create_dir_all(&dir_path)?;
     }
     if !dir_path.is_dir() {
-      bail!("Writing Bundles requires a directory... got {:?}", dir_path);
+      bail!(
+        "Writing Clusters requires a directory... got {:?}",
+        dir_path
+      );
     }
 
-    let mut my_writer = BundleWriter {
+    let mut my_writer = ClusterWriter {
       dir: dir_path,
-      dest_data: BundleWriter::make_dest_buffer(),
-      index_info: BundleWriter::make_index_buffer(),
+      dest_data: ClusterWriter::make_dest_buffer(),
+      index_info: ClusterWriter::make_index_buffer(),
       previous_hash: 0,
       previous_position: 0,
-      seen_data_files: HashSet::new(),
-      index_files: HashSet::new(),
+      seen_data_files: BTreeSet::new(),
+      index_files: BTreeSet::new(),
       start: Instant::now(),
       items_written: 0,
     };
@@ -100,30 +102,19 @@ impl BundleWriter {
 
     let item_bytes = serde_cbor::to_vec(&item)?;
 
-    let item_envelope = ItemEnvelope {
-      key_md5: MD5 { hash: the_hash },
-      position: cur_pos,
-      backpointer: self.previous_pos(),
-      data_len: item_bytes.len() as u32,
-      data_type: crate::envelopes::PayloadType::ENTRY,
-    };
-
-    let item_env_bytes = serde_cbor::to_vec(&item_envelope)?;
-    write_short(&mut self.dest_data, item_env_bytes.len() as u16)?;
     write_int(&mut self.dest_data, item_bytes.len() as u32)?;
 
-    (&mut self.dest_data).write_all(&item_env_bytes)?;
     (&mut self.dest_data).write_all(&item_bytes)?;
     self.index_info.push(IndexInfo {
-      hash: item_envelope.key_md5.hash,
+      hash: the_hash,
       offset: cur_pos,
       file_hash: 0,
     });
 
     self.previous_position = cur_pos;
 
-    if self.index_info.len() > BundleWriter::MAX_INDEX_CNT
-      || self.dest_data.pos() > BundleWriter::MAX_DATA_FILE_SIZE
+    if self.index_info.len() > ClusterWriter::MAX_INDEX_CNT
+      || self.dest_data.pos() > ClusterWriter::MAX_DATA_FILE_SIZE
     {
       self.write_data_and_index()?;
     }
@@ -135,40 +126,37 @@ impl BundleWriter {
     Ok(())
   }
 
-  pub fn finalize_bundle(&mut self) -> Result<PathBuf> {
+  pub fn finalize_cluster(&mut self) -> Result<PathBuf> {
     use std::io::Write;
     if self.previous_position != 0 {
       self.write_data_and_index()?;
     }
-    let mut bundle_file = vec![];
+    let mut cluster_file = vec![];
     {
-      let bundle_writer = &mut bundle_file;
-      write_int(bundle_writer, GoatRodeoBundle::BundleFileMagicNumber)?;
-      let bundle_env = BundleFileEnvelope {
+      let cluster_writer = &mut cluster_file;
+      write_int(cluster_writer, GoatRodeoCluster::ClusterFileMagicNumber)?;
+      let cluster_env = ClusterFileEnvelope {
         version: 1,
-        magic: GoatRodeoBundle::BundleFileMagicNumber,
-
-        timestamp: millis_now(),
-        info: HashMap::new(),
-        the_type: "Goat Rodeo Bundle".into(),
+        magic: GoatRodeoCluster::ClusterFileMagicNumber,
+        info: BTreeMap::new(),
         data_files: self.seen_data_files.iter().map(|v| *v).collect(),
         index_files: self.index_files.iter().map(|v| *v).collect(),
       };
-      write_envelope(bundle_writer, &bundle_env)?;
+      write_envelope(cluster_writer, &cluster_env)?;
     }
 
     // compute sha256 of index
-    let bundle_reader: &[u8] = &bundle_file;
-    let grb_sha = byte_slice_to_u63(&sha256_for_slice(bundle_reader))?;
+    let cluster_reader: &[u8] = &cluster_file;
+    let grc_sha = byte_slice_to_u63(&sha256_for_slice(cluster_reader))?;
 
-    // write the .grb file
+    // write the .grc file
 
-    let grb_file_path = path_plus_timed(&self.dir, &format!("{:016x}.grb", grb_sha));
-    let mut grb_file = File::create(&grb_file_path)?;
-    grb_file.write_all(&bundle_file)?;
-    grb_file.flush()?;
+    let grc_file_path = path_plus_timed(&self.dir, &format!("{:016x}.grc", grc_sha));
+    let mut grc_file = File::create(&grc_file_path)?;
+    grc_file.write_all(&cluster_file)?;
+    grc_file.flush()?;
 
-    Ok(grb_file_path)
+    Ok(grc_file_path)
   }
 
   pub fn write_data_and_index(&mut self) -> Result<()> {
@@ -202,7 +190,6 @@ impl BundleWriter {
         "computed grd sha and wrote at {:?}",
         Instant::now().duration_since(self.start)
       );
-      // self.dest_data = BundleWriter::make_dest_buffer();
       self.previous_position = 0;
       self.previous_hash = grd_sha;
       self.seen_data_files.insert(grd_sha);
@@ -223,16 +210,14 @@ impl BundleWriter {
       let mut index_file = vec![];
       {
         let index_writer = &mut index_file;
-        write_int(index_writer, GoatRodeoBundle::IndexFileMagicNumber)?;
+        write_int(index_writer, GoatRodeoCluster::IndexFileMagicNumber)?;
         let index_env = IndexEnvelope {
           version: 1,
-          magic: GoatRodeoBundle::IndexFileMagicNumber,
-          the_type: "Goat Rodeo Index".into(),
+          magic: GoatRodeoCluster::IndexFileMagicNumber,
           size: self.index_info.len() as u32,
           data_files: found_hashes.clone(),
           encoding: "MD5/Long/Long".into(),
-          timestamp: millis_now(),
-          info: HashMap::new(),
+          info: BTreeMap::new(),
         };
         write_envelope(index_writer, &index_env)?;
         for v in &self.index_info {
@@ -272,22 +257,22 @@ impl BundleWriter {
         "computed gri sha and wrote index file {:?}",
         Instant::now().duration_since(self.start)
       );
-      self.index_info = BundleWriter::make_index_buffer();
+      self.index_info = ClusterWriter::make_index_buffer();
       self.seen_data_files.extend(found_hashes);
     }
     self.dump_file_names();
     Ok(())
   }
   fn dump_file_names(&self) {
-      trace!("Data");
-      for d in &self.seen_data_files {
-          trace!("{:016x}", d);
-      }
+    trace!("Data");
+    for d in &self.seen_data_files {
+      trace!("{:016x}", d);
+    }
 
-      trace!("Index");
-      for d in &self.index_files {
-          trace!("{:016x}", d);
-      }
+    trace!("Index");
+    for d in &self.index_files {
+      trace!("{:016x}", d);
+    }
   }
   pub fn add_index(&mut self, hash: MD5Hash, file_hash: u64, offset: u64) -> Result<()> {
     self.index_info.push(IndexInfo {
@@ -296,7 +281,7 @@ impl BundleWriter {
       file_hash,
     });
 
-    if self.index_info.len() > BundleWriter::MAX_INDEX_CNT {
+    if self.index_info.len() > ClusterWriter::MAX_INDEX_CNT {
       self.write_data_and_index()?;
       self.write_data_envelope_start()?;
     }
@@ -304,17 +289,15 @@ impl BundleWriter {
   }
 
   fn write_data_envelope_start(&mut self) -> Result<()> {
-    write_int(&mut self.dest_data, GoatRodeoBundle::DataFileMagicNumber)?;
+    write_int(&mut self.dest_data, GoatRodeoCluster::DataFileMagicNumber)?;
 
     let data_envelope = DataFileEnvelope {
       version: 1,
-      magic: GoatRodeoBundle::DataFileMagicNumber,
-      the_type: "Goat Rodeo Data".into(),
+      magic: GoatRodeoCluster::DataFileMagicNumber,
       previous: self.previous_hash,
       depends_on: self.seen_data_files.clone(),
-      timestamp: millis_now(),
       built_from_merge: false,
-      info: HashMap::new(),
+      info: BTreeMap::new(),
     };
 
     write_envelope(&mut self.dest_data, &data_envelope)?;

@@ -11,5 +11,5 @@ pub mod merger;
 pub mod live_merge;
 pub mod index_file;
 pub mod data_file;
-pub mod bundle_writer;
+pub mod cluster_writer;
 pub mod sha_writer;

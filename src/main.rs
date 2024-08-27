@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use bigtent::{
-  config::Args, merger::merge_fresh, rodeo::GoatRodeoBundle, rodeo_server::RodeoServer,
+  config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster, rodeo_server::RodeoServer,
   server::run_web_server,
 };
 use clap::{CommandFactory, Parser};
@@ -18,9 +18,9 @@ fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
     let whole_path = path.clone().canonicalize()?;
     let dir_path = whole_path.parent().unwrap().to_path_buf();
     let index_build_start = Instant::now();
-    let bundle = GoatRodeoBundle::new(&dir_path, &whole_path)?;
+    let cluster = GoatRodeoCluster::new(&dir_path, &whole_path)?;
 
-    let index = RodeoServer::new_from_bundle(bundle, args.num_threads(), Some(args.clone()))?;
+    let index = RodeoServer::new_from_cluster(cluster, args.num_threads(), Some(args.clone()))?;
 
     info!(
       "Initial index build in {:?}",
@@ -29,7 +29,7 @@ fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
 
     run_web_server(index);
   } else {
-    bail!("Path to `.grb` does not point to a file: {:?}", path)
+    bail!("Path to `.grc` does not point to a file: {:?}", path)
   }
   Ok(())
 }
@@ -81,26 +81,26 @@ fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
 
   let start = Instant::now();
 
-  info!("Loading bundles...");
-  let mut bundles = vec![];
+  info!("Loading clusters...");
+  let mut clusters = vec![];
   for p in &paths {
-    for b in GoatRodeoBundle::bundle_files_in_dir(p.clone())? {
-      bundles.push(b);
+    for b in GoatRodeoCluster::cluster_files_in_dir(p.clone())? {
+      clusters.push(b);
     }
   }
   info!(
-    "Finished loading {} bundles at {:?}",
-    bundles.len(),
+    "Finished loading {} clusters at {:?}",
+    clusters.len(),
     Instant::now().duration_since(start)
   );
-  if bundles.len() < 2 {
+  if clusters.len() < 2 {
     bail!(
-      "There must be at least 2 bundles to merge... only got {}",
-      bundles.len()
+      "There must be at least 2 clusters to merge... only got {}",
+      clusters.len()
     );
   }
 
-  let ret = merge_fresh(bundles, args.threaded.unwrap_or(false), dest);
+  let ret = merge_fresh(clusters, args.threaded.unwrap_or(false), dest);
   info!(
     "Finished merging at {:?}",
     Instant::now().duration_since(start)
