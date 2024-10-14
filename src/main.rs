@@ -1,13 +1,14 @@
 use anyhow::{bail, Result};
 use bigtent::{
   config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster, rodeo_server::RodeoServer,
-  server::run_web_server,
+  server::run_web_server, structs::{ItemMetaData, Mergeable},
 };
 use clap::{CommandFactory, Parser};
 use env_logger::Env;
 #[cfg(not(test))]
 use log::{error, info}; // Use log crate when building application
 
+use serde::{Deserialize, Serialize};
 use signal_hook::{consts::SIGHUP, iterator::Signals};
 use std::{path::PathBuf, thread, time::Instant};
 #[cfg(test)]
@@ -68,7 +69,10 @@ fn run_full_server(args: Args) -> Result<()> {
   Ok(())
 }
 
-fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
+fn run_merge<MDT>(paths: Vec<PathBuf>, args: Args) -> Result<()> 
+where
+  for<'de2> MDT:
+    Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static,{
   for p in &paths {
     if !p.exists() || !p.is_dir() {
       bail!("Paths must be directories. {:?} is not", p);
@@ -82,7 +86,7 @@ fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
   let start = Instant::now();
 
   info!("Loading clusters...");
-  let mut clusters = vec![];
+  let mut clusters: Vec<GoatRodeoCluster<MDT>> = vec![];
   for p in &paths {
     for b in GoatRodeoCluster::cluster_files_in_dir(p.clone())? {
       clusters.push(b);
@@ -123,7 +127,7 @@ fn main() -> Result<()> {
   match (&args.rodeo, &args.conf, &args.fresh_merge) {
     (Some(rodeo), None, v) if v.len() == 0 => run_rodeo(rodeo, &args)?,
     (None, Some(_conf), v) if v.len() == 0 => run_full_server(args)?,
-    (None, None, v) if v.len() > 0 => run_merge(v.clone(), args)?,
+    (None, None, v) if v.len() > 0 => run_merge::<ItemMetaData>(v.clone(), args)?,
     _ => {
       Args::command().print_help()?;
     }

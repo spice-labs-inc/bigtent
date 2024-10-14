@@ -1,6 +1,5 @@
 use crate::{
-    rodeo::GoatRodeoCluster,
-    util::{byte_slice_to_u63, read_len_and_cbor, read_u32, sha256_for_reader},
+    rodeo::{GoatRodeoCluster, IndexFileMagicNumber}, structs::Mergeable, util::{byte_slice_to_u63, read_len_and_cbor, read_u32, sha256_for_reader}
 };
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -23,17 +22,24 @@ pub struct IndexEnvelope {
 }
 
 #[derive(Debug, Clone)]
-pub struct IndexFile {
+pub struct IndexFile<MDT>
+where
+  for<'de2> MDT:
+    Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static, {
     pub envelope: IndexEnvelope,
     pub file: Arc<Mutex<BufReader<File>>>,
     pub data_offset: u64,
+    _phantom: Option<MDT>
 }
 
-impl IndexFile {
-    pub fn new(dir: &PathBuf, hash: u64, check_hash: bool) -> Result<IndexFile> {
+impl <MDT> IndexFile<MDT>
+where
+  for<'de2> MDT:
+    Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static, {
+    pub fn new(dir: &PathBuf, hash: u64, check_hash: bool) -> Result<IndexFile<MDT>> {
         // ensure we close `file` after computing the hash
         if check_hash {
-            let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri")?;
+            let mut file = GoatRodeoCluster::<MDT>::find_file(&dir, hash, "gri")?;
 
             let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file)?)?;
             if tested_hash != hash {
@@ -45,15 +51,15 @@ impl IndexFile {
             }
         }
 
-        let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri")?;
+        let mut file = GoatRodeoCluster::<MDT>::find_file(&dir, hash, "gri")?;
 
         let ifp = &mut file;
         let magic = read_u32(ifp)?;
-        if magic != GoatRodeoCluster::IndexFileMagicNumber {
+        if magic != IndexFileMagicNumber {
             bail!(
                 "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.gri",
                 magic,
-                GoatRodeoCluster::IndexFileMagicNumber,
+                IndexFileMagicNumber,
                 hash
             );
         }
@@ -66,6 +72,7 @@ impl IndexFile {
             envelope: idx_env,
             file: Arc::new(Mutex::new(BufReader::new(file))),
             data_offset: idx_pos,
+            _phantom: None
         })
     }
 
