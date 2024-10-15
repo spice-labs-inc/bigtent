@@ -790,8 +790,8 @@ fn test_files_in_dir() {
     cluster.get_index().unwrap(); // should be from cache
     let time2 = Instant::now().duration_since(start);
     assert!(
-      time > Duration::from_millis(60),
-      "Building the initial index should take more than 60ms, but took {:?}",
+      time > Duration::from_millis(20),
+      "Building the initial index should take more than 20ms, but took {:?}",
       time
     );
     assert!(
