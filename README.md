@@ -18,7 +18,12 @@ oc_file='~/info_repo_ae.txt'
 
 If you change the `config.toml` file, send a `SIGHUP` (`kill -HUP <big_tent_process>`).
 
-To create an OmniBOR Corpus, use [Goat Rodeo](https://gitlab.com/spicelabs1/goatrodeo).
+To create an OmniBOR Corpus, use [Goat Rodeo](https://github.com/spice-labs-inc/goatrodeo).
+
+## Design docs
+
+In the [info](info/README.md) directory.
+
 
 ## Stuff
 
