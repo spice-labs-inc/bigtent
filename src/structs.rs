@@ -21,6 +21,8 @@ pub struct ItemMetaData {
   pub extra: BTreeMap<String, BTreeSet<String>>,
 }
 
+impl<'de2> MetaData<'de2> for ItemMetaData {}
+
 impl Mergeable for ItemMetaData {
   fn merge(&self, other: ItemMetaData) -> ItemMetaData {
     ItemMetaData {
@@ -69,10 +71,16 @@ pub trait Mergeable {
 
 pub type Edge = (EdgeType, String);
 
+/// A trait that defines the metadata field in an Item
+pub trait MetaData<'a>:
+  Deserialize<'a> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync
+{
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Item<MDT>
 where
-  for<'de2> MDT: Deserialize<'de2> + PartialEq + Clone + Mergeable + Sized,
+  for<'de2> MDT: MetaData<'de2>,
 {
   pub identifier: String,
   pub reference: LocationReference,
@@ -100,10 +108,9 @@ impl MDItem {
   }
 }
 
-
 impl<MDT> Item<MDT>
 where
-  for<'de2> MDT: Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send,
+  for<'de2> MDT: MetaData<'de2>,
 {
   pub const NOOP: LocationReference = (0u64, 0u64);
 
@@ -116,7 +123,7 @@ where
   }
 
   // tests two items... they are the same if they have the same
-  // `identifier`, `connections`, `metadata`, `file_size`, `version`,
+  // `identifier`, `connections`, `metadata`, `version`,
   // and `_type`
   pub fn is_same(&self, other: &Item<MDT>) -> bool {
     self.identifier == other.identifier
@@ -174,7 +181,7 @@ where
 
 pub enum ItemMergeResult<MDT>
 where
-  for<'de> MDT: Deserialize<'de> + PartialEq + Clone + Mergeable,
+  for<'de> MDT: MetaData<'de>,
 {
   Same,
   ContainsAll(LocationReference),

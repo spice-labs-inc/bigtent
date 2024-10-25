@@ -1,6 +1,5 @@
 #[cfg(not(test))]
 use log::{info, trace};
-use serde::{Deserialize, Serialize}; // Use log crate when building application
 
 use std::{
   collections::{BTreeMap, BTreeSet, HashSet},
@@ -19,7 +18,7 @@ use crate::{
   rodeo::{ClusterFileEnvelope, ClusterFileMagicNumber, DataFileMagicNumber, IndexFileMagicNumber},
   rodeo_server::MD5Hash,
   sha_writer::ShaWriter,
-  structs::{Item, Mergeable},
+  structs::{Item, MetaData},
   util::{
     byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope, write_int,
     write_long, write_short_signed,
@@ -96,7 +95,7 @@ impl ClusterWriter {
 
   pub fn write_item<MDT>(&mut self, mut item: Item<MDT>) -> Result<()>
   where
-    for<'de2> MDT: Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized,
+    for<'de2> MDT: MetaData<'de2>,
   {
     use std::io::Write;
     let the_hash = md5hash_str(&item.identifier);

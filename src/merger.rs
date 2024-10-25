@@ -4,7 +4,6 @@ use im::OrdMap;
 use log::error;
 #[cfg(not(test))]
 use log::info;
-use serde::{Deserialize, Serialize};
 use std::{
   fs::{self, File},
   io::{BufWriter, Write},
@@ -20,7 +19,7 @@ use crate::{
   mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
   rodeo_server::MD5Hash,
-  structs::{EdgeType, Item, Mergeable},
+  structs::{EdgeType, Item, MetaData},
   util::NiceDurationDisplay,
 };
 use anyhow::Result;
@@ -32,7 +31,7 @@ pub fn merge_fresh<PB: Into<PathBuf>, MDT>(
   dest_directory: PB,
 ) -> Result<()>
 where
-  for<'de2> MDT: Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send +Sync +'static,
+  for<'de2> MDT: MetaData<'de2> + 'static,
 {
   let start = Instant::now();
   let dest: PathBuf = dest_directory.into();
@@ -141,8 +140,10 @@ where
       which: usize,
       index_holder: &mut Vec<ClusterPos<Option<Receiver<(Item<MDT>, usize)>>>>,
       clusters: &Vec<GoatRodeoCluster<MDT>>,
-    ) -> Result<(Item<MDT>, usize)>   where
-    for<'de2> MDT: Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static, {
+    ) -> Result<(Item<MDT>, usize)>
+    where
+      for<'de2> MDT: MetaData<'de2>,
+    {
       match &index_holder[which].thing {
         Some(rx) => rx.recv().map_err(|e| e.into()),
         _ => match clusters[which].data_for_hash(hash) {

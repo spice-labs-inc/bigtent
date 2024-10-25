@@ -1,6 +1,5 @@
 #[cfg(not(test))]
 use log::info;
-use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Instant}; // Use log crate when building application
 
 use crate::{
@@ -8,7 +7,7 @@ use crate::{
   index_file::{IndexLoc, ItemOffset},
   mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
-  structs::{Item, ItemMergeResult, Mergeable},
+  structs::{Item, ItemMergeResult, MetaData},
   util::path_plus_timed,
 };
 use anyhow::{bail, Result};
@@ -17,10 +16,9 @@ use im::OrdMap;
 use std::println as info;
 use thousands::Separable;
 
-pub fn perform_merge<MDT>(clusters: Vec<GoatRodeoCluster<MDT>>) -> Result<GoatRodeoCluster<MDT>> 
+pub fn perform_merge<MDT>(clusters: Vec<GoatRodeoCluster<MDT>>) -> Result<GoatRodeoCluster<MDT>>
 where
-  for<'de2> MDT:
-    Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static,
+  for<'de2> MDT: MetaData<'de2>,
 {
   let start = Instant::now();
   if clusters.is_empty() {
@@ -244,7 +242,7 @@ fn test_live_merge() {
 
 pub fn persist_synthetic<MDT>(cluster: GoatRodeoCluster<MDT>) -> Result<GoatRodeoCluster<MDT>>
 where
-  for<'de2> MDT: Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync,
+  for<'de2> MDT: MetaData<'de2>,
 {
   // if it's not synthetic, just return it
   if !cluster.synthetic {

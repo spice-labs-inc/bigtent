@@ -5,7 +5,6 @@ use flume::{Receiver, Sender};
 use log::{error, info};
 use pipe::PipeWriter;
 use scopeguard::defer;
-use serde::{Deserialize, Serialize};
 use std::{
   collections::HashSet,
   io::{BufWriter, Write},
@@ -23,7 +22,7 @@ use crate::{
   config::Args,
   index_file::{IndexLoc, ItemOffset},
   rodeo::GoatRodeoCluster,
-  structs::{EdgeType, Item, ItemMetaData, Mergeable},
+  structs::{EdgeType, Item, ItemMetaData, MetaData},
   util::cbor_to_json_str,
 };
 
@@ -32,8 +31,7 @@ pub type MD5Hash = [u8; 16];
 #[derive(Debug)]
 pub struct RodeoServer<MDT>
 where
-  for<'de2> MDT:
-    Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static,
+  for<'de2> MDT: MetaData<'de2>,
 {
   threads: Mutex<Vec<JoinHandle<()>>>,
   cluster: ArcSwap<GoatRodeoCluster<MDT>>,
@@ -285,8 +283,7 @@ impl RodeoServer<ItemMetaData> {
     cluster: GoatRodeoCluster<ItemMetaData>,
     num_threads: u16,
     args_opt: Option<Args>,
-  ) -> Result<Arc<RodeoServer<ItemMetaData>>>
-  {
+  ) -> Result<Arc<RodeoServer<ItemMetaData>>> {
     let (tx, rx) = flume::unbounded();
 
     // do this in a block so the index is released at the end of the block
@@ -330,7 +327,8 @@ impl RodeoServer<ItemMetaData> {
   pub fn new(args: Args) -> Result<Arc<RodeoServer<ItemMetaData>>> {
     let config_table = args.read_conf_file()?;
 
-    let cluster = GoatRodeoCluster::<ItemMetaData>::cluster_from_config(args.conf_file()?, &config_table)?;
+    let cluster =
+      GoatRodeoCluster::<ItemMetaData>::cluster_from_config(args.conf_file()?, &config_table)?;
 
     RodeoServer::new_from_cluster(cluster, args.num_threads(), Some(args))
   }

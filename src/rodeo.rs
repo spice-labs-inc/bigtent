@@ -18,7 +18,7 @@ use crate::data_file::DataFile;
 use crate::index_file::{IndexFile, IndexLoc, ItemOffset};
 use crate::live_merge::perform_merge;
 use crate::rodeo_server::MD5Hash;
-use crate::structs::{EdgeType, Item, Mergeable};
+use crate::structs::{EdgeType, Item, MetaData};
 use crate::util::{
   byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
   read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
@@ -62,8 +62,7 @@ impl std::fmt::Display for ClusterFileEnvelope {
 #[derive(Debug, Clone)]
 pub struct GoatRodeoCluster<MDT>
 where
-  for<'de2> MDT:
-    Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static,
+  for<'de2> MDT: MetaData<'de2>,
 {
   pub envelope: ClusterFileEnvelope,
   pub cluster_file_hash: u64,
@@ -88,8 +87,7 @@ pub const ClusterFileMagicNumber: u32 = 0xba4a4a; // Banana
 
 impl<MDT> GoatRodeoCluster<MDT>
 where
-  for<'de2> MDT:
-    Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static,
+  for<'de2> MDT: MetaData<'de2>,
 {
   // Reset the index. Should be done with extreme care
   pub fn reset_index(&self) -> () {
@@ -789,6 +787,11 @@ fn test_files_in_dir() {
     let start = Instant::now();
     cluster.get_index().unwrap(); // should be from cache
     let time2 = Instant::now().duration_since(start);
+    // usually having timers in tests is suboptimal. I chose the
+    // 20ms time for loading data because it's less than the amount of
+    // time to load data on my [dpp] ThinkStation and M1 Mac
+    // ultimately, we should find a better way of determining that 
+    // some material compute took place
     assert!(
       time > Duration::from_millis(20),
       "Building the initial index should take more than 20ms, but took {:?}",

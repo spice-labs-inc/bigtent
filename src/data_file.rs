@@ -1,6 +1,6 @@
 use crate::{
   rodeo::{DataFileMagicNumber, GoatRodeoCluster},
-  structs::{Item, Mergeable},
+  structs::{Item, MetaData},
   util::{read_cbor, read_len_and_cbor, read_u32},
 };
 use anyhow::{anyhow, bail, Result};
@@ -9,6 +9,7 @@ use std::{
   collections::{BTreeMap, BTreeSet},
   fs::File,
   io::{BufReader, Seek},
+  marker::PhantomData,
   path::PathBuf,
   sync::{Arc, Mutex},
 };
@@ -26,19 +27,19 @@ pub struct DataFileEnvelope {
 #[derive(Debug, Clone)]
 pub struct DataFile<MDT>
 where
-  for<'de2> MDT:
-    Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static,
+  for<'de2> MDT: MetaData<'de2>,
 {
   pub envelope: DataFileEnvelope,
   pub file: Arc<Mutex<BufReader<File>>>,
   pub data_offset: u64,
-  _phantom: Option<MDT>,
+  // in order to generate a specialized struct with the `MDT` type,
+  // the struct must contain the type as an element. See https://doc.rust-lang.org/rust-by-example/generics/phantom.html
+  _phantom: PhantomData<MDT>,
 }
 
 impl<MDT> DataFile<MDT>
 where
-  for<'de2> MDT:
-    Deserialize<'de2> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync + 'static,
+  for<'de2> MDT: MetaData<'de2>,
 {
   pub fn new(dir: &PathBuf, hash: u64) -> Result<DataFile<MDT>> {
     let mut data_file = GoatRodeoCluster::<MDT>::find_file(dir, hash, "grd")?;
@@ -61,7 +62,7 @@ where
       envelope: env,
       file: Arc::new(Mutex::new(BufReader::with_capacity(4096, data_file))),
       data_offset: cur_pos,
-      _phantom: None
+      _phantom: PhantomData::default(),
     })
   }
 
@@ -77,8 +78,7 @@ where
     Ok(())
   }
 
-  pub fn read_item_at(&self, pos: u64) -> Result<Item<MDT>>
-  {
+  pub fn read_item_at(&self, pos: u64) -> Result<Item<MDT>> {
     let mut my_file = self
       .file
       .lock()
