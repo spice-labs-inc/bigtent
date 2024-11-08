@@ -39,7 +39,7 @@ pub struct Args {
   pub fresh_merge: Vec<PathBuf>,
 
   /// Use threads when possible
-  #[arg(long, short)]
+  #[arg(long)]
   pub threaded: Option<bool>,
 
   /// the destination for `mergenew`
