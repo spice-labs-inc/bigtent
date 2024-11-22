@@ -220,10 +220,10 @@ pub fn run_web_server(index: Arc<RodeoServer>) -> () {
         ("POST", "north") => north_serve(&index, request, None, false, start),
         ("POST", "north_purls") => north_serve(&index, request, None, true, start),
         ("GET", url) if url.starts_with("north/") => {
-          north_serve(&index, request, Some(&url[6..]), false,start)
+          north_serve(&index, request, Some(&url[6..]), false, start)
         }
         ("GET", url) if url.starts_with("north_purls/") => {
-          north_serve(&index, request, Some(&url[12..]),true, start)
+          north_serve(&index, request, Some(&url[12..]), true, start)
         }
         ("GET", url) if url.starts_with("aa/") => {
           serve_antialias(&index, request, &url[3..], start)
@@ -249,4 +249,36 @@ fn _split_path(path: String) -> Vec<String> {
   }
 
   segments
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_parse_body_to_json() {
+    let request_body_json = serde_json::json!({
+      "foo": "bar",
+      "baz": 42
+    });
+
+    let request_body_vec = request_body_json.to_string().as_bytes().to_vec();
+
+    let request = Request::fake_http(
+      "POST",
+      "/",
+      vec![
+        ("Content-Type".to_owned(), "application/json".to_owned()),
+        (
+          "Content-Length".to_owned(),
+          request_body_vec.len().to_string().to_owned(),
+        ),
+      ],
+      request_body_vec,
+    );
+
+    let result = parse_body_to_json(&request);
+
+    assert_eq!(result.expect("error"), request_body_json);
+  }
 }
