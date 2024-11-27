@@ -1,6 +1,6 @@
 #[cfg(not(test))]
 use log::info;
-use std::{collections::{ HashMap}, time::Instant}; // Use log crate when building application
+use std::{collections::HashMap, time::Instant}; // Use log crate when building application
 
 use crate::{
   cluster_writer::ClusterWriter,

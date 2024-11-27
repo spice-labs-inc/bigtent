@@ -14,7 +14,7 @@ use crate::{
 #[cfg(test)]
 use std::println as info;
 
-fn parse_body_to_json(request: &Request) -> Result<SJValue> {
+pub fn parse_body_to_json(request: &Request) -> Result<SJValue> {
   let count = match request.header("Content-Length") {
     Some(v) => match usize::from_str_radix(v, 10) {
       Ok(n) => n,
@@ -37,7 +37,7 @@ fn parse_body_to_json(request: &Request) -> Result<SJValue> {
   ret
 }
 
-fn value_to_string_array(pv: Result<SJValue>) -> Result<Vec<String>> {
+pub fn value_to_string_array(pv: Result<SJValue>) -> Result<Vec<String>> {
   match pv {
     Ok(SJValue::Array(arr)) => {
       let mut ret = vec![];
@@ -67,7 +67,7 @@ fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
   })
 }
 
-fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> Response {
+pub fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> Response {
   let body = value_to_string_array(parse_body_to_json(request));
 
   let cnt_string = body
@@ -90,7 +90,7 @@ fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> R
   }
 }
 
-fn north_serve(
+pub fn north_serve(
   index: &RodeoServer,
   request: &Request,
   path: Option<&str>,
@@ -136,7 +136,7 @@ fn north_serve(
   }
 }
 
-fn serve_antialias(
+pub fn serve_antialias(
   index: &RodeoServer,
   _request: &Request,
   path: &str,
@@ -165,7 +165,7 @@ fn serve_antialias(
   }
 }
 
-fn fix_path(p: String) -> String {
+pub fn fix_path(p: String) -> String {
   if p.starts_with("/omnibor") {
     return fix_path(p[8..].to_string());
   } else if p.starts_with("/omnibor_test") {
@@ -179,7 +179,7 @@ fn fix_path(p: String) -> String {
   p
 }
 
-fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response {
+pub fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response {
   // FIXME -- deal with getting a raw MD5 hex string
   let hash = md5hash_str(&path);
   match index.data_for_hash(hash) {
