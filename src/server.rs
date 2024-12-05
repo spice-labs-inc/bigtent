@@ -83,10 +83,10 @@ pub fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) 
   match body {
     Ok(v) if v.len() <= 420 => match serve_bulk(index, v) {
       Ok(r) => r,
-      Err(_) => Response::empty_400(),
+      Err(e) => rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
     },
-    Ok(_) => Response::empty_400(),
-    Err(_) => rouille::Response::empty_404(),
+    Ok(v) => rouille::Response::json(&format!("Bulk request for too many elements {}", v.len())).with_status_code(400),
+    Err(e) => rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
   }
 }
 
@@ -102,8 +102,8 @@ pub fn north_serve(
 
     match body {
       Ok(v) if v.len() <= 6000 => v,
-      Ok(_) => return Response::empty_400(),
-      Err(_) => return rouille::Response::empty_404(),
+      Ok(v) => return rouille::Response::json(&format!("Bulk request for too many elements {}", v.len())).with_status_code(400),
+      Err(e) => return rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
     }
   } else {
     match path {
@@ -161,7 +161,7 @@ pub fn serve_antialias(
         upgrade: None,
       },
     },
-    _ => rouille::Response::empty_404(),
+    _ => rouille::Response::json(&format!("Couldn't Anti-alias {}", path)).with_status_code(404),
   }
 }
 
@@ -197,7 +197,7 @@ pub fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Resp
         upgrade: None,
       },
     },
-    _ => rouille::Response::empty_404(),
+    _ => rouille::Response::json(&format!("Not found {}", path)).with_status_code(404),
   }
 }
 
