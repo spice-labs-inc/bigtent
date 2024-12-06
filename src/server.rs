@@ -14,7 +14,7 @@ use crate::{
 #[cfg(test)]
 use std::println as info;
 
-fn parse_body_to_json(request: &Request) -> Result<SJValue> {
+pub fn parse_body_to_json(request: &Request) -> Result<SJValue> {
   let count = match request.header("Content-Length") {
     Some(v) => match usize::from_str_radix(v, 10) {
       Ok(n) => n,
@@ -37,7 +37,7 @@ fn parse_body_to_json(request: &Request) -> Result<SJValue> {
   ret
 }
 
-fn value_to_string_array(pv: Result<SJValue>) -> Result<Vec<String>> {
+pub fn value_to_string_array(pv: Result<SJValue>) -> Result<Vec<String>> {
   match pv {
     Ok(SJValue::Array(arr)) => {
       let mut ret = vec![];
@@ -67,7 +67,7 @@ fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
   })
 }
 
-fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> Response {
+pub fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> Response {
   let body = value_to_string_array(parse_body_to_json(request));
 
   let cnt_string = body
@@ -83,14 +83,14 @@ fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> R
   match body {
     Ok(v) if v.len() <= 420 => match serve_bulk(index, v) {
       Ok(r) => r,
-      Err(_) => Response::empty_400(),
+      Err(e) => rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
     },
-    Ok(_) => Response::empty_400(),
-    Err(_) => rouille::Response::empty_404(),
+    Ok(v) => rouille::Response::json(&format!("Bulk request for too many elements {}", v.len())).with_status_code(400),
+    Err(e) => rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
   }
 }
 
-fn north_serve(
+pub fn north_serve(
   index: &RodeoServer,
   request: &Request,
   path: Option<&str>,
@@ -102,8 +102,8 @@ fn north_serve(
 
     match body {
       Ok(v) if v.len() <= 6000 => v,
-      Ok(_) => return Response::empty_400(),
-      Err(_) => return rouille::Response::empty_404(),
+      Ok(v) => return rouille::Response::json(&format!("Bulk request for too many elements {}", v.len())).with_status_code(400),
+      Err(e) => return rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
     }
   } else {
     match path {
@@ -136,7 +136,7 @@ fn north_serve(
   }
 }
 
-fn serve_antialias(
+pub fn serve_antialias(
   index: &RodeoServer,
   _request: &Request,
   path: &str,
@@ -161,11 +161,11 @@ fn serve_antialias(
         upgrade: None,
       },
     },
-    _ => rouille::Response::empty_404(),
+    _ => rouille::Response::json(&format!("Couldn't Anti-alias {}", path)).with_status_code(404),
   }
 }
 
-fn fix_path(p: String) -> String {
+pub fn fix_path(p: String) -> String {
   if p.starts_with("/omnibor") {
     return fix_path(p[8..].to_string());
   } else if p.starts_with("/omnibor_test") {
@@ -179,7 +179,7 @@ fn fix_path(p: String) -> String {
   p
 }
 
-fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response {
+pub fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response {
   // FIXME -- deal with getting a raw MD5 hex string
   let hash = md5hash_str(&path);
   match index.data_for_hash(hash) {
@@ -197,7 +197,7 @@ fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response
         upgrade: None,
       },
     },
-    _ => rouille::Response::empty_404(),
+    _ => rouille::Response::json(&format!("Not found {}", path)).with_status_code(404),
   }
 }
 

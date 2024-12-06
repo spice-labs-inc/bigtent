@@ -1,6 +1,6 @@
 #[cfg(not(test))]
 use log::info;
-use std::{collections::{ HashMap}, time::Instant}; // Use log crate when building application
+use std::{collections::HashMap, time::Instant}; // Use log crate when building application
 
 use crate::{
   cluster_writer::ClusterWriter,
@@ -17,6 +17,11 @@ use std::println as info;
 use thousands::Separable;
 
 pub fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoCluster> {
+  // filter out the blank cluster
+  let clusters: Vec<GoatRodeoCluster> = clusters
+    .into_iter()
+    .filter(|c| c.cluster_file_hash != 0)
+    .collect();
   let start = Instant::now();
   if clusters.is_empty() {
     bail!("`live_merge` requires at least one cluster");

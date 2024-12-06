@@ -13,3 +13,5 @@ pub mod index_file;
 pub mod data_file;
 pub mod cluster_writer;
 pub mod sha_writer;
+pub extern crate arc_swap;
+pub extern crate rouille;

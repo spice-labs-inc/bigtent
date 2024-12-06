@@ -31,7 +31,7 @@ pub type MD5Hash = [u8; 16];
 #[derive(Debug)]
 pub struct RodeoServer {
   threads: Mutex<Vec<JoinHandle<()>>>,
-  cluster: ArcSwap<GoatRodeoCluster>,
+  cluster: Arc<ArcSwap<GoatRodeoCluster>>,
   args: Args,
   config_table: ArcSwap<Table>,
   sender: Sender<IndexMsg>,
@@ -39,6 +39,17 @@ pub struct RodeoServer {
 }
 
 impl RodeoServer {
+  /// get the cluster arc swap so that the cluster can be substituted
+  pub fn get_cluster_arcswap(&self) -> Arc<ArcSwap<GoatRodeoCluster>> {
+    self.cluster.clone()
+  }
+
+  /// Get the current GoatRodeoCluster from the the server
+  pub fn get_cluster(&self) -> GoatRodeoCluster {
+    let the_cluster: GoatRodeoCluster = (&(**self.get_cluster_arcswap().load())).clone();
+    the_cluster
+  }
+
   pub fn find(&self, hash: MD5Hash) -> Result<Option<ItemOffset>> {
     self.cluster.load().find(hash)
   }
@@ -278,7 +289,7 @@ impl RodeoServer {
   /// and an optional set of args. This is meant to be used to create an Index without
   /// a well defined set of Args
   pub fn new_from_cluster(
-    cluster: GoatRodeoCluster,
+    cluster: Arc<ArcSwap<GoatRodeoCluster>>,
     num_threads: u16,
     args_opt: Option<Args>,
   ) -> Result<Arc<RodeoServer>> {
@@ -288,7 +299,7 @@ impl RodeoServer {
     if false {
       // dunno if this is a good idea...
       info!("Loading full index...");
-      cluster.get_index()?;
+      cluster.load().get_index()?;
       info!("Loaded index")
     }
 
@@ -298,7 +309,7 @@ impl RodeoServer {
     let ret = Arc::new(RodeoServer {
       threads: Mutex::new(vec![]),
       config_table: ArcSwap::new(Arc::new(config_table)),
-      cluster: ArcSwap::new(Arc::new(cluster)),
+      cluster: cluster,
       args: args,
       receiver: rx.clone(),
       sender: tx.clone(),
@@ -325,7 +336,7 @@ impl RodeoServer {
   pub fn new(args: Args) -> Result<Arc<RodeoServer>> {
     let config_table = args.read_conf_file()?;
 
-    let cluster = GoatRodeoCluster::cluster_from_config(args.conf_file()?, &config_table)?;
+    let cluster = Arc::new(ArcSwap::new(Arc::new(GoatRodeoCluster::cluster_from_config(args.conf_file()?, &config_table)?)));
 
     RodeoServer::new_from_cluster(cluster, args.num_threads(), Some(args))
   }

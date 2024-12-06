@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use arc_swap::ArcSwap;
 use bigtent::{
   config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster, rodeo_server::RodeoServer,
   server::run_web_server,
@@ -9,7 +10,7 @@ use env_logger::Env;
 use log::{error, info}; // Use log crate when building application
 
 use signal_hook::{consts::SIGHUP, iterator::Signals};
-use std::{path::PathBuf, thread, time::Instant};
+use std::{path::PathBuf, sync::Arc, thread, time::Instant};
 #[cfg(test)]
 use std::{println as info, println as error};
 
@@ -18,7 +19,7 @@ fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
     let whole_path = path.clone().canonicalize()?;
     let dir_path = whole_path.parent().unwrap().to_path_buf();
     let index_build_start = Instant::now();
-    let cluster = GoatRodeoCluster::new(&dir_path, &whole_path)?;
+    let cluster = Arc::new(ArcSwap::new(Arc::new(GoatRodeoCluster::new(&dir_path, &whole_path)?)));
 
     let index = RodeoServer::new_from_cluster(cluster, args.num_threads(), Some(args.clone()))?;
 

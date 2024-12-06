@@ -128,6 +128,28 @@ impl GoatRodeoCluster {
     })
   }
 
+  /// Create a Goat Rodeo cluster with no contents
+  pub fn blank(root_dir: &PathBuf) -> GoatRodeoCluster {
+    GoatRodeoCluster {
+      envelope: ClusterFileEnvelope {
+        version: 1,
+        magic: 1,
+        data_files: vec![],
+        index_files: vec![],
+        info: BTreeMap::new(),
+      },
+      path: root_dir.clone(),
+      cluster_path: root_dir.clone(),
+      data_files: HashMap::new(),
+      index_files: HashMap::new(),
+      index: Arc::new(ArcSwap::new(Arc::new(None))),
+      building_index: Arc::new(Mutex::new(false)),
+      cluster_file_hash: 0,
+      sub_clusters: HashMap::new(),
+      synthetic: false,
+    }
+  }
+
   pub fn new(root_dir: &PathBuf, cluster_path: &PathBuf) -> Result<GoatRodeoCluster> {
     let start = Instant::now();
     if !is_child_dir(root_dir, cluster_path)? {
@@ -250,7 +272,10 @@ impl GoatRodeoCluster {
   }
 
   pub fn common_parent_dir(clusters: &[GoatRodeoCluster]) -> Result<PathBuf> {
-    let paths = clusters.into_iter().map(|b| b.cluster_path.clone()).collect();
+    let paths = clusters
+      .into_iter()
+      .map(|b| b.cluster_path.clone())
+      .collect();
     find_common_root_dir(paths)
   }
 
@@ -299,7 +324,10 @@ impl GoatRodeoCluster {
 
     if clusters.len() == 0 {
       // this is weird... we should have gotten at least one item
-      bail!("No clusters were specified in {}", cluster_path_key.unwrap());
+      bail!(
+        "No clusters were specified in {}",
+        cluster_path_key.unwrap()
+      );
     } else if clusters.len() == 1 {
       return Ok(clusters.pop().unwrap()); // okay because just checked length
     } else {
@@ -745,7 +773,8 @@ fn test_files_in_dir() {
     return;
   }
 
-  let files = match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
+  let files = match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into())
+  {
     Ok(v) => v,
     Err(e) => {
       assert!(false, "Failure to read files {:?}", e);
