@@ -69,7 +69,7 @@ fn serve_bulk(index: &RodeoServer<ItemMetaData>, bulk_data: Vec<String>) -> Resu
   })
 }
 
-fn basic_bulk_serve(
+pub fn basic_bulk_serve(
   index: &RodeoServer<ItemMetaData>,
   request: &Request,
   start: Instant,
@@ -96,7 +96,7 @@ fn basic_bulk_serve(
   }
 }
 
-fn north_serve(
+pub fn north_serve(
   index: &RodeoServer<ItemMetaData>,
   request: &Request,
   path: Option<&str>,
@@ -142,7 +142,7 @@ fn north_serve(
   }
 }
 
-fn serve_antialias(
+pub fn serve_antialias(
   index: &RodeoServer<ItemMetaData>,
   _request: &Request,
   path: &str,
@@ -185,7 +185,7 @@ pub fn fix_path(p: String) -> String {
   p
 }
 
-fn line_serve(index: &RodeoServer<ItemMetaData>, _request: &Request, path: String) -> Response {
+pub fn line_serve(index: &RodeoServer<ItemMetaData>, _request: &Request, path: String) -> Response {
   // FIXME -- deal with getting a raw MD5 hex string
   let hash = md5hash_str(&path);
   match index.data_for_hash(hash) {
