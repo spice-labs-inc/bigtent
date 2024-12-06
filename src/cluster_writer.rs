@@ -1,5 +1,5 @@
 #[cfg(not(test))]
-use log::{info, trace}; // Use log crate when building application
+use log::{info, trace};
 
 use std::{
   collections::{BTreeMap, BTreeSet, HashSet},
@@ -15,10 +15,10 @@ use anyhow::{bail, Result};
 use crate::{
   data_file::DataFileEnvelope,
   index_file::IndexEnvelope,
-  rodeo::{ClusterFileEnvelope, GoatRodeoCluster},
+  rodeo::{ClusterFileEnvelope, ClusterFileMagicNumber, DataFileMagicNumber, IndexFileMagicNumber},
   rodeo_server::MD5Hash,
   sha_writer::ShaWriter,
-  structs::Item,
+  structs::{Item, MetaData},
   util::{
     byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope, write_int,
     write_long, write_short_signed,
@@ -93,7 +93,10 @@ impl ClusterWriter {
     self.previous_position
   }
 
-  pub fn write_item(&mut self, mut item: Item) -> Result<()> {
+  pub fn write_item<MDT>(&mut self, mut item: Item<MDT>) -> Result<()>
+  where
+    for<'de2> MDT: MetaData<'de2>,
+  {
     use std::io::Write;
     let the_hash = md5hash_str(&item.identifier);
     let cur_pos = self.dest_data.pos();
@@ -134,10 +137,10 @@ impl ClusterWriter {
     let mut cluster_file = vec![];
     {
       let cluster_writer = &mut cluster_file;
-      write_int(cluster_writer, GoatRodeoCluster::ClusterFileMagicNumber)?;
+      write_int(cluster_writer, ClusterFileMagicNumber)?;
       let cluster_env = ClusterFileEnvelope {
         version: 1,
-        magic: GoatRodeoCluster::ClusterFileMagicNumber,
+        magic: ClusterFileMagicNumber,
         info: BTreeMap::new(),
         data_files: self.seen_data_files.iter().map(|v| *v).collect(),
         index_files: self.index_files.iter().map(|v| *v).collect(),
@@ -210,10 +213,10 @@ impl ClusterWriter {
       let mut index_file = vec![];
       {
         let index_writer = &mut index_file;
-        write_int(index_writer, GoatRodeoCluster::IndexFileMagicNumber)?;
+        write_int(index_writer, IndexFileMagicNumber)?;
         let index_env = IndexEnvelope {
           version: 1,
-          magic: GoatRodeoCluster::IndexFileMagicNumber,
+          magic: IndexFileMagicNumber,
           size: self.index_info.len() as u32,
           data_files: found_hashes.clone(),
           encoding: "MD5/Long/Long".into(),
@@ -289,11 +292,11 @@ impl ClusterWriter {
   }
 
   fn write_data_envelope_start(&mut self) -> Result<()> {
-    write_int(&mut self.dest_data, GoatRodeoCluster::DataFileMagicNumber)?;
+    write_int(&mut self.dest_data, DataFileMagicNumber)?;
 
     let data_envelope = DataFileEnvelope {
       version: 1,
-      magic: GoatRodeoCluster::DataFileMagicNumber,
+      magic: DataFileMagicNumber,
       previous: self.previous_hash,
       depends_on: self.seen_data_files.clone(),
       built_from_merge: false,

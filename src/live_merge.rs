@@ -7,7 +7,7 @@ use crate::{
   index_file::{IndexLoc, ItemOffset},
   mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
-  structs::{Item, ItemMergeResult},
+  structs::{Item, ItemMergeResult, MetaData},
   util::path_plus_timed,
 };
 use anyhow::{bail, Result};
@@ -16,9 +16,11 @@ use im::OrdMap;
 use std::println as info;
 use thousands::Separable;
 
-pub fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoCluster> {
-  // filter out the blank cluster
-  let clusters: Vec<GoatRodeoCluster> = clusters
+pub fn perform_merge<MDT>(clusters: Vec<GoatRodeoCluster<MDT>>) -> Result<GoatRodeoCluster<MDT>>
+where
+  for<'de2> MDT: MetaData<'de2>,
+{
+  let clusters: Vec<GoatRodeoCluster<MDT>> = clusters
     .into_iter()
     .filter(|c| c.cluster_file_hash != 0)
     .collect();
@@ -242,7 +244,10 @@ fn test_live_merge() {
   }
 }
 
-pub fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster> {
+pub fn persist_synthetic<MDT>(cluster: GoatRodeoCluster<MDT>) -> Result<GoatRodeoCluster<MDT>>
+where
+  for<'de2> MDT: MetaData<'de2>,
+{
   // if it's not synthetic, just return it
   if !cluster.synthetic {
     return Ok(cluster);

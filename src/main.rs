@@ -1,8 +1,12 @@
 use anyhow::{bail, Result};
 use arc_swap::ArcSwap;
 use bigtent::{
-  config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster, rodeo_server::RodeoServer,
+  config::Args,
+  merger::merge_fresh,
+  rodeo::GoatRodeoCluster,
+  rodeo_server::RodeoServer,
   server::run_web_server,
+  structs::{ItemMetaData, MetaData},
 };
 use clap::{CommandFactory, Parser};
 use env_logger::Env;
@@ -69,7 +73,10 @@ fn run_full_server(args: Args) -> Result<()> {
   Ok(())
 }
 
-fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
+fn run_merge<MDT>(paths: Vec<PathBuf>, args: Args) -> Result<()>
+where
+  for<'de2> MDT: MetaData<'de2> + 'static,
+{
   for p in &paths {
     if !p.exists() || !p.is_dir() {
       bail!("Paths must be directories. {:?} is not", p);
@@ -83,7 +90,7 @@ fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
   let start = Instant::now();
 
   info!("Loading clusters...");
-  let mut clusters = vec![];
+  let mut clusters: Vec<GoatRodeoCluster<MDT>> = vec![];
   for p in &paths {
     for b in GoatRodeoCluster::cluster_files_in_dir(p.clone())? {
       clusters.push(b);
@@ -124,7 +131,11 @@ fn main() -> Result<()> {
   match (&args.rodeo, &args.conf, &args.fresh_merge) {
     (Some(rodeo), None, v) if v.len() == 0 => run_rodeo(rodeo, &args)?,
     (None, Some(_conf), v) if v.len() == 0 => run_full_server(args)?,
-    (None, None, v) if v.len() > 0 => run_merge(v.clone(), args)?,
+
+    // normally there'd be a generic here, but because this function is `main`, it's necessary
+    // to specify the concrete type (in this case `ItemMetaData`) rather than the generic
+    // type
+    (None, None, v) if v.len() > 0 => run_merge::<ItemMetaData>(v.clone(), args)?,
     _ => {
       Args::command().print_help()?;
     }

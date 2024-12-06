@@ -19,17 +19,20 @@ use crate::{
   mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
   rodeo_server::MD5Hash,
-  structs::{EdgeType, Item},
+  structs::{EdgeType, Item, MetaData},
   util::NiceDurationDisplay,
 };
 use anyhow::Result;
 use thousands::Separable;
 
-pub fn merge_fresh<PB: Into<PathBuf>>(
-  clusters: Vec<GoatRodeoCluster>,
+pub fn merge_fresh<PB: Into<PathBuf>, MDT>(
+  clusters: Vec<GoatRodeoCluster<MDT>>,
   use_threads: bool,
   dest_directory: PB,
-) -> Result<()> {
+) -> Result<()>
+where
+  for<'de2> MDT: MetaData<'de2> + 'static,
+{
   let start = Instant::now();
   let dest: PathBuf = dest_directory.into();
 
@@ -132,12 +135,15 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     let (next, opt_min) = top.without_min();
     top = opt_min;
 
-    fn get_item_and_pos(
+    fn get_item_and_pos<MDT>(
       hash: MD5Hash,
       which: usize,
-      index_holder: &mut Vec<ClusterPos<Option<Receiver<(Item, usize)>>>>,
-      clusters: &Vec<GoatRodeoCluster>,
-    ) -> Result<(Item, usize)> {
+      index_holder: &mut Vec<ClusterPos<Option<Receiver<(Item<MDT>, usize)>>>>,
+      clusters: &Vec<GoatRodeoCluster<MDT>>,
+    ) -> Result<(Item<MDT>, usize)>
+    where
+      for<'de2> MDT: MetaData<'de2>,
+    {
       match &index_holder[which].thing {
         Some(rx) => rx.recv().map_err(|e| e.into()),
         _ => match clusters[which].data_for_hash(hash) {

@@ -5,10 +5,12 @@ use anyhow::{bail, Result};
 use log::info;
 use rouille::{Request, Response, ResponseBody};
 use scopeguard::defer;
+
 use serde_json::Value as SJValue; // Use log crate when building application
 
 use crate::{
   rodeo_server::RodeoServer,
+  structs::ItemMetaData,
   util::{cbor_to_json_str, md5hash_str, read_all},
 };
 #[cfg(test)]
@@ -56,7 +58,7 @@ pub fn value_to_string_array(pv: Result<SJValue>) -> Result<Vec<String>> {
   }
 }
 
-fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
+fn serve_bulk(index: &RodeoServer<ItemMetaData>, bulk_data: Vec<String>) -> Result<Response> {
   let (rx, tx) = pipe::pipe();
   index.bulk_serve(bulk_data, tx, Instant::now())?;
   Ok(Response {
@@ -67,7 +69,11 @@ fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
   })
 }
 
-pub fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> Response {
+fn basic_bulk_serve(
+  index: &RodeoServer<ItemMetaData>,
+  request: &Request,
+  start: Instant,
+) -> Response {
   let body = value_to_string_array(parse_body_to_json(request));
 
   let cnt_string = body
@@ -90,8 +96,8 @@ pub fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) 
   }
 }
 
-pub fn north_serve(
-  index: &RodeoServer,
+fn north_serve(
+  index: &RodeoServer<ItemMetaData>,
   request: &Request,
   path: Option<&str>,
   purls_only: bool,
@@ -136,8 +142,8 @@ pub fn north_serve(
   }
 }
 
-pub fn serve_antialias(
-  index: &RodeoServer,
+fn serve_antialias(
+  index: &RodeoServer<ItemMetaData>,
   _request: &Request,
   path: &str,
   start: Instant,
@@ -179,7 +185,7 @@ pub fn fix_path(p: String) -> String {
   p
 }
 
-pub fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response {
+fn line_serve(index: &RodeoServer<ItemMetaData>, _request: &Request, path: String) -> Response {
   // FIXME -- deal with getting a raw MD5 hex string
   let hash = md5hash_str(&path);
   match index.data_for_hash(hash) {
@@ -201,7 +207,7 @@ pub fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Resp
   }
 }
 
-pub fn run_web_server(index: Arc<RodeoServer>) -> () {
+pub fn run_web_server(index: Arc<RodeoServer<ItemMetaData>>) -> () {
   rouille::start_server(
     index.the_args().to_socket_addrs().as_slice(),
     move |request| {
