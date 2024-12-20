@@ -166,7 +166,6 @@ pub struct Item {
     pub connections: BTreeSet<Edge>,
     pub metadata: Option<ItemMetaData>,
     pub merged_from: BTreeSet<LocationReference>,
-    pub file_size: i64,
 }
 ```
 
@@ -180,8 +179,6 @@ pub struct Item {
 
 `merged_from`: an ordered list of the `Items` that were merged into this `Item`.
 
-`file_size`: the size of the file the resulted in the creation of this `Item`. Note that this is a mistake... `file_size` should be in the `ItemMetaData` and this will be corrected in a future version of Big Tent.
-
 `metadata`: The `ItemMetaData` referenced by this `Item`.
 
 The `ItemMetaData` structure contains:
@@ -191,6 +188,7 @@ pub struct ItemMetaData {
     pub file_names: BTreeSet<String>,
     pub file_type: BTreeSet<String>,
     pub file_sub_type: BTreeSet<String>,
+    pub file_size: Option<i64>,
     pub extra: BTreeMap<String, BTreeSet<String>>,
 }
 ```
@@ -202,6 +200,8 @@ pub struct ItemMetaData {
 `file_type` the types of the files identified by the the tool that generated the hash (likely Goat Rodeo)
 
 `file_sub_type` the subtype of the file.
+
+`file_size`: the size of the file the resulted in the creation of this `Item`. Note that this is a mistake... `file_size` should be in the `ItemMetaData` and this will be corrected in a future version of Big Tent.
 
 `extra` a set of additional information about the file that represents this vertex.
 
