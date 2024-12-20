@@ -17,7 +17,7 @@ pub struct ItemMetaData {
   pub file_names: BTreeSet<String>,
   pub file_type: BTreeSet<String>,
   pub file_sub_type: BTreeSet<String>,
-  pub file_size: i64,
+  pub file_size: Option<i64>,
   pub extra: BTreeMap<String, BTreeSet<String>>,
 }
 

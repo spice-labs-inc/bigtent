@@ -363,9 +363,16 @@ pub fn read_cbor<T: DeserializeOwned, R: Read>(file: &mut R, len: usize) -> Resu
     Err(e) => {
       match serde_cbor::from_slice::<Value>(&*&buffer) {
         Ok(v) => {
-          info!("Deserialized value {:?}", v);
+          info!("Deserialized value {:?} but got error {}", v, e);
         }
-        Err(_) => {}
+        Err(e2) => {
+          info!(
+            "Failed to do basic deserialization of {} with errors e {} and e2 {}",
+            unsafe { String::from_utf8_unchecked(buffer) },
+            e,
+            e2
+          )
+        }
       }
       bail!("Failed to deserialize with error {}", e);
     }
