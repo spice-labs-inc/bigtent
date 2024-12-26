@@ -134,7 +134,6 @@ where
     })
   }
 
-
   /// Create a Goat Rodeo cluster with no contents
   pub fn blank(root_dir: &PathBuf) -> GoatRodeoCluster<MDT> {
     GoatRodeoCluster {
@@ -660,7 +659,7 @@ where
 
 #[test]
 fn test_antialias() {
-  use crate::structs::ItemMetaData;
+  use serde_cbor::Value;
   use std::{path::PathBuf, time::Instant};
   let start = Instant::now();
   let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
@@ -669,7 +668,7 @@ fn test_antialias() {
     return;
   }
 
-  let mut files = match GoatRodeoCluster::<ItemMetaData>::cluster_files_in_dir(
+  let mut files = match GoatRodeoCluster::<Value>::cluster_files_in_dir(
     "../goatrodeo/res_for_big_tent/".into(),
   ) {
     Ok(v) => v,
@@ -717,8 +716,8 @@ fn test_antialias() {
 
 #[test]
 fn test_generated_cluster() {
-  use crate::structs::ItemMetaData;
   use std::time::Instant;
+  use serde_cbor::Value;
 
   let test_paths: Vec<String> = vec![
     "../../tmp/oc_dest/result_aa".into(),
@@ -735,7 +734,7 @@ fn test_generated_cluster() {
     }
 
     let start = Instant::now();
-    let files = match GoatRodeoCluster::<ItemMetaData>::cluster_files_in_dir(test_path.into()) {
+    let files = match GoatRodeoCluster::<Value>::cluster_files_in_dir(test_path.into()) {
       Ok(v) => v,
       Err(e) => {
         assert!(false, "Failure to read files {:?}", e);
@@ -775,8 +774,8 @@ fn test_generated_cluster() {
 
 #[test]
 fn test_files_in_dir() {
-  use crate::structs::ItemMetaData;
   use std::time::{Duration, Instant};
+  use serde_cbor::Value;
 
   let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
   // punt test is the files don't exist
@@ -784,8 +783,7 @@ fn test_files_in_dir() {
     return;
   }
 
-
-  let files = match GoatRodeoCluster::<ItemMetaData>::cluster_files_in_dir(
+  let files = match GoatRodeoCluster::<Value>::cluster_files_in_dir(
     "../goatrodeo/res_for_big_tent/".into(),
   ) {
     Ok(v) => v,
@@ -806,12 +804,16 @@ fn test_files_in_dir() {
 
     total_index_size += complete_index.len();
 
-    assert!(complete_index.len() > 7_000, "the index should be large, but has {} items", complete_index.len());
+    assert!(
+      complete_index.len() > 7_000,
+      "the index should be large, but has {} items",
+      complete_index.len()
+    );
     let time = Instant::now().duration_since(start);
     let start = Instant::now();
     cluster.get_index().unwrap(); // should be from cache
     let time2 = Instant::now().duration_since(start);
-   
+
     assert!(
       time2 < Duration::from_millis(3),
       "Pulling from the cache should be less than 3 millis, but took {:?}",
