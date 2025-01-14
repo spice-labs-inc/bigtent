@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Result, Context};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -177,7 +177,7 @@ where
     };
 
     // open and get info from the data file
-    let mut cluster_file = File::open(file_path.clone())?;
+    let mut cluster_file = File::open(file_path.clone()).with_context(|| format!("opening cluster {:?}", file_path))?;
 
     let sha_u64 = byte_slice_to_u63(&sha256_for_reader(&mut cluster_file)?)?;
 
