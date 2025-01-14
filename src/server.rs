@@ -208,8 +208,10 @@ pub fn line_serve(index: &RodeoServer<Value>, _request: &Request, path: String) 
 }
 
 pub fn run_web_server(index: Arc<RodeoServer<Value>>) -> () {
+  let addrs = index.the_args().to_socket_addrs();
+  info!("Listen on {:?}", addrs);
   rouille::start_server(
-    index.the_args().to_socket_addrs().as_slice(),
+    addrs.as_slice(),
     move |request| {
       let start = Instant::now();
       let url = request.url();
