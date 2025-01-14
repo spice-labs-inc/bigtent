@@ -1,5 +1,5 @@
 use crate::{index_file::ItemOffset, rodeo_server::MD5Hash};
-use anyhow::{bail, Result};
+use anyhow::{bail, Result, Context};
 #[cfg(not(test))]
 use log::info;
 use serde::{de::DeserializeOwned, Serialize};
@@ -165,7 +165,7 @@ fn test_sha256() {
 pub fn is_child_dir(root: &PathBuf, potential_child: &PathBuf) -> Result<bool> {
   let full_root = root.canonicalize()?;
 
-  let full_kid = potential_child.canonicalize()?;
+  let full_kid = potential_child.canonicalize().with_context(|| format!("child directory {:?}", potential_child))?;
 
   let mut kid_parts = HashSet::new();
   for i in full_kid.iter() {
