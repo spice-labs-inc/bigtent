@@ -1,0 +1,99 @@
+openapi: 3.1.0
+info:
+  title: Spice Labs BigTent
+  version: 0.1.0
+  description: the BigTent API
+paths:
+  /{alias}:
+    get:
+      tags:
+      - package
+      operationId: dereferenceAlias
+      summary: dereference an asset by alias to get its root gitoid 
+      description: Get an asset by its alias
+      parameters:
+      - name: alias
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connections:
+                    type: array
+                    items:
+                      type: array
+                      items:
+                        type: string
+                  identifier:
+                    type: string
+                  merged_from:
+                    type: array
+                  metadata:
+                    type: 'object'
+                    properties:
+                  reference:
+                    type: array
+                    items:
+                      type: integer
+                required:
+                - connections
+                - identifier
+                - merged_from
+                - metadata
+                - reference
+          description: ''
+          headers: {}
+      security: []
+  /aa/{gitoid}:
+    get:
+      tags: 
+      - package
+      operationId: get
+      summary: Get by innate gitoid
+      description: Get an asset by its innate gitoid
+      parameters:
+      - name: gitoid
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connections:
+                    type: array
+                    items:
+                      type: array
+                      items:
+                        type: string
+                  identifier:
+                    type: string
+                  merged_from:
+                    type: array
+                  metadata:
+                    type: object
+                    properties:
+                  reference:
+                    type: array
+                    items:
+                      type: integer
+                required:
+                - connections
+                - identifier
+                - merged_from
+                - metadata
+                - reference
+          description: ''
+          headers: {}
+      security: []
+components: {}
