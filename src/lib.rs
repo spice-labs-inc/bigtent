@@ -15,3 +15,4 @@ pub mod cluster_writer;
 pub mod sha_writer;
 pub extern crate arc_swap;
 pub extern crate rouille;
+pub extern crate serde_cbor;
