@@ -18,7 +18,7 @@ use crate::data_file::DataFile;
 use crate::index_file::{IndexFile, IndexLoc, ItemOffset};
 use crate::live_merge::perform_merge;
 use crate::rodeo_server::MD5Hash;
-use crate::structs::Item;
+use crate::structs::{EdgeType, Item};
 use crate::util::{
   byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
   read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,

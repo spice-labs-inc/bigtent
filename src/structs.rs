@@ -83,49 +83,60 @@ impl Mergeable for Value {
   }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, PartialOrd, Ord, Eq, Hash)]
-pub struct EdgeType(String);
 
-impl EdgeType {
+pub trait EdgeType {
+  fn is_alias_from(&self) -> bool;
 
-  pub const TO_RIGHT: &str = ":->";
-  pub const FROM_LEFT: &str = ":<-";
-  pub const CONTAINS_DOWN: &str = ":\\/";
-  pub const CONTAINED_BY_UP: &str = ":^";
+  fn is_alias_to(&self) -> bool;
 
-  pub const CONTAINED_BY: &str = "ContainedBy:^";
-  pub const CONTAINS: &str = "Contains:\\/";
-  pub const ALIAS_TO: &str = "AliasTo:->";
-  pub const ALIAS_FROM: &str = "AliasFrom:<-";
+  fn is_from_left(&self) -> bool;
+
+  fn is_to_right(&self) -> bool;
+
+  fn is_contains_down(&self) -> bool;
+
+ fn is_contained_by_up(&self) -> bool;
+}
+
+pub const TO_RIGHT: &str = ":->";
+pub const FROM_LEFT: &str = ":<-";
+pub const CONTAINS_DOWN: &str = ":\\/";
+pub const CONTAINED_BY_UP: &str = ":^";
+
+pub const CONTAINED_BY: &str = "ContainedBy:^";
+pub const CONTAINS: &str = "Contains:\\/";
+pub const ALIAS_TO: &str = "AliasTo:->";
+pub const ALIAS_FROM: &str = "AliasFrom:<-";
 
 
-  pub fn is_alias_from(&self) -> bool {
-    self.0 == EdgeType::ALIAS_FROM
+impl EdgeType for String {
+  fn is_alias_from(&self) -> bool {
+    self == ALIAS_FROM
   }
 
-  pub fn is_alias_to(&self) -> bool {
-    self.0 == EdgeType::ALIAS_TO
+   fn is_alias_to(&self) -> bool {
+    self == ALIAS_TO
   }
 
-  pub fn is_from_left(&self) -> bool {
-    self.0.ends_with(EdgeType::FROM_LEFT)
+  fn is_from_left(&self) -> bool {
+    self.ends_with(FROM_LEFT)
   }
 
-  pub fn is_to_right(&self) -> bool {
-    self.0.ends_with(EdgeType::TO_RIGHT)
+  fn is_to_right(&self) -> bool {
+    self.ends_with(TO_RIGHT)
   }
 
-  pub fn is_contains_down(&self) -> bool {
-    self.0.ends_with(EdgeType::CONTAINS_DOWN)
+  fn is_contains_down(&self) -> bool {
+    self.ends_with(CONTAINS_DOWN)
   }
 
-  pub fn is_contained_by_up(&self) -> bool {
-    self.0.ends_with(EdgeType::CONTAINED_BY_UP)
+  fn is_contained_by_up(&self) -> bool {
+    self.ends_with(CONTAINED_BY_UP)
   }
 
 }
 
-pub type Edge = (EdgeType, String);
+pub type Edge = (String, String);
 
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

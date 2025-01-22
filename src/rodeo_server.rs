@@ -22,7 +22,7 @@ use crate::{
   config::Args,
   index_file::{IndexLoc, ItemOffset},
   rodeo::GoatRodeoCluster,
-  structs::Item,
+  structs::{EdgeType, Item},
   util::cbor_to_json_str,
 };
 

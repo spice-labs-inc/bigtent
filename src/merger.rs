@@ -19,7 +19,7 @@ use crate::{
   mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
   rodeo_server::MD5Hash,
-  structs::{EdgeType, Item},
+  structs::Item,
   util::NiceDurationDisplay,
 };
 use anyhow::Result;
@@ -29,8 +29,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
   clusters: Vec<GoatRodeoCluster>,
   use_threads: bool,
   dest_directory: PB,
-) -> Result<()>
-{
+) -> Result<()> {
   let start = Instant::now();
   let dest: PathBuf = dest_directory.into();
 
@@ -138,8 +137,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
       which: usize,
       index_holder: &mut Vec<ClusterPos<Option<Receiver<(Item, usize)>>>>,
       clusters: &Vec<GoatRodeoCluster>,
-    ) -> Result<(Item, usize)>
-    {
+    ) -> Result<(Item, usize)> {
       match &index_holder[which].thing {
         Some(rx) => rx.recv().map_err(|e| e.into()),
         _ => match clusters[which].data_for_hash(hash) {
@@ -169,7 +167,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
             .connections
             .iter()
             .filter(|v| v.1.starts_with("pkg:"))
-            .collect::<Vec<&(EdgeType, String)>>()
+            .collect::<Vec<&(String, String)>>()
           {
             v if !v.is_empty() => {
               for (_, purl) in v {
