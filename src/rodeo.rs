@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result, Context};
+use anyhow::{anyhow, bail, Context, Result};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18,7 +18,7 @@ use crate::data_file::DataFile;
 use crate::index_file::{IndexFile, IndexLoc, ItemOffset};
 use crate::live_merge::perform_merge;
 use crate::rodeo_server::MD5Hash;
-use crate::structs::{EdgeType, Item, MetaData};
+use crate::structs::Item;
 use crate::util::{
   byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
   read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
@@ -36,6 +36,20 @@ pub struct ClusterFileEnvelope {
   pub data_files: Vec<u64>,
   pub index_files: Vec<u64>,
   pub info: BTreeMap<String, String>,
+}
+
+impl ClusterFileEnvelope {
+  pub fn validate(&self) -> Result<()> {
+    if self.magic != ClusterFileMagicNumber {
+      bail!("Loaded a cluster with an invalid magic number: {:?}", self);
+    }
+
+    if self.version != 2 {
+      bail!("Loaded a Cluster with version {} but this code only supports version 2 Clusters", self.version);
+    }
+
+    Ok(())
+  }
 }
 
 impl std::fmt::Display for ClusterFileEnvelope {
@@ -60,17 +74,14 @@ impl std::fmt::Display for ClusterFileEnvelope {
 }
 
 #[derive(Debug, Clone)]
-pub struct GoatRodeoCluster<MDT>
-where
-  for<'de2> MDT: MetaData<'de2>,
-{
+pub struct GoatRodeoCluster {
   pub envelope: ClusterFileEnvelope,
   pub cluster_file_hash: u64,
   pub path: PathBuf,
   pub cluster_path: PathBuf,
-  pub data_files: HashMap<u64, DataFile<MDT>>,
-  pub index_files: HashMap<u64, IndexFile<MDT>>,
-  pub sub_clusters: HashMap<u64, GoatRodeoCluster<MDT>>,
+  pub data_files: HashMap<u64, DataFile>,
+  pub index_files: HashMap<u64, IndexFile>,
+  pub sub_clusters: HashMap<u64, GoatRodeoCluster>,
   pub synthetic: bool,
   index: Arc<ArcSwap<Option<Arc<Vec<ItemOffset>>>>>,
   building_index: Arc<Mutex<bool>>,
@@ -85,10 +96,7 @@ pub const IndexFileMagicNumber: u32 = 0x54154170; // Shishitō
 #[allow(non_upper_case_globals)]
 pub const ClusterFileMagicNumber: u32 = 0xba4a4a; // Banana
 
-impl<MDT> GoatRodeoCluster<MDT>
-where
-  for<'de2> MDT: MetaData<'de2>,
-{
+impl GoatRodeoCluster {
   // Reset the index. Should be done with extreme care
   pub fn reset_index(&self) -> () {
     self.index.store(Arc::new(None));
@@ -97,10 +105,10 @@ where
   pub fn create_synthetic_with(
     &self,
     index: Vec<ItemOffset>,
-    data_files: HashMap<u64, DataFile<MDT>>,
-    index_files: HashMap<u64, IndexFile<MDT>>,
-    sub_clusters: HashMap<u64, GoatRodeoCluster<MDT>>,
-  ) -> Result<GoatRodeoCluster<MDT>> {
+    data_files: HashMap<u64, DataFile>,
+    index_files: HashMap<u64, IndexFile>,
+    sub_clusters: HashMap<u64, GoatRodeoCluster>,
+  ) -> Result<GoatRodeoCluster> {
     if sub_clusters.len() == 0 {
       bail!("A synthetic cluster must have at least one underlying real cluster")
     }
@@ -135,7 +143,7 @@ where
   }
 
   /// Create a Goat Rodeo cluster with no contents
-  pub fn blank(root_dir: &PathBuf) -> GoatRodeoCluster<MDT> {
+  pub fn blank(root_dir: &PathBuf) -> GoatRodeoCluster {
     GoatRodeoCluster {
       envelope: ClusterFileEnvelope {
         version: 1,
@@ -156,7 +164,7 @@ where
     }
   }
 
-  pub fn new(root_dir: &PathBuf, cluster_path: &PathBuf) -> Result<GoatRodeoCluster<MDT>> {
+  pub fn new(root_dir: &PathBuf, cluster_path: &PathBuf) -> Result<GoatRodeoCluster> {
     let start = Instant::now();
     if !is_child_dir(root_dir, cluster_path)? {
       bail!(
@@ -177,7 +185,8 @@ where
     };
 
     // open and get info from the data file
-    let mut cluster_file = File::open(file_path.clone()).with_context(|| format!("opening cluster {:?}", file_path))?;
+    let mut cluster_file =
+      File::open(file_path.clone()).with_context(|| format!("opening cluster {:?}", file_path))?;
 
     let sha_u64 = byte_slice_to_u63(&sha256_for_reader(&mut cluster_file)?)?;
 
@@ -204,9 +213,7 @@ where
 
     let env: ClusterFileEnvelope = read_len_and_cbor(dfp)?;
 
-    if env.magic != ClusterFileMagicNumber {
-      bail!("Loaded a cluster with an invalid magic number: {:?}", env);
-    }
+    env.validate()?;
 
     info!(
       "Loaded cluster {:?} {} at {:?}",
@@ -277,7 +284,7 @@ where
     })
   }
 
-  pub fn common_parent_dir(clusters: &[GoatRodeoCluster<MDT>]) -> Result<PathBuf> {
+  pub fn common_parent_dir(clusters: &[GoatRodeoCluster]) -> Result<PathBuf> {
     let paths = clusters
       .into_iter()
       .map(|b| b.cluster_path.clone())
@@ -285,7 +292,7 @@ where
     find_common_root_dir(paths)
   }
 
-  pub fn cluster_from_config(file_name: PathBuf, conf: &Table) -> Result<GoatRodeoCluster<MDT>> {
+  pub fn cluster_from_config(file_name: PathBuf, conf: &Table) -> Result<GoatRodeoCluster> {
     let root_dir_key = conf.get("root_dir");
     let root_dir: PathBuf = match root_dir_key {
       Some(toml::Value::String(s)) => {
@@ -343,7 +350,7 @@ where
   }
 
   // All the non-synthetic sub-clusters
-  pub fn all_sub_clusters(&self) -> Vec<GoatRodeoCluster<MDT>> {
+  pub fn all_sub_clusters(&self) -> Vec<GoatRodeoCluster> {
     let mut ret = vec![];
 
     if !self.sub_clusters.is_empty() {
@@ -522,7 +529,7 @@ where
     }
   }
 
-  pub fn cluster_files_in_dir(path: PathBuf) -> Result<Vec<GoatRodeoCluster<MDT>>> {
+  pub fn cluster_files_in_dir(path: PathBuf) -> Result<Vec<GoatRodeoCluster>> {
     let the_dir = read_dir(path.clone())?;
     let mut ret = vec![];
     for f in the_dir {
@@ -548,7 +555,7 @@ where
     Ok(find_item(hash, &index))
   }
 
-  pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item<MDT>> {
+  pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item> {
     let data_files = &self.data_files;
     let data_file = data_files.get(&file_hash);
     match data_file {
@@ -582,10 +589,10 @@ where
     }
   }
 
-  pub fn antialias_for(&self, data: &str) -> Result<Item<MDT>> {
+  pub fn antialias_for(&self, data: &str) -> Result<Item> {
     let mut ret = self.data_for_key(data)?;
     while ret.is_alias() {
-      match ret.connections.iter().find(|x| x.0 == EdgeType::AliasTo) {
+      match ret.connections.iter().find(|x| x.0.is_alias_to()) {
         Some(v) => {
           ret = self.data_for_key(&v.1)?;
         }
@@ -598,7 +605,7 @@ where
     Ok(ret)
   }
 
-  pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Item<MDT>> {
+  pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Item> {
     match index_loc {
       loc @ IndexLoc::Loc { file_hash, .. } => Ok(self.entry_for(*file_hash, loc.offset())?),
       IndexLoc::Chain(offsets) => {
@@ -628,7 +635,7 @@ where
     }
   }
 
-  pub fn vec_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<Item<MDT>>> {
+  pub fn vec_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<Item>> {
     match index_loc {
       loc @ IndexLoc::Loc { file_hash, .. } => Ok(vec![self.entry_for(*file_hash, loc.offset())?]),
       IndexLoc::Chain(offsets) => {
@@ -642,7 +649,7 @@ where
     }
   }
 
-  pub fn data_for_hash(&self, hash: MD5Hash) -> Result<Item<MDT>> {
+  pub fn data_for_hash(&self, hash: MD5Hash) -> Result<Item> {
     let entry_offset = match self.find(hash)? {
       Some(eo) => eo,
       _ => bail!(format!("Could not find entry for hash {:x?}", hash)),
@@ -651,7 +658,7 @@ where
     self.data_for_entry_offset(&entry_offset.loc)
   }
 
-  pub fn data_for_key(&self, data: &str) -> Result<Item<MDT>> {
+  pub fn data_for_key(&self, data: &str) -> Result<Item> {
     let md5_hash = md5hash_str(data);
     self.data_for_hash(md5_hash)
   }
@@ -659,7 +666,6 @@ where
 
 #[test]
 fn test_antialias() {
-  use serde_cbor::Value;
   use std::{path::PathBuf, time::Instant};
   let start = Instant::now();
   let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
@@ -668,15 +674,14 @@ fn test_antialias() {
     return;
   }
 
-  let mut files = match GoatRodeoCluster::<Value>::cluster_files_in_dir(
-    "../goatrodeo/res_for_big_tent/".into(),
-  ) {
-    Ok(v) => v,
-    Err(e) => {
-      assert!(false, "Failure to read files {:?}", e);
-      return;
-    }
-  };
+  let mut files =
+    match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
+      Ok(v) => v,
+      Err(e) => {
+        assert!(false, "Failure to read files {:?}", e);
+        return;
+      }
+    };
   println!("Read cluster at {:?}", start.elapsed());
 
   assert!(files.len() > 0, "Need a cluster");
@@ -717,7 +722,6 @@ fn test_antialias() {
 #[test]
 fn test_generated_cluster() {
   use std::time::Instant;
-  use serde_cbor::Value;
 
   let test_paths: Vec<String> = vec![
     "../../tmp/oc_dest/result_aa".into(),
@@ -734,7 +738,7 @@ fn test_generated_cluster() {
     }
 
     let start = Instant::now();
-    let files = match GoatRodeoCluster::<Value>::cluster_files_in_dir(test_path.into()) {
+    let files = match GoatRodeoCluster::cluster_files_in_dir(test_path.into()) {
       Ok(v) => v,
       Err(e) => {
         assert!(false, "Failure to read files {:?}", e);
@@ -775,7 +779,6 @@ fn test_generated_cluster() {
 #[test]
 fn test_files_in_dir() {
   use std::time::{Duration, Instant};
-  use serde_cbor::Value;
 
   let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
   // punt test is the files don't exist
@@ -783,9 +786,8 @@ fn test_files_in_dir() {
     return;
   }
 
-  let files = match GoatRodeoCluster::<Value>::cluster_files_in_dir(
-    "../goatrodeo/res_for_big_tent/".into(),
-  ) {
+  let files = match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into())
+  {
     Ok(v) => v,
     Err(e) => {
       assert!(false, "Failure to read files {:?}", e);

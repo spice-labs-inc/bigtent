@@ -6,7 +6,6 @@ use bigtent::{
   rodeo::GoatRodeoCluster,
   rodeo_server::RodeoServer,
   server::run_web_server,
-  structs::{ItemMetaData, MetaData},
 };
 use clap::{CommandFactory, Parser};
 use env_logger::Env;
@@ -73,9 +72,7 @@ fn run_full_server(args: Args) -> Result<()> {
   Ok(())
 }
 
-fn run_merge<MDT>(paths: Vec<PathBuf>, args: Args) -> Result<()>
-where
-  for<'de2> MDT: MetaData<'de2> + 'static,
+fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()>
 {
   for p in &paths {
     if !p.exists() || !p.is_dir() {
@@ -90,7 +87,7 @@ where
   let start = Instant::now();
 
   info!("Loading clusters...");
-  let mut clusters: Vec<GoatRodeoCluster<MDT>> = vec![];
+  let mut clusters: Vec<GoatRodeoCluster> = vec![];
   for p in &paths {
     for b in GoatRodeoCluster::cluster_files_in_dir(p.clone())? {
       clusters.push(b);
@@ -135,7 +132,7 @@ fn main() -> Result<()> {
     // normally there'd be a generic here, but because this function is `main`, it's necessary
     // to specify the concrete type (in this case `ItemMetaData`) rather than the generic
     // type
-    (None, None, v) if v.len() > 0 => run_merge::<ItemMetaData>(v.clone(), args)?,
+    (None, None, v) if v.len() > 0 => run_merge(v.clone(), args)?,
     _ => {
       Args::command().print_help()?;
     }

@@ -1,12 +1,15 @@
 use crate::{
   rodeo::{GoatRodeoCluster, IndexFileMagicNumber},
-  structs::MetaData,
   util::{byte_slice_to_u63, read_len_and_cbor, read_u32, sha256_for_reader},
 };
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-  collections::{BTreeMap, HashSet}, fs::File, io::{BufReader, Read, Seek, SeekFrom}, marker::PhantomData, path::PathBuf, sync::{Arc, Mutex}
+  collections::{BTreeMap, HashSet},
+  fs::File,
+  io::{BufReader, Read, Seek, SeekFrom},
+  path::PathBuf,
+  sync::{Arc, Mutex},
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -20,26 +23,17 @@ pub struct IndexEnvelope {
 }
 
 #[derive(Debug, Clone)]
-pub struct IndexFile<MDT>
-where
-  for<'de2> MDT: MetaData<'de2>,
-{
+pub struct IndexFile {
   pub envelope: IndexEnvelope,
   pub file: Arc<Mutex<BufReader<File>>>,
   pub data_offset: u64,
-  // in order to generate a specialized struct with the `MDT` type,
-  // the struct must contain the type as an element. See https://doc.rust-lang.org/rust-by-example/generics/phantom.html
-  _phantom: PhantomData<MDT>,
 }
 
-impl<MDT> IndexFile<MDT>
-where
-  for<'de2> MDT: MetaData<'de2>,
-{
-  pub fn new(dir: &PathBuf, hash: u64, check_hash: bool) -> Result<IndexFile<MDT>> {
+impl IndexFile {
+  pub fn new(dir: &PathBuf, hash: u64, check_hash: bool) -> Result<IndexFile> {
     // ensure we close `file` after computing the hash
     if check_hash {
-      let mut file = GoatRodeoCluster::<MDT>::find_file(&dir, hash, "gri")?;
+      let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri")?;
 
       let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file)?)?;
       if tested_hash != hash {
@@ -51,7 +45,7 @@ where
       }
     }
 
-    let mut file = GoatRodeoCluster::<MDT>::find_file(&dir, hash, "gri")?;
+    let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri")?;
 
     let ifp = &mut file;
     let magic = read_u32(ifp)?;
@@ -72,7 +66,6 @@ where
       envelope: idx_env,
       file: Arc::new(Mutex::new(BufReader::new(file))),
       data_offset: idx_pos,
-      _phantom: PhantomData::default(),
     })
   }
 

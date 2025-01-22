@@ -3,74 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_cbor::Value;
 
-#[derive(Debug, Eq, PartialEq, PartialOrd, Deserialize, Serialize, Clone, Copy, Hash, Ord)]
-pub enum EdgeType {
-  AliasTo,
-  AliasFrom,
-  Contains,
-  ContainedBy,
-  BuildsTo,
-  BuiltFrom,
-}
-
-#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
-pub struct ItemMetaData {
-  pub file_names: BTreeSet<String>,
-  pub file_type: BTreeSet<String>,
-  pub file_sub_type: BTreeSet<String>,
-  pub file_size: Option<i64>,
-  pub extra: BTreeMap<String, BTreeSet<String>>,
-}
-
-impl<'de2> MetaData<'de2> for ItemMetaData {}
-
-impl<'de2> MetaData<'de2> for Value {}
-
-impl Mergeable for ItemMetaData {
-  fn merge(&self, other: ItemMetaData) -> ItemMetaData {
-    ItemMetaData {
-      file_names: {
-        let mut it = self.file_names.clone();
-        it.extend(other.file_names);
-        it
-      },
-      file_type: {
-        let mut it = self.file_type.clone();
-        it.extend(other.file_type.clone());
-        it
-      },
-      file_sub_type: {
-        let mut it = self.file_sub_type.clone();
-        it.extend(other.file_sub_type.clone());
-        it
-      },
-      file_size: self.file_size,
-      extra: {
-        let mut it = self.extra.clone();
-        for (k, v) in other.extra.iter() {
-          let v = v.clone();
-          let the_val = match it.get(k) {
-            Some(mine) => {
-              let mut tmp = mine.clone();
-              tmp.extend(v);
-              tmp
-            }
-            None => v,
-          };
-
-          it.insert(k.clone(), the_val);
-        }
-        it
-      },
-    }
-  }
-}
 
 pub type LocationReference = (u64, u64);
 
 pub trait Mergeable {
   fn merge(&self, other: Self) -> Self;
 }
+
 
 /// Merge two values
 fn merge_values(v1: &Value, v2: Option<&Value>) -> Value {
@@ -144,30 +83,63 @@ impl Mergeable for Value {
   }
 }
 
-pub type Edge = (EdgeType, String);
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, PartialOrd, Ord, Eq, Hash)]
+pub struct EdgeType(String);
 
-/// A trait that defines the metadata field in an Item
-pub trait MetaData<'a>:
-  Deserialize<'a> + Serialize + PartialEq + Clone + Mergeable + Sized + Send + Sync
-{
+impl EdgeType {
+
+  pub const TO_RIGHT: &str = ":->";
+  pub const FROM_LEFT: &str = ":<-";
+  pub const CONTAINS_DOWN: &str = ":\\/";
+  pub const CONTAINED_BY_UP: &str = ":^";
+
+  pub const CONTAINED_BY: &str = "ContainedBy:^";
+  pub const CONTAINS: &str = "Contains:\\/";
+  pub const ALIAS_TO: &str = "AliasTo:->";
+  pub const ALIAS_FROM: &str = "AliasFrom:<-";
+
+
+  pub fn is_alias_from(&self) -> bool {
+    self.0 == EdgeType::ALIAS_FROM
+  }
+
+  pub fn is_alias_to(&self) -> bool {
+    self.0 == EdgeType::ALIAS_TO
+  }
+
+  pub fn is_from_left(&self) -> bool {
+    self.0.ends_with(EdgeType::FROM_LEFT)
+  }
+
+  pub fn is_to_right(&self) -> bool {
+    self.0.ends_with(EdgeType::TO_RIGHT)
+  }
+
+  pub fn is_contains_down(&self) -> bool {
+    self.0.ends_with(EdgeType::CONTAINS_DOWN)
+  }
+
+  pub fn is_contained_by_up(&self) -> bool {
+    self.0.ends_with(EdgeType::CONTAINED_BY_UP)
+  }
+
 }
 
+pub type Edge = (EdgeType, String);
+
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Item<MDT>
-where
-  for<'de2> MDT: MetaData<'de2>,
+pub struct Item
 {
   pub identifier: String,
   pub reference: LocationReference,
   pub connections: BTreeSet<Edge>,
-  #[serde(bound(deserialize = "Option<MDT>: Deserialize<'de>"))]
-  pub metadata: Option<MDT>,
+  pub body_mime_type: Option<String>,
+  pub body: Option<Value>,
   pub merged_from: BTreeSet<LocationReference>,
 }
 
-impl<MDT> Item<MDT>
-where
-  for<'de2> MDT: MetaData<'de2>,
+impl Item
 {
   pub const NOOP: LocationReference = (0u64, 0u64);
 
@@ -178,7 +150,7 @@ where
       .connections
       .iter()
       // find all aliases to this thing that start with `pkg:`
-      .filter(|c| c.0 == EdgeType::AliasFrom && c.1.starts_with("pkg:"))
+      .filter(|c| c.0.is_alias_from() && c.1.starts_with("pkg:"))
       // make into a string
       .map(|c| c.1.clone())
       // turn into a Vec<String>
@@ -186,24 +158,33 @@ where
   }
 
   pub fn is_alias(&self) -> bool {
-    self.connections.iter().any(|v| v.0 == EdgeType::AliasTo)
+    self.connections.iter().any(|v| v.0.is_alias_to())
   }
   pub fn remove_references(&mut self) {
-    self.reference = Item::<MDT>::NOOP;
+    self.reference = Item::NOOP;
     self.merged_from = BTreeSet::new();
   }
 
   // tests two items... they are the same if they have the same
   // `identifier`, `connections`, `metadata`, `version`,
   // and `_type`
-  pub fn is_same(&self, other: &Item<MDT>) -> bool {
+  pub fn is_same(&self, other: &Item) -> bool {
     self.identifier == other.identifier
       && self.connections == other.connections
-      && self.metadata == other.metadata
+      && self.body_mime_type == other.body_mime_type
+      && self.body == other.body
   }
 
   // merge to `Item`s
-  pub fn merge(&self, other: Item<MDT>) -> Item<MDT> {
+  pub fn merge(&self, other: Item) -> Item {
+    let (body, mime_type) = match (&self.body, other.body, self.body_mime_type == other.body_mime_type) {
+      (None, None, _) => (None, None),
+      (None, Some(a), _) => (Some(a), other.body_mime_type.clone()),
+      (Some(a), None, _) => (Some(a.clone()), self.body_mime_type.clone()),
+      (Some(a), Some(b), true) => (Some(a.merge(b)), self.body_mime_type.clone()),
+      _ => (self.body.clone(), self.body_mime_type.clone())
+    };
+
     Item {
       identifier: self.identifier.clone(),
       reference: self.reference,
@@ -212,19 +193,15 @@ where
         it.extend(other.connections);
         it
       },
-      metadata: match (&self.metadata, other.metadata) {
-        (None, None) => None,
-        (None, Some(a)) => Some(a),
-        (Some(a), None) => Some(a.clone()),
-        (Some(a), Some(b)) => Some(a.merge(b)),
-      },
+      body_mime_type: mime_type,
+      body: body,
       merged_from: self.merged_from.clone(),
     }
   }
 
   // merges this item and returns a new item with `merged_from` set
   // correctly if there were changes
-  pub fn merge_vecs(items: Vec<Item<MDT>>) -> ItemMergeResult<MDT> {
+  pub fn merge_vecs(items: Vec<Item>) -> ItemMergeResult {
     let len = items.len();
     if len <= 1 {
       return ItemMergeResult::Same;
@@ -250,14 +227,9 @@ where
   }
 }
 
-pub enum ItemMergeResult<MDT>
-where
-  for<'de> MDT: MetaData<'de>,
+pub enum ItemMergeResult
 {
   Same,
   ContainsAll(LocationReference),
-  New(Item<MDT>),
+  New(Item),
 }
-
-/// The Item<ItemMetaData> type that replaces the old baked in Item
-pub type MDItem = Item<ItemMetaData>;
