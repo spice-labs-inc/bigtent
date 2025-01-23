@@ -93,13 +93,11 @@ impl ClusterWriter {
     self.previous_position
   }
 
-  pub fn write_item(&mut self, mut item: Item) -> Result<()>
+  pub fn write_item(&mut self, item: Item) -> Result<()>
   {
     use std::io::Write;
     let the_hash = md5hash_str(&item.identifier);
     let cur_pos = self.dest_data.pos();
-
-    item.reference = (0, cur_pos);
 
     let item_bytes = serde_cbor::to_vec(&item)?;
 

@@ -100,11 +100,11 @@ pub trait EdgeType {
 
 pub const TO_RIGHT: &str = ":->";
 pub const FROM_LEFT: &str = ":<-";
-pub const CONTAINS_DOWN: &str = ":\\/";
+pub const CONTAINS_DOWN: &str = ":||";
 pub const CONTAINED_BY_UP: &str = ":^";
 
 pub const CONTAINED_BY: &str = "ContainedBy:^";
-pub const CONTAINS: &str = "Contains:\\/";
+pub const CONTAINS: &str = "Contains:||";
 pub const ALIAS_TO: &str = "AliasTo:->";
 pub const ALIAS_FROM: &str = "AliasFrom:<-";
 
@@ -147,7 +147,6 @@ pub struct Item
   pub connections: BTreeSet<Edge>,
   pub body_mime_type: Option<String>,
   pub body: Option<Value>,
-  pub merged_from: BTreeSet<LocationReference>,
 }
 
 impl Item
@@ -173,7 +172,6 @@ impl Item
   }
   pub fn remove_references(&mut self) {
     self.reference = Item::NOOP;
-    self.merged_from = BTreeSet::new();
   }
 
   // tests two items... they are the same if they have the same
@@ -206,7 +204,6 @@ impl Item
       },
       body_mime_type: mime_type,
       body: body,
-      merged_from: self.merged_from.clone(),
     }
   }
 
@@ -233,7 +230,6 @@ impl Item
       }
     }
 
-    base.merged_from = mf;
     return ItemMergeResult::New(base);
   }
 }
