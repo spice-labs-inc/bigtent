@@ -6,7 +6,6 @@ use log::info;
 use rouille::{Request, Response, ResponseBody};
 use scopeguard::defer;
 
-use serde_cbor::Value;
 use serde_json::Value as SJValue; // Use log crate when building application
 
 use crate::{
@@ -58,7 +57,7 @@ pub fn value_to_string_array(pv: Result<SJValue>) -> Result<Vec<String>> {
   }
 }
 
-fn serve_bulk(index: &RodeoServer<Value>, bulk_data: Vec<String>) -> Result<Response> {
+fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
   let (rx, tx) = pipe::pipe();
   index.bulk_serve(bulk_data, tx, Instant::now())?;
   Ok(Response {
@@ -70,7 +69,7 @@ fn serve_bulk(index: &RodeoServer<Value>, bulk_data: Vec<String>) -> Result<Resp
 }
 
 pub fn basic_bulk_serve(
-  index: &RodeoServer<Value>,
+  index: &RodeoServer,
   request: &Request,
   start: Instant,
 ) -> Response {
@@ -97,7 +96,7 @@ pub fn basic_bulk_serve(
 }
 
 pub fn north_serve(
-  index: &RodeoServer<Value>,
+  index: &RodeoServer,
   request: &Request,
   path: Option<&str>,
   purls_only: bool,
@@ -143,7 +142,7 @@ pub fn north_serve(
 }
 
 pub fn serve_antialias(
-  index: &RodeoServer<Value>,
+  index: &RodeoServer,
   _request: &Request,
   path: &str,
   start: Instant,
@@ -185,7 +184,7 @@ pub fn fix_path(p: String) -> String {
   p
 }
 
-pub fn line_serve(index: &RodeoServer<Value>, _request: &Request, path: String) -> Response {
+pub fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response {
   // FIXME -- deal with getting a raw MD5 hex string
   let hash = md5hash_str(&path);
   match index.data_for_hash(hash) {
@@ -207,7 +206,7 @@ pub fn line_serve(index: &RodeoServer<Value>, _request: &Request, path: String) 
   }
 }
 
-pub fn run_web_server(index: Arc<RodeoServer<Value>>) -> () {
+pub fn run_web_server(index: Arc<RodeoServer>) -> () {
   let addrs = index.the_args().to_socket_addrs();
   info!("Listen on {:?}", addrs);
   rouille::start_server(

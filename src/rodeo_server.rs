@@ -5,7 +5,6 @@ use flume::{Receiver, Sender};
 use log::{error, info};
 use pipe::PipeWriter;
 use scopeguard::defer;
-use serde_cbor::Value;
 use std::{
   collections::HashSet,
   io::{BufWriter, Write},
@@ -23,58 +22,55 @@ use crate::{
   config::Args,
   index_file::{IndexLoc, ItemOffset},
   rodeo::GoatRodeoCluster,
-  structs::{EdgeType, Item, MetaData},
+  structs::{EdgeType, Item},
   util::cbor_to_json_str,
 };
 
 pub type MD5Hash = [u8; 16];
 
 #[derive(Debug)]
-pub struct RodeoServer<MDT>
-where
-  for<'de2> MDT: MetaData<'de2>,
-{
+pub struct RodeoServer {
   threads: Mutex<Vec<JoinHandle<()>>>,
-  cluster: Arc<ArcSwap<GoatRodeoCluster<MDT>>>,
+  cluster: Arc<ArcSwap<GoatRodeoCluster>>,
   args: Args,
   config_table: ArcSwap<Table>,
   sender: Sender<IndexMsg>,
   receiver: Receiver<IndexMsg>,
 }
 
-impl RodeoServer<Value> {
+impl RodeoServer {
   pub fn find(&self, hash: MD5Hash) -> Result<Option<ItemOffset>> {
     self.cluster.load().find(hash)
   }
 
-   /// get the cluster arc swap so that the cluster can be substituted
-   pub fn get_cluster_arcswap(&self) -> Arc<ArcSwap<GoatRodeoCluster<Value>>> {
+  /// get the cluster arc swap so that the cluster can be substituted
+  pub fn get_cluster_arcswap(&self) -> Arc<ArcSwap<GoatRodeoCluster>> {
     self.cluster.clone()
   }
 
   /// Get the current GoatRodeoCluster from the the server
-  pub fn get_cluster(&self) -> GoatRodeoCluster<Value> {
-    let the_cluster: GoatRodeoCluster<Value> = (&(**self.get_cluster_arcswap().load())).clone();
+  pub fn get_cluster(&self) -> GoatRodeoCluster {
+    let the_cluster: GoatRodeoCluster = (&(**self.get_cluster_arcswap().load())).clone();
     the_cluster
   }
 
-  pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item<Value>> {
+  pub fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item> {
     self.cluster.load().entry_for(file_hash, offset)
   }
 
-  pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Item<Value>> {
+  pub fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Item> {
     self.cluster.load().data_for_entry_offset(index_loc)
   }
 
-  pub fn data_for_hash(&self, hash: MD5Hash) -> Result<Item<Value>> {
+  pub fn data_for_hash(&self, hash: MD5Hash) -> Result<Item> {
     self.cluster.load().data_for_hash(hash)
   }
 
-  pub fn data_for_key(&self, data: &str) -> Result<Item<Value>> {
+  pub fn data_for_key(&self, data: &str) -> Result<Item> {
     self.cluster.load().data_for_key(data)
   }
 
-  pub fn antialias_for(&self, data: &str) -> Result<Item<Value>> {
+  pub fn antialias_for(&self, data: &str) -> Result<Item> {
     self.cluster.load().antialias_for(data)
   }
 
@@ -117,13 +113,10 @@ impl RodeoServer<Value> {
     }
   }
 
-  fn contained_by(data: &Item<Value>) -> HashSet<String> {
+  fn contained_by(data: &Item) -> HashSet<String> {
     let mut ret = HashSet::new();
     for edge in data.connections.iter() {
-      if edge.0 == EdgeType::ContainedBy
-        || edge.0 == EdgeType::AliasTo
-        || edge.0 == EdgeType::BuildsTo
-      {
+      if edge.0.is_contained_by_up() || edge.0.is_to_right() {
         ret.insert(edge.1.clone());
       }
     }
@@ -238,7 +231,7 @@ impl RodeoServer<Value> {
     Ok(())
   }
 
-  fn thread_handler_loop(index: Arc<RodeoServer<Value>>) -> Result<()> {
+  fn thread_handler_loop(index: Arc<RodeoServer>) -> Result<()> {
     loop {
       match index.receiver.recv()? {
         IndexMsg::End => {
@@ -292,10 +285,10 @@ impl RodeoServer<Value> {
   /// and an optional set of args. This is meant to be used to create an Index without
   /// a well defined set of Args
   pub fn new_from_cluster(
-    cluster: Arc<ArcSwap<GoatRodeoCluster<Value>>>,
+    cluster: Arc<ArcSwap<GoatRodeoCluster>>,
     num_threads: u16,
     args_opt: Option<Args>,
-  ) -> Result<Arc<RodeoServer<Value>>> {
+  ) -> Result<Arc<RodeoServer>> {
     let (tx, rx) = flume::unbounded();
 
     // do this in a block so the index is released at the end of the block
@@ -336,11 +329,12 @@ impl RodeoServer<Value> {
     Ok(ret)
   }
 
-  pub fn new(args: Args) -> Result<Arc<RodeoServer<Value>>> {
+  pub fn new(args: Args) -> Result<Arc<RodeoServer>> {
     let config_table = args.read_conf_file()?;
 
-    let cluster =
-      Arc::new(ArcSwap::new(Arc::new(GoatRodeoCluster::<Value>::cluster_from_config(args.conf_file()?, &config_table)?)));
+    let cluster = Arc::new(ArcSwap::new(Arc::new(
+      GoatRodeoCluster::cluster_from_config(args.conf_file()?, &config_table)?,
+    )));
 
     RodeoServer::new_from_cluster(cluster, args.num_threads(), Some(args))
   }

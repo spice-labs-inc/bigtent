@@ -1,6 +1,6 @@
 [package]
 name = "bigtent"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["David Pollak <feeder.of.the.bears@gmail.com>"]
 rust-version = "1.81.0"
