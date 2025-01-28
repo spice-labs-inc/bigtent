@@ -1,26 +1,14 @@
 name: Publish Container Images
 
-#on: workflow_dispatch
-  #release:
-  #  types: [published] # todo - change this to trigger on other workflows
-  #push:
-  #  branches:
-  #    - main
-  #workflow_run:
-  #  workflows: [Scala Build & Test]
-  #  types:
-  #    - completed
 on:
-  push:
-    branches:  
-      - "main"
-      - "initial-ci-setup"
-    # Publish semver tags as releases.
-    tags: [ 'v*.*.*' ]
   workflow_run:
     workflows: ["Rust Build & Test"]
-    types: [completed]
-    branches: [main]
+    types:
+      - "completed"
+    branches: 
+      - "main"
+    tags: 
+      - "v*.*.*"
   
 env:
   REGISTRY: ghcr.io
@@ -30,7 +18,7 @@ jobs:
     push_to_registry:
       name: Push Docker image to Docker Hub
       runs-on: ubuntu-latest
-      #if: ${{ github.event.workflow_run.conclusion == 'success' }}
+      if: ${{ github.event.workflow_run.conclusion == 'success' }}
       permissions:
         packages: write
         contents: read
