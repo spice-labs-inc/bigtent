@@ -6,15 +6,21 @@ use bigtent::{
   rodeo::GoatRodeoCluster,
   rodeo_server::RodeoServer,
   server::run_web_server,
-  structs::{ItemMetaData, MetaData},
+  structs::{EdgeType, ItemMetaData, MetaData},
 };
 use clap::{CommandFactory, Parser};
 use env_logger::Env;
 #[cfg(not(test))]
 use log::{error, info}; // Use log crate when building application
 
+use serde_cbor::Value;
 use signal_hook::{consts::SIGHUP, iterator::Signals};
-use std::{path::PathBuf, sync::Arc, thread, time::Instant};
+use std::{
+  path::PathBuf,
+  sync::Arc,
+  thread::{self},
+  time::Instant,
+};
 #[cfg(test)]
 use std::{println as info, println as error};
 
@@ -23,7 +29,8 @@ fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
     let whole_path = path.clone().canonicalize()?;
     let dir_path = whole_path.parent().unwrap().to_path_buf();
     let index_build_start = Instant::now();
-    let cluster = Arc::new(ArcSwap::new(Arc::new(GoatRodeoCluster::new(&dir_path, &whole_path)?)));
+    let cluster_arc = Arc::new(GoatRodeoCluster::new(&dir_path, &whole_path)?);
+    let cluster = Arc::new(ArcSwap::new(cluster_arc.clone()));
 
     let index = RodeoServer::new_from_cluster(cluster, args.num_threads(), Some(args.clone()))?;
 
@@ -32,10 +39,35 @@ fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
       Instant::now().duration_since(index_build_start)
     );
 
+    if args.find_common() {
+      let finding_cluster = cluster_arc.clone();
+      let thread = thread::Builder::new();
+      thread.spawn(move || {
+        find_common_gitoids(finding_cluster).expect("Should get all the cluster info");
+      })?;
+    }
+
     run_web_server(index);
   } else {
     bail!("Path to `.grc` does not point to a file: {:?}", path)
   }
+  Ok(())
+}
+
+fn find_common_gitoids(cluster: Arc<GoatRodeoCluster<Value>>) -> Result<()> {
+  let index = cluster.get_index()?;
+  for offset in index.iter() {
+    let item = cluster.data_for_hash(offset.hash)?;
+    let connections = item
+      .connections
+      .iter()
+      .filter(|x| x.0 == EdgeType::ContainedBy)
+      .count();
+    if connections > 50_000 {
+      println!("Count {} identifier {} item {:?}", connections, item.identifier, item.connections.iter().filter(|c| c.0 == EdgeType::AliasFrom).collect::<Vec<&(EdgeType, String)>>());
+    }
+  }
+
   Ok(())
 }
 

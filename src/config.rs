@@ -45,6 +45,10 @@ pub struct Args {
   /// the destination for `mergenew`
   #[arg(long)]
   pub dest: Option<PathBuf>,
+
+  /// find the commonly used items
+  #[arg(long)]
+  pub common: Option<bool>,
 }
 
 impl Args {
@@ -65,6 +69,13 @@ impl Args {
 
   pub fn num_threads(&self) -> u16 {
     self.threads.unwrap_or(7)
+  }
+
+  pub fn find_common(&self) -> bool {
+    match self.common {
+      None => false,
+      Some(c) => c
+    }
   }
 
   pub fn conf_file(&self) -> Result<PathBuf> {
