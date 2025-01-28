@@ -51,7 +51,7 @@ jobs:
           run: |
             last_version_tag="$(git log --format="%D" | perl -ne '/tag: (v[^, )]+)/ and print $1 and exit or print "v0.0.1" and exit')"
             dirty="$(git diff --quiet || echo -- -dirty)"
-            snapshot="$(git diff --quiet $last_version_tag || echo -SNAPSHOT)"
+            snapshot="$(git diff --quiet -- $last_version_tag || echo -SNAPSHOT)"
             rev_version="$(echo $last_version_tag$dirty$snapshot | sed -e 's/^v//')"
             echo "rev_version=$rev_version" >> "$GITHUB_ENV"
             sed -i -e "s/^version = .*/version = \"$rev_version\"/" Cargo.toml
