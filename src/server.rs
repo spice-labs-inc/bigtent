@@ -68,11 +68,7 @@ fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
   })
 }
 
-pub fn basic_bulk_serve(
-  index: &RodeoServer,
-  request: &Request,
-  start: Instant,
-) -> Response {
+pub fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> Response {
   let body = value_to_string_array(parse_body_to_json(request));
 
   let cnt_string = body
@@ -90,7 +86,8 @@ pub fn basic_bulk_serve(
       Ok(r) => r,
       Err(e) => rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
     },
-    Ok(v) => rouille::Response::json(&format!("Bulk request for too many elements {}", v.len())).with_status_code(400),
+    Ok(v) => rouille::Response::json(&format!("Bulk request for too many elements {}", v.len()))
+      .with_status_code(400),
     Err(e) => rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
   }
 }
@@ -107,7 +104,10 @@ pub fn north_serve(
 
     match body {
       Ok(v) if v.len() <= 6000 => v,
-      Ok(v) => return rouille::Response::json(&format!("Bulk request for too many elements {}", v.len())).with_status_code(400),
+      Ok(v) => {
+        return rouille::Response::json(&format!("Bulk request for too many elements {}", v.len()))
+          .with_status_code(400)
+      }
       Err(e) => return rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
     }
   } else {
@@ -170,6 +170,38 @@ pub fn serve_antialias(
   }
 }
 
+/// Serve all the "contains" gitoids for a given Item
+/// Follows `AliasTo` links
+pub fn serve_flatten(
+  index: &RodeoServer,
+  _request: &Request,
+  path: &str,
+  start: Instant,
+) -> Response {
+  defer! {
+    info!("Served flatten for {} in {:?}", path,
+    start.elapsed());
+  }
+  match index.get_cluster_arcswap().load().flatten_contents(path.into()) {
+    Ok(line) => match cbor_to_json_str(&line) {
+      Ok(line) => Response {
+        status_code: 200,
+        headers: vec![("Content-Type".into(), "application/json".into())],
+        data: ResponseBody::from_string(line),
+        upgrade: None,
+      },
+      Err(_e) => Response {
+        status_code: 500,
+        headers: vec![],
+        data: ResponseBody::from_string("Error"),
+        upgrade: None,
+      },
+    },
+    Err(e) => rouille::Response::json(&format!("Couldn't flatten {} because {:?}", path, e))
+      .with_status_code(404),
+  }
+}
+
 pub fn fix_path(p: String) -> String {
   if p.starts_with("/omnibor") {
     return fix_path(p[8..].to_string());
@@ -209,37 +241,35 @@ pub fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Resp
 pub fn run_web_server(index: Arc<RodeoServer>) -> () {
   let addrs = index.the_args().to_socket_addrs();
   info!("Listen on {:?}", addrs);
-  rouille::start_server(
-    addrs.as_slice(),
-    move |request| {
-      let start = Instant::now();
-      let url = request.url();
-      defer! {
-        info!("Serving {} took {:?}", url,  start.elapsed());
-      }
+  rouille::start_server(addrs.as_slice(), move |request| {
+    let start = Instant::now();
+    let url = request.url();
+    defer! {
+      info!("Serving {} took {:?}", url,  start.elapsed());
+    }
 
-      let path = request.url();
+    let path = request.url();
 
-      let path = fix_path(path);
-      let path_str: &str = &path;
-      match (request.method(), path_str) {
-        ("POST", "bulk") => basic_bulk_serve(&index, request, start),
-        ("POST", "north") => north_serve(&index, request, None, false, start),
-        ("POST", "north_purls") => north_serve(&index, request, None, true, start),
-        ("GET", url) if url.starts_with("north/") => {
-          north_serve(&index, request, Some(&url[6..]), false, start)
-        }
-        ("GET", url) if url.starts_with("north_purls/") => {
-          north_serve(&index, request, Some(&url[12..]), true, start)
-        }
-        ("GET", url) if url.starts_with("aa/") => {
-          serve_antialias(&index, request, &url[3..], start)
-        }
-        ("GET", _url) => line_serve(&index, request, path),
-        _ => rouille::Response::empty_404(),
+    let path = fix_path(path);
+    let path_str: &str = &path;
+    match (request.method(), path_str) {
+      ("POST", "bulk") => basic_bulk_serve(&index, request, start),
+      ("POST", "north") => north_serve(&index, request, None, false, start),
+      ("POST", "north_purls") => north_serve(&index, request, None, true, start),
+      ("GET", url) if url.starts_with("north/") => {
+        north_serve(&index, request, Some(&url[6..]), false, start)
       }
-    },
-  );
+      ("GET", url) if url.starts_with("north_purls/") => {
+        north_serve(&index, request, Some(&url[12..]), true, start)
+      }
+      ("GET", url) if url.starts_with("aa/") => serve_antialias(&index, request, &url[3..], start),
+      ("GET", url) if url.starts_with("flatten/") => {
+        serve_flatten(&index, request, &url[8..], start)
+      }
+      ("GET", _url) => line_serve(&index, request, path),
+      _ => rouille::Response::empty_404(),
+    }
+  });
 }
 
 fn _split_path(path: String) -> Vec<String> {

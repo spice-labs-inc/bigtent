@@ -45,7 +45,10 @@ impl ClusterFileEnvelope {
     }
 
     if self.version != 2 {
-      bail!("Loaded a Cluster with version {} but this code only supports version 2 Clusters", self.version);
+      bail!(
+        "Loaded a Cluster with version {} but this code only supports version 2 Clusters",
+        self.version
+      );
     }
 
     Ok(())
@@ -589,6 +592,54 @@ impl GoatRodeoCluster {
     }
   }
 
+  /// Given the id of an item, find all the gitoid:sha256 that this
+  /// item contains and all the contained items contain
+  pub fn flatten_contents(&self, data: String) -> Result<HashSet<String>> {
+    // to return
+    let mut ret = HashSet::new();
+
+    // items left to process
+    let mut to_process = HashSet::new();
+    to_process.insert(data);
+
+    // items we've seen
+    let mut processed = HashSet::new();
+
+    // if we've got more ids to process
+    while !to_process.is_empty() {
+      // for each id
+      for id in to_process.clone().into_iter() {
+        // remove the processed id from the list to process
+        to_process.remove(&id);
+
+        // and note that it's been processed
+        processed.insert(id.clone());
+
+        // get the corresponding item
+        let item = self.data_for_key(&id)?;
+
+        // for each connection
+        for (conn_type, conn_id) in item.connections {
+          // if it's "contains" or "alias to"
+          if EdgeType::is_contains_down(&conn_type) || EdgeType::is_alias_to(&conn_type) {
+            // if we haven't processed it, add it to the list
+            if !processed.contains(&conn_id) {
+              to_process.insert(conn_id.clone());
+            }
+
+            if EdgeType::is_contains_down(&conn_type) {
+              // and add it to the items being returned if it's "contains"
+              ret.insert(conn_id);
+            }
+          }
+        }
+      }
+    }
+    Ok(ret)
+  }
+
+  /// Given a key, traverse the `AliasTo` references to find
+  /// the item that the item is an alias to
   pub fn antialias_for(&self, data: &str) -> Result<Item> {
     let mut ret = self.data_for_key(data)?;
     while ret.is_alias() {
@@ -662,6 +713,42 @@ impl GoatRodeoCluster {
     let md5_hash = md5hash_str(data);
     self.data_for_hash(md5_hash)
   }
+}
+
+#[test]
+fn test_flatten() {
+  use std::{path::PathBuf, time::Instant};
+  let start = Instant::now();
+  let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
+  // punt test is the files don't exist
+  if !goat_rodeo_test_data.is_dir() {
+    return;
+  }
+
+  let mut files =
+    match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into()) {
+      Ok(v) => v,
+      Err(e) => {
+        assert!(false, "Failure to read files {:?}", e);
+        return;
+      }
+    };
+  println!("Read cluster at {:?}", start.elapsed());
+
+  assert!(files.len() > 0, "Need a cluster");
+  let cluster = files.pop().expect("Expect a cluster");
+
+  match cluster.antialias_for("pkg:deb/debian/tk8.6@8.6.14-1build1") {
+    Ok(item) => {
+      let base: HashSet<String> = item.connections.into_iter().filter(|c| EdgeType::is_contains_down(&c.0)).map(|c| c.1).collect();
+      assert!(base.len() > 1, "There must be more than 1 gitoid in the base, only found {}", base.len());
+      let found = cluster.flatten_contents("pkg:deb/debian/tk8.6@8.6.14-1build1".into()).expect("Should be able to get flattened gitoids");
+      assert!(found.is_superset(&base), "The flattened set should contain the entire base");
+    }
+    Err(_) => println!("Didn't find the expected purl: pkg:deb/debian/tk8.6@8.6.14-1build1")
+  }
+
+  println!("Tested flatten at {:?}", start.elapsed());
 }
 
 #[test]
