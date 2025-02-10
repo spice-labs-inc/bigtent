@@ -36,7 +36,7 @@ impl RodeoServer {
     self.cluster.clone()
   }
 
-  /// Get the current GoatRodeoCluster from the the server
+  /// Get the current GoatRodeoCluster from the server
   pub fn get_cluster(&self) -> Arc<GoatRodeoCluster> {
     let the_cluster: Arc<GoatRodeoCluster> = (&(*self.get_cluster_arcswap().load())).clone();
     the_cluster
@@ -128,15 +128,3 @@ impl RodeoServer {
     RodeoServer::new_from_cluster(cluster, Some(args)).await
   }
 }
-// #[derive(Clone)]
-// enum IndexMsg {
-//   End,
-//   Bulk(Vec<String>, PipeWriter, Instant),
-//   North {
-//     #[allow(dead_code)]
-//     gitoids: Vec<String>,
-//     purls_only: bool,
-//     tx: PipeWriter,
-//     start: Instant,
-//   },
-// }

@@ -790,7 +790,7 @@ async fn test_antialias() {
   use std::{path::PathBuf, time::Instant};
   let start = Instant::now();
   let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
-  // punt test is the files don't exist
+  // punt test if the files don't exist
   if !goat_rodeo_test_data.is_dir() {
     return;
   }
@@ -860,7 +860,7 @@ async fn test_generated_cluster() {
   for test_path in &test_paths {
     info!("\n\n==============\n\nTesting path {}", test_path);
     let goat_rodeo_test_data: PathBuf = test_path.into();
-    // punt test is the files don't exist
+    // punt test if the files don't exist
     if !goat_rodeo_test_data.is_dir() {
       break;
     }
@@ -909,7 +909,7 @@ async fn test_files_in_dir() {
   use std::time::{Duration, Instant};
 
   let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
-  // punt test is the files don't exist
+  // punt test if the files don't exist
   if !goat_rodeo_test_data.is_dir() {
     return;
   }
