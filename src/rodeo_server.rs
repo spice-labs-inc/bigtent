@@ -31,15 +31,9 @@ impl RodeoServer {
     self.cluster.load().find(hash).await
   }
 
-  /// get the cluster arc swap so that the cluster can be substituted
-  pub fn get_cluster_arcswap(&self) -> Arc<ArcSwap<GoatRodeoCluster>> {
-    self.cluster.clone()
-  }
-
   /// Get the current GoatRodeoCluster from the server
   pub fn get_cluster(&self) -> Arc<GoatRodeoCluster> {
-    let the_cluster: Arc<GoatRodeoCluster> = (&(*self.get_cluster_arcswap().load())).clone();
-    the_cluster
+    self.cluster.load().clone()
   }
 
   pub async fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item> {
