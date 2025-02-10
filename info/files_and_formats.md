@@ -171,7 +171,7 @@ pub struct Item {
 
 `identifier` is the primary key of the record.
 
-`reference` is a tuple of `u64` containing the 8 most significant bytes of the the SHA256 of the file (note that this will be 0 on disk and is populated by
+`reference` is a tuple of `u64` containing the 8 most significant bytes of the SHA256 of the file (note that this will be 0 on disk and is populated by
   Big Tent when serving the record) and the offset of the record in the file (technically, the offset to the length field).
 
 `connections`: an ordered list of a tuple of `EdgeType` and `String` where `EdgeType` is an enumeration of `AliasTo`, `AliasFrom`, `Contains`, `ContainedBy`,
@@ -197,7 +197,7 @@ pub struct ItemMetaData {
 
 `file_names` contains the names of the files that were hashed to create the metadata record.
 
-`file_type` the types of the files identified by the the tool that generated the hash (likely Goat Rodeo)
+`file_type` the types of the files identified by the tool that generated the hash (likely Goat Rodeo)
 
 `file_sub_type` the subtype of the file.
 

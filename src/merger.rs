@@ -1,7 +1,4 @@
-use flume::Receiver;
 use im::OrdMap;
-
-use log::error;
 #[cfg(not(test))]
 use log::info;
 use std::{
@@ -25,9 +22,8 @@ use crate::{
 use anyhow::Result;
 use thousands::Separable;
 
-pub fn merge_fresh<PB: Into<PathBuf>>(
+pub async fn merge_fresh<PB: Into<PathBuf>>(
   clusters: Vec<GoatRodeoCluster>,
-  use_threads: bool,
   dest_directory: PB,
 ) -> Result<()> {
   let start = Instant::now();
@@ -54,22 +50,23 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
   let mut index_holder = vec![];
 
   for cluster in &clusters {
-    let index = cluster.get_index()?;
+    let index = cluster.get_index().await?;
     let index_len = index.len();
 
-    let (tx, rx) = flume::bounded(32);
+    // let (tx, rx) = flume::bounded(32);
 
-    if use_threads {
+    /* if use_threads {
       let index_shadow = index.clone();
       let cluster_shadow = cluster.clone();
 
-      std::thread::spawn(move || {
+      std::thread::spawn(async move || {
         let mut loop_cnt = 0usize;
         let start = Instant::now();
         let index_len = index_shadow.len();
         for io in index_shadow.iter() {
           let item = cluster_shadow
             .data_for_entry_offset(&io.loc)
+            .await
             .expect("Expected to load data");
 
           match tx.send((item, loop_cnt)) {
@@ -103,13 +100,13 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
           }
         }
       });
-    }
+    }*/
 
     index_holder.push(ClusterPos {
       cluster: index.clone(),
       pos: 0,
       len: index.len(),
-      thing: if use_threads { Some(rx) } else { None },
+      //  thing: if use_threads { Some(rx) } else { None },
     });
 
     max_merge_len += index_len;
@@ -120,7 +117,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     Instant::now().duration_since(start)
   );
 
-  let mut cluster_writer = ClusterWriter::new(&dest)?;
+  let mut cluster_writer = ClusterWriter::new(&dest).await?;
   let merge_start = Instant::now();
 
   let mut top = OrdMap::new();
@@ -132,19 +129,20 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     let (next, opt_min) = top.without_min();
     top = opt_min;
 
-    fn get_item_and_pos(
+    async fn get_item_and_pos(
       hash: MD5Hash,
       which: usize,
-      index_holder: &mut Vec<ClusterPos<Option<Receiver<(Item, usize)>>>>,
+      // index_holder: &mut Vec<ClusterPos /*<Option<Receiver<(Item, usize)>>>*/>,
       clusters: &Vec<GoatRodeoCluster>,
     ) -> Result<(Item, usize)> {
-      match &index_holder[which].thing {
-        Some(rx) => rx.recv().map_err(|e| e.into()),
-        _ => match clusters[which].data_for_hash(hash) {
-          Ok(i) => Ok((i, 0)),
-          Err(e) => Err(e),
-        },
-      }
+      /*match &index_holder[which].thing {
+      Some(rx) => rx.recv().map_err(|e| e.into()),
+      _ =>*/
+      match clusters[which].data_for_hash(hash).await {
+        Ok(i) => Ok((i, 0)),
+        Err(e) => Err(e),
+      } /*,
+        }*/
     }
 
     match next {
@@ -158,9 +156,10 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
           let (mut merge_final, _the_pos) = get_item_and_pos(
             merge_base.item_offset.hash,
             merge_base.which,
-            &mut index_holder,
+          //  &mut index_holder,
             &clusters,
-          )?;
+          )
+          .await?;
 
           merge_final.remove_references();
           match merge_final
@@ -189,7 +188,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
         let cur_pos = cluster_writer.cur_pos() as u64;
         top.reference.1 = cur_pos;
 
-        cluster_writer.write_item(top)?;
+        cluster_writer.write_item(top).await?;
 
         loop_cnt += 1;
 
@@ -201,8 +200,8 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
           let nd: NiceDurationDisplay = remaining.into();
           let td: NiceDurationDisplay = merge_start.elapsed().into();
           info!(
-            "{} cnt {}m of {}m merge cnt {} position {}M at {} estimated end {}",
-            if use_threads { "T-Merge" } else { "Merge" },
+            "Merge cnt {}m of {}m merge cnt {} position {}M at {} estimated end {}",
+            //if use_threads { "T-Merge" } else { "Merge" },
             (loop_cnt / 1_000_000).separate_with_commas(),
             ((max_merge_len - merge_cnt) / 1_000_000).separate_with_commas(),
             merge_cnt.separate_with_commas(),
@@ -218,7 +217,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     }
   }
 
-  cluster_writer.finalize_cluster()?;
+  cluster_writer.finalize_cluster().await?;
   info!(
     "Finished {} loops at {:?}",
     loop_cnt.separate_with_commas(),

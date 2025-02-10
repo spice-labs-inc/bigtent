@@ -15,7 +15,7 @@ pub struct MD5 {
 
 impl MD5 {
     pub fn random(rng: &mut ThreadRng) -> MD5 {
-        MD5 { hash: rng.gen() }
+        MD5 { hash: rng.random() }
     }
 }
 
@@ -29,7 +29,7 @@ type Position = u64;
 // }
 
 pub fn random_position(rng: &mut ThreadRng) -> Position {
-    rng.gen()
+    rng.random()
 }
 
 
@@ -37,5 +37,5 @@ type MultifilePosition = (u64, u64);
 
 pub const MULTIFILE_NOOP: MultifilePosition = (0u64, 0u64);
 pub fn multifile_position_rand(rng: &mut ThreadRng) -> MultifilePosition {
-    (rng.gen(), rng.gen())
+    (rng.random(), rng.random())
 }

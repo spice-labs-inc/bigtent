@@ -1,15 +1,21 @@
 use crate::{
+  data_file::GOAT_RODEO_INDEX_FILE_SUFFIX,
   rodeo::{GoatRodeoCluster, IndexFileMagicNumber},
+  tokio::io::AsyncSeekExt,
   util::{byte_slice_to_u63, read_len_and_cbor, read_u32, sha256_for_reader},
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::{
   collections::{BTreeMap, HashSet},
-  fs::File,
-  io::{BufReader, Read, Seek, SeekFrom},
+  io::SeekFrom,
   path::PathBuf,
-  sync::{Arc, Mutex},
+  sync::Arc,
+};
+use tokio::{
+  fs::File,
+  io::{AsyncReadExt, BufReader},
+  sync::Mutex,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -30,12 +36,12 @@ pub struct IndexFile {
 }
 
 impl IndexFile {
-  pub fn new(dir: &PathBuf, hash: u64, check_hash: bool) -> Result<IndexFile> {
+  pub async fn new(dir: &PathBuf, hash: u64, check_hash: bool) -> Result<IndexFile> {
     // ensure we close `file` after computing the hash
     if check_hash {
-      let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri")?;
+      let mut file = GoatRodeoCluster::find_file(&dir, hash, GOAT_RODEO_INDEX_FILE_SUFFIX).await?;
 
-      let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file)?)?;
+      let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file).await?)?;
       if tested_hash != hash {
         bail!(
           "Index file for {:016x} does not match {:016x}",
@@ -45,22 +51,23 @@ impl IndexFile {
       }
     }
 
-    let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri")?;
+    let mut file = GoatRodeoCluster::find_file(&dir, hash, GOAT_RODEO_INDEX_FILE_SUFFIX).await?;
 
     let ifp = &mut file;
-    let magic = read_u32(ifp)?;
+    let magic = read_u32(ifp).await?;
     if magic != IndexFileMagicNumber {
       bail!(
-        "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.gri",
+        "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.{}",
         magic,
         IndexFileMagicNumber,
-        hash
+        hash,
+        GOAT_RODEO_INDEX_FILE_SUFFIX
       );
     }
 
-    let idx_env: IndexEnvelope = read_len_and_cbor(ifp)?;
+    let idx_env: IndexEnvelope = read_len_and_cbor(ifp).await?;
 
-    let idx_pos: u64 = file.seek(SeekFrom::Current(0))?;
+    let idx_pos: u64 = file.seek(SeekFrom::Current(0)).await?;
 
     Ok(IndexFile {
       envelope: idx_env,
@@ -69,23 +76,21 @@ impl IndexFile {
     })
   }
 
-  pub fn read_index(&self) -> Result<Vec<ItemOffset>> {
+  pub async fn read_index(&self) -> Result<Vec<ItemOffset>> {
     let mut ret = Vec::with_capacity(self.envelope.size as usize);
     let mut last = [0u8; 16];
     // let mut not_sorted = false;
 
-    let mut my_file = self
-      .file
-      .lock()
-      .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
+    let mut my_file = self.file.lock().await;
+    //      .map_err(|e| anyhow!("Failed to lock {:?}", e))?;
     let fp: &mut BufReader<File> = &mut my_file;
-    fp.seek(SeekFrom::Start(self.data_offset))?;
+    fp.seek(SeekFrom::Start(self.data_offset)).await?;
     let mut buf = vec![];
-    fp.read_to_end(&mut buf)?;
+    fp.read_to_end(&mut buf).await?;
 
     let mut info: &[u8] = &buf;
     for _ in 0..self.envelope.size {
-      let eo = ItemOffset::read(&mut info)?;
+      let eo = ItemOffset::read(&mut info).await?;
       if eo.hash < last {
         // not_sorted = true;
         bail!("Not sorted!!! last {:?} eo.hash {:?}", last, eo.hash);
@@ -123,7 +128,7 @@ impl IndexLoc {
       IndexLoc::Loc {
         offset: off,
         file_hash: _,
-      } => *off & 0xFFFFFFFFFFFFFF, // lop off the top 8 bits
+      } => *off & 0xffffffffffffff, // lop off the top 8 bits
       _ => u64::MAX,
     }
   }
@@ -136,13 +141,13 @@ pub struct ItemOffset {
 }
 
 impl ItemOffset {
-  pub fn read<R: Read>(reader: &mut R) -> Result<ItemOffset> {
+  pub async fn read<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<ItemOffset> {
     let mut hash_bytes = u128::default().to_be_bytes();
     let mut file_bytes = u64::default().to_be_bytes();
     let mut loc_bytes = u64::default().to_be_bytes();
-    let hl = reader.read(&mut hash_bytes)?;
-    let fl = reader.read(&mut file_bytes)?;
-    let ll = reader.read(&mut loc_bytes)?;
+    let hl = reader.read(&mut hash_bytes).await?;
+    let fl = reader.read(&mut file_bytes).await?;
+    let ll = reader.read(&mut loc_bytes).await?;
     if hl != hash_bytes.len() || ll != loc_bytes.len() || fl != file_bytes.len() {
       bail!("Failed to read enough bytes for EntryOffset")
     }
@@ -155,13 +160,13 @@ impl ItemOffset {
     })
   }
 
-  pub fn build_from_index_file(file_name: &str) -> Result<Vec<ItemOffset>> {
+  pub async fn build_from_index_file(file_name: &str) -> Result<Vec<ItemOffset>> {
     // make sure the buffer is a multiple of 24 (the length of the u128 + u64 + u64)
-    let mut reader = BufReader::with_capacity(32 * 4096, File::open(file_name)?);
+    let mut reader = BufReader::with_capacity(32 * 4096, File::open(file_name).await?);
     let mut stuff = vec![];
 
     loop {
-      match ItemOffset::read(&mut reader) {
+      match ItemOffset::read(&mut reader).await {
         Ok(eo) => {
           stuff.push(eo);
         }

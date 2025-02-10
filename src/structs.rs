@@ -234,6 +234,11 @@ impl Item
   }
 }
 
+impl Into<serde_json::Value> for Item {
+    fn into(self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap()
+    }
+}
 pub enum ItemMergeResult
 {
   Same,

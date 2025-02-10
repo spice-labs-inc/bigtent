@@ -1,321 +1,231 @@
-use std::{sync::Arc, time::Instant};
+use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Instant};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
+use axum::{
+  extract::{Path, State},
+  http::StatusCode,
+  response::IntoResponse,
+  routing::{get, post},
+  Json, Router,
+};
+use axum_streams::*;
+
 #[cfg(not(test))]
 use log::info;
-use rouille::{Request, Response, ResponseBody};
-use scopeguard::defer;
 
-use serde_json::Value as SJValue; // Use log crate when building application
+use tokio::sync::mpsc::Receiver;
+use tokio_stream::Stream; // Use log crate when building application
 
-use crate::{
-  rodeo_server::RodeoServer,
-  util::{cbor_to_json_str, md5hash_str, read_all},
-};
+use crate::{rodeo_server::RodeoServer, structs::Item};
 #[cfg(test)]
 use std::println as info;
 
-pub fn parse_body_to_json(request: &Request) -> Result<SJValue> {
-  let count = match request.header("Content-Length") {
-    Some(v) => match usize::from_str_radix(v, 10) {
-      Ok(n) => n,
-      _ => {
-        bail!("Couldn't get bytes count for content length");
+async fn stream_items(rodeo: Arc<RodeoServer>, items: Vec<String>) -> Receiver<Item> {
+  let (mtx, mrx) = tokio::sync::mpsc::channel::<Item>(32);
+
+  tokio::spawn(async move {
+    for item_id in items {
+      match rodeo.data_for_key(&item_id).await {
+        Ok(i) => {
+          if !mtx.is_closed() {
+            let _ = mtx.send(i).await;
+          }
+        }
+        Err(_) => {}
       }
-    },
-    _ => {
-      bail!("Content length header required");
     }
-  };
+  });
 
-  let mut body = match request.data() {
-    Some(v) => v,
-    None => bail!("Request has no body"),
-  };
-
-  let bytes = read_all(&mut body, count)?;
-  let ret = serde_json::from_slice::<SJValue>(&bytes).map_err(|e| e.into());
-  ret
+  mrx
 }
 
-pub fn value_to_string_array(pv: Result<SJValue>) -> Result<Vec<String>> {
-  match pv {
-    Ok(SJValue::Array(arr)) => {
-      let mut ret = vec![];
-      for v in arr {
-        match v {
-          SJValue::String(s) => ret.push(s),
-          _ => {}
-        }
-      }
-      Ok(ret)
-    }
-    Ok(_) => {
-      bail!("Must supply an array of String");
-    }
-    Err(e) => Err(e),
+pub struct TokioReceiverToStream<T> {
+  pub receiver: Receiver<T>,
+}
+
+impl<T> Stream for TokioReceiverToStream<T> {
+  type Item = T;
+
+  fn poll_next(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<Option<Self::Item>> {
+    let x = Pin::into_inner(self);
+
+    x.receiver.poll_recv(cx)
   }
 }
 
-fn serve_bulk(index: &RodeoServer, bulk_data: Vec<String>) -> Result<Response> {
-  let (rx, tx) = pipe::pipe();
-  index.bulk_serve(bulk_data, tx, Instant::now())?;
-  Ok(Response {
-    status_code: 200,
-    headers: vec![("Content-Type".into(), "application/json".into())],
-    data: ResponseBody::from_reader(rx),
-    upgrade: None,
+#[axum::debug_handler]
+async fn serve_bulk(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Json(payload): Json<Vec<String>>,
+) -> impl IntoResponse {
+  let start = Instant::now();
+  let payload_len = payload.len();
+  scopeguard::defer! {
+    info!("Served bulk for {} items in {:?}",payload_len,
+    start.elapsed());
+  }
+
+  StreamBodyAs::json_array(TokioReceiverToStream {
+    receiver: stream_items(rodeo, payload).await,
   })
 }
 
-pub fn basic_bulk_serve(index: &RodeoServer, request: &Request, start: Instant) -> Response {
-  let body = value_to_string_array(parse_body_to_json(request));
+async fn serve_gitoid(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Path(gitoid): Path<String>,
+) -> Result<Json<Item>, impl IntoResponse> {
+  let ret = rodeo.data_for_key(&gitoid).await;
 
-  let cnt_string = body
-    .as_ref()
-    .map(|b| b.len().to_string())
-    .unwrap_or("Failed to parse body".into());
-
-  defer! {
-    info!("Served bulk for {} items in {:?}",cnt_string,
-    start.elapsed());
-  }
-
-  match body {
-    Ok(v) if v.len() <= 420 => match serve_bulk(index, v) {
-      Ok(r) => r,
-      Err(e) => rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
-    },
-    Ok(v) => rouille::Response::json(&format!("Bulk request for too many elements {}", v.len()))
-      .with_status_code(400),
-    Err(e) => rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
+  match ret {
+    Ok(item) => Ok(Json(item)),
+    Err(_) => Err((
+      StatusCode::NOT_FOUND,
+      format!("No item found for key {}", gitoid),
+    )),
   }
 }
 
-pub fn north_serve(
-  index: &RodeoServer,
-  request: &Request,
-  path: Option<&str>,
-  purls_only: bool,
-  start: Instant,
-) -> Response {
-  let to_serve: Vec<String> = if request.method() == "POST" {
-    let body = value_to_string_array(parse_body_to_json(request));
+async fn serve_anti_alias(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Path(gitoid): Path<String>,
+) -> Result<Json<Item>, impl IntoResponse> {
+  let ret = rodeo.antialias_for(&gitoid).await;
 
-    match body {
-      Ok(v) if v.len() <= 6000 => v,
-      Ok(v) => {
-        return rouille::Response::json(&format!("Bulk request for too many elements {}", v.len()))
-          .with_status_code(400)
-      }
-      Err(e) => return rouille::Response::json(&format!("Error {}", e)).with_status_code(400),
-    }
-  } else {
-    match path {
-      Some(p) => vec![p.into()],
-      _ => return rouille::Response::empty_404(),
-    }
+  match ret {
+    Ok(item) => Ok(Json(item)),
+    Err(_) => Err((
+      StatusCode::NOT_FOUND,
+      format!("No item found for key {}", gitoid),
+    )),
+  }
+}
+
+async fn serve_flatten_both(rodeo: Arc<RodeoServer>, payload: Vec<String>) -> Result<impl IntoResponse, impl IntoResponse> {
+  let start = Instant::now();
+  let payload_len = payload.len();
+  scopeguard::defer! {
+    info!("Served bulk flatten for {} items in {:?}",payload_len,
+    start.elapsed());
+  }
+
+  let stream: Receiver<serde_json::Value> = match rodeo.get_cluster().stream_flattened_items( payload).await {
+    Ok(s) => s,
+    Err(_e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "??")),
   };
+let tok_stream = TokioReceiverToStream {
+  receiver: stream,
+};
 
-  let serve_clone = to_serve.clone();
-
-  defer! {
-    info!("Served North for {:?} in {:?}", serve_clone,
-    start.elapsed());
-  }
-
-  let (rx, tx) = pipe::pipe();
-  match index.do_north_serve(to_serve, purls_only, tx, Instant::now()) {
-    Ok(_) => Response {
-      status_code: 200,
-      headers: vec![("Content-Type".into(), "application/json".into())],
-      data: ResponseBody::from_reader(rx),
-      upgrade: None,
-    },
-    _ => Response {
-      status_code: 500,
-      headers: vec![],
-      data: ResponseBody::from_string("Failed to serve north"),
-      upgrade: None,
-    },
-  }
+  Ok(StreamBodyAs::json_array(tok_stream))
 }
 
-pub fn serve_antialias(
-  index: &RodeoServer,
-  _request: &Request,
-  path: &str,
-  start: Instant,
-) -> Response {
-  defer! {
-    info!("Served Antialias for {} in {:?}", path,
-    start.elapsed());
-  }
-  match index.antialias_for(path) {
-    Ok(line) => match cbor_to_json_str(&line) {
-      Ok(line) => Response {
-        status_code: 200,
-        headers: vec![("Content-Type".into(), "application/json".into())],
-        data: ResponseBody::from_string(line),
-        upgrade: None,
-      },
-      Err(_e) => Response {
-        status_code: 500,
-        headers: vec![],
-        data: ResponseBody::from_string("Error"),
-        upgrade: None,
-      },
-    },
-    _ => rouille::Response::json(&format!("Couldn't Anti-alias {}", path)).with_status_code(404),
-  }
+async fn serve_flatten(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Path(gitoid): Path<String>,
+) -> impl IntoResponse {
+  serve_flatten_both(rodeo, vec![gitoid]).await
 }
 
 /// Serve all the "contains" gitoids for a given Item
 /// Follows `AliasTo` links
-pub fn serve_flatten(
-  index: &RodeoServer,
-  _request: &Request,
-  path: &str,
-  start: Instant,
-) -> Response {
-  defer! {
-    info!("Served flatten for {} in {:?}", path,
+async fn serve_flatten_bulk(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Json(payload): Json<Vec<String>>,
+) -> impl IntoResponse {
+
+  serve_flatten_both(rodeo, payload).await
+
+}
+
+async fn serve_north(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Path(gitoid): Path<String>,
+) -> impl IntoResponse {
+  do_north(rodeo, vec![gitoid], false).await
+}
+
+async fn serve_north_purls(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Path(gitoid): Path<String>,
+) -> impl IntoResponse {
+  do_north(rodeo, vec![gitoid], true).await
+}
+
+async fn serve_north_bulk(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Json(payload): Json<Vec<String>>,
+) -> impl IntoResponse {
+  do_north(rodeo, payload, false).await
+}
+
+async fn serve_north_purls_bulk(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Json(payload): Json<Vec<String>>,
+) -> impl IntoResponse {
+  do_north(rodeo, payload, true).await
+}
+
+async fn do_north(
+  rodeo: Arc<RodeoServer>,
+  gitoids: Vec<String>,
+  purls_only: bool,
+) -> impl IntoResponse {
+  let start = Instant::now();
+  let gitoid_clone = gitoids.clone();
+  scopeguard::defer! {
+    info!("Served North for {:?} in {:?}", gitoid_clone,
     start.elapsed());
   }
-  match index.get_cluster_arcswap().load().flatten_contents(path.into()) {
-    Ok(line) => match cbor_to_json_str(&line) {
-      Ok(line) => Response {
-        status_code: 200,
-        headers: vec![("Content-Type".into(), "application/json".into())],
-        data: ResponseBody::from_string(line),
-        upgrade: None,
-      },
-      Err(_e) => Response {
-        status_code: 500,
-        headers: vec![],
-        data: ResponseBody::from_string("Error"),
-        upgrade: None,
-      },
-    },
-    Err(e) => rouille::Response::json(&format!("Couldn't flatten {} because {:?}", path, e))
-      .with_status_code(404),
-  }
-}
+  let (mtx, mrx) = tokio::sync::mpsc::channel::<serde_json::Value>(32);
 
-pub fn fix_path(p: String) -> String {
-  if p.starts_with("/omnibor") {
-    return fix_path(p[8..].to_string());
-  } else if p.starts_with("/omnibor_test") {
-    return fix_path(p[13..].to_string());
-  } else if p.starts_with("/purl") {
-    return fix_path(p[5..].to_string());
-  } else if p.starts_with("/") {
-    return fix_path(p[1..].to_string());
-  }
-
-  p
-}
-
-pub fn line_serve(index: &RodeoServer, _request: &Request, path: String) -> Response {
-  // FIXME -- deal with getting a raw MD5 hex string
-  let hash = md5hash_str(&path);
-  match index.data_for_hash(hash) {
-    Ok(line) => match cbor_to_json_str(&line) {
-      Ok(line) => Response {
-        status_code: 200,
-        headers: vec![("Content-Type".into(), "application/json".into())],
-        data: ResponseBody::from_string(line),
-        upgrade: None,
-      },
-      Err(_e) => Response {
-        status_code: 500,
-        headers: vec![],
-        data: ResponseBody::from_string("Error"),
-        upgrade: None,
-      },
-    },
-    _ => rouille::Response::json(&format!("Not found {}", path)).with_status_code(404),
-  }
-}
-
-pub fn run_web_server(index: Arc<RodeoServer>) -> () {
-  let addrs = index.the_args().to_socket_addrs();
-  info!("Listen on {:?}", addrs);
-  rouille::start_server(addrs.as_slice(), move |request| {
-    let start = Instant::now();
-    let url = request.url();
-    defer! {
-      info!("Serving {} took {:?}", url,  start.elapsed());
-    }
-
-    let path = request.url();
-
-    let path = fix_path(path);
-    let path_str: &str = &path;
-    match (request.method(), path_str) {
-      ("POST", "bulk") => basic_bulk_serve(&index, request, start),
-      ("POST", "north") => north_serve(&index, request, None, false, start),
-      ("POST", "north_purls") => north_serve(&index, request, None, true, start),
-      ("GET", url) if url.starts_with("north/") => {
-        north_serve(&index, request, Some(&url[6..]), false, start)
-      }
-      ("GET", url) if url.starts_with("north_purls/") => {
-        north_serve(&index, request, Some(&url[12..]), true, start)
-      }
-      ("GET", url) if url.starts_with("aa/") => serve_antialias(&index, request, &url[3..], start),
-      ("GET", url) if url.starts_with("flatten/") => {
-        serve_flatten(&index, request, &url[8..], start)
-      }
-      ("GET", _url) => line_serve(&index, request, path),
-      _ => rouille::Response::empty_404(),
+  tokio::spawn(async move {
+    match rodeo
+      .get_cluster()
+      .north_send(gitoids, purls_only, mtx, start)
+      .await
+    {
+      Ok(_) => {}
+      Err(e) => log::error!("Failed to do `north_send` {:?}", e),
     }
   });
+
+  StreamBodyAs::json_array(TokioReceiverToStream { receiver: mrx })
 }
 
-fn _split_path(path: String) -> Vec<String> {
-  let mut segments = Vec::new();
+fn build_route(state: Arc<RodeoServer>) -> Router {
+  let app: Router<()> = Router::new()
+    .route("/bulk", post(serve_bulk))
+    .route("/{*gitoid}", get(serve_gitoid))
+    .route("/aa/{*gitoid}", get(serve_anti_alias))
+    .route("/north/{*gitoid}", get(serve_north))
+    .route("/flatten/{*gitoid}", get(serve_flatten))
+    .route("/north_purls/{*gitoid}", get(serve_north_purls))
+    .route("/north", post(serve_north_bulk))
+    .route("/flatten", post(serve_flatten_bulk))
+    .route("/north_purls", post(serve_north_purls_bulk))
+    .with_state(state);
 
-  for s in path.split('/') {
-    match s {
-      "" | "." => {}
-      ".." => {
-        segments.pop();
-      }
-      s => segments.push(s.to_string()),
-    }
-  }
-
-  segments
+  app
 }
 
-#[cfg(test)]
-mod tests {
-  use super::*;
+pub async fn run_web_server(index: Arc<RodeoServer>) -> Result<()> {
+  let state = index.clone();
+  let addrs = index.the_args().to_socket_addrs();
+  info!("Listen on {:?}", addrs);
 
-  #[test]
-  fn test_parse_body_to_json() {
-    let request_body_json = serde_json::json!({
-      "foo": "bar",
-      "baz": 42
-    });
+  let app = build_route(state);
 
-    let request_body_vec = request_body_json.to_string().as_bytes().to_vec();
+  let nested = Router::new().nest("/omnibor", app.clone());
 
-    let request = Request::fake_http(
-      "POST",
-      "/",
-      vec![
-        ("Content-Type".to_owned(), "application/json".to_owned()),
-        (
-          "Content-Length".to_owned(),
-          request_body_vec.len().to_string().to_owned(),
-        ),
-      ],
-      request_body_vec,
-    );
+  let aggregated = nested.merge(app);
 
-    let result = parse_body_to_json(&request);
-
-    assert_eq!(result.expect("error"), request_body_json);
-  }
+  let s: &[SocketAddr] = &addrs;
+  let listener = tokio::net::TcpListener::bind(s).await?;
+  axum::serve(listener, aggregated).await?;
+  Ok(())
 }
+
+
