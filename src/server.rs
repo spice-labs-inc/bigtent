@@ -103,6 +103,43 @@ async fn serve_anti_alias(
   }
 }
 
+async fn serve_flatten_both(rodeo: Arc<RodeoServer>, payload: Vec<String>) -> Result<impl IntoResponse, impl IntoResponse> {
+  let start = Instant::now();
+  let payload_len = payload.len();
+  scopeguard::defer! {
+    info!("Served bulk flatten for {} items in {:?}",payload_len,
+    start.elapsed());
+  }
+
+  let stream: Receiver<serde_json::Value> = match rodeo.get_cluster().stream_flattened_items( payload).await {
+    Ok(s) => s,
+    Err(_e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "??")),
+  };
+let tok_stream = TokioReceiverToStream {
+  receiver: stream,
+};
+
+  Ok(StreamBodyAs::json_array(tok_stream))
+}
+
+async fn serve_flatten(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Path(gitoid): Path<String>,
+) -> impl IntoResponse {
+  serve_flatten_both(rodeo, vec![gitoid]).await
+}
+
+/// Serve all the "contains" gitoids for a given Item
+/// Follows `AliasTo` links
+async fn serve_flatten_bulk(
+  State(rodeo): State<Arc<RodeoServer>>,
+  Json(payload): Json<Vec<String>>,
+) -> impl IntoResponse {
+
+  serve_flatten_both(rodeo, payload).await
+
+}
+
 async fn serve_north(
   State(rodeo): State<Arc<RodeoServer>>,
   Path(gitoid): Path<String>,
@@ -117,14 +154,14 @@ async fn serve_north_purls(
   do_north(rodeo, vec![gitoid], true).await
 }
 
-async fn serve_bulk_north(
+async fn serve_north_bulk(
   State(rodeo): State<Arc<RodeoServer>>,
   Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
   do_north(rodeo, payload, false).await
 }
 
-async fn serve_bulk_north_purls(
+async fn serve_north_purls_bulk(
   State(rodeo): State<Arc<RodeoServer>>,
   Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
@@ -164,9 +201,11 @@ fn build_route(state: Arc<RodeoServer>) -> Router {
     .route("/{*gitoid}", get(serve_gitoid))
     .route("/aa/{*gitoid}", get(serve_anti_alias))
     .route("/north/{*gitoid}", get(serve_north))
+    .route("/flatten/{*gitoid}", get(serve_flatten))
     .route("/north_purls/{*gitoid}", get(serve_north_purls))
-    .route("/north", post(serve_bulk_north))
-    .route("/north_purls", post(serve_bulk_north_purls))
+    .route("/north", post(serve_north_bulk))
+    .route("/flatten", post(serve_flatten_bulk))
+    .route("/north_purls", post(serve_north_purls_bulk))
     .with_state(state);
 
   app
@@ -189,34 +228,4 @@ pub async fn run_web_server(index: Arc<RodeoServer>) -> Result<()> {
   Ok(())
 }
 
-// #[cfg(test)]
-// mod tests {
-//   use super::*;
 
-//   #[test]
-//   fn test_parse_body_to_json() {
-//     let request_body_json = serde_json::json!({
-//       "foo": "bar",
-//       "baz": 42
-//     });
-
-//     let request_body_vec = request_body_json.to_string().as_bytes().to_vec();
-
-//     let request = Request::fake_http(
-//       "POST",
-//       "/",
-//       vec![
-//         ("Content-Type".to_owned(), "application/json".to_owned()),
-//         (
-//           "Content-Length".to_owned(),
-//           request_body_vec.len().to_string().to_owned(),
-//         ),
-//       ],
-//       request_body_vec,
-//     );
-
-//     let result = parse_body_to_json(&request);
-
-//     assert_eq!(result.expect("error"), request_body_json);
-//   }
-// }

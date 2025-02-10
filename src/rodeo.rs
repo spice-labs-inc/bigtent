@@ -1,4 +1,4 @@
-use anyhow::{ bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use scopeguard::defer;
 use serde::{Deserialize, Serialize};
@@ -10,11 +10,18 @@ use std::{
   time::Instant,
 };
 use thousands::Separable;
-use tokio::{fs::{read_dir, File}, io::BufReader, sync::{mpsc::Sender, Mutex}};
+use tokio::{
+  fs::{read_dir, File},
+  io::BufReader,
+  sync::{
+    mpsc::{Receiver, Sender},
+    Mutex,
+  },
+};
 use toml::Table; // Use log crate when building application
 
 use crate::{
-  data_file::{DataReader, DataFile},
+  data_file::{DataFile, DataReader},
   index_file::{IndexFile, IndexLoc, ItemOffset},
   live_merge::perform_merge,
   rodeo_server::{MD5Hash, RodeoServer},
@@ -236,7 +243,8 @@ impl GoatRodeoCluster {
         &root_dir,
         *index_file,
         false, /*TODO -- optional testing of index hash */
-      ).await?;
+      )
+      .await?;
 
       for data_hash in &the_file.envelope.data_files {
         indexed_hashes.insert(*data_hash);
@@ -382,9 +390,7 @@ impl GoatRodeoCluster {
 
     let start = Instant::now();
 
-    let mut my_lock = self
-      .building_index
-      .lock().await;
+    let mut my_lock = self.building_index.lock().await;
     *my_lock = false;
 
     // test again after acquiring the lock
@@ -540,7 +546,7 @@ impl GoatRodeoCluster {
     let mut ret = vec![];
 
     while let Some(f) = the_dir.next_entry().await? {
-    //for f in the_dir.next_entry().await {
+      //for f in the_dir.next_entry().await {
       let file = f;
       let file_extn = file
         .path()
@@ -597,7 +603,52 @@ impl GoatRodeoCluster {
     }
   }
 
-pub async fn north_send(
+  /// create a stream for the flattened items
+  pub async fn stream_flattened_items(
+    self: Arc<GoatRodeoCluster>,
+    gitoids: Vec<String>,
+  ) -> Result<Receiver<serde_json::Value>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
+
+    tokio::spawn(async move {
+      let mut to_find = HashSet::new();
+      for s in gitoids {
+        to_find.insert(s);
+      }
+      let mut found = HashSet::new();
+      while !to_find.is_empty() {
+        let mut new_to_find = HashSet::new();
+        for gitoid in to_find.clone() {
+          match self.data_for_key(&gitoid).await {
+            Ok(item) => {
+              item
+                .connections
+                .iter()
+                .filter(|a| a.0.is_alias_to())
+                .for_each(|s| {
+                  if !to_find.contains(&s.1) && found.contains(&s.1) {
+                    new_to_find.insert(s.1.clone());
+                  }
+                });
+              for s in item.connections.iter().filter(|a| a.0.is_contains_down()) {
+                if !to_find.contains(&s.1) && found.contains(&s.1) {
+                  new_to_find.insert(s.1.clone());
+                  let _ = tx.send(s.1.clone().into()).await;
+                }
+              }
+            }
+            Err(_) => {}
+          }
+          found.insert(gitoid);
+        }
+
+        to_find = new_to_find;
+      }
+    });
+
+    Ok(rx)
+  }
+  pub async fn north_send(
     &self,
     gitoids: Vec<String>,
     purls_only: bool,
@@ -639,14 +690,14 @@ pub async fn north_send(
               for purl in item.find_purls() {
                 if !found_purls.contains(&purl) {
                   tx.send(purl.clone().into()).await?;
-                  
+
                   found_purls.insert(purl);
                 }
               }
             } else {
               tx.send(item.into()).await?;
             }
-            
+
             to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
           }
           _ => {}
@@ -705,12 +756,14 @@ pub async fn north_send(
 
   pub async fn vec_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<Item>> {
     match index_loc {
-      loc @ IndexLoc::Loc { file_hash, .. } => Ok(vec![self.entry_for(*file_hash, loc.offset()).await?]),
+      loc @ IndexLoc::Loc { file_hash, .. } => {
+        Ok(vec![self.entry_for(*file_hash, loc.offset()).await?])
+      }
       IndexLoc::Chain(offsets) => {
         let mut ret = vec![];
         for offset in offsets {
-         let mut some = Box::pin(self.vec_for_entry_offset(&offset)).await?;
-         ret.append(&mut some);
+          let mut some = Box::pin(self.vec_for_entry_offset(&offset)).await?;
+          ret.append(&mut some);
         }
         Ok(ret)
       }
@@ -726,7 +779,7 @@ pub async fn north_send(
     self.data_for_entry_offset(&entry_offset.loc).await
   }
 
-  pub  async fn data_for_key(&self, data: &str) -> Result<Item> {
+  pub async fn data_for_key(&self, data: &str) -> Result<Item> {
     let md5_hash = md5hash_str(data);
     self.data_for_hash(md5_hash).await
   }
@@ -754,11 +807,17 @@ async fn test_antialias() {
 
   assert!(files.len() > 0, "Need a cluster");
   let cluster = files.pop().expect("Expect a cluster");
-  let index = cluster.get_index().await.expect("To be able to get the index");
+  let index = cluster
+    .get_index()
+    .await
+    .expect("To be able to get the index");
 
   let mut aliases = vec![];
   for v in index.iter() {
-    let item = cluster.data_for_hash(v.hash).await.expect("Should get an item");
+    let item = cluster
+      .data_for_hash(v.hash)
+      .await
+      .expect("Should get an item");
     if item.is_alias() {
       aliases.push(item);
     }
@@ -769,7 +828,8 @@ async fn test_antialias() {
   for ai in aliases.iter().take(20) {
     println!("Antialias for {}", ai.identifier);
     let new_item = cluster
-      .antialias_for(&ai.identifier).await
+      .antialias_for(&ai.identifier)
+      .await
       .expect("Expect to get the antialiased thing");
     assert!(!new_item.is_alias(), "Expecting a non-aliased thing");
     assert!(
@@ -854,14 +914,14 @@ async fn test_files_in_dir() {
     return;
   }
 
-  let files = match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into()).await
-  {
-    Ok(v) => v,
-    Err(e) => {
-      assert!(false, "Failure to read files {:?}", e);
-      return;
-    }
-  };
+  let files =
+    match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into()).await {
+      Ok(v) => v,
+      Err(e) => {
+        assert!(false, "Failure to read files {:?}", e);
+        return;
+      }
+    };
 
   assert!(files.len() > 0, "We should find some files");
   let mut total_index_size = 0;

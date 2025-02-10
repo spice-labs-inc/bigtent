@@ -37,8 +37,8 @@ impl RodeoServer {
   }
 
   /// Get the current GoatRodeoCluster from the the server
-  pub fn get_cluster(&self) -> GoatRodeoCluster {
-    let the_cluster: GoatRodeoCluster = (&(**self.get_cluster_arcswap().load())).clone();
+  pub fn get_cluster(&self) -> Arc<GoatRodeoCluster> {
+    let the_cluster: Arc<GoatRodeoCluster> = (&(*self.get_cluster_arcswap().load())).clone();
     the_cluster
   }
 
