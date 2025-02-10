@@ -16,7 +16,7 @@ use im::OrdMap;
 use std::println as info;
 use thousands::Separable;
 
-pub fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoCluster>
+pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoCluster>
 {
   let clusters: Vec<GoatRodeoCluster> = clusters
     .into_iter()
@@ -36,7 +36,7 @@ pub fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoCluster
   let mut max_size = 0usize;
 
   for cluster in &clusters {
-    let index = cluster.get_index()?;
+    let index = cluster.get_index().await?;
     let index_len = index.len();
     max_size += index_len;
     index_holder.push(ClusterPos {
@@ -242,14 +242,14 @@ fn test_live_merge() {
   }
 }
 
-pub fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster>
+pub async fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster>
 {
   // if it's not synthetic, just return it
   if !cluster.synthetic {
     return Ok(cluster);
   }
 
-  let enclosed = cluster.all_sub_clusters();
+  let enclosed = cluster.all_sub_clusters().await;
   let root_path = GoatRodeoCluster::common_parent_dir(enclosed.as_slice())?;
   let target_dir = path_plus_timed(&root_path, "synthetic_cluster");
   std::fs::create_dir_all(&target_dir)?;
@@ -257,33 +257,33 @@ pub fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster>
   let mut merge_cnt = 0usize;
   let start = Instant::now();
 
-  let mut writer = ClusterWriter::new(&target_dir)?;
+  let mut writer = ClusterWriter::new(&target_dir).await?;
 
-  for idx in cluster.get_index()?.iter() {
+  for idx in cluster.get_index().await?.iter() {
     match idx.loc {
-      IndexLoc::Loc { offset, file_hash } => writer.add_index(idx.hash, file_hash, offset)?,
+      IndexLoc::Loc { offset, file_hash } => writer.add_index(idx.hash, file_hash, offset).await?,
       IndexLoc::Chain(_) => {
-        let found = cluster.vec_for_entry_offset(&idx.loc)?;
+        let found = cluster.vec_for_entry_offset(&idx.loc).await?;
         if found.len() == 0 {
           // weird, but do nothing... don't add the index
         } else if found.len() == 1 {
           // if we only find one, then just write the index for that item
-          writer.add_index(idx.hash, found[0].reference.0, found[0].reference.1)?;
+          writer.add_index(idx.hash, found[0].reference.0, found[0].reference.1).await?;
         } else {
           let the_ref = found[0].reference;
           match Item::merge_vecs(found) {
             ItemMergeResult::Same => {
               // just add the index
-              writer.add_index(idx.hash, the_ref.0, the_ref.1)?
+              writer.add_index(idx.hash, the_ref.0, the_ref.1).await?
             }
             ItemMergeResult::ContainsAll(loc_ref) => {
               // just add the index
-              writer.add_index(idx.hash, loc_ref.0, loc_ref.1)?
+              writer.add_index(idx.hash, loc_ref.0, loc_ref.1).await?
             }
             ItemMergeResult::New(item) => {
               // need a real new item
               merge_cnt += 1;
-              writer.write_item(item)?
+              writer.write_item(item).await?
             }
           }
         }
@@ -301,6 +301,6 @@ pub fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster>
     }
   }
 
-  let new_cluster_path = writer.finalize_cluster()?;
-  GoatRodeoCluster::new(&root_path, &new_cluster_path)
+  let new_cluster_path = writer.finalize_cluster().await?;
+  GoatRodeoCluster::new(&root_path, &new_cluster_path).await
 }

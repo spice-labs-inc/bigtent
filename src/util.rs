@@ -1,5 +1,5 @@
 use crate::{index_file::ItemOffset, rodeo_server::MD5Hash};
-use anyhow::{bail, Result, Context};
+use anyhow::{bail, Context, Result};
 #[cfg(not(test))]
 use log::info;
 use serde::{de::DeserializeOwned, Serialize};
@@ -7,10 +7,10 @@ use serde_cbor::Value;
 use std::{
   collections::{BTreeMap, HashSet},
   ffi::OsStr,
-  io::{Read, Write},
   path::PathBuf,
   time::{Duration, SystemTime},
-}; // Use log crate when building application
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(test)]
 use std::println as info;
@@ -130,13 +130,13 @@ fn test_big_sha() {
   sha256_for_slice(v.as_slice());
 }
 
-pub fn sha256_for_reader<R: Read>(r: &mut R) -> Result<[u8; 32]> {
+pub async fn sha256_for_reader<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<[u8; 32]> {
   use sha2::{Digest, Sha256};
   // create a Sha256 object
   let mut hasher = Sha256::new();
   let mut buffer = [0u8; BYTE_BUFFER_SIZE];
   loop {
-    let read = r.read(&mut buffer)?;
+    let read = r.read(&mut buffer).await?;
     if read == 0 {
       break;
     }
@@ -145,11 +145,11 @@ pub fn sha256_for_reader<R: Read>(r: &mut R) -> Result<[u8; 32]> {
   Ok(hasher.finalize().into())
 }
 
-#[test]
-fn test_sha256() {
-  use bytes::Buf;
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_sha256() {
   use hex_literal::hex;
-  let res = sha256_for_reader(&mut b"hello world".reader()).unwrap();
+  let mut to_hash: &[u8] = b"hello world";
+  let res = sha256_for_reader(&mut to_hash).await.unwrap();
   assert_eq!(
     res,
     hex!("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
@@ -165,7 +165,9 @@ fn test_sha256() {
 pub fn is_child_dir(root: &PathBuf, potential_child: &PathBuf) -> Result<bool> {
   let full_root = root.canonicalize()?;
 
-  let full_kid = potential_child.canonicalize().with_context(|| format!("child directory {:?}", potential_child))?;
+  let full_kid = potential_child
+    .canonicalize()
+    .with_context(|| format!("child directory {:?}", potential_child))?;
 
   let mut kid_parts = HashSet::new();
   for i in full_kid.iter() {
@@ -293,7 +295,7 @@ pub fn timed_filename(suffix: &str) -> String {
   )
 }
 
-pub fn read_all<R: Read>(r: &mut R, max: usize) -> Result<Vec<u8>> {
+pub async fn read_all<R: AsyncReadExt + Unpin>(r: &mut R, max: usize) -> Result<Vec<u8>> {
   let mut ret = vec![];
   let mut buf = [0u8; BYTE_BUFFER_SIZE];
   let mut read: usize = 0;
@@ -302,7 +304,7 @@ pub fn read_all<R: Read>(r: &mut R, max: usize) -> Result<Vec<u8>> {
     if to_read <= 0 {
       break;
     }
-    match r.read(&mut buf[0..to_read]) {
+    match r.read(&mut buf[0..to_read]).await {
       Ok(0) => {
         break;
       }
@@ -320,43 +322,48 @@ pub fn read_all<R: Read>(r: &mut R, max: usize) -> Result<Vec<u8>> {
   Ok(ret)
 }
 
-pub fn read_u16<R: Read>(r: &mut R) -> Result<u16> {
+pub async fn read_u16<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<u16> {
   let mut buf = [0u8; 2];
-  r.read_exact(&mut buf)?;
+  r.read_exact(&mut buf).await?;
   Ok(u16::from_be_bytes(buf))
 }
 
-pub fn read_u32<R: Read>(r: &mut R) -> Result<u32> {
+pub async fn read_u32<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<u32> {
   let mut buf = [0u8; 4];
-  r.read_exact(&mut buf)?;
+  r.read_exact(&mut buf).await?;
 
   Ok(u32::from_be_bytes(buf))
 }
 
-pub fn read_u64<R: Read>(r: &mut R) -> Result<u64> {
+pub async fn read_u64<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<u64> {
   let mut buf = [0u8; 8];
-  r.read_exact(&mut buf)?;
+  r.read_exact(&mut buf).await?;
 
   Ok(u64::from_be_bytes(buf))
 }
 
-pub fn read_len_and_cbor<T: DeserializeOwned, R: Read>(file: &mut R) -> Result<T> {
-  let len = read_u16(file)? as usize;
+pub async fn read_len_and_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
+  file: &mut R,
+) -> Result<T> {
+  let len = read_u16(file).await? as usize;
   let mut buffer = Vec::with_capacity(len);
   for _ in 0..len {
     buffer.push(0u8);
   }
-  file.read_exact(&mut buffer)?;
+  file.read_exact(&mut buffer).await?;
 
   serde_cbor::from_reader(&*buffer).map_err(|e| e.into())
 }
 
-pub fn read_cbor<T: DeserializeOwned, R: Read>(file: &mut R, len: usize) -> Result<T> {
+pub async fn read_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
+  file: &mut R,
+  len: usize,
+) -> Result<T> {
   let mut buffer = Vec::with_capacity(len);
   for _ in 0..len {
     buffer.push(0u8);
   }
-  file.read_exact(&mut buffer)?;
+  file.read_exact(&mut buffer).await?;
 
   match serde_cbor::from_slice(&*buffer) {
     Ok(v) => Ok(v),
@@ -379,44 +386,44 @@ pub fn read_cbor<T: DeserializeOwned, R: Read>(file: &mut R, len: usize) -> Resu
   }
 }
 
-pub fn write_int<W: Write>(target: &mut W, val: u32) -> Result<()> {
-  target.write_all(&val.to_be_bytes())?;
+pub async fn write_int<W: AsyncWriteExt + Unpin>(target: &mut W, val: u32) -> Result<()> {
+  target.write_all(&val.to_be_bytes()).await?;
   Ok(())
 }
 
-pub fn write_short<W: Write>(target: &mut W, val: u16) -> Result<()> {
-  target.write_all(&val.to_be_bytes())?;
+pub async fn write_short<W: AsyncWriteExt + Unpin>(target: &mut W, val: u16) -> Result<()> {
+  target.write_all(&val.to_be_bytes()).await?;
   Ok(())
 }
 
-pub fn write_short_signed<W: Write>(target: &mut W, val: i16) -> Result<()> {
-  target.write_all(&val.to_be_bytes())?;
+pub async fn write_short_signed<W: AsyncWriteExt + Unpin>(target: &mut W, val: i16) -> Result<()> {
+  target.write_all(&val.to_be_bytes()).await?;
   Ok(())
 }
 
-pub fn write_long<W: Write>(target: &mut W, val: u64) -> Result<()> {
-  target.write_all(&val.to_be_bytes())?;
+pub async  fn write_long<W: AsyncWriteExt + Unpin>(target: &mut W, val: u64) -> Result<()> {
+  target.write_all(&val.to_be_bytes()).await?;
   Ok(())
 }
 
-pub fn write_envelope<W: Write, T: Serialize>(target: &mut W, envelope: &T) -> Result<()> {
+pub async fn write_envelope<W: AsyncWriteExt + Unpin, T: Serialize>(target: &mut W, envelope: &T) -> Result<()> {
   let bytes = serde_cbor::to_vec(envelope)?;
-  write_short(target, bytes.len() as u16)?;
-  target.write_all(&bytes)?;
+  write_short(target, bytes.len() as u16).await?;
+  target.write_all(&bytes).await?;
   Ok(())
 }
 
-pub fn write_envelope_and_payload<W: Write, T: Serialize, T2: Serialize>(
+pub async fn write_envelope_and_payload<W: AsyncWriteExt + Unpin, T: Serialize, T2: Serialize>(
   target: &mut W,
   envelope: &T,
   payload: &T2,
 ) -> Result<()> {
   let env_bytes = serde_cbor::to_vec(envelope)?;
   let payload_bytes = serde_cbor::to_vec(payload)?;
-  write_short(target, env_bytes.len() as u16)?;
-  write_int(target, payload_bytes.len() as u32)?;
-  target.write_all(&env_bytes)?;
-  target.write_all(&payload_bytes)?;
+  write_short(target, env_bytes.len() as u16).await?;
+  write_int(target, payload_bytes.len() as u32).await?;
+  target.write_all(&env_bytes).await?;
+  target.write_all(&payload_bytes).await?;
   Ok(())
 }
 

@@ -25,7 +25,7 @@ use crate::{
 use anyhow::Result;
 use thousands::Separable;
 
-pub fn merge_fresh<PB: Into<PathBuf>>(
+pub async fn merge_fresh<PB: Into<PathBuf>>(
   clusters: Vec<GoatRodeoCluster>,
   use_threads: bool,
   dest_directory: PB,
@@ -54,7 +54,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
   let mut index_holder = vec![];
 
   for cluster in &clusters {
-    let index = cluster.get_index()?;
+    let index = cluster.get_index().await?;
     let index_len = index.len();
 
     let (tx, rx) = flume::bounded(32);
@@ -63,13 +63,14 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
       let index_shadow = index.clone();
       let cluster_shadow = cluster.clone();
 
-      std::thread::spawn(move || {
+      std::thread::spawn(async move || {
         let mut loop_cnt = 0usize;
         let start = Instant::now();
         let index_len = index_shadow.len();
         for io in index_shadow.iter() {
           let item = cluster_shadow
             .data_for_entry_offset(&io.loc)
+            .await
             .expect("Expected to load data");
 
           match tx.send((item, loop_cnt)) {
@@ -120,7 +121,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     Instant::now().duration_since(start)
   );
 
-  let mut cluster_writer = ClusterWriter::new(&dest)?;
+  let mut cluster_writer = ClusterWriter::new(&dest).await?;
   let merge_start = Instant::now();
 
   let mut top = OrdMap::new();
@@ -132,7 +133,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     let (next, opt_min) = top.without_min();
     top = opt_min;
 
-    fn get_item_and_pos(
+    async fn get_item_and_pos(
       hash: MD5Hash,
       which: usize,
       index_holder: &mut Vec<ClusterPos<Option<Receiver<(Item, usize)>>>>,
@@ -140,7 +141,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     ) -> Result<(Item, usize)> {
       match &index_holder[which].thing {
         Some(rx) => rx.recv().map_err(|e| e.into()),
-        _ => match clusters[which].data_for_hash(hash) {
+        _ => match clusters[which].data_for_hash(hash).await {
           Ok(i) => Ok((i, 0)),
           Err(e) => Err(e),
         },
@@ -160,7 +161,8 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
             merge_base.which,
             &mut index_holder,
             &clusters,
-          )?;
+          )
+          .await?;
 
           merge_final.remove_references();
           match merge_final
@@ -189,7 +191,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
         let cur_pos = cluster_writer.cur_pos() as u64;
         top.reference.1 = cur_pos;
 
-        cluster_writer.write_item(top)?;
+        cluster_writer.write_item(top).await?;
 
         loop_cnt += 1;
 
@@ -218,7 +220,7 @@ pub fn merge_fresh<PB: Into<PathBuf>>(
     }
   }
 
-  cluster_writer.finalize_cluster()?;
+  cluster_writer.finalize_cluster().await?;
   info!(
     "Finished {} loops at {:?}",
     loop_cnt.separate_with_commas(),

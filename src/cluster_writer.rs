@@ -1,9 +1,9 @@
 #[cfg(not(test))]
 use log::{info, trace};
+use tokio::{fs::File, io::AsyncWriteExt};
 
 use std::{
   collections::{BTreeMap, BTreeSet, HashSet},
-  fs::{self, File},
   path::PathBuf,
   time::Instant,
 };
@@ -44,8 +44,11 @@ pub struct ClusterWriter {
 }
 
 impl ClusterWriter {
-  const MAX_INDEX_CNT: usize = 25 * 1024 * 1024; // 25M
-  const MAX_DATA_FILE_SIZE: u64 = 15 * 1024 * 1024 * 1024; // 15GB
+  // 25M
+  const MAX_DATA_FILE_SIZE: u64 = 15 * 1024 * 1024 * 1024;
+  const MAX_INDEX_CNT: usize = 25 * 1024 * 1024;
+
+  // 15GB
   #[inline]
   fn make_dest_buffer() -> ShaWriter {
     ShaWriter::new(10_000_000)
@@ -56,10 +59,10 @@ impl ClusterWriter {
     Vec::with_capacity(10_000)
   }
 
-  pub fn new<I: Into<PathBuf>>(dir: I) -> Result<ClusterWriter> {
+  pub async fn new<I: Into<PathBuf>>(dir: I) -> Result<ClusterWriter> {
     let dir_path: PathBuf = dir.into();
     if !dir_path.exists() {
-      fs::create_dir_all(&dir_path)?;
+      tokio::fs::create_dir_all(&dir_path).await?;
     }
     if !dir_path.is_dir() {
       bail!(
@@ -80,7 +83,7 @@ impl ClusterWriter {
       items_written: 0,
     };
 
-    my_writer.write_data_envelope_start()?;
+    my_writer.write_data_envelope_start().await?;
 
     Ok(my_writer)
   }
@@ -93,17 +96,15 @@ impl ClusterWriter {
     self.previous_position
   }
 
-  pub fn write_item(&mut self, item: Item) -> Result<()>
-  {
-    use std::io::Write;
+  pub async fn write_item(&mut self, item: Item) -> Result<()> {
     let the_hash = md5hash_str(&item.identifier);
     let cur_pos = self.dest_data.pos();
 
     let item_bytes = serde_cbor::to_vec(&item)?;
 
-    write_int(&mut self.dest_data, item_bytes.len() as u32)?;
+    write_int(&mut self.dest_data, item_bytes.len() as u32).await?;
 
-    (&mut self.dest_data).write_all(&item_bytes)?;
+    (&mut self.dest_data).write_all(&item_bytes).await?;
     self.index_info.push(IndexInfo {
       hash: the_hash,
       offset: cur_pos,
@@ -115,7 +116,7 @@ impl ClusterWriter {
     if self.index_info.len() > ClusterWriter::MAX_INDEX_CNT
       || self.dest_data.pos() > ClusterWriter::MAX_DATA_FILE_SIZE
     {
-      self.write_data_and_index()?;
+      self.write_data_and_index().await?;
     }
 
     self.items_written += 1;
@@ -125,15 +126,14 @@ impl ClusterWriter {
     Ok(())
   }
 
-  pub fn finalize_cluster(&mut self) -> Result<PathBuf> {
-    use std::io::Write;
+  pub async fn finalize_cluster(&mut self) -> Result<PathBuf> {
     if self.previous_position != 0 {
-      self.write_data_and_index()?;
+      self.write_data_and_index().await?;
     }
     let mut cluster_file = vec![];
     {
       let cluster_writer = &mut cluster_file;
-      write_int(cluster_writer, ClusterFileMagicNumber)?;
+      write_int(cluster_writer, ClusterFileMagicNumber).await?;
       let cluster_env = ClusterFileEnvelope {
         version: 1,
         magic: ClusterFileMagicNumber,
@@ -141,7 +141,7 @@ impl ClusterWriter {
         data_files: self.seen_data_files.iter().map(|v| *v).collect(),
         index_files: self.index_files.iter().map(|v| *v).collect(),
       };
-      write_envelope(cluster_writer, &cluster_env)?;
+      write_envelope(cluster_writer, &cluster_env).await?;
     }
 
     // compute sha256 of index
@@ -151,21 +151,20 @@ impl ClusterWriter {
     // write the .grc file
 
     let grc_file_path = path_plus_timed(&self.dir, &format!("{:016x}.grc", grc_sha));
-    let mut grc_file = File::create(&grc_file_path)?;
-    grc_file.write_all(&cluster_file)?;
-    grc_file.flush()?;
+    let mut grc_file = File::create(&grc_file_path).await?;
+    grc_file.write_all(&cluster_file).await?;
+    grc_file.flush().await?;
 
     Ok(grc_file_path)
   }
 
-  pub fn write_data_and_index(&mut self) -> Result<()> {
-    use std::io::Write;
+  pub async fn write_data_and_index(&mut self) -> Result<()> {
     let mut grd_sha = 0;
     if self.previous_position != 0 {
-      write_short_signed(&mut self.dest_data, -1)?; // a marker that says end of file
+      write_short_signed(&mut self.dest_data, -1).await?; // a marker that says end of file
 
       // write final back-pointer (to the last entry record)
-      write_long(&mut self.dest_data, self.previous_position)?;
+      write_long(&mut self.dest_data, self.previous_position).await?;
 
       info!(
         "computing grd sha {:?}",
@@ -181,9 +180,9 @@ impl ClusterWriter {
 
       let grd_file_path = self.dir.join(format!("{:016x}.grd", grd_sha));
 
-      let mut grd_file = File::create(grd_file_path)?;
-      grd_file.write_all(&data)?;
-      grd_file.flush()?;
+      let mut grd_file = File::create(grd_file_path).await?;
+      grd_file.write_all(&data).await?;
+      grd_file.flush().await?;
 
       info!(
         "computed grd sha and wrote at {:?}",
@@ -192,7 +191,7 @@ impl ClusterWriter {
       self.previous_position = 0;
       self.previous_hash = grd_sha;
       self.seen_data_files.insert(grd_sha);
-      self.write_data_envelope_start()?;
+      self.write_data_envelope_start().await?;
     }
 
     if self.index_info.len() > 0 {
@@ -209,7 +208,7 @@ impl ClusterWriter {
       let mut index_file = vec![];
       {
         let index_writer = &mut index_file;
-        write_int(index_writer, IndexFileMagicNumber)?;
+        write_int(index_writer, IndexFileMagicNumber).await?;
         let index_env = IndexEnvelope {
           version: 1,
           magic: IndexFileMagicNumber,
@@ -218,9 +217,9 @@ impl ClusterWriter {
           encoding: "MD5/Long/Long".into(),
           info: BTreeMap::new(),
         };
-        write_envelope(index_writer, &index_env)?;
+        write_envelope(index_writer, &index_env).await?;
         for v in &self.index_info {
-          index_writer.write_all(&v.hash)?;
+          std::io::Write::write_all( index_writer, &v.hash)?;
           write_long(
             index_writer,
             if v.file_hash == 0 {
@@ -231,8 +230,9 @@ impl ClusterWriter {
             } else {
               v.file_hash
             },
-          )?;
-          write_long(index_writer, v.offset)?;
+          )
+          .await?;
+          write_long(index_writer, v.offset).await?;
         }
       }
 
@@ -248,9 +248,9 @@ impl ClusterWriter {
       // write the .gri file
       {
         let gri_file_path = self.dir.join(format!("{:016x}.gri", gri_sha));
-        let mut gri_file = File::create(gri_file_path)?;
-        gri_file.write_all(&index_file)?;
-        gri_file.flush()?;
+        let mut gri_file = File::create(gri_file_path).await?;
+        gri_file.write_all(&index_file).await?;
+        gri_file.flush().await?;
       }
       info!(
         "computed gri sha and wrote index file {:?}",
@@ -262,6 +262,7 @@ impl ClusterWriter {
     self.dump_file_names();
     Ok(())
   }
+
   fn dump_file_names(&self) {
     trace!("Data");
     for d in &self.seen_data_files {
@@ -273,7 +274,8 @@ impl ClusterWriter {
       trace!("{:016x}", d);
     }
   }
-  pub fn add_index(&mut self, hash: MD5Hash, file_hash: u64, offset: u64) -> Result<()> {
+
+  pub async fn add_index(&mut self, hash: MD5Hash, file_hash: u64, offset: u64) -> Result<()> {
     self.index_info.push(IndexInfo {
       hash,
       offset,
@@ -281,14 +283,14 @@ impl ClusterWriter {
     });
 
     if self.index_info.len() > ClusterWriter::MAX_INDEX_CNT {
-      self.write_data_and_index()?;
-      self.write_data_envelope_start()?;
+      self.write_data_and_index().await?;
+      self.write_data_envelope_start().await?;
     }
     Ok(())
   }
 
-  fn write_data_envelope_start(&mut self) -> Result<()> {
-    write_int(&mut self.dest_data, DataFileMagicNumber)?;
+  async fn write_data_envelope_start(&mut self) -> Result<()> {
+    write_int(&mut self.dest_data, DataFileMagicNumber).await?;
 
     let data_envelope = DataFileEnvelope {
       version: 1,
@@ -299,7 +301,7 @@ impl ClusterWriter {
       info: BTreeMap::new(),
     };
 
-    write_envelope(&mut self.dest_data, &data_envelope)?;
+    write_envelope(&mut self.dest_data, &data_envelope).await?;
 
     self.previous_position = 0;
     Ok(())
