@@ -2,7 +2,8 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 #[cfg(not(test))]
 use log::info;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
+use crate::structs::EdgeType;
 
 #[cfg(test)]
 use std::println as info;
@@ -61,201 +62,18 @@ impl RodeoServer {
     self.cluster.load().antialias_for(data).await
   }
 
-  // pub fn bulk_serve(&self, data: Vec<String>, dest: PipeWriter, start: Instant) -> Result<()> {
-  //   self
-  //     .sender
-  //     .send(IndexMsg::Bulk(data, dest, start))
-  //     .map_err(|e| e.into())
-  // }
+  pub fn contained_by(data: &Item) -> HashSet<String> {
+    let mut ret = HashSet::new();
+    for edge in data.connections.iter() {
+      if edge.0.is_contained_by_up() || edge.0.is_to_right() {
+        ret.insert(edge.1.clone());
+      }
+    }
 
-  // pub fn do_north_serve(
-  //   &self,
-  //   gitoids: Vec<String>,
-  //   purls_only: bool,
-  //   dest: PipeWriter,
-  //   start: Instant,
-  // ) -> Result<()> {
-  //   self
-  //     .sender
-  //     .send(IndexMsg::North {
-  //       gitoids,
-  //       purls_only,
-  //       tx: dest,
-  //       start,
-  //     })
-  //     .map_err(|e| e.into())
-  // }
+    ret
+  }
 
-  // pub async fn shutdown(&self) -> () {
-  //   for _ in 0..self.args.num_threads() + 10 {
-  //     self.sender.send(IndexMsg::End).unwrap();
-  //   }
 
-  //   // destroy the old thread pool
-  //   let mut threads = self.threads.lock().await; // self.threads.swap(Arc::new(vec![]));;
-
-  //   for _ in 0..threads.len() - 1 {
-  //     let y = threads.pop().unwrap();
-
-  //     y.await.unwrap();
-  //   }
-  // }
-
-  // fn contained_by(data: &Item) -> HashSet<String> {
-  //   let mut ret = HashSet::new();
-  //   for edge in data.connections.iter() {
-  //     if edge.0.is_contained_by_up() || edge.0.is_to_right() {
-  //       ret.insert(edge.1.clone());
-  //     }
-  //   }
-
-  //   ret
-  // }
-
-  // async fn north_send(
-  //   &self,
-  //   gitoids: Vec<String>,
-  //   purls_only: bool,
-  //   _tx: PipeWriter,
-  //   start: Instant,
-  // ) -> Result<()> {
-  //   let mut br = BufWriter::new(tx);
-  //   let mut found = HashSet::new();
-  //   let mut to_find = HashSet::new();
-  //   let mut found_purls = HashSet::<String>::new();
-  //   to_find.extend(gitoids);
-  //   let mut first = true;
-
-  //   br.write_all(if purls_only { b"[" } else { b"{" })?;
-
-  //   let cnt = AtomicU32::new(0);
-
-  //   defer! {
-  //     info!("North: Sent {} items in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
-  //     start.elapsed());
-  //   }
-  //   fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
-  //     let mut ret = a.clone();
-  //     for i in b.clone() {
-  //       ret.remove(&i);
-  //     }
-  //     ret
-  //   }
-
-  //   loop {
-  //     let to_search = less(&to_find, &found);
-
-  //     if to_search.len() == 0 {
-  //       break;
-  //     }
-  //     for this_oid in to_search {
-  //       found.insert(this_oid.clone());
-  //       match self.data_for_key(&this_oid).await {
-  //         Ok(item) => {
-  //           if purls_only {
-  //             for purl in item.find_purls() {
-  //               if !found_purls.contains(&purl) {
-  //                 let json_str = serde_json::to_string(&purl)?;
-  //                 br.write_fmt(format_args!(
-  //                   "{}{}",
-  //                   if !first { ",\n" } else { "" },
-  //                   json_str
-  //                 ))?;
-  //                 found_purls.insert(purl);
-  //                 first = false;
-  //               }
-  //             }
-  //           } else {
-  //             br.write_fmt(format_args!(
-  //               "{}\n \"{}\": {}\n",
-  //               if !first { "," } else { "" },
-  //               this_oid,
-  //               cbor_to_json_str(&item)?
-  //             ))?;
-  //             first = false;
-  //           }
-  //           let and_then = RodeoServer::contained_by(&item);
-  //           to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
-  //         }
-  //         _ => {
-  //           // don't write "not found" items if we're just writing pURLs
-  //           if !purls_only {
-  //             br.write_fmt(format_args!(
-  //               "{}\n \"{}\": null\n",
-  //               if !first { "," } else { "" },
-  //               this_oid,
-  //             ))?;
-  //           }
-  //         }
-  //       }
-  //       cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-  //     }
-  //   }
-
-  //   br.write_all(if purls_only { b"]" } else { b"}\n" })?;
-  //   Ok(())
-  // }
-
-  // async fn bulk_send(&self, data: Vec<String>, dest: PipeWriter) -> Result<()> {
-  //   let mut br = BufWriter::new(dest);
-  //   let mut first = true;
-  //   br.write_all(b"{\n")?;
-  //   for v in data {
-  //     if !first {
-  //       br.write_all(b",")?;
-  //     }
-  //     first = false;
-  //     match self.data_for_key(&v).await {
-  //       Ok(cbor) => {
-  //         br.write_fmt(format_args!("\"{}\": [{}]\n", v, cbor_to_json_str(&cbor)?))?;
-  //       }
-  //       Err(_) => {
-  //         br.write_fmt(format_args!("\"{}\": []\n", v))?;
-  //       }
-  //     }
-  //   }
-  //   br.write_all(b"}\n")?;
-
-  //   Ok(())
-  // }
-
-  // async fn thread_handler_loop(index: Arc<RodeoServer>) -> Result<()> {
-  //   loop {
-  //     match index.receiver.recv_async().await? {
-  //       IndexMsg::End => {
-  //         break;
-  //       }
-  //       IndexMsg::Bulk(data, dest, start) => {
-  //         let data_len = data.len();
-  //         match index.bulk_send(data, dest).await {
-  //           Ok(_) => {}
-  //           Err(e) => {
-  //             error!("Bulk failure {:?}", e);
-  //           }
-  //         }
-  //         info!("Bulk send of {} items took {:?}", data_len, start.elapsed());
-  //       }
-  //       IndexMsg::North {
-  //         gitoids,
-  //         tx,
-  //         start,
-  //         purls_only,
-  //       } => {
-  //         match index
-  //           .north_send(gitoids.clone(), purls_only, tx, start)
-  //           .await
-  //         {
-  //           Ok(_) => {}
-  //           Err(e) => {
-  //             error!("Bulk failure {:?}", e);
-  //           }
-  //         }
-  //         info!("North of {:?} took {:?}", gitoids, start.elapsed());
-  //       }
-  //     }
-  //   }
-  //   Ok(())
-  // }
 
   pub fn get_config_table(&self) -> Arc<Map<String, toml::Value>> {
     self.config_table.load().clone()

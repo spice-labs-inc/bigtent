@@ -1,22 +1,23 @@
 use anyhow::{ bail, Context, Result};
 use arc_swap::ArcSwap;
+use scopeguard::defer;
 use serde::{Deserialize, Serialize};
 use std::{
   collections::{BTreeMap, HashMap, HashSet},
   ops::Deref,
   path::{Path, PathBuf},
-  sync::Arc,
+  sync::{atomic::AtomicU32, Arc},
   time::Instant,
 };
 use thousands::Separable;
-use tokio::{fs::{read_dir, File}, io::BufReader, sync::Mutex};
+use tokio::{fs::{read_dir, File}, io::BufReader, sync::{mpsc::Sender, Mutex}};
 use toml::Table; // Use log crate when building application
 
 use crate::{
   data_file::DataFile,
   index_file::{IndexFile, IndexLoc, ItemOffset},
   live_merge::perform_merge,
-  rodeo_server::MD5Hash,
+  rodeo_server::{MD5Hash, RodeoServer},
   structs::{EdgeType, Item},
   util::{
     byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
@@ -594,6 +595,66 @@ impl GoatRodeoCluster {
       }
       None => bail!("Couldn't find file for hash {:x}", file_hash),
     }
+  }
+
+pub async fn north_send(
+    &self,
+    gitoids: Vec<String>,
+    purls_only: bool,
+    tx: Sender<serde_json::Value>,
+    start: Instant,
+  ) -> Result<()> {
+    let mut found = HashSet::new();
+    let mut to_find = HashSet::new();
+    let mut found_purls = HashSet::<String>::new();
+    to_find.extend(gitoids);
+
+    let cnt = AtomicU32::new(0);
+
+    defer! {
+      info!("North: Sent {} items in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
+      start.elapsed());
+    }
+
+    fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
+      let mut ret = a.clone();
+      for i in b.iter() {
+        ret.remove(i);
+      }
+      ret
+    }
+
+    loop {
+      let to_search = less(&to_find, &found);
+
+      if to_search.len() == 0 {
+        break;
+      }
+      for this_oid in to_search {
+        found.insert(this_oid.clone());
+        match self.data_for_key(&this_oid).await {
+          Ok(item) => {
+            let and_then = RodeoServer::contained_by(&item);
+            if purls_only {
+              for purl in item.find_purls() {
+                if !found_purls.contains(&purl) {
+                  tx.send(purl.clone().into()).await?;
+                  
+                  found_purls.insert(purl);
+                }
+              }
+            } else {
+              tx.send(item.into()).await?;
+            }
+            
+            to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
+          }
+          _ => {}
+        }
+        cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      }
+    }
+    Ok(())
   }
 
   pub async fn antialias_for(&self, data: &str) -> Result<Item> {
