@@ -35,18 +35,23 @@ pub struct DataFile {
   pub data_offset: u64,
 }
 
+pub const GOAT_RODEO_DATA_FILE_SUFFIX: &str = "grd";
+pub const GOAT_RODEO_INDEX_FILE_SUFFIX: &str = "gri";
+pub const GOAT_RODEO_CLUSTER_FILE_SUFFIX: &str = "grc";
+
 impl DataFile {
   pub async fn new(dir: &PathBuf, hash: u64) -> Result<DataFile> {
-    let mut data_file = GoatRodeoCluster::find_file(dir, hash, "grd").await?;
+    let mut data_file = GoatRodeoCluster::find_file(dir, hash, GOAT_RODEO_DATA_FILE_SUFFIX).await?;
 
     let dfp: &mut File = &mut data_file;
     let magic = read_u32(dfp).await?;
     if magic != DataFileMagicNumber {
       bail!(
-        "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.grd",
+        "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.{}",
         magic,
         DataFileMagicNumber,
-        hash
+        hash,
+        GOAT_RODEO_DATA_FILE_SUFFIX
       );
     }
 
@@ -88,7 +93,7 @@ impl DataFile {
   pub async fn read_item_at(&self, pos: u64) -> Result<Item> {
     let mut my_file = self.file.lock().await;
     let my_reader: &mut Box<dyn DataReader> = &mut my_file;
-    
+
     tokio::task::block_in_place(move || {
       DataFile::seek_to(my_reader, pos)?;
 

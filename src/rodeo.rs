@@ -21,7 +21,7 @@ use tokio::{
 use toml::Table; // Use log crate when building application
 
 use crate::{
-  data_file::{DataFile, DataReader},
+  data_file::{DataFile, DataReader, GOAT_RODEO_CLUSTER_FILE_SUFFIX},
   index_file::{IndexFile, IndexLoc, ItemOffset},
   live_merge::perform_merge,
   rodeo_server::{MD5Hash, RodeoServer},
@@ -555,7 +555,7 @@ impl GoatRodeoCluster {
         .flatten()
         .map(|s| s.to_owned());
 
-      if file.file_type().await?.is_file() && file_extn == Some("grc".into()) {
+      if file.file_type().await?.is_file() && file_extn == Some(GOAT_RODEO_CLUSTER_FILE_SUFFIX.into()) {
         let walker = GoatRodeoCluster::new(&path, &file.path()).await?;
         ret.push(walker)
       }

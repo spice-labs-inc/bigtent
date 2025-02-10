@@ -44,11 +44,11 @@ pub struct ClusterWriter {
 }
 
 impl ClusterWriter {
-  // 25M
+  // 15GB
   const MAX_DATA_FILE_SIZE: u64 = 15 * 1024 * 1024 * 1024;
+  // 25M
   const MAX_INDEX_CNT: usize = 25 * 1024 * 1024;
 
-  // 15GB
   #[inline]
   fn make_dest_buffer() -> ShaWriter {
     ShaWriter::new(10_000_000)
@@ -219,7 +219,7 @@ impl ClusterWriter {
         };
         write_envelope(index_writer, &index_env).await?;
         for v in &self.index_info {
-          std::io::Write::write_all( index_writer, &v.hash)?;
+          std::io::Write::write_all(index_writer, &v.hash)?;
           write_long(
             index_writer,
             if v.file_hash == 0 {

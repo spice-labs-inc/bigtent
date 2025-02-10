@@ -1,4 +1,5 @@
 use crate::{
+  data_file::GOAT_RODEO_INDEX_FILE_SUFFIX,
   rodeo::{GoatRodeoCluster, IndexFileMagicNumber},
   tokio::io::AsyncSeekExt,
   util::{byte_slice_to_u63, read_len_and_cbor, read_u32, sha256_for_reader},
@@ -38,7 +39,7 @@ impl IndexFile {
   pub async fn new(dir: &PathBuf, hash: u64, check_hash: bool) -> Result<IndexFile> {
     // ensure we close `file` after computing the hash
     if check_hash {
-      let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri").await?;
+      let mut file = GoatRodeoCluster::find_file(&dir, hash, GOAT_RODEO_INDEX_FILE_SUFFIX).await?;
 
       let tested_hash = byte_slice_to_u63(&sha256_for_reader(&mut file).await?)?;
       if tested_hash != hash {
@@ -50,16 +51,17 @@ impl IndexFile {
       }
     }
 
-    let mut file = GoatRodeoCluster::find_file(&dir, hash, "gri").await?;
+    let mut file = GoatRodeoCluster::find_file(&dir, hash, GOAT_RODEO_INDEX_FILE_SUFFIX).await?;
 
     let ifp = &mut file;
     let magic = read_u32(ifp).await?;
     if magic != IndexFileMagicNumber {
       bail!(
-        "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.gri",
+        "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.{}",
         magic,
         IndexFileMagicNumber,
-        hash
+        hash,
+        GOAT_RODEO_INDEX_FILE_SUFFIX
       );
     }
 

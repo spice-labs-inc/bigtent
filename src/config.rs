@@ -14,12 +14,6 @@ pub struct Args {
   #[arg(short, long)]
   pub conf: Option<PathBuf>,
 
-  // /// Number of threads to allow for servicing.
-  // /// A small number if on spinning disks, larger
-  // /// for SSD
-  // #[arg(short, long)]
-  // pub threads: Option<u16>,
-
   /// hostname to bind to
   #[arg(long)]
   pub host: Vec<String>,
@@ -62,11 +56,7 @@ impl Args {
       Err(e) => bail!("Must provide a valid toml file: {:?}", e),
     }
   }
-
-  // pub fn num_threads(&self) -> u16 {
-  //   self.threads.unwrap_or(7)
-  // }
-
+  
   pub fn conf_file(&self) -> Result<PathBuf> {
     match &self.conf {
       Some(n) if n.exists() && n.is_file() => Ok(
