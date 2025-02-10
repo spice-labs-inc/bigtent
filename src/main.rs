@@ -1,10 +1,7 @@
 use anyhow::{bail, Result};
 use arc_swap::ArcSwap;
 use bigtent::{
-  config::Args,
-  merger::merge_fresh,
-  rodeo::GoatRodeoCluster,
-  rodeo_server::RodeoServer,
+  config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster, rodeo_server::RodeoServer,
   server::run_web_server,
 };
 use clap::{CommandFactory, Parser};
@@ -22,7 +19,9 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
     let whole_path = path.clone().canonicalize()?;
     let dir_path = whole_path.parent().unwrap().to_path_buf();
     let index_build_start = Instant::now();
-    let cluster = Arc::new(ArcSwap::new(Arc::new(GoatRodeoCluster::new(&dir_path, &whole_path).await?)));
+    let cluster = Arc::new(ArcSwap::new(Arc::new(
+      GoatRodeoCluster::new(&dir_path, &whole_path).await?,
+    )));
 
     let index = RodeoServer::new_from_cluster(cluster, Some(args.clone())).await?;
 
@@ -49,21 +48,42 @@ async fn run_full_server(args: Args) -> Result<()> {
 
   let mut sig_hup = Signals::new([SIGHUP])?;
   let i2 = index.clone();
+  let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(10);
 
-  thread::spawn(async move || {
+  // Async closures are not supported, so to live in async-land
+  // we need to spawn a Tokio task that waits for the MPSC message
+  // and does the rebuild
+  tokio::spawn(async move {
+    loop {
+      match rx.recv().await {
+        Some(_) => {
+          info!("Got rebuild signal");
+          let start = Instant::now();
+          match i2.rebuild().await {
+            Ok(_) => {
+              info!(
+                "Done rebuilding. Took {:?}",
+                Instant::now().duration_since(start)
+              );
+            }
+            Err(e) => {
+              error!("Rebuild error {:?}", e);
+            }
+          }
+        }
+        None => {break;}
+      }
+    }
+  });
+  
+  // and we spawn a real thread to wait on `sig_hup`
+  // and when there's a sighup, send a message into the channel
+  // which will cause the async tasks to do the rebuild... sigh
+  thread::spawn(move || {
     for _ in sig_hup.forever() {
-      info!("Got rebuild signal");
-      let start = Instant::now();
-      match i2.rebuild().await {
-        Ok(_) => {
-          info!(
-            "Done rebuilding. Took {:?}",
-            Instant::now().duration_since(start)
-          );
-        }
-        Err(e) => {
-          error!("Rebuild error {:?}", e);
-        }
+      match tx.blocking_send(true) {
+        Ok(_) => {}
+        Err(_) => {break;}
       }
     }
   });
@@ -72,8 +92,7 @@ async fn run_full_server(args: Args) -> Result<()> {
   Ok(())
 }
 
-async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()>
-{
+async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
   for p in &paths {
     if !p.exists() || !p.is_dir() {
       bail!("Paths must be directories. {:?} is not", p);
@@ -105,7 +124,7 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()>
     );
   }
 
-  let ret = merge_fresh(clusters, args.threaded.unwrap_or(false), dest).await;
+  let ret = merge_fresh(clusters, dest).await;
   info!(
     "Finished merging at {:?}",
     Instant::now().duration_since(start)

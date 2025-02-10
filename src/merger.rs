@@ -1,7 +1,4 @@
-use flume::Receiver;
 use im::OrdMap;
-
-use log::error;
 #[cfg(not(test))]
 use log::info;
 use std::{
@@ -27,7 +24,6 @@ use thousands::Separable;
 
 pub async fn merge_fresh<PB: Into<PathBuf>>(
   clusters: Vec<GoatRodeoCluster>,
-  use_threads: bool,
   dest_directory: PB,
 ) -> Result<()> {
   let start = Instant::now();
@@ -57,9 +53,9 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     let index = cluster.get_index().await?;
     let index_len = index.len();
 
-    let (tx, rx) = flume::bounded(32);
+    // let (tx, rx) = flume::bounded(32);
 
-    if use_threads {
+    /* if use_threads {
       let index_shadow = index.clone();
       let cluster_shadow = cluster.clone();
 
@@ -104,13 +100,13 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
           }
         }
       });
-    }
+    }*/
 
     index_holder.push(ClusterPos {
       cluster: index.clone(),
       pos: 0,
       len: index.len(),
-      thing: if use_threads { Some(rx) } else { None },
+      //  thing: if use_threads { Some(rx) } else { None },
     });
 
     max_merge_len += index_len;
@@ -136,16 +132,17 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     async fn get_item_and_pos(
       hash: MD5Hash,
       which: usize,
-      index_holder: &mut Vec<ClusterPos<Option<Receiver<(Item, usize)>>>>,
+      // index_holder: &mut Vec<ClusterPos /*<Option<Receiver<(Item, usize)>>>*/>,
       clusters: &Vec<GoatRodeoCluster>,
     ) -> Result<(Item, usize)> {
-      match &index_holder[which].thing {
-        Some(rx) => rx.recv().map_err(|e| e.into()),
-        _ => match clusters[which].data_for_hash(hash).await {
-          Ok(i) => Ok((i, 0)),
-          Err(e) => Err(e),
-        },
-      }
+      /*match &index_holder[which].thing {
+      Some(rx) => rx.recv().map_err(|e| e.into()),
+      _ =>*/
+      match clusters[which].data_for_hash(hash).await {
+        Ok(i) => Ok((i, 0)),
+        Err(e) => Err(e),
+      } /*,
+        }*/
     }
 
     match next {
@@ -159,7 +156,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
           let (mut merge_final, _the_pos) = get_item_and_pos(
             merge_base.item_offset.hash,
             merge_base.which,
-            &mut index_holder,
+          //  &mut index_holder,
             &clusters,
           )
           .await?;
@@ -203,8 +200,8 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
           let nd: NiceDurationDisplay = remaining.into();
           let td: NiceDurationDisplay = merge_start.elapsed().into();
           info!(
-            "{} cnt {}m of {}m merge cnt {} position {}M at {} estimated end {}",
-            if use_threads { "T-Merge" } else { "Merge" },
+            "Merge cnt {}m of {}m merge cnt {} position {}M at {} estimated end {}",
+            //if use_threads { "T-Merge" } else { "Merge" },
             (loop_cnt / 1_000_000).separate_with_commas(),
             ((max_merge_len - merge_cnt) / 1_000_000).separate_with_commas(),
             merge_cnt.separate_with_commas(),

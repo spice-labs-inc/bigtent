@@ -43,7 +43,7 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
       cluster: index.clone(),
       pos: 0,
       len: index.len(),
-      thing: 0,
+      // thing: 0,
     });
   }
 

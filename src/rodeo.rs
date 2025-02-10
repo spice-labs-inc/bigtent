@@ -14,7 +14,7 @@ use tokio::{fs::{read_dir, File}, io::BufReader, sync::{mpsc::Sender, Mutex}};
 use toml::Table; // Use log crate when building application
 
 use crate::{
-  data_file::DataFile,
+  data_file::{DataAsyncReader, DataFile},
   index_file::{IndexFile, IndexLoc, ItemOffset},
   live_merge::perform_merge,
   rodeo_server::{MD5Hash, RodeoServer},
@@ -83,7 +83,7 @@ pub struct GoatRodeoCluster {
   pub cluster_file_hash: u64,
   pub path: PathBuf,
   pub cluster_path: PathBuf,
-  pub data_files: HashMap<u64, Arc<DataFile<File>>>,
+  pub data_files: HashMap<u64, Arc<DataFile>>,
   pub index_files: HashMap<u64, IndexFile>,
   pub sub_clusters: HashMap<u64, GoatRodeoCluster>,
   pub synthetic: bool,
@@ -109,7 +109,7 @@ impl GoatRodeoCluster {
   pub fn create_synthetic_with(
     &self,
     index: Vec<ItemOffset>,
-    data_files: HashMap<u64, Arc<DataFile<File>>>,
+    data_files: HashMap<u64, Arc<DataFile>>,
     index_files: HashMap<u64, IndexFile>,
     sub_clusters: HashMap<u64, GoatRodeoCluster>,
   ) -> Result<GoatRodeoCluster> {
@@ -499,7 +499,7 @@ impl GoatRodeoCluster {
     Ok(ret_arc)
   }
 
-  pub fn data_file(&self, hash: u64) -> Result<Arc<Mutex<BufReader<File>>>> {
+  pub fn data_file(&self, hash: u64) -> Result<Arc<Mutex<Box<dyn DataAsyncReader>>>> {
     match self.data_files.get(&hash) {
       Some(df) => Ok(df.file.clone()),
       None => bail!("Data file '{:016x}.grd' not found", hash),

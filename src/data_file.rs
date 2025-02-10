@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::{
   fs::File,
-  io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader},
+  io::{AsyncRead, AsyncSeek, AsyncSeekExt, BufReader},
   sync::Mutex,
 };
 
@@ -26,15 +26,21 @@ pub struct DataFileEnvelope {
   pub info: BTreeMap<String, String>,
 }
 
+pub trait DataAsyncReader: AsyncRead + AsyncSeek + Unpin + Send+ Sync + std::fmt::Debug {}
+
+impl DataAsyncReader for BufReader<File> {}
+
+impl DataAsyncReader for File {}
+
 #[derive(Debug, Clone)]
-pub struct DataFile<F: AsyncRead + AsyncReadExt + AsyncSeek + AsyncSeekExt + Unpin> {
+pub struct DataFile {
   pub envelope: DataFileEnvelope,
-  pub file: Arc<Mutex<BufReader<F>>>,
+  pub file: Arc<Mutex<Box<dyn DataAsyncReader>>>,
   pub data_offset: u64,
 }
 
-impl DataFile<File> {
-  pub async fn new(dir: &PathBuf, hash: u64) -> Result<DataFile<File>> {
+impl DataFile {
+  pub async fn new(dir: &PathBuf, hash: u64) -> Result<DataFile> {
     let mut data_file = GoatRodeoCluster::find_file(dir, hash, "grd").await?;
     let dfp: &mut File = &mut data_file;
     let magic = read_u32(dfp).await?;
@@ -53,12 +59,13 @@ impl DataFile<File> {
     // FIXME do additional validation of the envelope
     Ok(DataFile {
       envelope: env,
-      file: Arc::new(Mutex::new(BufReader::with_capacity(4096, data_file))),
+      //file: Arc::new(Mutex::new(Box::new(BufReader::with_capacity(4096, data_file)))),
+      file: Arc::new(Mutex::new(Box::new(data_file))),
       data_offset: cur_pos,
     })
   }
 
-  async fn seek_to(file: &mut BufReader<File>, desired_pos: u64) -> Result<()> {
+  async fn seek_to(file: &mut Box<dyn DataAsyncReader>, desired_pos: u64) -> Result<()> {
     let pos = file.stream_position().await?;
     if pos == desired_pos {
       return Ok(());
@@ -72,8 +79,9 @@ impl DataFile<File> {
 
   pub async fn read_item_at(&self, pos: u64) -> Result<Item> {
     let mut my_file = self.file.lock().await;
-    DataFile::seek_to(&mut my_file, pos).await?;
-    let my_reader: &mut BufReader<File> = &mut my_file;
+    let my_reader: &mut Box<dyn DataAsyncReader> = &mut my_file;
+    DataFile::seek_to(my_reader, pos).await?;
+    
     let item_len = read_u32(my_reader).await?;
     let item = read_cbor(&mut *my_file, item_len as usize).await?;
     Ok(item)
