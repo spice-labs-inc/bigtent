@@ -161,12 +161,12 @@ async fn do_north(
 fn build_route(state: Arc<RodeoServer>) -> Router {
   let app: Router<()> = Router::new()
     .route("/bulk", post(serve_bulk))
-    .route("/:gitoid", get(serve_gitoid))
-    .route("/aa/:gitoid", get(serve_anti_alias))
+    .route("/{*gitoid}", get(serve_gitoid))
+    .route("/aa/{*gitoid}", get(serve_anti_alias))
+    .route("/north/{*gitoid}", get(serve_north))
+    .route("/north_purls/{*gitoid}", get(serve_north_purls))
     .route("/north", post(serve_bulk_north))
     .route("/north_purls", post(serve_bulk_north_purls))
-    .route("/north/:gitoid", post(serve_north))
-    .route("/north_purls/:gitoid", post(serve_north_purls))
     .with_state(state);
 
   app

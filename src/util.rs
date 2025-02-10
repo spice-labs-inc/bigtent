@@ -5,10 +5,7 @@ use log::info;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
 use std::{
-  collections::{BTreeMap, HashSet},
-  ffi::OsStr,
-  path::PathBuf,
-  time::{Duration, SystemTime},
+  collections::{BTreeMap, HashSet}, ffi::OsStr, io::Read, path::PathBuf, time::{Duration, SystemTime}
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -335,6 +332,13 @@ pub async fn read_u32<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<u32> {
   Ok(u32::from_be_bytes(buf))
 }
 
+pub fn read_u32_sync<R: Read + Unpin>(r: &mut R) -> Result<u32> {
+  let mut buf = [0u8; 4];
+  r.read_exact(&mut buf)?;
+
+  Ok(u32::from_be_bytes(buf))
+}
+
 pub async fn read_u64<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<u64> {
   let mut buf = [0u8; 8];
   r.read_exact(&mut buf).await?;
@@ -364,6 +368,37 @@ pub async fn read_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
     buffer.push(0u8);
   }
   file.read_exact(&mut buffer).await?;
+
+  match serde_cbor::from_slice(&*buffer) {
+    Ok(v) => Ok(v),
+    Err(e) => {
+      match serde_cbor::from_slice::<Value>(&*&buffer) {
+        Ok(v) => {
+          info!("Deserialized value {:?} but got error {}", v, e);
+        }
+        Err(e2) => {
+          info!(
+            "Failed to do basic deserialization of {} with errors e {} and e2 {}",
+            unsafe { String::from_utf8_unchecked(buffer) },
+            e,
+            e2
+          )
+        }
+      }
+      bail!("Failed to deserialize with error {}", e);
+    }
+  }
+}
+
+pub fn read_cbor_sync<T: DeserializeOwned, R: Read + Unpin>(
+  file: &mut R,
+  len: usize,
+) -> Result<T> {
+  let mut buffer = Vec::with_capacity(len);
+  for _ in 0..len {
+    buffer.push(0u8);
+  }
+  file.read_exact(&mut buffer)?;
 
   match serde_cbor::from_slice(&*buffer) {
     Ok(v) => Ok(v),

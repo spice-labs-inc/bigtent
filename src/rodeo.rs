@@ -14,7 +14,7 @@ use tokio::{fs::{read_dir, File}, io::BufReader, sync::{mpsc::Sender, Mutex}};
 use toml::Table; // Use log crate when building application
 
 use crate::{
-  data_file::{DataAsyncReader, DataFile},
+  data_file::{DataReader, DataFile},
   index_file::{IndexFile, IndexLoc, ItemOffset},
   live_merge::perform_merge,
   rodeo_server::{MD5Hash, RodeoServer},
@@ -499,7 +499,7 @@ impl GoatRodeoCluster {
     Ok(ret_arc)
   }
 
-  pub fn data_file(&self, hash: u64) -> Result<Arc<Mutex<Box<dyn DataAsyncReader>>>> {
+  pub fn data_file(&self, hash: u64) -> Result<Arc<Mutex<Box<dyn DataReader>>>> {
     match self.data_files.get(&hash) {
       Some(df) => Ok(df.file.clone()),
       None => bail!("Data file '{:016x}.grd' not found", hash),
@@ -732,7 +732,7 @@ pub async fn north_send(
   }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_antialias() {
   use std::{path::PathBuf, time::Instant};
   let start = Instant::now();

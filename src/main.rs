@@ -132,7 +132,7 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
   ret
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 100)]
 async fn main() -> Result<()> {
   let env = Env::default()
     .filter_or("MY_LOG_LEVEL", "info")
