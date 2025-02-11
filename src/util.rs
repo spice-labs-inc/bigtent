@@ -1,11 +1,15 @@
-use crate::{index_file::ItemOffset, rodeo_server::MD5Hash};
+use crate::index_file::ItemOffset;
 use anyhow::{bail, Context, Result};
 #[cfg(not(test))]
 use log::info;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
 use std::{
-  collections::{BTreeMap, HashSet}, ffi::OsStr, io::Read, path::PathBuf, time::{Duration, SystemTime}
+  collections::{BTreeMap, HashSet},
+  ffi::OsStr,
+  io::Read,
+  path::PathBuf,
+  time::{Duration, SystemTime},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -157,6 +161,10 @@ async fn test_sha256() {
     res,
     hex!("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
   );
+}
+
+pub fn current_date_string() -> String {
+  format!("{:?}", chrono::offset::Utc::now())
 }
 
 pub fn is_child_dir(root: &PathBuf, potential_child: &PathBuf) -> Result<bool> {
@@ -390,10 +398,7 @@ pub async fn read_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
   }
 }
 
-pub fn read_cbor_sync<T: DeserializeOwned, R: Read + Unpin>(
-  file: &mut R,
-  len: usize,
-) -> Result<T> {
+pub fn read_cbor_sync<T: DeserializeOwned, R: Read + Unpin>(file: &mut R, len: usize) -> Result<T> {
   let mut buffer = Vec::with_capacity(len);
   for _ in 0..len {
     buffer.push(0u8);
@@ -436,12 +441,15 @@ pub async fn write_short_signed<W: AsyncWriteExt + Unpin>(target: &mut W, val: i
   Ok(())
 }
 
-pub async  fn write_long<W: AsyncWriteExt + Unpin>(target: &mut W, val: u64) -> Result<()> {
+pub async fn write_long<W: AsyncWriteExt + Unpin>(target: &mut W, val: u64) -> Result<()> {
   target.write_all(&val.to_be_bytes()).await?;
   Ok(())
 }
 
-pub async fn write_envelope<W: AsyncWriteExt + Unpin, T: Serialize>(target: &mut W, envelope: &T) -> Result<()> {
+pub async fn write_envelope<W: AsyncWriteExt + Unpin, T: Serialize>(
+  target: &mut W,
+  envelope: &T,
+) -> Result<()> {
   let bytes = serde_cbor::to_vec(envelope)?;
   write_short(target, bytes.len() as u16).await?;
   target.write_all(&bytes).await?;
@@ -497,28 +505,13 @@ pub fn as_str<'a>(v: &'a Value) -> Option<&'a String> {
   }
 }
 
-pub fn cbor_to_json_str<T: Serialize>(input: &T) -> Result<String> {
-  let json: serde_json::Value = serde_json::to_value(input)?;
-  let ret = serde_json::to_string_pretty(&json)?;
-  Ok(ret)
-}
-
 pub struct NiceDurationDisplay {
   pub d: u64,
   pub h: u64,
   pub m: u64,
   pub s: u64,
 }
-// impl Into<NiceDurationDisplay> for Duration {
-//     fn into(self) -> NiceDurationDisplay {
-//       NiceDurationDisplay {
-//         d: self.num_days(),
-//         h: self.num_hours() % 24,
-//         m: self.num_minutes() % 60,
-//         s: self.num_seconds() % 60,
-//       }
-//     }
-// }
+
 impl From<Duration> for NiceDurationDisplay {
   fn from(value: Duration) -> Self {
     let secs = value.as_secs();
@@ -560,3 +553,5 @@ impl std::fmt::Display for NiceDurationDisplay {
     }
   }
 }
+
+pub type MD5Hash = [u8; 16];

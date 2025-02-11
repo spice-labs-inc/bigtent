@@ -24,11 +24,11 @@ use crate::{
   data_file::{DataFile, DataReader, GOAT_RODEO_CLUSTER_FILE_SUFFIX},
   index_file::{IndexFile, IndexLoc, ItemOffset},
   live_merge::perform_merge,
-  rodeo_server::{MD5Hash, RodeoServer},
   structs::{EdgeType, Item},
   util::{
-    byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
-    read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
+    byte_slice_to_u63, current_date_string, find_common_root_dir, find_item, hex_to_u64,
+    is_child_dir, md5hash_str, read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
+    MD5Hash,
   },
 };
 #[cfg(not(test))]
@@ -41,6 +41,7 @@ use std::println as info;
 pub struct ClusterFileEnvelope {
   pub version: u32,
   pub magic: u32,
+  pub built_on: Option<String>,
   pub data_files: Vec<u64>,
   pub index_files: Vec<u64>,
   pub info: BTreeMap<String, String>,
@@ -159,6 +160,7 @@ impl GoatRodeoCluster {
       envelope: ClusterFileEnvelope {
         version: 1,
         magic: 1,
+        built_on: Some(current_date_string()),
         data_files: vec![],
         index_files: vec![],
         info: BTreeMap::new(),
@@ -555,7 +557,9 @@ impl GoatRodeoCluster {
         .flatten()
         .map(|s| s.to_owned());
 
-      if file.file_type().await?.is_file() && file_extn == Some(GOAT_RODEO_CLUSTER_FILE_SUFFIX.into()) {
+      if file.file_type().await?.is_file()
+        && file_extn == Some(GOAT_RODEO_CLUSTER_FILE_SUFFIX.into())
+      {
         let walker = GoatRodeoCluster::new(&path, &file.path()).await?;
         ret.push(walker)
       }
@@ -685,7 +689,7 @@ impl GoatRodeoCluster {
         found.insert(this_oid.clone());
         match self.data_for_key(&this_oid).await {
           Ok(item) => {
-            let and_then = RodeoServer::contained_by(&item);
+            let and_then = item.contained_by();
             if purls_only {
               for purl in item.find_purls() {
                 if !found_purls.contains(&purl) {
@@ -695,7 +699,7 @@ impl GoatRodeoCluster {
                 }
               }
             } else {
-              tx.send(item.into()).await?;
+              tx.send(item.to_json()).await?;
             }
 
             to_find = to_find.union(&and_then).map(|s| s.clone()).collect();

@@ -16,8 +16,7 @@ use im::OrdMap;
 use std::println as info;
 use thousands::Separable;
 
-pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoCluster>
-{
+pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoCluster> {
   let clusters: Vec<GoatRodeoCluster> = clusters
     .into_iter()
     .filter(|c| c.cluster_file_hash != 0)
@@ -242,8 +241,7 @@ fn test_live_merge() {
   }
 }
 
-pub async fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster>
-{
+pub async fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster> {
   // if it's not synthetic, just return it
   if !cluster.synthetic {
     return Ok(cluster);
@@ -268,7 +266,9 @@ pub async fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoClu
           // weird, but do nothing... don't add the index
         } else if found.len() == 1 {
           // if we only find one, then just write the index for that item
-          writer.add_index(idx.hash, found[0].reference.0, found[0].reference.1).await?;
+          writer
+            .add_index(idx.hash, found[0].reference.0, found[0].reference.1)
+            .await?;
         } else {
           let the_ref = found[0].reference;
           match Item::merge_vecs(found) {

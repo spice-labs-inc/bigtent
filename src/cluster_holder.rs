@@ -2,72 +2,30 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 #[cfg(not(test))]
 use log::info;
-use std::{collections::HashSet, sync::Arc};
-use crate::structs::EdgeType;
+use std::sync::Arc;
 
+use crate::{config::Args, rodeo::GoatRodeoCluster};
 #[cfg(test)]
 use std::println as info;
 use toml::{map::Map, Table};
-// use num_traits::ops::bytes::ToBytes;
-use crate::{
-  config::Args,
-  index_file::{IndexLoc, ItemOffset},
-  rodeo::GoatRodeoCluster,
-  structs::Item,
-};
 
-pub type MD5Hash = [u8; 16];
-
-#[derive(Debug)]
-pub struct RodeoServer {
-  // threads: Mutex<Vec<JoinHandle<()>>>,
+#[derive(Debug, Clone)]
+pub struct ClusterHolder {
   cluster: Arc<ArcSwap<GoatRodeoCluster>>,
   args: Args,
-  config_table: ArcSwap<Table>,
+  config_table: Arc<ArcSwap<Table>>,
 }
 
-impl RodeoServer {
-  pub async fn find(&self, hash: MD5Hash) -> Result<Option<ItemOffset>> {
-    self.cluster.load().find(hash).await
+impl ClusterHolder {
+  /// update the cluster
+  pub fn update_cluster(&self, new_cluster: Arc<GoatRodeoCluster>) {
+    self.cluster.store(new_cluster);
   }
 
   /// Get the current GoatRodeoCluster from the server
   pub fn get_cluster(&self) -> Arc<GoatRodeoCluster> {
     self.cluster.load().clone()
   }
-
-  pub async fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item> {
-    self.cluster.load().entry_for(file_hash, offset).await
-  }
-
-  pub async fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Item> {
-    self.cluster.load().data_for_entry_offset(index_loc).await
-  }
-
-  pub async fn data_for_hash(&self, hash: MD5Hash) -> Result<Item> {
-    self.cluster.load().data_for_hash(hash).await
-  }
-
-  pub async fn data_for_key(&self, data: &str) -> Result<Item> {
-    self.cluster.load().data_for_key(data).await
-  }
-
-  pub async fn antialias_for(&self, data: &str) -> Result<Item> {
-    self.cluster.load().antialias_for(data).await
-  }
-
-  pub fn contained_by(data: &Item) -> HashSet<String> {
-    let mut ret = HashSet::new();
-    for edge in data.connections.iter() {
-      if edge.0.is_contained_by_up() || edge.0.is_to_right() {
-        ret.insert(edge.1.clone());
-      }
-    }
-
-    ret
-  }
-
-
 
   pub fn get_config_table(&self) -> Arc<Map<String, toml::Value>> {
     self.config_table.load().clone()
@@ -91,7 +49,7 @@ impl RodeoServer {
   pub async fn new_from_cluster(
     cluster: Arc<ArcSwap<GoatRodeoCluster>>,
     args_opt: Option<Args>,
-  ) -> Result<Arc<RodeoServer>> {
+  ) -> Result<Arc<ClusterHolder>> {
     // do this in a block so the index is released at the end of the block
     if false {
       // dunno if this is a good idea...
@@ -103,8 +61,8 @@ impl RodeoServer {
     let args = args_opt.unwrap_or_default();
     let config_table = args.read_conf_file().await.unwrap_or_default();
 
-    let ret = Arc::new(RodeoServer {
-      config_table: ArcSwap::new(Arc::new(config_table)),
+    let ret = Arc::new(ClusterHolder {
+      config_table: Arc::new(ArcSwap::new(Arc::new(config_table))),
       cluster: cluster,
       args: args,
     });
@@ -112,13 +70,13 @@ impl RodeoServer {
     Ok(ret)
   }
 
-  pub async fn new(args: Args) -> Result<Arc<RodeoServer>> {
+  pub async fn new(args: Args) -> Result<Arc<ClusterHolder>> {
     let config_table = args.read_conf_file().await?;
 
     let cluster = Arc::new(ArcSwap::new(Arc::new(
       GoatRodeoCluster::cluster_from_config(args.conf_file()?, &config_table).await?,
     )));
 
-    RodeoServer::new_from_cluster(cluster, Some(args)).await
+    ClusterHolder::new_from_cluster(cluster, Some(args)).await
   }
 }
