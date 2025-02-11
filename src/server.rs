@@ -195,7 +195,8 @@ async fn do_north(
   StreamBodyAs::json_array(TokioReceiverToStream { receiver: mrx })
 }
 
-fn build_route(state: Arc<ClusterHolder>) -> Router {
+/// Build up the routes for the default Big Tent features
+pub fn build_route(state: Arc<ClusterHolder>) -> Router {
   let app: Router<()> = Router::new()
     .route("/bulk", post(serve_bulk))
     .route("/{*gitoid}", get(serve_gitoid))

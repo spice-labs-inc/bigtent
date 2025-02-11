@@ -19,7 +19,7 @@ use thousands::Separable;
 pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoCluster> {
   let clusters: Vec<GoatRodeoCluster> = clusters
     .into_iter()
-    .filter(|c| c.cluster_file_hash != 0)
+    .filter(|c| c.get_cluster_file_hash() != 0)
     .collect();
   let start = Instant::now();
   if clusters.is_empty() {
@@ -54,7 +54,7 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
   // build submap
   let mut submap = HashMap::new();
   for b in &clusters {
-    submap.insert(b.cluster_file_hash, b.clone());
+    submap.insert(b.get_cluster_file_hash(), b.clone());
   }
 
   let mut new_index = Vec::with_capacity(max_size * 90usize / 100usize);
@@ -107,8 +107,8 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
   let mut data_files = HashMap::new();
   let mut index_files = HashMap::new();
   for b in clusters.iter() {
-    data_files.extend(b.data_files.clone());
-    index_files.extend(b.index_files.clone());
+    data_files.extend(b.get_data_files().clone());
+    index_files.extend(b.get_index_files().clone());
   }
 
   let b0 = &clusters[0];
@@ -243,7 +243,7 @@ fn test_live_merge() {
 
 pub async fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster> {
   // if it's not synthetic, just return it
-  if !cluster.synthetic {
+  if !cluster.is_synthetic() {
     return Ok(cluster);
   }
 

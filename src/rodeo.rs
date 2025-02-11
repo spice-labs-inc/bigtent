@@ -87,14 +87,14 @@ impl std::fmt::Display for ClusterFileEnvelope {
 
 #[derive(Debug, Clone)]
 pub struct GoatRodeoCluster {
-  pub envelope: ClusterFileEnvelope,
-  pub cluster_file_hash: u64,
-  pub path: PathBuf,
-  pub cluster_path: PathBuf,
-  pub data_files: HashMap<u64, Arc<DataFile>>,
-  pub index_files: HashMap<u64, IndexFile>,
-  pub sub_clusters: HashMap<u64, GoatRodeoCluster>,
-  pub synthetic: bool,
+  envelope: ClusterFileEnvelope,
+  cluster_file_hash: u64,
+  path: PathBuf,
+  cluster_path: PathBuf,
+  data_files: HashMap<u64, Arc<DataFile>>,
+  index_files: HashMap<u64, IndexFile>,
+  sub_clusters: HashMap<u64, GoatRodeoCluster>,
+  synthetic: bool,
   index: Arc<ArcSwap<Option<Arc<Vec<ItemOffset>>>>>,
   building_index: Arc<Mutex<bool>>,
 }
@@ -109,9 +109,24 @@ pub const IndexFileMagicNumber: u32 = 0x54154170; // Shishitō
 pub const ClusterFileMagicNumber: u32 = 0xba4a4a; // Banana
 
 impl GoatRodeoCluster {
-  // Reset the index. Should be done with extreme care
-  pub fn reset_index(&self) -> () {
-    self.index.store(Arc::new(None));
+  /// get the cluster file hash
+  pub fn get_cluster_file_hash(&self) -> u64 {
+    self.cluster_file_hash
+  }
+
+  /// is the cluster synthetic (built from lots of clusters)
+  pub fn is_synthetic(&self) -> bool {
+    self.synthetic
+  }
+
+  /// Get the data file mapping
+  pub fn get_data_files<'a>(&'a self) -> &'a HashMap<u64, Arc<DataFile>> {
+    &self.data_files
+  }
+
+  /// Get the index file mapping
+  pub fn get_index_files<'a>(&'a self) -> &'a HashMap<u64, IndexFile> {
+    &self.index_files
   }
 
   pub fn create_synthetic_with(
