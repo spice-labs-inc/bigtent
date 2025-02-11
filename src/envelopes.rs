@@ -8,15 +8,15 @@ use serde::{Deserialize, Serialize};
  */
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
 pub struct MD5 {
-    #[serde(alias = "h")]
-    #[serde(rename(serialize = "h"))]
-    pub hash: [u8; 16],
+  #[serde(alias = "h")]
+  #[serde(rename(serialize = "h"))]
+  pub hash: [u8; 16],
 }
 
 impl MD5 {
-    pub fn random(rng: &mut ThreadRng) -> MD5 {
-        MD5 { hash: rng.random() }
-    }
+  pub fn random(rng: &mut ThreadRng) -> MD5 {
+    MD5 { hash: rng.random() }
+  }
 }
 
 type Position = u64;
@@ -29,13 +29,12 @@ type Position = u64;
 // }
 
 pub fn random_position(rng: &mut ThreadRng) -> Position {
-    rng.random()
+  rng.random()
 }
-
 
 type MultifilePosition = (u64, u64);
 
 pub const MULTIFILE_NOOP: MultifilePosition = (0u64, 0u64);
 pub fn multifile_position_rand(rng: &mut ThreadRng) -> MultifilePosition {
-    (rng.random(), rng.random())
+  (rng.random(), rng.random())
 }

@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use arc_swap::ArcSwap;
 use bigtent::{
-  config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster, rodeo_server::RodeoServer,
+  cluster_holder::ClusterHolder, config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster,
   server::run_web_server,
 };
 use clap::{CommandFactory, Parser};
@@ -23,7 +23,7 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
       GoatRodeoCluster::new(&dir_path, &whole_path).await?,
     )));
 
-    let index = RodeoServer::new_from_cluster(cluster, Some(args.clone())).await?;
+    let index = ClusterHolder::new_from_cluster(cluster, Some(args.clone())).await?;
 
     info!(
       "Initial index build in {:?}",
@@ -39,7 +39,7 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
 
 async fn run_full_server(args: Args) -> Result<()> {
   let index_build_start = Instant::now();
-  let index = RodeoServer::new(args).await?;
+  let index = ClusterHolder::new(args).await?;
 
   info!(
     "Initial index build in {:?}",
@@ -71,11 +71,13 @@ async fn run_full_server(args: Args) -> Result<()> {
             }
           }
         }
-        None => {break;}
+        None => {
+          break;
+        }
       }
     }
   });
-  
+
   // and we spawn a real thread to wait on `sig_hup`
   // and when there's a sighup, send a message into the channel
   // which will cause the async tasks to do the rebuild... sigh
@@ -83,7 +85,9 @@ async fn run_full_server(args: Args) -> Result<()> {
     for _ in sig_hup.forever() {
       match tx.blocking_send(true) {
         Ok(_) => {}
-        Err(_) => {break;}
+        Err(_) => {
+          break;
+        }
       }
     }
   });

@@ -1,10 +1,10 @@
 use anyhow::{bail, Result};
 use clap::Parser;
-use tokio::fs::File;
 use std::{
   net::{SocketAddr, ToSocketAddrs},
   path::{Path, PathBuf},
 };
+use tokio::fs::File;
 use toml::Table;
 
 #[derive(Parser, Debug, Default, Clone, PartialEq)]
@@ -48,7 +48,8 @@ impl Args {
       _ => {
         bail!("A configuration file must be supplied")
       }
-    }).await?;
+    })
+    .await?;
     let mut contents = String::new();
     conf_file.read_to_string(&mut contents).await?;
     match contents.parse::<Table>() {
@@ -56,7 +57,7 @@ impl Args {
       Err(e) => bail!("Must provide a valid toml file: {:?}", e),
     }
   }
-  
+
   pub fn conf_file(&self) -> Result<PathBuf> {
     match &self.conf {
       Some(n) if n.exists() && n.is_file() => Ok(

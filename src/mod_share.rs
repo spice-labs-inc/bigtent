@@ -8,7 +8,7 @@ pub struct ClusterPos /*<T>*/ {
   pub cluster: Arc<Vec<ItemOffset>>,
   pub pos: usize,
   pub len: usize,
- // pub thing: T,
+  // pub thing: T,
 }
 
 #[derive(Debug, Clone)]
@@ -19,7 +19,7 @@ pub struct ItemOffsetPlusWhich {
 
 pub fn update_top<I: IntoIterator<Item = usize> /* , T*/>(
   top: &mut OrdMap<[u8; 16], Vec<ItemOffsetPlusWhich>>,
-  index_holder: &mut Vec<ClusterPos/*<T>*/>,
+  index_holder: &mut Vec<ClusterPos /*<T>*/>,
   what: I,
 ) {
   for j in what {

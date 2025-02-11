@@ -16,16 +16,16 @@ use log::info;
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::Stream; // Use log crate when building application
 
-use crate::{rodeo_server::RodeoServer, structs::Item};
+use crate::{cluster_holder::ClusterHolder, structs::Item};
 #[cfg(test)]
 use std::println as info;
 
-async fn stream_items(rodeo: Arc<RodeoServer>, items: Vec<String>) -> Receiver<Item> {
+async fn stream_items(rodeo: Arc<ClusterHolder>, items: Vec<String>) -> Receiver<Item> {
   let (mtx, mrx) = tokio::sync::mpsc::channel::<Item>(32);
 
   tokio::spawn(async move {
     for item_id in items {
-      match rodeo.data_for_key(&item_id).await {
+      match rodeo.get_cluster().data_for_key(&item_id).await {
         Ok(i) => {
           if !mtx.is_closed() {
             let _ = mtx.send(i).await;
@@ -58,7 +58,7 @@ impl<T> Stream for TokioReceiverToStream<T> {
 
 #[axum::debug_handler]
 async fn serve_bulk(
-  State(rodeo): State<Arc<RodeoServer>>,
+  State(rodeo): State<Arc<ClusterHolder>>,
   Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
   let start = Instant::now();
@@ -74,13 +74,13 @@ async fn serve_bulk(
 }
 
 async fn serve_gitoid(
-  State(rodeo): State<Arc<RodeoServer>>,
+  State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
-) -> Result<Json<Item>, impl IntoResponse> {
-  let ret = rodeo.data_for_key(&gitoid).await;
+) -> Result<Json<serde_json::Value>, impl IntoResponse> {
+  let ret = rodeo.get_cluster().data_for_key(&gitoid).await;
 
   match ret {
-    Ok(item) => Ok(Json(item)),
+    Ok(item) => Ok(Json(item.to_json())),
     Err(_) => Err((
       StatusCode::NOT_FOUND,
       format!("No item found for key {}", gitoid),
@@ -89,13 +89,13 @@ async fn serve_gitoid(
 }
 
 async fn serve_anti_alias(
-  State(rodeo): State<Arc<RodeoServer>>,
+  State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
-) -> Result<Json<Item>, impl IntoResponse> {
-  let ret = rodeo.antialias_for(&gitoid).await;
+) -> Result<Json<serde_json::Value>, impl IntoResponse> {
+  let ret = rodeo.get_cluster().antialias_for(&gitoid).await;
 
   match ret {
-    Ok(item) => Ok(Json(item)),
+    Ok(item) => Ok(Json(item.to_json())),
     Err(_) => Err((
       StatusCode::NOT_FOUND,
       format!("No item found for key {}", gitoid),
@@ -103,7 +103,10 @@ async fn serve_anti_alias(
   }
 }
 
-async fn serve_flatten_both(rodeo: Arc<RodeoServer>, payload: Vec<String>) -> Result<impl IntoResponse, impl IntoResponse> {
+async fn serve_flatten_both(
+  rodeo: Arc<ClusterHolder>,
+  payload: Vec<String>,
+) -> Result<impl IntoResponse, impl IntoResponse> {
   let start = Instant::now();
   let payload_len = payload.len();
   scopeguard::defer! {
@@ -111,19 +114,18 @@ async fn serve_flatten_both(rodeo: Arc<RodeoServer>, payload: Vec<String>) -> Re
     start.elapsed());
   }
 
-  let stream: Receiver<serde_json::Value> = match rodeo.get_cluster().stream_flattened_items( payload).await {
-    Ok(s) => s,
-    Err(_e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "??")),
-  };
-let tok_stream = TokioReceiverToStream {
-  receiver: stream,
-};
+  let stream: Receiver<serde_json::Value> =
+    match rodeo.get_cluster().stream_flattened_items(payload).await {
+      Ok(s) => s,
+      Err(_e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "??")),
+    };
+  let tok_stream = TokioReceiverToStream { receiver: stream };
 
   Ok(StreamBodyAs::json_array(tok_stream))
 }
 
 async fn serve_flatten(
-  State(rodeo): State<Arc<RodeoServer>>,
+  State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
 ) -> impl IntoResponse {
   serve_flatten_both(rodeo, vec![gitoid]).await
@@ -132,44 +134,42 @@ async fn serve_flatten(
 /// Serve all the "contains" gitoids for a given Item
 /// Follows `AliasTo` links
 async fn serve_flatten_bulk(
-  State(rodeo): State<Arc<RodeoServer>>,
+  State(rodeo): State<Arc<ClusterHolder>>,
   Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
-
   serve_flatten_both(rodeo, payload).await
-
 }
 
 async fn serve_north(
-  State(rodeo): State<Arc<RodeoServer>>,
+  State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
 ) -> impl IntoResponse {
   do_north(rodeo, vec![gitoid], false).await
 }
 
 async fn serve_north_purls(
-  State(rodeo): State<Arc<RodeoServer>>,
+  State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
 ) -> impl IntoResponse {
   do_north(rodeo, vec![gitoid], true).await
 }
 
 async fn serve_north_bulk(
-  State(rodeo): State<Arc<RodeoServer>>,
+  State(rodeo): State<Arc<ClusterHolder>>,
   Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
   do_north(rodeo, payload, false).await
 }
 
 async fn serve_north_purls_bulk(
-  State(rodeo): State<Arc<RodeoServer>>,
+  State(rodeo): State<Arc<ClusterHolder>>,
   Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
   do_north(rodeo, payload, true).await
 }
 
 async fn do_north(
-  rodeo: Arc<RodeoServer>,
+  rodeo: Arc<ClusterHolder>,
   gitoids: Vec<String>,
   purls_only: bool,
 ) -> impl IntoResponse {
@@ -195,7 +195,7 @@ async fn do_north(
   StreamBodyAs::json_array(TokioReceiverToStream { receiver: mrx })
 }
 
-fn build_route(state: Arc<RodeoServer>) -> Router {
+fn build_route(state: Arc<ClusterHolder>) -> Router {
   let app: Router<()> = Router::new()
     .route("/bulk", post(serve_bulk))
     .route("/{*gitoid}", get(serve_gitoid))
@@ -211,7 +211,7 @@ fn build_route(state: Arc<RodeoServer>) -> Router {
   app
 }
 
-pub async fn run_web_server(index: Arc<RodeoServer>) -> Result<()> {
+pub async fn run_web_server(index: Arc<ClusterHolder>) -> Result<()> {
   let state = index.clone();
   let addrs = index.the_args().to_socket_addrs();
   info!("Listen on {:?}", addrs);
@@ -227,5 +227,3 @@ pub async fn run_web_server(index: Arc<RodeoServer>) -> Result<()> {
   axum::serve(listener, aggregated).await?;
   Ok(())
 }
-
-

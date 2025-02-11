@@ -15,9 +15,8 @@ use crate::{
   cluster_writer::ClusterWriter,
   mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
-  rodeo_server::MD5Hash,
   structs::Item,
-  util::NiceDurationDisplay,
+  util::{MD5Hash, NiceDurationDisplay},
 };
 use anyhow::Result;
 use thousands::Separable;
@@ -132,17 +131,12 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     async fn get_item_and_pos(
       hash: MD5Hash,
       which: usize,
-      // index_holder: &mut Vec<ClusterPos /*<Option<Receiver<(Item, usize)>>>*/>,
       clusters: &Vec<GoatRodeoCluster>,
     ) -> Result<(Item, usize)> {
-      /*match &index_holder[which].thing {
-      Some(rx) => rx.recv().map_err(|e| e.into()),
-      _ =>*/
       match clusters[which].data_for_hash(hash).await {
         Ok(i) => Ok((i, 0)),
         Err(e) => Err(e),
-      } /*,
-        }*/
+      }
     }
 
     match next {
@@ -156,7 +150,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
           let (mut merge_final, _the_pos) = get_item_and_pos(
             merge_base.item_offset.hash,
             merge_base.which,
-          //  &mut index_holder,
+            //  &mut index_holder,
             &clusters,
           )
           .await?;

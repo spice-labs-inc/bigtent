@@ -1,15 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_cbor::Value;
-
 
 pub type LocationReference = (u64, u64);
 
 pub trait Mergeable {
   fn merge(&self, other: Self) -> Self;
 }
-
 
 /// Merge two values
 fn merge_values(v1: &Value, v2: Option<&Value>) -> Value {
@@ -83,7 +81,6 @@ impl Mergeable for Value {
   }
 }
 
-
 pub trait EdgeType {
   fn is_alias_from(&self) -> bool;
 
@@ -95,7 +92,7 @@ pub trait EdgeType {
 
   fn is_contains_down(&self) -> bool;
 
- fn is_contained_by_up(&self) -> bool;
+  fn is_contained_by_up(&self) -> bool;
 }
 
 pub const TO_RIGHT: &str = ":->";
@@ -108,13 +105,12 @@ pub const CONTAINS: &str = "Contains:||";
 pub const ALIAS_TO: &str = "AliasTo:->";
 pub const ALIAS_FROM: &str = "AliasFrom:<-";
 
-
 impl EdgeType for String {
   fn is_alias_from(&self) -> bool {
     self == ALIAS_FROM
   }
 
-   fn is_alias_to(&self) -> bool {
+  fn is_alias_to(&self) -> bool {
     self == ALIAS_TO
   }
 
@@ -133,15 +129,12 @@ impl EdgeType for String {
   fn is_contained_by_up(&self) -> bool {
     self.ends_with(CONTAINED_BY_UP)
   }
-
 }
 
 pub type Edge = (String, String);
 
-
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Item
-{
+pub struct Item {
   pub identifier: String,
   pub reference: LocationReference,
   pub connections: BTreeSet<Edge>,
@@ -149,8 +142,19 @@ pub struct Item
   pub body: Option<Value>,
 }
 
-impl Item
-{
+impl From<Item> for serde_json::Value {
+  fn from(value: Item) -> Self {
+    value.to_json()
+  }
+}
+
+impl From<&Item> for serde_json::Value {
+  fn from(value: &Item) -> Self {
+    value.to_json()
+  }
+}
+
+impl Item {
   pub const NOOP: LocationReference = (0u64, 0u64);
 
   /// Find all the aliases that are package URLs
@@ -174,6 +178,30 @@ impl Item
     self.reference = Item::NOOP;
   }
 
+  /// get all the connections that are either `contained_by_up` or `is_to_right`
+  pub fn contained_by(&self) -> HashSet<String> {
+    let mut ret = HashSet::new();
+    for edge in self.connections.iter() {
+      if edge.0.is_contained_by_up() || edge.0.is_to_right() {
+        ret.insert(edge.1.clone());
+      }
+    }
+
+    ret
+  }
+
+  pub fn to_json(&self) -> serde_json::Value {
+    let mut ret = serde_json::to_value(self).expect("Should be able to serialize Item");
+    match ret {
+      serde_json::Value::Object(mut m) => {
+        m.remove_entry("reference");
+        ret = serde_json::Value::Object(m)
+      }
+      _ => {}
+    }
+    ret
+  }
+
   // tests two items... they are the same if they have the same
   // `identifier`, `connections`, `metadata`, `version`,
   // and `_type`
@@ -186,12 +214,16 @@ impl Item
 
   // merge to `Item`s
   pub fn merge(&self, other: Item) -> Item {
-    let (body, mime_type) = match (&self.body, other.body, self.body_mime_type == other.body_mime_type) {
+    let (body, mime_type) = match (
+      &self.body,
+      other.body,
+      self.body_mime_type == other.body_mime_type,
+    ) {
       (None, None, _) => (None, None),
       (None, Some(a), _) => (Some(a), other.body_mime_type.clone()),
       (Some(a), None, _) => (Some(a.clone()), self.body_mime_type.clone()),
       (Some(a), Some(b), true) => (Some(a.merge(b)), self.body_mime_type.clone()),
-      _ => (self.body.clone(), self.body_mime_type.clone())
+      _ => (self.body.clone(), self.body_mime_type.clone()),
     };
 
     Item {
@@ -234,13 +266,7 @@ impl Item
   }
 }
 
-impl Into<serde_json::Value> for Item {
-    fn into(self) -> serde_json::Value {
-        serde_json::to_value(self).unwrap()
-    }
-}
-pub enum ItemMergeResult
-{
+pub enum ItemMergeResult {
   Same,
   ContainsAll(LocationReference),
   New(Item),
