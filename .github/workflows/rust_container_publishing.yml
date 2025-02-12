@@ -5,11 +5,12 @@ on:
     types:
       - "published"
   workflow_run:
-    workflows: ["Rust Build & Test"]
-      types:
-        - "completed"
-      branches:
-        - "main"
+    workflows: 
+      - "Rust Build & Test"
+    types:
+      - "completed"
+    branches:
+      - "main"
   
 env:
   REGISTRY: ghcr.io
