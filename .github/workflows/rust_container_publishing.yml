@@ -1,16 +1,14 @@
 name: Publish Container Images
 
 on:
-  release:
-    types:
-      - "published"
   workflow_run:
-    workflows: 
-      - "Rust Build & Test"
+    workflows: ["Rust Build & Test"]
     types:
       - "completed"
-    branches:
+    branches: 
       - "main"
+    tags: 
+      - "v*.*.*"
   
 env:
   REGISTRY: ghcr.io
@@ -20,6 +18,7 @@ jobs:
     push_to_registry:
       name: Push Docker image to Docker Hub
       runs-on: ubuntu-latest
+      if: ${{ github.event.workflow_run.conclusion == 'success' }}
       permissions:
         packages: write
         contents: read
