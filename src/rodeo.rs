@@ -97,6 +97,7 @@ pub struct GoatRodeoCluster {
   synthetic: bool,
   index: Arc<ArcSwap<Option<Arc<Vec<ItemOffset>>>>>,
   building_index: Arc<Mutex<bool>>,
+  name: String,
 }
 
 #[allow(non_upper_case_globals)]
@@ -129,12 +130,18 @@ impl GoatRodeoCluster {
     &self.index_files
   }
 
+  /// get the name of the cluster
+  pub fn name(&self) -> String {
+    self.name.clone()
+  }
+
   pub fn create_synthetic_with(
     &self,
     index: Vec<ItemOffset>,
     data_files: HashMap<u64, Arc<DataFile>>,
     index_files: HashMap<u64, IndexFile>,
     sub_clusters: HashMap<u64, GoatRodeoCluster>,
+    name: String,
   ) -> Result<GoatRodeoCluster> {
     if sub_clusters.len() == 0 {
       bail!("A synthetic cluster must have at least one underlying real cluster")
@@ -166,6 +173,7 @@ impl GoatRodeoCluster {
       cluster_file_hash: my_hash,
       sub_clusters,
       synthetic: true,
+      name: name,
     })
   }
 
@@ -189,6 +197,7 @@ impl GoatRodeoCluster {
       cluster_file_hash: 0,
       sub_clusters: HashMap::new(),
       synthetic: false,
+      name: format!("{:?}", root_dir),
     }
   }
 
@@ -312,6 +321,7 @@ impl GoatRodeoCluster {
       cluster_file_hash: sha_u64,
       sub_clusters: HashMap::new(),
       synthetic: false,
+      name: format!("{:?}", cluster_path),
     })
   }
 
