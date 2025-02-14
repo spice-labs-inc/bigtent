@@ -30,6 +30,16 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
     return Ok(clusters[0].clone());
   }
 
+  let mut whole_name = "Live Merged: ".to_string();
+  let mut first_name = true;
+  for c in &clusters {
+    if !first_name {
+      whole_name.push_str(", ");
+    }
+    first_name = false;
+    whole_name.push_str(&c.name());
+  }
+
   let mut index_holder = vec![];
 
   let mut max_size = 0usize;
@@ -113,7 +123,7 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
 
   let b0 = &clusters[0];
   info!("Merge took {:?}", Instant::now().duration_since(start));
-  b0.create_synthetic_with(new_index, data_files, index_files, submap)
+  b0.create_synthetic_with(new_index, data_files, index_files, submap, whole_name)
 }
 
 #[cfg(feature = "longtest")]

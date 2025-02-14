@@ -48,65 +48,22 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 
   let mut index_holder = vec![];
 
-  for cluster in &clusters {
+  for (idx, cluster) in clusters.iter().enumerate() {
     let index = cluster.get_index().await?;
     let index_len = index.len();
-
-    // let (tx, rx) = flume::bounded(32);
-
-    /* if use_threads {
-      let index_shadow = index.clone();
-      let cluster_shadow = cluster.clone();
-
-      std::thread::spawn(async move || {
-        let mut loop_cnt = 0usize;
-        let start = Instant::now();
-        let index_len = index_shadow.len();
-        for io in index_shadow.iter() {
-          let item = cluster_shadow
-            .data_for_entry_offset(&io.loc)
-            .await
-            .expect("Expected to load data");
-
-          match tx.send((item, loop_cnt)) {
-            Ok(_) => {}
-            Err(e) => {
-              error!(
-                "On {:016x} failed to send {} of {} error {}",
-                cluster_shadow.cluster_file_hash,
-                loop_cnt.separate_with_commas(),
-                index_len.separate_with_commas(),
-                e
-              );
-              panic!(
-                "On {:016x} failed to send {} of {} error {}",
-                cluster_shadow.cluster_file_hash,
-                loop_cnt.separate_with_commas(),
-                index_len.separate_with_commas(),
-                e
-              );
-            }
-          };
-          loop_cnt += 1;
-          if false && loop_cnt % 2_500_000 == 0 {
-            info!(
-              "Cluster fetcher {:016x} loop {} of {} at {:?}",
-              cluster_shadow.cluster_file_hash,
-              loop_cnt.separate_with_commas(),
-              index_len.separate_with_commas(),
-              start.elapsed()
-            );
-          }
-        }
-      });
-    }*/
 
     index_holder.push(ClusterPos {
       cluster: index.clone(),
       pos: 0,
       len: index.len(),
-      //  thing: if use_threads { Some(rx) } else { None },
     });
+
+    info!(
+      "Loaded cluster {} of {}, from {}",
+      idx + 1,
+      clusters.len(),
+      cluster.name()
+    );
 
     max_merge_len += index_len;
   }
