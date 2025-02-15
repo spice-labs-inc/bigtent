@@ -19,8 +19,8 @@ use crate::{
   sha_writer::ShaWriter,
   structs::Item,
   util::{
-    byte_slice_to_u63, current_date_string, md5hash_str, path_plus_timed, sha256_for_slice,
-    write_envelope, write_int, write_long, write_short_signed, MD5Hash,
+    byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope, write_int,
+    write_long, write_short_signed, MD5Hash,
   },
 };
 
@@ -136,8 +136,6 @@ impl ClusterWriter {
       let cluster_env = ClusterFileEnvelope {
         version: 1,
         magic: ClusterFileMagicNumber,
-        built_on: Some(current_date_string()),
-        builder: Some(format!("Big Tent Version {}", "FIXME")),
         info: BTreeMap::new(),
         data_files: self.seen_data_files.iter().map(|v| *v).collect(),
         index_files: self.index_files.iter().map(|v| *v).collect(),

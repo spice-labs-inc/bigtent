@@ -6,7 +6,6 @@ use crate::{
   index_file::{IndexLoc, ItemOffset},
   mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
-
 };
 use anyhow::{bail, Result};
 use im::OrdMap;

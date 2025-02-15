@@ -97,7 +97,6 @@ pub const FROM: &str = ":from";
 pub const DOWN: &str = ":down";
 pub const UP: &str = ":up";
 
-
 pub const CONTAINED_BY: &str = "contained:up";
 pub const CONTAINS: &str = "contained:down";
 pub const ALIAS_TO: &str = "alias:to";
@@ -223,7 +222,7 @@ impl Item {
 
     Item {
       identifier: self.identifier.clone(),
-     // reference: self.reference,
+      // reference: self.reference,
       connections: {
         let mut it = self.connections.clone();
         it.extend(other.connections);

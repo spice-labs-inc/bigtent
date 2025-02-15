@@ -26,9 +26,8 @@ use crate::{
   live_merge::perform_merge,
   structs::{EdgeType, Item},
   util::{
-    byte_slice_to_u63, current_date_string, find_common_root_dir, find_item, hex_to_u64,
-    is_child_dir, md5hash_str, read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
-    MD5Hash,
+    byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
+    read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice, MD5Hash,
   },
 };
 #[cfg(not(test))]
@@ -41,8 +40,6 @@ use std::println as info;
 pub struct ClusterFileEnvelope {
   pub version: u32,
   pub magic: u32,
-  pub built_on: Option<String>,
-  pub builder: Option<String>,
   pub data_files: Vec<u64>,
   pub index_files: Vec<u64>,
   pub info: BTreeMap<String, String>,
@@ -184,8 +181,6 @@ impl GoatRodeoCluster {
       envelope: ClusterFileEnvelope {
         version: 1,
         magic: 1,
-        built_on: Some(current_date_string()),
-        builder: Some(format!("Big Tent Version {}", "FIXME")),
         data_files: vec![],
         index_files: vec![],
         info: BTreeMap::new(),
