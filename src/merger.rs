@@ -104,7 +104,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         let mut to_merge = vec![];
 
         for merge_base in items {
-          let (mut merge_final, _the_pos) = get_item_and_pos(
+          let (merge_final, _the_pos) = get_item_and_pos(
             merge_base.item_offset.hash,
             merge_base.which,
             //  &mut index_holder,
@@ -112,7 +112,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
           )
           .await?;
 
-          merge_final.remove_references();
+          // merge_final.remove_references();
           match merge_final
             .connections
             .iter()
@@ -131,13 +131,13 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 
         let mut top = to_merge.pop().unwrap();
         merge_cnt += to_merge.len();
-        top.remove_references();
-        for mut i in to_merge {
-          i.remove_references();
+        //top.remove_references();
+        for i in to_merge {
+          //i.remove_references();
           top = top.merge(i);
         }
         let cur_pos = cluster_writer.cur_pos() as u64;
-        top.reference.1 = cur_pos;
+        // top.reference.1 = cur_pos;
 
         cluster_writer.write_item(top).await?;
 

@@ -42,6 +42,7 @@ pub struct ClusterFileEnvelope {
   pub version: u32,
   pub magic: u32,
   pub built_on: Option<String>,
+  pub builder: Option<String>,
   pub data_files: Vec<u64>,
   pub index_files: Vec<u64>,
   pub info: BTreeMap<String, String>,
@@ -184,6 +185,7 @@ impl GoatRodeoCluster {
         version: 1,
         magic: 1,
         built_on: Some(current_date_string()),
+        builder: Some(format!("Big Tent Version {}", "FIXME")),
         data_files: vec![],
         index_files: vec![],
         info: BTreeMap::new(),
@@ -603,28 +605,28 @@ impl GoatRodeoCluster {
     let data_file = data_files.get(&file_hash);
     match data_file {
       Some(df) => {
-        let mut item = df.read_item_at(offset).await?;
-        match item.reference.0 {
-          0 => item.reference.0 = file_hash,
-          v if v != file_hash => {
-            bail!(
-              "Got item {} that should have had a file_hash of {:016x}, but had {:016x}",
-              item.identifier,
-              file_hash,
-              item.reference.0,
-            )
-          }
-          _ => {}
-        }
+        let item = df.read_item_at(offset).await?;
+        // match item.reference.0 {
+        //   0 => item.reference.0 = file_hash,
+        //   v if v != file_hash => {
+        //     bail!(
+        //       "Got item {} that should have had a file_hash of {:016x}, but had {:016x}",
+        //       item.identifier,
+        //       file_hash,
+        //       item.reference.0,
+        //     )
+        //   }
+        //   _ => {}
+        // }
 
-        if item.reference.1 != offset {
-          bail!(
-            "Expecting item {} to have offset {}, but reported offset {}",
-            item.identifier,
-            offset,
-            item.reference.1
-          )
-        }
+        // if item.reference.1 != offset {
+        //   bail!(
+        //     "Expecting item {} to have offset {}, but reported offset {}",
+        //     item.identifier,
+        //     offset,
+        //     item.reference.1
+        //   )
+        // }
 
         Ok(item)
       }

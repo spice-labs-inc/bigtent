@@ -137,6 +137,7 @@ impl ClusterWriter {
         version: 1,
         magic: ClusterFileMagicNumber,
         built_on: Some(current_date_string()),
+        builder: Some(format!("Big Tent Version {}", "FIXME")),
         info: BTreeMap::new(),
         data_files: self.seen_data_files.iter().map(|v| *v).collect(),
         index_files: self.index_files.iter().map(|v| *v).collect(),
