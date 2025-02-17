@@ -43,6 +43,7 @@ jobs:
             rev_version="$(echo $last_version_tag$dirty$snapshot | sed -e 's/^v//')"
             echo "rev_version=$rev_version" >> "$GITHUB_ENV"
             sed -i -e "s/^version = .*/version = \"$rev_version\"/" Cargo.toml
+            echo "Version set to '$rev_version'"
         - name: Log in to Docker Hub
           uses: docker/login-action@v3
           with:
