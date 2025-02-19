@@ -26,9 +26,8 @@ use crate::{
   live_merge::perform_merge,
   structs::{EdgeType, Item},
   util::{
-    byte_slice_to_u63, current_date_string, find_common_root_dir, find_item, hex_to_u64,
-    is_child_dir, md5hash_str, read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
-    MD5Hash,
+    byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
+    read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice, MD5Hash,
   },
 };
 #[cfg(not(test))]
@@ -41,7 +40,6 @@ use std::println as info;
 pub struct ClusterFileEnvelope {
   pub version: u32,
   pub magic: u32,
-  pub built_on: Option<String>,
   pub data_files: Vec<u64>,
   pub index_files: Vec<u64>,
   pub info: BTreeMap<String, String>,
@@ -183,7 +181,6 @@ impl GoatRodeoCluster {
       envelope: ClusterFileEnvelope {
         version: 1,
         magic: 1,
-        built_on: Some(current_date_string()),
         data_files: vec![],
         index_files: vec![],
         info: BTreeMap::new(),
@@ -603,28 +600,28 @@ impl GoatRodeoCluster {
     let data_file = data_files.get(&file_hash);
     match data_file {
       Some(df) => {
-        let mut item = df.read_item_at(offset).await?;
-        match item.reference.0 {
-          0 => item.reference.0 = file_hash,
-          v if v != file_hash => {
-            bail!(
-              "Got item {} that should have had a file_hash of {:016x}, but had {:016x}",
-              item.identifier,
-              file_hash,
-              item.reference.0,
-            )
-          }
-          _ => {}
-        }
+        let item = df.read_item_at(offset).await?;
+        // match item.reference.0 {
+        //   0 => item.reference.0 = file_hash,
+        //   v if v != file_hash => {
+        //     bail!(
+        //       "Got item {} that should have had a file_hash of {:016x}, but had {:016x}",
+        //       item.identifier,
+        //       file_hash,
+        //       item.reference.0,
+        //     )
+        //   }
+        //   _ => {}
+        // }
 
-        if item.reference.1 != offset {
-          bail!(
-            "Expecting item {} to have offset {}, but reported offset {}",
-            item.identifier,
-            offset,
-            item.reference.1
-          )
-        }
+        // if item.reference.1 != offset {
+        //   bail!(
+        //     "Expecting item {} to have offset {}, but reported offset {}",
+        //     item.identifier,
+        //     offset,
+        //     item.reference.1
+        //   )
+        // }
 
         Ok(item)
       }

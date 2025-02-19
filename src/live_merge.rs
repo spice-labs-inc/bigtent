@@ -3,12 +3,9 @@ use log::info;
 use std::{collections::HashMap, time::Instant}; // Use log crate when building application
 
 use crate::{
-  cluster_writer::ClusterWriter,
   index_file::{IndexLoc, ItemOffset},
   mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
-  structs::{Item, ItemMergeResult},
-  util::path_plus_timed,
 };
 use anyhow::{bail, Result};
 use im::OrdMap;
@@ -251,66 +248,66 @@ fn test_live_merge() {
   }
 }
 
-pub async fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster> {
-  // if it's not synthetic, just return it
-  if !cluster.is_synthetic() {
-    return Ok(cluster);
-  }
+// pub async fn persist_synthetic(cluster: GoatRodeoCluster) -> Result<GoatRodeoCluster> {
+//   // if it's not synthetic, just return it
+//   if !cluster.is_synthetic() {
+//     return Ok(cluster);
+//   }
 
-  let enclosed = cluster.all_sub_clusters().await;
-  let root_path = GoatRodeoCluster::common_parent_dir(enclosed.as_slice())?;
-  let target_dir = path_plus_timed(&root_path, "synthetic_cluster");
-  std::fs::create_dir_all(&target_dir)?;
-  let mut loop_cnt = 0usize;
-  let mut merge_cnt = 0usize;
-  let start = Instant::now();
+//   let enclosed = cluster.all_sub_clusters().await;
+//   let root_path = GoatRodeoCluster::common_parent_dir(enclosed.as_slice())?;
+//   let target_dir = path_plus_timed(&root_path, "synthetic_cluster");
+//   std::fs::create_dir_all(&target_dir)?;
+//   let mut loop_cnt = 0usize;
+//   let mut merge_cnt = 0usize;
+//   let start = Instant::now();
 
-  let mut writer = ClusterWriter::new(&target_dir).await?;
+//   let mut writer = ClusterWriter::new(&target_dir).await?;
 
-  for idx in cluster.get_index().await?.iter() {
-    match idx.loc {
-      IndexLoc::Loc { offset, file_hash } => writer.add_index(idx.hash, file_hash, offset).await?,
-      IndexLoc::Chain(_) => {
-        let found = cluster.vec_for_entry_offset(&idx.loc).await?;
-        if found.len() == 0 {
-          // weird, but do nothing... don't add the index
-        } else if found.len() == 1 {
-          // if we only find one, then just write the index for that item
-          writer
-            .add_index(idx.hash, found[0].reference.0, found[0].reference.1)
-            .await?;
-        } else {
-          let the_ref = found[0].reference;
-          match Item::merge_vecs(found) {
-            ItemMergeResult::Same => {
-              // just add the index
-              writer.add_index(idx.hash, the_ref.0, the_ref.1).await?
-            }
-            ItemMergeResult::ContainsAll(loc_ref) => {
-              // just add the index
-              writer.add_index(idx.hash, loc_ref.0, loc_ref.1).await?
-            }
-            ItemMergeResult::New(item) => {
-              // need a real new item
-              merge_cnt += 1;
-              writer.write_item(item).await?
-            }
-          }
-        }
-      }
-    }
+//   for idx in cluster.get_index().await?.iter() {
+//     match idx.loc {
+//       IndexLoc::Loc { offset, file_hash } => writer.add_index(idx.hash, file_hash, offset).await?,
+//       IndexLoc::Chain(_) => {
+//         let found = cluster.vec_for_entry_offset(&idx.loc).await?;
+//         if found.len() == 0 {
+//           // weird, but do nothing... don't add the index
+//         } else if found.len() == 1 {
+//           // if we only find one, then just write the index for that item
+//           writer
+//             .add_index(idx.hash, found[0].reference.0, found[0].reference.1)
+//             .await?;
+//         } else {
+//           let the_ref = found[0].reference;
+//           match Item::merge_vecs(found) {
+//             ItemMergeResult::Same => {
+//               // just add the index
+//               writer.add_index(idx.hash, the_ref.0, the_ref.1).await?
+//             }
+//             ItemMergeResult::ContainsAll(loc_ref) => {
+//               // just add the index
+//               writer.add_index(idx.hash, loc_ref.0, loc_ref.1).await?
+//             }
+//             ItemMergeResult::New(item) => {
+//               // need a real new item
+//               merge_cnt += 1;
+//               writer.write_item(item).await?
+//             }
+//           }
+//         }
+//       }
+//     }
 
-    loop_cnt += 1;
-    if loop_cnt % 1_000_000 == 0 {
-      info!(
-        "Persist synthetic loop {} merged {} at {:?}",
-        loop_cnt.separate_with_commas(),
-        merge_cnt.separate_with_commas(),
-        Instant::now().duration_since(start)
-      );
-    }
-  }
+//     loop_cnt += 1;
+//     if loop_cnt % 1_000_000 == 0 {
+//       info!(
+//         "Persist synthetic loop {} merged {} at {:?}",
+//         loop_cnt.separate_with_commas(),
+//         merge_cnt.separate_with_commas(),
+//         Instant::now().duration_since(start)
+//       );
+//     }
+//   }
 
-  let new_cluster_path = writer.finalize_cluster().await?;
-  GoatRodeoCluster::new(&root_path, &new_cluster_path).await
-}
+//   let new_cluster_path = writer.finalize_cluster().await?;
+//   GoatRodeoCluster::new(&root_path, &new_cluster_path).await
+// }

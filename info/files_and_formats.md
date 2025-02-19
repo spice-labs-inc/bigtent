@@ -15,7 +15,7 @@ There are five basic file types in Big Tent:
 Cluster, Index, and Data files are named based on the SHA256 of the file.
 
 The SHA256 is computed for the file and the most significant 8 bytes of the hash
-are converted to hexidecimal and used as part of the filename.
+are converted to hexadecimal and used as part of the filename.
 
 For Index and Data files, the names are the hex of the most significant
 8 bytes with `.gri` or `.grd` suffix. Examples `3d58cbbc64cc612b.gri` and
@@ -126,7 +126,7 @@ The format of the Data File is as follows:
 The first 4 bytes of the file is a magic number: `DataFileMagicNumber: u32 = 0x00be1100; // Bell`
 stored in Big Endian format.
 
-A two byte envelope lentgh (Big Endian) followed by the Data File envelope:
+A two byte envelope length (Big Endian) followed by the Data File envelope:
 
 ```rust
 pub struct DataFileEnvelope {
@@ -144,7 +144,7 @@ pub struct DataFileEnvelope {
 `magic` == `DataFileMagicNumber`
 
 `previous` contains the most significant 8 bytes of the hash of the previous data file in
-a particular set of data files. This allows for the potential recostruction of Index and Cluster
+a particular set of data files. This allows for the potential reconstruction of Index and Cluster
 files from a set of data files.
 
 `depends_on` when Big Tent databases are merged, there is a history kept of the previous data records
@@ -162,24 +162,20 @@ The balance of the Data File is a series of length fields as u32 Big Endian and 
 ```rust
 pub struct Item {
     pub identifier: String,
-    pub reference: LocationReference,
     pub connections: BTreeSet<Edge>,
-    pub metadata: Option<ItemMetaData>,
-    pub merged_from: BTreeSet<LocationReference>,
+    pub body: Option<Value>,
+    pub body_mime_type: Option<String>
 }
 ```
 
 `identifier` is the primary key of the record.
 
-`reference` is a tuple of `u64` containing the 8 most significant bytes of the SHA256 of the file (note that this will be 0 on disk and is populated by
-  Big Tent when serving the record) and the offset of the record in the file (technically, the offset to the length field).
-
 `connections`: an ordered list of a tuple of `EdgeType` and `String` where `EdgeType` is an enumeration of `AliasTo`, `AliasFrom`, `Contains`, `ContainedBy`,
   `BuildsTo`, and `BuiltFrom`. It's ordered to ensure reproducibility.
 
-`merged_from`: an ordered list of the `Items` that were merged into this `Item`.
+`body`: The optional JSON/CBOR body for this item. Typically it's something like `ItemMetaData`
 
-`metadata`: The `ItemMetaData` referenced by this `Item`.
+`body_mime_type`: The mime type for the body. 
 
 The `ItemMetaData` structure contains:
 

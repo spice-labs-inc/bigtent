@@ -2,9 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_cbor::Value;
-
-pub type LocationReference = (u64, u64);
-
 pub trait Mergeable {
   fn merge(&self, other: Self) -> Self;
 }
@@ -86,24 +83,24 @@ pub trait EdgeType {
 
   fn is_alias_to(&self) -> bool;
 
-  fn is_from_left(&self) -> bool;
+  fn is_from(&self) -> bool;
 
-  fn is_to_right(&self) -> bool;
+  fn is_to(&self) -> bool;
 
   fn is_contains_down(&self) -> bool;
 
   fn is_contained_by_up(&self) -> bool;
 }
 
-pub const TO_RIGHT: &str = ":->";
-pub const FROM_LEFT: &str = ":<-";
-pub const CONTAINS_DOWN: &str = ":||";
-pub const CONTAINED_BY_UP: &str = ":^";
+pub const TO: &str = ":to";
+pub const FROM: &str = ":from";
+pub const DOWN: &str = ":down";
+pub const UP: &str = ":up";
 
-pub const CONTAINED_BY: &str = "ContainedBy:^";
-pub const CONTAINS: &str = "Contains:||";
-pub const ALIAS_TO: &str = "AliasTo:->";
-pub const ALIAS_FROM: &str = "AliasFrom:<-";
+pub const CONTAINED_BY: &str = "contained:up";
+pub const CONTAINS: &str = "contained:down";
+pub const ALIAS_TO: &str = "alias:to";
+pub const ALIAS_FROM: &str = "alias:from";
 
 impl EdgeType for String {
   fn is_alias_from(&self) -> bool {
@@ -114,20 +111,20 @@ impl EdgeType for String {
     self == ALIAS_TO
   }
 
-  fn is_from_left(&self) -> bool {
-    self.ends_with(FROM_LEFT)
+  fn is_from(&self) -> bool {
+    self.ends_with(FROM)
   }
 
-  fn is_to_right(&self) -> bool {
-    self.ends_with(TO_RIGHT)
+  fn is_to(&self) -> bool {
+    self.ends_with(TO)
   }
 
   fn is_contains_down(&self) -> bool {
-    self.ends_with(CONTAINS_DOWN)
+    self.ends_with(CONTAINS)
   }
 
   fn is_contained_by_up(&self) -> bool {
-    self.ends_with(CONTAINED_BY_UP)
+    self.ends_with(CONTAINED_BY)
   }
 }
 
@@ -136,7 +133,6 @@ pub type Edge = (String, String);
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Item {
   pub identifier: String,
-  pub reference: LocationReference,
   pub connections: BTreeSet<Edge>,
   pub body_mime_type: Option<String>,
   pub body: Option<Value>,
@@ -155,8 +151,6 @@ impl From<&Item> for serde_json::Value {
 }
 
 impl Item {
-  pub const NOOP: LocationReference = (0u64, 0u64);
-
   /// Find all the aliases that are package URLs
   pub fn find_purls(&self) -> Vec<String> {
     self
@@ -174,15 +168,15 @@ impl Item {
   pub fn is_alias(&self) -> bool {
     self.connections.iter().any(|v| v.0.is_alias_to())
   }
-  pub fn remove_references(&mut self) {
-    self.reference = Item::NOOP;
-  }
+  // pub fn remove_references(&mut self) {
+  //   self.reference = Item::NOOP;
+  // }
 
   /// get all the connections that are either `contained_by_up` or `is_to_right`
   pub fn contained_by(&self) -> HashSet<String> {
     let mut ret = HashSet::new();
     for edge in self.connections.iter() {
-      if edge.0.is_contained_by_up() || edge.0.is_to_right() {
+      if edge.0.is_contained_by_up() || edge.0.is_to() {
         ret.insert(edge.1.clone());
       }
     }
@@ -228,7 +222,7 @@ impl Item {
 
     Item {
       identifier: self.identifier.clone(),
-      reference: self.reference,
+      // reference: self.reference,
       connections: {
         let mut it = self.connections.clone();
         it.extend(other.connections);
@@ -238,36 +232,4 @@ impl Item {
       body: body,
     }
   }
-
-  // merges this item and returns a new item with `merged_from` set
-  // correctly if there were changes
-  pub fn merge_vecs(items: Vec<Item>) -> ItemMergeResult {
-    let len = items.len();
-    if len <= 1 {
-      return ItemMergeResult::Same;
-    }
-
-    let mut base = items[0].clone();
-    let mut mf = BTreeSet::new();
-
-    mf.insert(base.reference);
-    for i in 1..len {
-      mf.insert(items[i].reference);
-      base = items[i].merge(base);
-    }
-
-    for i in 0..len {
-      if base.is_same(&items[i]) {
-        return ItemMergeResult::ContainsAll(items[i].reference);
-      }
-    }
-
-    return ItemMergeResult::New(base);
-  }
-}
-
-pub enum ItemMergeResult {
-  Same,
-  ContainsAll(LocationReference),
-  New(Item),
 }
