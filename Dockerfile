@@ -1,26 +1,16 @@
-FROM messense/rust-musl-cross:x86_64-musl AS build
-
+FROM alpine:3.21 AS builder
 LABEL MAINTAINER="ext-engineering@spicelabs.io"
 
+RUN apk add perl make curl gcc rustup musl-dev
 
-# Create a new empty shell project
-RUN USER=root cargo new --bin bigtent
-WORKDIR /bigtent
+RUN rustup-init -y
 
-# copy over manifests
-COPY ./Cargo.lock ./Cargo.lock
-COPY ./Cargo.toml ./Cargo.toml
+ADD . /src/bigtent
+WORKDIR /src/bigtent
 
-# copy source tree
-COPY ./src ./src
-
-# build for release
+ENV PATH="/root/.cargo/bin:${PATH}"
 RUN cargo build --release
 
-# final base image
-FROM messense/rust-musl-cross:x86_64-musl
-
-# copy the build artifact from the build stage
-COPY --from=build /bigtent/target/x86_64-unknown-linux-musl/release/bigtent  .
-
-ENTRYPOINT ["./bigtent"]
+FROM alpine:3.21
+COPY --from=builder /src/bigtent/target/release/bigtent /bigtent
+CMD ["/bigtent"]

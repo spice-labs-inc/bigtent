@@ -1,14 +1,15 @@
 name: Publish Container Images
 
 on:
+  push:
+    # Publish semver tags as releases.
+    tags: [ 'v*.*.*' ]
   workflow_run:
     workflows: ["Rust Build & Test"]
     types:
       - "completed"
     branches: 
       - "main"
-    tags: 
-      - "v*.*.*"
   
 env:
   REGISTRY: ghcr.io
@@ -17,8 +18,7 @@ env:
 jobs:
     push_to_registry:
       name: Push Docker image to Docker Hub
-      runs-on: ubuntu-latest
-      if: ${{ github.event.workflow_run.conclusion == 'success' }}
+      runs-on: ubuntu-24.04
       permissions:
         packages: write
         contents: read
@@ -43,6 +43,7 @@ jobs:
             rev_version="$(echo $last_version_tag$dirty$snapshot | sed -e 's/^v//')"
             echo "rev_version=$rev_version" >> "$GITHUB_ENV"
             sed -i -e "s/^version = .*/version = \"$rev_version\"/" Cargo.toml
+            echo "Version set to '$rev_version'"
         - name: Log in to Docker Hub
           uses: docker/login-action@v3
           with:
