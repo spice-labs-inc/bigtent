@@ -87,7 +87,7 @@ impl std::fmt::Display for ClusterFileEnvelope {
 pub struct GoatRodeoCluster {
   envelope: ClusterFileEnvelope,
   cluster_file_hash: u64,
-  path: PathBuf,
+  cluster_root_path: PathBuf,
   cluster_path: PathBuf,
   data_files: HashMap<u64, Arc<DataFile>>,
   index_files: HashMap<u64, IndexFile>,
@@ -162,7 +162,7 @@ impl GoatRodeoCluster {
 
     Ok(GoatRodeoCluster {
       envelope: self.envelope.clone(),
-      path: self.path.clone(),
+      cluster_root_path: self.cluster_root_path.clone(),
       cluster_path: self.cluster_path.clone(),
       data_files: data_files,
       index_files: index_files,
@@ -175,6 +175,12 @@ impl GoatRodeoCluster {
     })
   }
 
+  /// When clusters are merged, they must share a root path
+  /// return the root path for the cluster
+  pub fn get_root_path(&self) -> PathBuf {
+    self.cluster_root_path.clone()
+  }
+
   /// Create a Goat Rodeo cluster with no contents
   pub fn blank(root_dir: &PathBuf) -> GoatRodeoCluster {
     GoatRodeoCluster {
@@ -185,7 +191,7 @@ impl GoatRodeoCluster {
         index_files: vec![],
         info: BTreeMap::new(),
       },
-      path: root_dir.clone(),
+      cluster_root_path: root_dir.clone(),
       cluster_path: root_dir.clone(),
       data_files: HashMap::new(),
       index_files: HashMap::new(),
@@ -309,7 +315,7 @@ impl GoatRodeoCluster {
 
     Ok(GoatRodeoCluster {
       envelope: env,
-      path: root_dir.clone(),
+      cluster_root_path: root_dir.clone(),
       cluster_path: cluster_path.clone(),
       data_files: data_files,
       index_files: index_files,
