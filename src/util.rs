@@ -78,6 +78,9 @@ pub fn millis_now() -> i64 {
 }
 
 pub fn find_item(to_find: [u8; 16], offsets: &[ItemOffset]) -> Option<ItemOffset> {
+  if offsets.len() == 0 {
+    return None
+  } 
   let mut low = 0;
   let mut hi = offsets.len() - 1;
 
@@ -96,6 +99,7 @@ pub fn find_item(to_find: [u8; 16], offsets: &[ItemOffset]) -> Option<ItemOffset
       None => return None,
     }
   }
+
 
   None
 }
