@@ -576,7 +576,6 @@ impl GoatRodeoCluster {
     let mut ret = vec![];
 
     while let Some(f) = the_dir.next_entry().await? {
-      //for f in the_dir.next_entry().await {
       let file = f;
       let file_extn = file
         .path()
@@ -585,11 +584,15 @@ impl GoatRodeoCluster {
         .flatten()
         .map(|s| s.to_owned());
 
-      if file.file_type().await?.is_file()
-        && file_extn == Some(GOAT_RODEO_CLUSTER_FILE_SUFFIX.into())
-      {
+      let file_type = file.file_type().await?;
+
+      if file_type.is_file() && file_extn == Some(GOAT_RODEO_CLUSTER_FILE_SUFFIX.into()) {
         let walker = GoatRodeoCluster::new(&path, &file.path()).await?;
         ret.push(walker)
+      } else if file_type.is_dir() {
+        let mut more =
+          Box::pin(GoatRodeoCluster::cluster_files_in_dir(file.path().clone())).await?;
+        ret.append(&mut more);
       }
     }
 
