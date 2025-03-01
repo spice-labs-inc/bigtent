@@ -13,7 +13,7 @@ use std::println as info;
 
 use crate::{
   cluster_writer::ClusterWriter,
-  mod_share::{update_top, ClusterPos},
+  mod_share::{ClusterPos, update_top},
   rodeo::GoatRodeoCluster,
   structs::Item,
   util::{MD5Hash, NiceDurationDisplay},
@@ -105,7 +105,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 
         for merge_base in items {
           let (merge_final, _the_pos) = get_item_and_pos(
-            merge_base.item_offset.hash,
+            *merge_base.item_offset.hash(),
             merge_base.which,
             //  &mut index_holder,
             &clusters,

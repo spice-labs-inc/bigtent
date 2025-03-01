@@ -10,7 +10,7 @@ use std::{
 #[cfg(test)]
 use std::{println as info, println as trace};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::{
   data_file::DataFileEnvelope,
@@ -19,8 +19,8 @@ use crate::{
   sha_writer::ShaWriter,
   structs::Item,
   util::{
-    byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope, write_int,
-    write_long, write_short_signed, MD5Hash,
+    MD5Hash, byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope,
+    write_int, write_long, write_short_signed,
   },
 };
 
@@ -95,6 +95,8 @@ impl ClusterWriter {
     self.previous_position
   }
 
+  /// add an `Item` to the cluster. for good performance
+  /// `Item`s should be written in order by MD5 hash of the `item.identifier`
   pub async fn write_item(&mut self, item: Item) -> Result<()> {
     let the_hash = md5hash_str(&item.identifier);
     let cur_pos = self.dest_data.pos();

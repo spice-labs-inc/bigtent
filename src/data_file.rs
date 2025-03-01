@@ -3,7 +3,7 @@ use crate::{
   structs::Item,
   util::{read_cbor_sync, read_len_and_cbor, read_u32, read_u32_sync},
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{
   collections::{BTreeMap, BTreeSet},

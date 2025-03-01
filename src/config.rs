@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Parser;
 use std::{
   net::{SocketAddr, ToSocketAddrs},
@@ -27,7 +27,10 @@ pub struct Args {
   pub rodeo: Option<PathBuf>,
 
   /// to merge many directories containing `.grc` files into
-  /// an entirely new cluster without preserving history
+  /// an entirely new cluster without preserving history.
+  /// Note that merging a lot of clusters will require having
+  /// a lot of files open. If you get a 'Too many open files'
+  /// error, please run 'ulimit -n 4096'
   #[arg(long, num_args=1..)]
   pub fresh_merge: Vec<PathBuf>,
 
