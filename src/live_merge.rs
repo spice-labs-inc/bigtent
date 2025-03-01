@@ -4,10 +4,10 @@ use std::{collections::HashMap, time::Instant}; // Use log crate when building a
 
 use crate::{
   index_file::{IndexLoc, ItemOffset},
-  mod_share::{update_top, ClusterPos},
+  mod_share::{ClusterPos, update_top},
   rodeo::GoatRodeoCluster,
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use im::OrdMap;
 #[cfg(test)]
 use std::println as info;
@@ -64,7 +64,7 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
     submap.insert(b.get_cluster_file_hash(), b.clone());
   }
 
-  let mut new_index = Vec::with_capacity(max_size * 90usize / 100usize);
+  let mut new_index: Vec<ItemOffset<IndexLoc>> = Vec::with_capacity(max_size * 90usize / 100usize);
   let mut loop_cnt = 0usize;
 
   let mut top = OrdMap::new();
@@ -82,14 +82,14 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
 
         // we've only got one... so just put it in the new index
         if items.len() == 1 {
-          new_index.push(items.pop().unwrap().item_offset);
+          new_index.push(items.pop().unwrap().item_offset.into());
         } else {
           let computed_loc = items
             .iter()
-            .flat_map(|item| item.item_offset.loc.as_vec())
+            .flat_map(|item| item.item_offset.index_loc())
             .collect();
           let new_item_offset = ItemOffset {
-            hash: items[0].item_offset.hash,
+            hash: *items[0].item_offset.hash(),
             loc: IndexLoc::Chain(computed_loc),
           };
           new_index.push(new_item_offset);
@@ -120,7 +120,13 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
 
   let b0 = &clusters[0];
   info!("Merge took {:?}", Instant::now().duration_since(start));
-  b0.create_synthetic_with(new_index, data_files, index_files, submap, whole_name)
+  b0.create_synthetic_with(
+    new_index.into(),
+    data_files,
+    index_files,
+    submap,
+    whole_name,
+  )
 }
 
 #[cfg(feature = "longtest")]

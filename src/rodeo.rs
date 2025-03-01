@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use scopeguard::defer;
 use serde::{Deserialize, Serialize};
@@ -6,28 +6,28 @@ use std::{
   collections::{BTreeMap, HashMap, HashSet},
   ops::Deref,
   path::{Path, PathBuf},
-  sync::{atomic::AtomicU32, Arc},
+  sync::{Arc, atomic::AtomicU32},
   time::Instant,
 };
 use thousands::Separable;
 use tokio::{
-  fs::{read_dir, File},
+  fs::{File, read_dir},
   io::BufReader,
   sync::{
-    mpsc::{Receiver, Sender},
     Mutex,
+    mpsc::{Receiver, Sender},
   },
 };
 use toml::Table; // Use log crate when building application
 
 use crate::{
   data_file::{DataFile, DataReader, GOAT_RODEO_CLUSTER_FILE_SUFFIX},
-  index_file::{IndexFile, IndexLoc, ItemOffset},
+  index_file::{EitherItemOffset, EitherItemOffsetVec, GetOffset, IndexFile, IndexLoc},
   live_merge::perform_merge,
   structs::{EdgeType, Item},
   util::{
-    byte_slice_to_u63, find_common_root_dir, find_item, hex_to_u64, is_child_dir, md5hash_str,
-    read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice, MD5Hash,
+    MD5Hash, byte_slice_to_u63, find_common_root_dir, hex_to_u64, is_child_dir, md5hash_str,
+    read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
   },
 };
 #[cfg(not(test))]
@@ -93,7 +93,7 @@ pub struct GoatRodeoCluster {
   index_files: HashMap<u64, IndexFile>,
   sub_clusters: HashMap<u64, GoatRodeoCluster>,
   synthetic: bool,
-  index: Arc<ArcSwap<Option<Arc<Vec<ItemOffset>>>>>,
+  index: Arc<ArcSwap<Option<Arc<EitherItemOffsetVec>>>>,
   building_index: Arc<Mutex<bool>>,
   name: String,
 }
@@ -135,7 +135,7 @@ impl GoatRodeoCluster {
 
   pub fn create_synthetic_with(
     &self,
-    index: Vec<ItemOffset>,
+    index: EitherItemOffsetVec,
     data_files: HashMap<u64, Arc<DataFile>>,
     index_files: HashMap<u64, IndexFile>,
     sub_clusters: HashMap<u64, GoatRodeoCluster>,
@@ -409,8 +409,11 @@ impl GoatRodeoCluster {
     ret
   }
 
-  pub async fn get_index(&self) -> Result<Arc<Vec<ItemOffset>>> {
+  pub async fn get_index(&self) -> Result<Arc<EitherItemOffsetVec>> {
+    // get the index
     let tmp = self.index.load().clone();
+
+    // if it's already built, just return it
     match tmp.deref() {
       Some(v) => {
         return Ok(v.clone());
@@ -527,7 +530,7 @@ impl GoatRodeoCluster {
       start.elapsed()
     );
 
-    let ret_arc = Arc::new(ret);
+    let ret_arc: Arc<EitherItemOffsetVec> = Arc::new(ret.into());
     self.index.store(Arc::new(Some(ret_arc.clone())));
     // keep the lock alive
     *my_lock = false;
@@ -599,9 +602,9 @@ impl GoatRodeoCluster {
     Ok(ret)
   }
 
-  pub async fn find(&self, hash: MD5Hash) -> Result<Option<ItemOffset>> {
+  pub async fn find(&self, hash: MD5Hash) -> Result<Option<EitherItemOffset>> {
     let index = self.get_index().await?;
-    Ok(find_item(hash, &index))
+    Ok(index.find(hash))
   }
 
   pub async fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item> {
@@ -610,31 +613,12 @@ impl GoatRodeoCluster {
     match data_file {
       Some(df) => {
         let item = df.read_item_at(offset).await?;
-        // match item.reference.0 {
-        //   0 => item.reference.0 = file_hash,
-        //   v if v != file_hash => {
-        //     bail!(
-        //       "Got item {} that should have had a file_hash of {:016x}, but had {:016x}",
-        //       item.identifier,
-        //       file_hash,
-        //       item.reference.0,
-        //     )
-        //   }
-        //   _ => {}
-        // }
-
-        // if item.reference.1 != offset {
-        //   bail!(
-        //     "Expecting item {} to have offset {}, but reported offset {}",
-        //     item.identifier,
-        //     offset,
-        //     item.reference.1
-        //   )
-        // }
 
         Ok(item)
       }
-      None => bail!("Couldn't find file for hash {:x}", file_hash),
+      None => {
+        bail!("Couldn't find file for hash {:x}", file_hash);
+      }
     }
   }
 
@@ -761,7 +745,11 @@ impl GoatRodeoCluster {
 
   pub async fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Item> {
     match index_loc {
-      loc @ IndexLoc::Loc { file_hash, .. } => Ok(self.entry_for(*file_hash, loc.offset()).await?),
+      loc @ IndexLoc::Loc(_) => Ok(
+        self
+          .entry_for(loc.get_file_hash(), loc.get_offset())
+          .await?,
+      ),
       IndexLoc::Chain(offsets) => {
         let mut ret: Vec<Item> = vec![];
         for offset in offsets {
@@ -791,9 +779,11 @@ impl GoatRodeoCluster {
 
   pub async fn vec_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<Item>> {
     match index_loc {
-      loc @ IndexLoc::Loc { file_hash, .. } => {
-        Ok(vec![self.entry_for(*file_hash, loc.offset()).await?])
-      }
+      loc @ IndexLoc::Loc(_) => Ok(vec![
+        self
+          .entry_for(loc.get_file_hash(), loc.get_offset())
+          .await?,
+      ]),
       IndexLoc::Chain(offsets) => {
         let mut ret = vec![];
         for offset in offsets {
@@ -811,7 +801,7 @@ impl GoatRodeoCluster {
       _ => bail!(format!("Could not find entry for hash {:x?}", hash)),
     };
 
-    self.data_for_entry_offset(&entry_offset.loc).await
+    self.data_for_entry_offset(&entry_offset.loc()).await
   }
 
   pub async fn data_for_key(&self, data: &str) -> Result<Item> {
@@ -845,12 +835,13 @@ async fn test_antialias() {
   let index = cluster
     .get_index()
     .await
-    .expect("To be able to get the index");
+    .expect("To be able to get the index")
+    .flatten();
 
   let mut aliases = vec![];
   for v in index.iter() {
     let item = cluster
-      .data_for_hash(v.hash)
+      .data_for_hash(*v.hash())
       .await
       .expect("Should get an item");
     if item.is_alias() {
@@ -932,8 +923,8 @@ async fn test_generated_cluster() {
       );
       info!("Index size {}", complete_index.len());
 
-      for i in complete_index.deref() {
-        cluster.find(i.hash).await.unwrap().unwrap();
+      for i in complete_index.deref().flatten() {
+        cluster.find(*i.hash()).await.unwrap().unwrap();
       }
     }
   }
