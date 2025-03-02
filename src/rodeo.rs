@@ -185,8 +185,8 @@ impl GoatRodeoCluster {
   pub fn blank(root_dir: &PathBuf) -> GoatRodeoCluster {
     GoatRodeoCluster {
       envelope: ClusterFileEnvelope {
-        version: 1,
-        magic: 1,
+        version: 2,
+        magic: ClusterFileMagicNumber,
         data_files: vec![],
         index_files: vec![],
         info: BTreeMap::new(),

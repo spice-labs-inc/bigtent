@@ -136,7 +136,7 @@ impl ClusterWriter {
       let cluster_writer = &mut cluster_file;
       write_int(cluster_writer, ClusterFileMagicNumber).await?;
       let cluster_env = ClusterFileEnvelope {
-        version: 1,
+        version: 2,
         magic: ClusterFileMagicNumber,
         info: BTreeMap::new(),
         data_files: self.seen_data_files.iter().map(|v| *v).collect(),
