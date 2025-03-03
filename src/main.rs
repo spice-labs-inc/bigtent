@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
 use bigtent::{
   cluster_holder::ClusterHolder, config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster,

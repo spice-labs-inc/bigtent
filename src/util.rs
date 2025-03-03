@@ -1,8 +1,7 @@
-use crate::index_file::ItemOffset;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 #[cfg(not(test))]
 use log::info;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_cbor::Value;
 use std::{
   collections::{BTreeMap, HashSet},
@@ -75,29 +74,6 @@ pub fn millis_now() -> i64 {
     .duration_since(SystemTime::UNIX_EPOCH)
     .unwrap()
     .as_millis() as i64
-}
-
-pub fn find_item(to_find: [u8; 16], offsets: &[ItemOffset]) -> Option<ItemOffset> {
-  let mut low = 0;
-  let mut hi = offsets.len() - 1;
-
-  while low <= hi {
-    let mid = low + (hi - low) / 2;
-    match offsets.get(mid) {
-      Some(entry) => {
-        if entry.hash == to_find {
-          return Some(entry.clone());
-        } else if entry.hash > to_find {
-          hi = mid - 1;
-        } else {
-          low = mid + 1;
-        }
-      }
-      None => return None,
-    }
-  }
-
-  None
 }
 
 pub fn md5hash_str(st: &str) -> MD5Hash {

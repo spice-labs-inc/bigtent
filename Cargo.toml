@@ -1,9 +1,9 @@
 [package]
 name = "bigtent"
 version = "0.7.4"
-edition = "2021"
+edition = "2024"
 authors = ["David Pollak <feeder.of.the.bears@gmail.com>"]
-rust-version = "1.81.0"
+rust-version = "1.85.0"
 description = "An opinionated Graph Database"
 readme = "README.md"
 repository = "https://bigtent.cc"
@@ -20,13 +20,13 @@ name = "bigtent"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.95"
+anyhow = "1.0"
 regex = "1.11"
 md5 = "0.7.0"
 sha2 = "0.10.8"
 hex = "0.4.3"
 bytes = "1.10"
-hex-literal = "0.4.1"
+hex-literal = "1"
 shellexpand = "3.1.0"
 chrono = "0.4"
 
@@ -57,11 +57,14 @@ pipe = "0.4.0"
 flume = { version = "0.11", features = ["spin"] }
 scopeguard = "1.2.0"
 
-rand = "0.9.0"
-
 # Logging
 log = "0.4"
 env_logger = "0.11"
+
+utoipa = {version = "5", features=["axum_extras"]}
+
+[dev-dependencies]
+rand = "0.9.0"
 
 [features]
 
