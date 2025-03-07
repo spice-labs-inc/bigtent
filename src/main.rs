@@ -10,6 +10,7 @@ use env_logger::Env;
 use log::{error, info}; // Use log crate when building application
 
 use signal_hook::{consts::SIGHUP, iterator::Signals};
+use thousands::Separable;
 use std::{path::PathBuf, sync::Arc, thread, time::Instant};
 #[cfg(test)]
 use std::{println as info, println as error};
@@ -18,19 +19,24 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
   if path.exists() && path.is_file() {
     let whole_path = path.clone().canonicalize()?;
     let dir_path = whole_path.parent().unwrap().to_path_buf();
+    info!("Single cluster server for {:?} with dir_path {:?}", whole_path, dir_path);
     let index_build_start = Instant::now();
     let cluster = Arc::new(ArcSwap::new(Arc::new(
       GoatRodeoCluster::new(&dir_path, &whole_path).await?,
     )));
 
-    let index = ClusterHolder::new_from_cluster(cluster, Some(args.clone())).await?;
+    info!("Forcing full index read");
+    let built_index = cluster.load().get_index().await?;
+    info!("Index read complete, len {}", built_index.len().separate_with_commas());
+
+    let cluster_holder = ClusterHolder::new_from_cluster(cluster, Some(args.clone())).await?;
 
     info!(
       "Initial index build in {:?}",
       Instant::now().duration_since(index_build_start)
     );
 
-    run_web_server(index).await?;
+    run_web_server(cluster_holder).await?;
   } else {
     bail!("Path to `.grc` does not point to a file: {:?}", path)
   }
