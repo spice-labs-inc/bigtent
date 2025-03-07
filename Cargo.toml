@@ -1,9 +1,9 @@
 [package]
 name = "bigtent"
 version = "0.7.5"
-edition = "2024"
+edition = "2021"
 authors = ["David Pollak <feeder.of.the.bears@gmail.com>"]
-rust-version = "1.85.0"
+rust-version = "1.82.0"
 description = "An opinionated Graph Database"
 readme = "README.md"
 repository = "https://bigtent.cc"
@@ -26,7 +26,7 @@ md5 = "0.7.0"
 sha2 = "0.10.8"
 hex = "0.4.3"
 bytes = "1.10"
-hex-literal = "1"
+hex-literal = "0.4"
 shellexpand = "3.1.0"
 chrono = "0.4"
 
@@ -69,4 +69,4 @@ rand = "0.9.0"
 [features]
 
 longtest = [] # feature has no explicit dependencies
-oldstuff = []
+
