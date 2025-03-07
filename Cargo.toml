@@ -1,6 +1,6 @@
 [package]
 name = "bigtent"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 authors = ["David Pollak <feeder.of.the.bears@gmail.com>"]
 rust-version = "1.82.0"
@@ -69,4 +69,4 @@ rand = "0.9.0"
 [features]
 
 longtest = [] # feature has no explicit dependencies
-oldstuff = []
+
