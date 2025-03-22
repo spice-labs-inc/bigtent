@@ -13,7 +13,7 @@ use std::println as info;
 
 use crate::{
   cluster_writer::ClusterWriter,
-  mod_share::{ClusterPos, update_top},
+  mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
   structs::Item,
   util::{MD5Hash, NiceDurationDisplay},

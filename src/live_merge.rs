@@ -4,10 +4,10 @@ use std::{collections::HashMap, time::Instant}; // Use log crate when building a
 
 use crate::{
   index_file::{IndexLoc, ItemOffset},
-  mod_share::{ClusterPos, update_top},
+  mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
 };
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use im::OrdMap;
 #[cfg(test)]
 use std::println as info;

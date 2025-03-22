@@ -131,16 +131,14 @@ impl EdgeType for String {
   fn is_contained_by_up(&self) -> bool {
     self.ends_with(CONTAINED_BY)
   }
-  
+
   fn is_built_from(&self) -> bool {
-        self.ends_with(BUILT_FROM)
-    }
-  
+    self.ends_with(BUILT_FROM)
+  }
+
   fn is_builds_to(&self) -> bool {
-        self.ends_with(BUILDS_TO)
-    }
-
-
+    self.ends_with(BUILDS_TO)
+  }
 }
 
 pub type Edge = (String, String);

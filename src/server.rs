@@ -129,7 +129,7 @@ async fn serve_anti_alias(
 async fn serve_flatten_both(
   rodeo: Arc<ClusterHolder>,
   payload: Vec<String>,
-  source: bool
+  source: bool,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
   let start = Instant::now();
   let payload_len = payload.len();
@@ -138,11 +138,14 @@ async fn serve_flatten_both(
     start.elapsed());
   }
 
-  let stream: Receiver<serde_json::Value> =
-    match rodeo.get_cluster().stream_flattened_items(payload, source).await {
-      Ok(s) => s,
-      Err(e) => return Err((StatusCode::NOT_FOUND, format!("{}", e))),
-    };
+  let stream: Receiver<serde_json::Value> = match rodeo
+    .get_cluster()
+    .stream_flattened_items(payload, source)
+    .await
+  {
+    Ok(s) => s,
+    Err(e) => return Err((StatusCode::NOT_FOUND, format!("{}", e))),
+  };
   let tok_stream = TokioReceiverToStream { receiver: stream };
 
   Ok(StreamBodyAs::json_array(tok_stream))
@@ -250,7 +253,6 @@ pub fn build_route(state: Arc<ClusterHolder>) -> Router {
     .route("/{*gitoid}", get(serve_gitoid))
     .route("/aa/{*gitoid}", get(serve_anti_alias))
     .route("/north/{*gitoid}", get(serve_north))
-    
     .route("/north_purls/{*gitoid}", get(serve_north_purls))
     .route("/north", post(serve_north_bulk))
     .route("/flatten_source/{*gitoid}", get(serve_flatten_source))
@@ -284,8 +286,7 @@ pub async fn run_web_server(index: Arc<ClusterHolder>) -> Result<()> {
   let addrs = index.the_args().to_socket_addrs();
   info!("Listen on {:?}", addrs);
 
-  let app = build_route(state)
-    .layer(middleware::from_fn(request_log_middleware));
+  let app = build_route(state).layer(middleware::from_fn(request_log_middleware));
 
   let nested = Router::new().nest("/omnibor", app.clone());
 

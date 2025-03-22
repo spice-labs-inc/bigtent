@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::{config::Args, rodeo::GoatRodeoCluster};
 #[cfg(test)]
 use std::println as info;
-use toml::{Table, map::Map};
+use toml::{map::Map, Table};
 
 #[derive(Debug, Clone)]
 pub struct ClusterHolder {

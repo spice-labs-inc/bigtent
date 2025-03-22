@@ -10,7 +10,7 @@ use std::{
 #[cfg(test)]
 use std::{println as info, println as trace};
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 use crate::{
   data_file::DataFileEnvelope,
@@ -19,8 +19,8 @@ use crate::{
   sha_writer::ShaWriter,
   structs::Item,
   util::{
-    MD5Hash, byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope,
-    write_int, write_long, write_short_signed,
+    byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope, write_int,
+    write_long, write_short_signed, MD5Hash,
   },
 };
 

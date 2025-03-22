@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use arc_swap::ArcSwap;
 use bigtent::{
   cluster_holder::ClusterHolder, config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster,
@@ -10,16 +10,19 @@ use env_logger::Env;
 use log::{error, info}; // Use log crate when building application
 
 use signal_hook::{consts::SIGHUP, iterator::Signals};
-use thousands::Separable;
 use std::{path::PathBuf, sync::Arc, thread, time::Instant};
 #[cfg(test)]
 use std::{println as info, println as error};
+use thousands::Separable;
 
 async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
   if path.exists() && path.is_file() {
     let whole_path = path.clone().canonicalize()?;
     let dir_path = whole_path.parent().unwrap().to_path_buf();
-    info!("Single cluster server for {:?} with dir_path {:?}", whole_path, dir_path);
+    info!(
+      "Single cluster server for {:?} with dir_path {:?}",
+      whole_path, dir_path
+    );
     let index_build_start = Instant::now();
     let cluster = Arc::new(ArcSwap::new(Arc::new(
       GoatRodeoCluster::new(&dir_path, &whole_path).await?,
@@ -27,7 +30,10 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
 
     info!("Forcing full index read");
     let built_index = cluster.load().get_md5_to_item_offset_index().await?;
-    info!("Index read complete, len {}", built_index.len().separate_with_commas());
+    info!(
+      "Index read complete, len {}",
+      built_index.len().separate_with_commas()
+    );
 
     let cluster_holder = ClusterHolder::new_from_cluster(cluster, Some(args.clone())).await?;
 
