@@ -42,7 +42,7 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
   let mut max_size = 0usize;
 
   for cluster in &clusters {
-    let index = cluster.get_index().await?;
+    let index = cluster.get_md5_to_item_offset_index().await?;
     let index_len = index.len();
     max_size += index_len;
     index_holder.push(ClusterPos {

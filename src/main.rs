@@ -26,7 +26,7 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
     )));
 
     info!("Forcing full index read");
-    let built_index = cluster.load().get_index().await?;
+    let built_index = cluster.load().get_md5_to_item_offset_index().await?;
     info!("Index read complete, len {}", built_index.len().separate_with_commas());
 
     let cluster_holder = ClusterHolder::new_from_cluster(cluster, Some(args.clone())).await?;

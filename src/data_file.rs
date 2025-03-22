@@ -41,7 +41,7 @@ pub const GOAT_RODEO_CLUSTER_FILE_SUFFIX: &str = "grc";
 
 impl DataFile {
   pub async fn new(dir: &PathBuf, hash: u64) -> Result<DataFile> {
-    let mut data_file = GoatRodeoCluster::find_file(dir, hash, GOAT_RODEO_DATA_FILE_SUFFIX).await?;
+    let mut data_file = GoatRodeoCluster::find_data_or_index_file_from_sha256(dir, hash, GOAT_RODEO_DATA_FILE_SUFFIX).await?;
 
     let dfp: &mut File = &mut data_file;
     let magic = read_u32(dfp).await?;

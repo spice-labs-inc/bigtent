@@ -18,7 +18,7 @@ use crate::{
   structs::Item,
   util::{MD5Hash, NiceDurationDisplay},
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use thousands::Separable;
 
 pub async fn merge_fresh<PB: Into<PathBuf>>(
@@ -49,7 +49,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
   let mut index_holder = vec![];
 
   for (idx, cluster) in clusters.iter().enumerate() {
-    let index = cluster.get_index().await?;
+    let index = cluster.get_md5_to_item_offset_index().await?;
     let index_len = index.len();
 
     index_holder.push(ClusterPos {
@@ -90,8 +90,9 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
       which: usize,
       clusters: &Vec<GoatRodeoCluster>,
     ) -> Result<(Item, usize)> {
-      match clusters[which].data_for_hash(hash).await {
-        Ok(i) => Ok((i, 0)),
+      match clusters[which].item_for_hash(hash, None).await {
+        Ok(Some(i)) => Ok((i, 0)),
+        Ok(None) => bail!("Item with hash {:?} not found", hash),
         Err(e) => Err(e),
       }
     }

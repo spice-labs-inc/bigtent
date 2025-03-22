@@ -54,7 +54,7 @@ impl ClusterHolder {
     if false {
       // dunno if this is a good idea...
       info!("Loading full index...");
-      cluster.load().get_index().await?;
+      cluster.load().get_md5_to_item_offset_index().await?;
       info!("Loaded index")
     }
 
