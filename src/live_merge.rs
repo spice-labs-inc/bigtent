@@ -4,10 +4,10 @@ use std::{collections::HashMap, time::Instant}; // Use log crate when building a
 
 use crate::{
   index_file::{IndexLoc, ItemOffset},
-  mod_share::{ClusterPos, update_top},
+  mod_share::{update_top, ClusterPos},
   rodeo::GoatRodeoCluster,
 };
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use im::OrdMap;
 #[cfg(test)]
 use std::println as info;
@@ -42,7 +42,7 @@ pub async fn perform_merge(clusters: Vec<GoatRodeoCluster>) -> Result<GoatRodeoC
   let mut max_size = 0usize;
 
   for cluster in &clusters {
-    let index = cluster.get_index().await?;
+    let index = cluster.get_md5_to_item_offset_index().await?;
     let index_len = index.len();
     max_size += index_len;
     index_holder.push(ClusterPos {
