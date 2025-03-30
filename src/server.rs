@@ -17,7 +17,7 @@ use log::info;
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::Stream;
 
-use crate::{cluster_holder::ClusterHolder, structs::Item};
+use crate::{rodeo::holder::ClusterHolder, structs::Item};
 #[cfg(test)]
 use std::println as info;
 
@@ -26,7 +26,7 @@ async fn stream_items(rodeo: Arc<ClusterHolder>, items: Vec<String>) -> Receiver
 
   tokio::spawn(async move {
     for item_id in items {
-      match rodeo.get_cluster().item_for_identifier(&item_id).await {
+      match rodeo.get_cluster().item_for_identifier(&item_id) {
         Ok(Some(i)) => {
           if !mtx.is_closed() {
             let _ = mtx.send(i).await;
@@ -98,7 +98,7 @@ async fn serve_gitoid(
 ) -> Result<Json<serde_json::Value>, impl IntoResponse> {
   let to_find = compute_package(&gitoid, &uri);
 
-  let ret = rodeo.get_cluster().item_for_identifier(&to_find).await;
+  let ret = rodeo.get_cluster().item_for_identifier(&to_find);
 
   match ret {
     Ok(Some(item)) => Ok(Json(item.to_json())),
@@ -115,7 +115,7 @@ async fn serve_anti_alias(
   uri: Uri,
 ) -> Result<Json<serde_json::Value>, impl IntoResponse> {
   let to_find = compute_package(&gitoid, &uri);
-  let ret = rodeo.get_cluster().antialias_for(&to_find).await;
+  let ret = rodeo.get_cluster().antialias_for(&to_find);
 
   match ret {
     Ok(Some(item)) => Ok(Json(item.to_json())),

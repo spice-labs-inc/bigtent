@@ -1,19 +1,19 @@
 use anyhow::{bail, Result};
 use arc_swap::ArcSwap;
 use bigtent::{
-  cluster_holder::ClusterHolder, config::Args, merger::merge_fresh, rodeo::GoatRodeoCluster,
+  config::Args,
+  fresh_merge::merge_fresh,
+  rodeo::{goat::GoatRodeoCluster, holder::ClusterHolder},
   server::run_web_server,
 };
 use clap::{CommandFactory, Parser};
 use env_logger::Env;
 #[cfg(not(test))]
-use log::{error, info}; // Use log crate when building application
+use log::info; // Use log crate when building application
 
-use signal_hook::{consts::SIGHUP, iterator::Signals};
-use std::{path::PathBuf, sync::Arc, thread, time::Instant};
 #[cfg(test)]
-use std::{println as info, println as error};
-use thousands::Separable;
+use std::println as info;
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
   if path.exists() && path.is_file() {
@@ -24,16 +24,9 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
       whole_path, dir_path
     );
     let index_build_start = Instant::now();
-    let cluster = Arc::new(ArcSwap::new(Arc::new(
-      GoatRodeoCluster::new(&dir_path, &whole_path).await?,
-    )));
-
-    info!("Forcing full index read");
-    let built_index = cluster.load().get_md5_to_item_offset_index().await?;
-    info!(
-      "Index read complete, len {}",
-      built_index.len().separate_with_commas()
-    );
+    let cluster = Arc::new(ArcSwap::new(
+      GoatRodeoCluster::new(&dir_path, &whole_path, false).await?,
+    ));
 
     let cluster_holder = ClusterHolder::new_from_cluster(cluster, Some(args.clone())).await?;
 
@@ -49,64 +42,64 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
   Ok(())
 }
 
-async fn run_full_server(args: Args) -> Result<()> {
-  let index_build_start = Instant::now();
-  let index = ClusterHolder::new(args).await?;
+// async fn run_full_server(args: Args) -> Result<()> {
+//   let index_build_start = Instant::now();
+//   let index = ClusterHolder::new(args).await?;
 
-  info!(
-    "Initial index build in {:?}",
-    Instant::now().duration_since(index_build_start)
-  );
+//   info!(
+//     "Initial index build in {:?}",
+//     Instant::now().duration_since(index_build_start)
+//   );
 
-  let mut sig_hup = Signals::new([SIGHUP])?;
-  let i2 = index.clone();
-  let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(10);
+//   let mut sig_hup = Signals::new([SIGHUP])?;
+//   let i2 = index.clone();
+//   let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(10);
 
-  // Async closures are not supported, so to live in async-land
-  // we need to spawn a Tokio task that waits for the MPSC message
-  // and does the rebuild
-  tokio::spawn(async move {
-    loop {
-      match rx.recv().await {
-        Some(_) => {
-          info!("Got rebuild signal");
-          let start = Instant::now();
-          match i2.rebuild().await {
-            Ok(_) => {
-              info!(
-                "Done rebuilding. Took {:?}",
-                Instant::now().duration_since(start)
-              );
-            }
-            Err(e) => {
-              error!("Rebuild error {:?}", e);
-            }
-          }
-        }
-        None => {
-          break;
-        }
-      }
-    }
-  });
+//   // Async closures are not supported, so to live in async-land
+//   // we need to spawn a Tokio task that waits for the MPSC message
+//   // and does the rebuild
+//   tokio::spawn(async move {
+//     loop {
+//       match rx.recv().await {
+//         Some(_) => {
+//           info!("Got rebuild signal");
+//           let start = Instant::now();
+//           match i2.rebuild().await {
+//             Ok(_) => {
+//               info!(
+//                 "Done rebuilding. Took {:?}",
+//                 Instant::now().duration_since(start)
+//               );
+//             }
+//             Err(e) => {
+//               error!("Rebuild error {:?}", e);
+//             }
+//           }
+//         }
+//         None => {
+//           break;
+//         }
+//       }
+//     }
+//   });
 
-  // and we spawn a real thread to wait on `sig_hup`
-  // and when there's a sighup, send a message into the channel
-  // which will cause the async tasks to do the rebuild... sigh
-  thread::spawn(move || {
-    for _ in sig_hup.forever() {
-      match tx.blocking_send(true) {
-        Ok(_) => {}
-        Err(_) => {
-          break;
-        }
-      }
-    }
-  });
+//   // and we spawn a real thread to wait on `sig_hup`
+//   // and when there's a sighup, send a message into the channel
+//   // which will cause the async tasks to do the rebuild... sigh
+//   thread::spawn(move || {
+//     for _ in sig_hup.forever() {
+//       match tx.blocking_send(true) {
+//         Ok(_) => {}
+//         Err(_) => {
+//           break;
+//         }
+//       }
+//     }
+//   });
 
-  run_web_server(index).await?;
-  Ok(())
-}
+//   run_web_server(index).await?;
+//   Ok(())
+// }
 
 async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
   for p in &paths {
@@ -122,9 +115,9 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
   let start = Instant::now();
 
   info!("Loading clusters...");
-  let mut clusters: Vec<GoatRodeoCluster> = vec![];
+  let mut clusters: Vec<Arc<GoatRodeoCluster>> = vec![];
   for p in &paths {
-    for b in GoatRodeoCluster::cluster_files_in_dir(p.clone()).await? {
+    for b in GoatRodeoCluster::cluster_files_in_dir(p.clone(), false).await? {
       clusters.push(b);
     }
   }
@@ -159,14 +152,14 @@ async fn main() -> Result<()> {
   info!("Starting");
   let args = Args::parse();
 
-  match (&args.rodeo, &args.conf, &args.fresh_merge) {
-    (Some(rodeo), None, v) if v.len() == 0 => run_rodeo(rodeo, &args).await?,
-    (None, Some(_conf), v) if v.len() == 0 => run_full_server(args).await?,
+  match (&args.rodeo, &args.fresh_merge) {
+    (Some(rodeo), v) if v.len() == 0 => run_rodeo(rodeo, &args).await?,
+    // (None, Some(_conf), v) if v.len() == 0 => run_full_server(args).await?,
 
     // normally there'd be a generic here, but because this function is `main`, it's necessary
     // to specify the concrete type (in this case `ItemMetaData`) rather than the generic
     // type
-    (None, None, v) if v.len() > 0 => run_merge(v.clone(), args).await?,
+    (None, v) if v.len() > 0 => run_merge(v.clone(), args).await?,
     _ => {
       Args::command().print_help()?;
     }

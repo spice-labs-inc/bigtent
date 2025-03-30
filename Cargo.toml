@@ -37,12 +37,7 @@ serde_json = "1.0"
 serde_cbor = "0.11.2"
 axum = {version = "0.8", features = ["json", "macros"]}
 axum-streams = {version="0.20", features=["json", "csv"]}
-# tower = "0.5"
-# tower-http = {version = "0.6", features=["trace"]}
-# tracing = "0.1"
-# tracing-subscriber = { version = "0.3", features=["env-filter"] }
 futures = "0.3"
-im = { version = "15.1.0", features = ["serde"] }
 
 
 # Execution stuff
@@ -52,11 +47,9 @@ tokio-stream = {version = "0.1"}
 signal-hook = "0.3.17"
 arc-swap = "1.7.1"
 clap = { version = "4.5", features = ["derive"] }
-toml = "0.8"
 thousands = "0.2.0"
-pipe = "0.4.0"
 
-flume = { version = "0.11", features = ["spin"] }
+flume = { version = "0.11", features = ["spin", "async"] }
 scopeguard = "1.2.0"
 
 # Logging
@@ -64,7 +57,7 @@ log = "0.4"
 env_logger = "0.11"
 
 utoipa = {version = "5", features=["axum_extras"]}
-
+memmap2 = {version = "0.9"}
 [dev-dependencies]
 rand = "0.9.0"
 

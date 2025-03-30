@@ -6,7 +6,7 @@ use serde_cbor::Value;
 use std::{
   collections::{BTreeMap, HashSet},
   ffi::OsStr,
-  io::Read,
+  io::{Read, Write},
   path::PathBuf,
   time::{Duration, SystemTime},
 };
@@ -114,6 +114,21 @@ pub async fn sha256_for_reader<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<[u8
   let mut buffer = [0u8; BYTE_BUFFER_SIZE];
   loop {
     let read = r.read(&mut buffer).await?;
+    if read == 0 {
+      break;
+    }
+    hasher.update(&buffer[0..read]);
+  }
+  Ok(hasher.finalize().into())
+}
+
+pub fn sha256_for_reader_sync<R: Read>(r: &mut R) -> Result<[u8; 32]> {
+  use sha2::{Digest, Sha256};
+  // create a Sha256 object
+  let mut hasher = Sha256::new();
+  let mut buffer = [0u8; BYTE_BUFFER_SIZE];
+  loop {
+    let read = r.read(&mut buffer)?;
     if read == 0 {
       break;
     }
@@ -309,6 +324,12 @@ pub async fn read_u16<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<u16> {
   Ok(u16::from_be_bytes(buf))
 }
 
+pub fn read_u16_sync<R: Read>(r: &mut R) -> Result<u16> {
+  let mut buf = [0u8; 2];
+  r.read_exact(&mut buf)?;
+  Ok(u16::from_be_bytes(buf))
+}
+
 pub async fn read_u32<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<u32> {
   let mut buf = [0u8; 4];
   r.read_exact(&mut buf).await?;
@@ -316,7 +337,7 @@ pub async fn read_u32<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<u32> {
   Ok(u32::from_be_bytes(buf))
 }
 
-pub fn read_u32_sync<R: Read + Unpin>(r: &mut R) -> Result<u32> {
+pub fn read_u32_sync<R: Read>(r: &mut R) -> Result<u32> {
   let mut buf = [0u8; 4];
   r.read_exact(&mut buf)?;
 
@@ -339,6 +360,17 @@ pub async fn read_len_and_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
     buffer.push(0u8);
   }
   file.read_exact(&mut buffer).await?;
+
+  serde_cbor::from_reader(&*buffer).map_err(|e| e.into())
+}
+
+pub fn read_len_and_cbor_sync<T: DeserializeOwned, R: Read>(file: &mut R) -> Result<T> {
+  let len = read_u16_sync(file)? as usize;
+  let mut buffer = Vec::with_capacity(len);
+  for _ in 0..len {
+    buffer.push(0u8);
+  }
+  file.read_exact(&mut buffer)?;
 
   serde_cbor::from_reader(&*buffer).map_err(|e| e.into())
 }
@@ -419,6 +451,11 @@ pub async fn write_short_signed<W: AsyncWriteExt + Unpin>(target: &mut W, val: i
 
 pub async fn write_long<W: AsyncWriteExt + Unpin>(target: &mut W, val: u64) -> Result<()> {
   target.write_all(&val.to_be_bytes()).await?;
+  Ok(())
+}
+
+pub fn write_usize_sync<W: Write>(target: &mut W, val: usize) -> Result<()> {
+  target.write_all(&val.to_be_bytes())?;
   Ok(())
 }
 
