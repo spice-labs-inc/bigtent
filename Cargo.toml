@@ -26,9 +26,9 @@ md5 = "0.7.0"
 sha2 = "0.10.8"
 hex = "0.4.3"
 bytes = "1.10"
-hex-literal = "1"
+hex-literal = "0.4"
 shellexpand = "3.1.0"
-chrono = "=0.4.39"
+chrono = "0.4"
 
 # Web Framework stuff
 url = "2.5"
@@ -37,12 +37,10 @@ serde_json = "1.0"
 serde_cbor = "0.11.2"
 axum = {version = "0.8", features = ["json", "macros"]}
 axum-streams = {version="0.20", features=["json", "csv"]}
-# tower = "0.5"
-# tower-http = {version = "0.6", features=["trace"]}
-# tracing = "0.1"
-# tracing-subscriber = { version = "0.3", features=["env-filter"] }
 futures = "0.3"
 im = { version = "15.1.0", features = ["serde"] }
+# tracing = "0.1.40"
+# tracing-subscriber = { version = "0.3.18", features = ["env-filter"]}
 
 
 # Execution stuff

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::{config::Args, rodeo::GoatRodeoCluster};
 #[cfg(test)]
 use std::println as info;
-use toml::{map::Map, Table};
+use toml::{Table, map::Map};
 
 #[derive(Debug, Clone)]
 pub struct ClusterHolder {
@@ -54,7 +54,7 @@ impl ClusterHolder {
     if false {
       // dunno if this is a good idea...
       info!("Loading full index...");
-      cluster.load().get_md5_to_item_offset_index().await?;
+      cluster.load().get_index().await?;
       info!("Loaded index")
     }
 

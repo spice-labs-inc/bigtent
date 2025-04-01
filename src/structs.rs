@@ -90,10 +90,6 @@ pub trait EdgeType {
   fn is_contains_down(&self) -> bool;
 
   fn is_contained_by_up(&self) -> bool;
-
-  fn is_built_from(&self) -> bool;
-
-  fn is_builds_to(&self) -> bool;
 }
 
 pub const TO: &str = ":to";
@@ -105,8 +101,7 @@ pub const CONTAINED_BY: &str = "contained:up";
 pub const CONTAINS: &str = "contained:down";
 pub const ALIAS_TO: &str = "alias:to";
 pub const ALIAS_FROM: &str = "alias:from";
-pub const BUILDS_TO: &str = "build:up";
-pub const BUILT_FROM: &str = "build:down";
+
 impl EdgeType for String {
   fn is_alias_from(&self) -> bool {
     self == ALIAS_FROM
@@ -130,14 +125,6 @@ impl EdgeType for String {
 
   fn is_contained_by_up(&self) -> bool {
     self.ends_with(CONTAINED_BY)
-  }
-
-  fn is_built_from(&self) -> bool {
-    self.ends_with(BUILT_FROM)
-  }
-
-  fn is_builds_to(&self) -> bool {
-    self.ends_with(BUILDS_TO)
   }
 }
 

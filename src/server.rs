@@ -2,12 +2,11 @@ use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use axum::{
-  extract::{Path, Request, State},
-  http::{StatusCode, Uri},
-  middleware::{self, Next},
-  response::{IntoResponse, Response},
-  routing::{get, post},
   Json, Router,
+  extract::{Path, State},
+  http::StatusCode,
+  response::IntoResponse,
+  routing::{get, post},
 };
 use axum_streams::*;
 
@@ -15,7 +14,7 @@ use axum_streams::*;
 use log::info;
 
 use tokio::sync::mpsc::Receiver;
-use tokio_stream::Stream;
+use tokio_stream::Stream; // Use log crate when building application
 
 use crate::{cluster_holder::ClusterHolder, structs::Item};
 #[cfg(test)]
@@ -26,13 +25,13 @@ async fn stream_items(rodeo: Arc<ClusterHolder>, items: Vec<String>) -> Receiver
 
   tokio::spawn(async move {
     for item_id in items {
-      match rodeo.get_cluster().item_for_identifier(&item_id).await {
-        Ok(Some(i)) => {
+      match rodeo.get_cluster().data_for_key(&item_id).await {
+        Ok(i) => {
           if !mtx.is_closed() {
             let _ = mtx.send(i).await;
           }
         }
-        _ => {}
+        Err(_) => {}
       }
     }
   });
@@ -74,37 +73,17 @@ async fn serve_bulk(
   })
 }
 
-/// compute the package from either uri which will include query parameters (which are part of)
-/// a pURL or the path that was passed in
-fn compute_package(maybe_gitoid: &str, uri: &Uri) -> String {
-  if let Some(pq) = uri.path_and_query() {
-    let path = pq.as_str();
-    let offset = path.find(maybe_gitoid);
-    if let Some(actual_offset) = offset {
-      path[actual_offset..].to_string()
-    } else {
-      path.to_string()
-    }
-  } else {
-    maybe_gitoid.to_string()
-  }
-}
-
-#[axum::debug_handler]
 async fn serve_gitoid(
   State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
-  uri: Uri,
 ) -> Result<Json<serde_json::Value>, impl IntoResponse> {
-  let to_find = compute_package(&gitoid, &uri);
-
-  let ret = rodeo.get_cluster().item_for_identifier(&to_find).await;
+  let ret = rodeo.get_cluster().data_for_key(&gitoid).await;
 
   match ret {
-    Ok(Some(item)) => Ok(Json(item.to_json())),
-    _ => Err((
+    Ok(item) => Ok(Json(item.to_json())),
+    Err(_) => Err((
       StatusCode::NOT_FOUND,
-      format!("No item found for key {}", to_find),
+      format!("No item found for key {}", gitoid),
     )),
   }
 }
@@ -112,16 +91,14 @@ async fn serve_gitoid(
 async fn serve_anti_alias(
   State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
-  uri: Uri,
 ) -> Result<Json<serde_json::Value>, impl IntoResponse> {
-  let to_find = compute_package(&gitoid, &uri);
-  let ret = rodeo.get_cluster().antialias_for(&to_find).await;
+  let ret = rodeo.get_cluster().antialias_for(&gitoid).await;
 
   match ret {
-    Ok(Some(item)) => Ok(Json(item.to_json())),
-    _ => Err((
+    Ok(item) => Ok(Json(item.to_json())),
+    Err(_) => Err((
       StatusCode::NOT_FOUND,
-      format!("No item found for key {}", to_find),
+      format!("No item found for key {}", gitoid),
     )),
   }
 }
@@ -129,7 +106,6 @@ async fn serve_anti_alias(
 async fn serve_flatten_both(
   rodeo: Arc<ClusterHolder>,
   payload: Vec<String>,
-  source: bool,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
   let start = Instant::now();
   let payload_len = payload.len();
@@ -138,44 +114,21 @@ async fn serve_flatten_both(
     start.elapsed());
   }
 
-  let stream: Receiver<serde_json::Value> = match rodeo
-    .get_cluster()
-    .stream_flattened_items(payload, source)
-    .await
-  {
-    Ok(s) => s,
-    Err(e) => return Err((StatusCode::NOT_FOUND, format!("{}", e))),
-  };
+  let stream: Receiver<serde_json::Value> =
+    match rodeo.get_cluster().stream_flattened_items(payload).await {
+      Ok(s) => s,
+      Err(_e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "??")),
+    };
   let tok_stream = TokioReceiverToStream { receiver: stream };
 
   Ok(StreamBodyAs::json_array(tok_stream))
 }
 
-async fn serve_flatten_source(
-  State(rodeo): State<Arc<ClusterHolder>>,
-  Path(gitoid): Path<String>,
-  uri: Uri,
-) -> impl IntoResponse {
-  let to_find = compute_package(&gitoid, &uri);
-  serve_flatten_both(rodeo, vec![to_find], true).await
-}
-
-/// Serve all the "contains" gitoids for a given Item
-/// Follows `AliasTo` links
-async fn serve_flatten_source_bulk(
-  State(rodeo): State<Arc<ClusterHolder>>,
-  Json(payload): Json<Vec<String>>,
-) -> impl IntoResponse {
-  serve_flatten_both(rodeo, payload, true).await
-}
-
 async fn serve_flatten(
   State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
-  uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&gitoid, &uri);
-  serve_flatten_both(rodeo, vec![to_find], false).await
+  serve_flatten_both(rodeo, vec![gitoid]).await
 }
 
 /// Serve all the "contains" gitoids for a given Item
@@ -184,25 +137,21 @@ async fn serve_flatten_bulk(
   State(rodeo): State<Arc<ClusterHolder>>,
   Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
-  serve_flatten_both(rodeo, payload, false).await
+  serve_flatten_both(rodeo, payload).await
 }
 
 async fn serve_north(
   State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
-  uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&gitoid, &uri);
-  do_north(rodeo, vec![to_find], false).await
+  do_north(rodeo, vec![gitoid], false).await
 }
 
 async fn serve_north_purls(
   State(rodeo): State<Arc<ClusterHolder>>,
   Path(gitoid): Path<String>,
-  uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&gitoid, &uri);
-  do_north(rodeo, vec![to_find], true).await
+  do_north(rodeo, vec![gitoid], true).await
 }
 
 async fn serve_north_bulk(
@@ -253,11 +202,9 @@ pub fn build_route(state: Arc<ClusterHolder>) -> Router {
     .route("/{*gitoid}", get(serve_gitoid))
     .route("/aa/{*gitoid}", get(serve_anti_alias))
     .route("/north/{*gitoid}", get(serve_north))
+    .route("/flatten/{*gitoid}", get(serve_flatten))
     .route("/north_purls/{*gitoid}", get(serve_north_purls))
     .route("/north", post(serve_north_bulk))
-    .route("/flatten_source/{*gitoid}", get(serve_flatten_source))
-    .route("/flatten_source", post(serve_flatten_source_bulk))
-    .route("/flatten/{*gitoid}", get(serve_flatten))
     .route("/flatten", post(serve_flatten_bulk))
     .route("/north_purls", post(serve_north_purls_bulk))
     .with_state(state);
@@ -265,28 +212,12 @@ pub fn build_route(state: Arc<ClusterHolder>) -> Router {
   app
 }
 
-/// middleware for request logging
-pub async fn request_log_middleware(request: Request, next: Next) -> Response {
-  let start = Instant::now();
-  let request_uri_string = format!("{}", request.uri());
-  let response = next.run(request).await;
-
-  info!(
-    "Served {} response {} time {:?}",
-    request_uri_string,
-    response.status(),
-    Instant::now().duration_since(start)
-  );
-
-  response
-}
-
 pub async fn run_web_server(index: Arc<ClusterHolder>) -> Result<()> {
   let state = index.clone();
   let addrs = index.the_args().to_socket_addrs();
   info!("Listen on {:?}", addrs);
 
-  let app = build_route(state).layer(middleware::from_fn(request_log_middleware));
+  let app = build_route(state);
 
   let nested = Router::new().nest("/omnibor", app.clone());
 

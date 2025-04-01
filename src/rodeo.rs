@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use scopeguard::defer;
 use serde::{Deserialize, Serialize};
@@ -6,16 +6,16 @@ use std::{
   collections::{BTreeMap, HashMap, HashSet},
   ops::Deref,
   path::{Path, PathBuf},
-  sync::{atomic::AtomicU32, Arc},
+  sync::{Arc, atomic::AtomicU32},
   time::Instant,
 };
 use thousands::Separable;
 use tokio::{
-  fs::{read_dir, File},
+  fs::{File, read_dir},
   io::BufReader,
   sync::{
-    mpsc::{Receiver, Sender},
     Mutex,
+    mpsc::{Receiver, Sender},
   },
 };
 use toml::Table; // Use log crate when building application
@@ -26,8 +26,8 @@ use crate::{
   live_merge::perform_merge,
   structs::{EdgeType, Item},
   util::{
-    byte_slice_to_u63, find_common_root_dir, hex_to_u64, is_child_dir, md5hash_str,
-    read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice, MD5Hash,
+    MD5Hash, byte_slice_to_u63, find_common_root_dir, hex_to_u64, is_child_dir, md5hash_str,
+    read_len_and_cbor, read_u32, sha256_for_reader, sha256_for_slice,
   },
 };
 #[cfg(not(test))]
@@ -409,14 +409,7 @@ impl GoatRodeoCluster {
     ret
   }
 
-  /// Big Tent has an in-memory index of MD5 hash of identifier to the
-  /// location (`ItemOffset`) of the indexed `Item`. This function
-  /// returns the index. If the index has not been loaded from disk
-  /// (loading in all the `.gri` files referenced in the `.grc` cluster definition)
-  /// the items are loaded. The load process can take a while (3+ minutes for 2B
-  /// index entries). If there are multiple threads, waiting on the load,
-  /// only one will actually do the load
-  pub async fn get_md5_to_item_offset_index(&self) -> Result<Arc<EitherItemOffsetVec>> {
+  pub async fn get_index(&self) -> Result<Arc<EitherItemOffsetVec>> {
     // get the index
     let tmp = self.index.load().clone();
 
@@ -545,28 +538,14 @@ impl GoatRodeoCluster {
     Ok(ret_arc)
   }
 
-  /// Data files (files that contain `Item`s) are named based on the 8 most significant
-  /// bytes of their sha256 (with the most significant bit set to 0). This data structure
-  /// opens each of the data files so that when an `Item` needs to be read, the
-  /// `Mutex`ed file handle can be looked up in a hash table. This function
-  /// Does the lookup
-  pub fn find_data_file_from_sha256(&self, hash: u64) -> Result<Arc<Mutex<Box<dyn DataReader>>>> {
+  pub fn data_file(&self, hash: u64) -> Result<Arc<Mutex<Box<dyn DataReader>>>> {
     match self.data_files.get(&hash) {
       Some(df) => Ok(df.file.clone()),
       None => bail!("Data file '{:016x}.grd' not found", hash),
     }
   }
 
-  /// Big Tent and Goat Rodeo store data and index files with names based on the
-  /// sha256 of the file contents. This function, given a root_path, finds
-  /// the file with the correct hash. Note that this is the most significant
-  /// 8 bytes of the sha256 with the most significant bit set to zero. This
-  /// is because the JVM's `long` is signed
-  pub async fn find_data_or_index_file_from_sha256(
-    root_path: &PathBuf,
-    hash: u64,
-    suffix: &str,
-  ) -> Result<File> {
+  pub async fn find_file(path: &PathBuf, hash: u64, suffix: &str) -> Result<File> {
     fn find(name: &str, dir: &Path) -> Result<Option<PathBuf>> {
       for entry in dir.read_dir()?.into_iter() {
         let entry = entry?;
@@ -589,13 +568,12 @@ impl GoatRodeoCluster {
       Ok(None)
     }
     let file_name = format!("{:016x}.{}", hash, suffix);
-    match find(&file_name, root_path)? {
+    match find(&file_name, path)? {
       Some(f) => Ok(File::open(f).await?),
-      _ => bail!("Couldn't find {} in {:?}", file_name, root_path),
+      _ => bail!("Couldn't find {} in {:?}", file_name, path),
     }
   }
 
-  /// Given a path, find all the `.grc` files in the path
   pub async fn cluster_files_in_dir(path: PathBuf) -> Result<Vec<GoatRodeoCluster>> {
     let mut the_dir = read_dir(path.clone()).await?;
     let mut ret = vec![];
@@ -624,25 +602,12 @@ impl GoatRodeoCluster {
     Ok(ret)
   }
 
-  /// given an identifier, convert it into a hash and then look up the hash in the
-  /// index. This is a fast operation as it's just a binary search of the index which is
-  /// in memory
-  pub async fn identifier_to_item_offset(
-    &self,
-    identifier: &str,
-  ) -> Result<Option<EitherItemOffset>> {
-    let hash = md5hash_str(identifier);
-    Ok(self.hash_to_item_offset(hash).await?)
-  }
-
-  /// from a hash, find the ItemOffset
-  pub async fn hash_to_item_offset(&self, hash: MD5Hash) -> Result<Option<EitherItemOffset>> {
-    let index = self.get_md5_to_item_offset_index().await?;
+  pub async fn find(&self, hash: MD5Hash) -> Result<Option<EitherItemOffset>> {
+    let index = self.get_index().await?;
     Ok(index.find(hash))
   }
 
-  /// given a hash, find an item
-  pub async fn hash_to_item(&self, file_hash: u64, offset: u64) -> Result<Item> {
+  pub async fn entry_for(&self, file_hash: u64, offset: u64) -> Result<Item> {
     let data_files = &self.data_files;
     let data_file = data_files.get(&file_hash);
     match data_file {
@@ -657,73 +622,43 @@ impl GoatRodeoCluster {
     }
   }
 
-  /// create a stream for the flattened items. If any of the `gitoids` cannot
-  /// be found, an `Err` is put in the stream and the flattening is completed.
-  ///
-  /// If `source` is true, the flattening includes "built from" and the returned
-  /// items are the items that the code was built from
+  /// create a stream for the flattened items
   pub async fn stream_flattened_items(
     self: Arc<GoatRodeoCluster>,
     gitoids: Vec<String>,
-    source: bool,
   ) -> Result<Receiver<serde_json::Value>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
-    let mut to_find = HashSet::new();
-    let mut not_found = vec![];
 
-    for s in gitoids {
-      match self.identifier_to_item_offset(&s).await {
-        Ok(Some(_)) => {
-          to_find.insert(s);
-        }
-        _ => {
-          not_found.push(s);
-        }
-      }
-    }
-
-    if !not_found.is_empty() {
-      bail!("The following items are not found {:?}", not_found);
-    }
-
-    // populate the channel
     tokio::spawn(async move {
-      let mut processed = HashSet::new();
+      let mut to_find = HashSet::new();
+      for s in gitoids {
+        to_find.insert(s);
+      }
+      let mut found = HashSet::new();
       while !to_find.is_empty() {
         let mut new_to_find = HashSet::new();
-        for identifier in to_find.clone() {
-          match self.item_for_identifier(&identifier).await {
-            Ok(Some(item)) => {
-              // deal with anti-aliasing
+        for gitoid in to_find.clone() {
+          match self.data_for_key(&gitoid).await {
+            Ok(item) => {
               item
                 .connections
                 .iter()
                 .filter(|a| a.0.is_alias_to())
                 .for_each(|s| {
-                  if !to_find.contains(&s.1) && !processed.contains(&s.1) {
+                  if !to_find.contains(&s.1) && found.contains(&s.1) {
                     new_to_find.insert(s.1.clone());
                   }
                 });
-
-              // process
-              for s in item
-                .connections
-                .iter()
-                .filter(|a| a.0.is_contains_down() || (source && a.0.is_built_from()))
-              {
-                if !to_find.contains(&s.1) && !processed.contains(&s.1) {
+              for s in item.connections.iter().filter(|a| a.0.is_contains_down()) {
+                if !to_find.contains(&s.1) && found.contains(&s.1) {
                   new_to_find.insert(s.1.clone());
-
-                  // if we are looking at source only, only include build sources
-                  if !source || s.0.is_built_from() {
-                    let _ = tx.send(s.1.clone().into()).await;
-                  }
+                  let _ = tx.send(s.1.clone().into()).await;
                 }
               }
             }
-            _ => {}
+            Err(_) => {}
           }
-          processed.insert(identifier);
+          found.insert(gitoid);
         }
 
         to_find = new_to_find;
@@ -767,8 +702,8 @@ impl GoatRodeoCluster {
       }
       for this_oid in to_search {
         found.insert(this_oid.clone());
-        match self.item_for_identifier(&this_oid).await {
-          Ok(Some(item)) => {
+        match self.data_for_key(&this_oid).await {
+          Ok(item) => {
             let and_then = item.contained_by();
             if purls_only {
               for purl in item.find_purls() {
@@ -792,21 +727,12 @@ impl GoatRodeoCluster {
     Ok(())
   }
 
-  pub async fn antialias_for(&self, data: &str) -> Result<Option<Item>> {
-    let mut ret = match self.item_for_identifier(data).await? {
-      Some(i) => i,
-      _ => return Ok(None),
-    };
+  pub async fn antialias_for(&self, data: &str) -> Result<Item> {
+    let mut ret = self.data_for_key(data).await?;
     while ret.is_alias() {
       match ret.connections.iter().find(|x| x.0.is_alias_to()) {
         Some(v) => {
-          ret = match self.item_for_identifier(&v.1).await? {
-            Some(v) => v,
-            _ => bail!(
-              "Expecting to traverse from {}, but no aliases found",
-              ret.identifier
-            ),
-          };
+          ret = self.data_for_key(&v.1).await?;
         }
         None => {
           bail!("Unexpected situation");
@@ -814,14 +740,14 @@ impl GoatRodeoCluster {
       }
     }
 
-    Ok(Some(ret))
+    Ok(ret)
   }
 
   pub async fn data_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Item> {
     match index_loc {
       loc @ IndexLoc::Loc(_) => Ok(
         self
-          .hash_to_item(loc.get_file_hash(), loc.get_offset())
+          .entry_for(loc.get_file_hash(), loc.get_offset())
           .await?,
       ),
       IndexLoc::Chain(offsets) => {
@@ -855,7 +781,7 @@ impl GoatRodeoCluster {
     match index_loc {
       loc @ IndexLoc::Loc(_) => Ok(vec![
         self
-          .hash_to_item(loc.get_file_hash(), loc.get_offset())
+          .entry_for(loc.get_file_hash(), loc.get_offset())
           .await?,
       ]),
       IndexLoc::Chain(offsets) => {
@@ -869,22 +795,18 @@ impl GoatRodeoCluster {
     }
   }
 
-  pub async fn item_for_hash(&self, hash: MD5Hash, original: Option<&str>) -> Result<Option<Item>> {
-    match self.hash_to_item_offset(hash).await? {
-      Some(eo) => Ok(Some(self.data_for_entry_offset(&eo.loc()).await?)),
-      _ => match original {
-        Some(id) => bail!(format!(
-          "Could not find `Item` for identifier {} hash {:x?}",
-          id, hash
-        )),
-        _ => bail!(format!("Could not find `Item` for hash {:x?}", hash)),
-      },
-    }
+  pub async fn data_for_hash(&self, hash: MD5Hash) -> Result<Item> {
+    let entry_offset = match self.find(hash).await? {
+      Some(eo) => eo,
+      _ => bail!(format!("Could not find entry for hash {:x?}", hash)),
+    };
+
+    self.data_for_entry_offset(&entry_offset.loc()).await
   }
 
-  pub async fn item_for_identifier(&self, data: &str) -> Result<Option<Item>> {
+  pub async fn data_for_key(&self, data: &str) -> Result<Item> {
     let md5_hash = md5hash_str(data);
-    self.item_for_hash(md5_hash, Some(data)).await
+    self.data_for_hash(md5_hash).await
   }
 }
 
@@ -911,7 +833,7 @@ async fn test_antialias() {
   assert!(files.len() > 0, "Need a cluster");
   let cluster = files.pop().expect("Expect a cluster");
   let index = cluster
-    .get_md5_to_item_offset_index()
+    .get_index()
     .await
     .expect("To be able to get the index")
     .flatten();
@@ -919,10 +841,9 @@ async fn test_antialias() {
   let mut aliases = vec![];
   for v in index.iter() {
     let item = cluster
-      .item_for_hash(*v.hash(), None)
+      .data_for_hash(*v.hash())
       .await
-      .expect("Should get an item")
-      .expect("And it should be a Some");
+      .expect("Should get an item");
     if item.is_alias() {
       aliases.push(item);
     }
@@ -935,8 +856,7 @@ async fn test_antialias() {
     let new_item = cluster
       .antialias_for(&ai.identifier)
       .await
-      .expect("Expect to get the antialiased thing")
-      .expect("And it's not a None");
+      .expect("Expect to get the antialiased thing");
     assert!(!new_item.is_alias(), "Expecting a non-aliased thing");
     assert!(
       new_item
@@ -988,7 +908,7 @@ async fn test_generated_cluster() {
     let mut pass_num = 0;
     for cluster in files {
       pass_num += 1;
-      let complete_index = cluster.get_md5_to_item_offset_index().await.unwrap();
+      let complete_index = cluster.get_index().await.unwrap();
 
       info!(
         "Loaded index for pass {} at {:?}",
@@ -1004,11 +924,7 @@ async fn test_generated_cluster() {
       info!("Index size {}", complete_index.len());
 
       for i in complete_index.deref().flatten() {
-        cluster
-          .hash_to_item_offset(*i.hash())
-          .await
-          .unwrap()
-          .unwrap();
+        cluster.find(*i.hash()).await.unwrap().unwrap();
       }
     }
   }
@@ -1040,7 +956,7 @@ async fn test_files_in_dir() {
     assert!(cluster.index_files.len() > 0);
 
     let start = Instant::now();
-    let complete_index = cluster.get_md5_to_item_offset_index().await.unwrap();
+    let complete_index = cluster.get_index().await.unwrap();
 
     total_index_size += complete_index.len();
 
@@ -1051,7 +967,7 @@ async fn test_files_in_dir() {
     );
     let time = Instant::now().duration_since(start);
     let start = Instant::now();
-    cluster.get_md5_to_item_offset_index().await.unwrap(); // should be from cache
+    cluster.get_index().await.unwrap(); // should be from cache
     let time2 = Instant::now().duration_since(start);
 
     assert!(
