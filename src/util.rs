@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 #[cfg(not(test))]
 use log::info;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
 use std::{
   collections::{BTreeMap, HashSet},
