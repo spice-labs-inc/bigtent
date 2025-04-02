@@ -1,5 +1,5 @@
 use crate::{
-  structs::Item,
+  item::Item,
   util::{read_cbor_sync, read_len_and_cbor_sync, read_u32_sync},
 };
 use anyhow::{bail, Result};

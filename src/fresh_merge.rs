@@ -15,7 +15,7 @@ use std::println as info;
 
 use crate::{
   rodeo::{goat::GoatRodeoCluster, index::EitherItemOffset, writer::ClusterWriter},
-  structs::Item,
+  item::Item,
   util::{MD5Hash, NiceDurationDisplay},
 };
 use anyhow::Result;

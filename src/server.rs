@@ -17,7 +17,7 @@ use log::info;
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::Stream;
 
-use crate::{rodeo::holder::ClusterHolder, structs::Item};
+use crate::{rodeo::holder::ClusterHolder, item::Item};
 #[cfg(test)]
 use std::println as info;
 

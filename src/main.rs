@@ -42,64 +42,6 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
   Ok(())
 }
 
-// async fn run_full_server(args: Args) -> Result<()> {
-//   let index_build_start = Instant::now();
-//   let index = ClusterHolder::new(args).await?;
-
-//   info!(
-//     "Initial index build in {:?}",
-//     Instant::now().duration_since(index_build_start)
-//   );
-
-//   let mut sig_hup = Signals::new([SIGHUP])?;
-//   let i2 = index.clone();
-//   let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(10);
-
-//   // Async closures are not supported, so to live in async-land
-//   // we need to spawn a Tokio task that waits for the MPSC message
-//   // and does the rebuild
-//   tokio::spawn(async move {
-//     loop {
-//       match rx.recv().await {
-//         Some(_) => {
-//           info!("Got rebuild signal");
-//           let start = Instant::now();
-//           match i2.rebuild().await {
-//             Ok(_) => {
-//               info!(
-//                 "Done rebuilding. Took {:?}",
-//                 Instant::now().duration_since(start)
-//               );
-//             }
-//             Err(e) => {
-//               error!("Rebuild error {:?}", e);
-//             }
-//           }
-//         }
-//         None => {
-//           break;
-//         }
-//       }
-//     }
-//   });
-
-//   // and we spawn a real thread to wait on `sig_hup`
-//   // and when there's a sighup, send a message into the channel
-//   // which will cause the async tasks to do the rebuild... sigh
-//   thread::spawn(move || {
-//     for _ in sig_hup.forever() {
-//       match tx.blocking_send(true) {
-//         Ok(_) => {}
-//         Err(_) => {
-//           break;
-//         }
-//       }
-//     }
-//   });
-
-//   run_web_server(index).await?;
-//   Ok(())
-// }
 
 async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
   for p in &paths {

@@ -23,7 +23,7 @@ use tokio::{
 };
 
 use crate::{
-  structs::{EdgeType, Item},
+  item::{EdgeType, Item},
   util::{
     byte_slice_to_u63, find_common_root_dir, hex_to_u64, is_child_dir, md5hash_str,
     read_len_and_cbor, read_u32, sha256_for_reader, MD5Hash,

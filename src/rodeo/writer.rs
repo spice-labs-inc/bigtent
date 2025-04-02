@@ -16,7 +16,7 @@ use anyhow::{bail, Result};
 
 use crate::{
   rodeo::index::{IndexEnvelope, IndexFileMagicNumber},
-  structs::Item,
+  item::Item,
   util::{
     byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope, write_int,
     write_long, write_short_signed, write_usize_sync, MD5Hash,
@@ -42,7 +42,6 @@ pub struct ClusterWriter {
   previous_position: usize,
   seen_data_files: Arc<Mutex<BTreeSet<u64>>>,
   index_files: Arc<Mutex<BTreeSet<u64>>>,
-  start: Instant,
   items_written: usize,
 }
 
@@ -85,7 +84,6 @@ impl ClusterWriter {
       previous_position: 0,
       seen_data_files: Arc::new(Mutex::new(BTreeSet::new())),
       index_files: Arc::new(Mutex::new(BTreeSet::new())),
-      start: Instant::now(),
       items_written: 0,
     };
 

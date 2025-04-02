@@ -11,7 +11,7 @@ pub mod rodeo {
   pub mod index;
   pub mod writer;
 }
-pub mod structs;
+pub mod item;
 pub mod util;
 pub extern crate arc_swap;
 pub extern crate axum;

@@ -13,6 +13,8 @@ pub struct ClusterFileEnvelope {
 
 #[allow(non_upper_case_globals)]
 pub const ClusterFileMagicNumber: u32 = 0xba4a4a; // Banana
+#[allow(non_upper_case_globals)]
+pub const MinClusterVersion: u32 = 3;
 
 impl ClusterFileEnvelope {
   pub fn validate(&self) -> Result<()> {
@@ -20,10 +22,10 @@ impl ClusterFileEnvelope {
       bail!("Loaded a cluster with an invalid magic number: {:?}", self);
     }
 
-    if self.version != 2 {
+    if self.version != MinClusterVersion {
       bail!(
-        "Loaded a Cluster with version {} but this code only supports version 2 Clusters",
-        self.version
+        "Loaded a Cluster with version {} but this code only supports version {} Clusters",
+        self.version, MinClusterVersion
       );
     }
 
