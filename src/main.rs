@@ -42,7 +42,6 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
   Ok(())
 }
 
-
 async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
   for p in &paths {
     if !p.exists() || !p.is_dir() {

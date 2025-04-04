@@ -12,7 +12,6 @@ fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
   v2_contains: &F2,
 ) -> Value {
   fn fix(filename: &Value, gitoids: Vec<String>) -> Vec<String> {
-    
     let expanded_filename = fix_uno(filename);
     let mut ret = vec![];
     for the_filename in expanded_filename {
@@ -324,6 +323,17 @@ impl Item {
       && self.connections == other.connections
       && self.body_mime_type == other.body_mime_type
       && self.body == other.body
+  }
+
+  pub fn merge_items(mut items: Vec<Item>) -> Option<Item> {
+    let mut ret: Option<Item> = None;
+    while let Some(to_merge) = items.pop() {
+      ret = Some(match ret {
+        None => to_merge,
+        Some(a) => a.merge(to_merge),
+      });
+    }
+    ret
   }
 
   // merge to `Item`s

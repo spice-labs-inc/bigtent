@@ -1,14 +1,14 @@
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use memmap2::Mmap;
-use scopeguard::defer;
+use tokio_util::either::Either;
 use std::{
   cmp::Ordering,
   collections::{HashMap, HashSet},
   fs::File,
   ops::Deref,
   path::{Path, PathBuf},
-  sync::{atomic::AtomicU32, Arc},
+  sync::Arc,
   time::Instant,
 };
 use thousands::Separable;
@@ -38,7 +38,8 @@ use std::println as info;
 use super::{
   cluster::{ClusterFileEnvelope, ClusterFileMagicNumber},
   data::{DataFile, GOAT_RODEO_CLUSTER_FILE_SUFFIX},
-  index::{EitherItemOffset, EitherItemOffsetVec, GetOffset, IndexFile, IndexLoc},
+  goat_trait::{impl_north_send, impl_stream_flattened_items, GoatRodeoTrait},
+  index::{find_item_offset, GetOffset, IndexFile, ItemLoc, ItemOffset},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -88,22 +89,104 @@ pub struct GoatRodeoCluster {
   data_files: HashMap<u64, Arc<DataFile>>,
   index_files: HashMap<u64, Arc<IndexFile>>,
   index_offset: Arc<Vec<IndexOffset>>,
-  index: Arc<ArcSwap<Option<Arc<EitherItemOffsetVec>>>>,
+  index: Arc<ArcSwap<Option<Arc<Vec<ItemOffset>>>>>,
   building_index: Arc<Mutex<bool>>,
   name: String,
   number_of_items: usize,
   load_index: bool,
 }
 
+impl GoatRodeoTrait for GoatRodeoCluster {
+  /// create a stream for the flattened items. If any of the `gitoids` cannot
+  /// be found, an `Err` is put in the stream and the flattening is completed.
+  ///
+  /// If `source` is true, the flattening includes "built from" and the returned
+  /// items are the items that the code was built from
+  async fn stream_flattened_items(
+    self: Arc<GoatRodeoCluster>,
+    gitoids: Vec<String>,
+    source: bool,
+  ) -> Result<Receiver<Either<Item, String>>> {
+    impl_stream_flattened_items(self, gitoids, source).await
+  }
+
+  fn get_purl(&self) -> Result<PathBuf> {
+    Ok(
+      self
+        .cluster_path
+        .canonicalize()?
+        .with_file_name("purls.txt"),
+    )
+  }
+
+  /// get the number of items this cluster is managing
+  fn number_of_items(&self) -> usize {
+    self.number_of_items
+  }
+
+  async fn north_send(
+    &self,
+    gitoids: Vec<String>,
+    purls_only: bool,
+    tx: Sender<Either<Item, String>>,
+    start: Instant,
+  ) -> Result<()> {
+    impl_north_send(self, gitoids, purls_only, tx, start).await
+  }
+
+  fn item_for_identifier(&self, data: &str) -> Result<Option<Item>> {
+    let md5_hash = md5hash_str(data);
+    self.item_for_hash(md5_hash)
+  }
+
+  fn item_for_hash(&self, hash: MD5Hash) -> Result<Option<Item>> {
+    match self.hash_to_item_offset(hash)? {
+      Some(eo) => Ok(Some(self.item_from_index_loc(&eo.loc)?)),
+      None => Ok(None),
+    }
+  }
+
+  fn antialias_for(&self, data: &str) -> Result<Option<Item>> {
+    let mut ret = match self.item_for_identifier(data)? {
+      Some(i) => i,
+      _ => return Ok(None),
+    };
+    while ret.is_alias() {
+      match ret.connections.iter().find(|x| x.0.is_alias_to()) {
+        Some(v) => {
+          ret = match self.item_for_identifier(&v.1)? {
+            Some(v) => v,
+            _ => bail!(
+              "Expecting to traverse from {}, but no aliases found",
+              ret.identifier
+            ),
+          };
+        }
+        None => {
+          bail!("Unexpected situation");
+        }
+      }
+    }
+
+    Ok(Some(ret))
+  }
+
+  fn has_identifier(&self, identifier: &str) -> bool {
+    match self.identifier_to_item_offset(identifier) {
+      Ok(Some(_)) => true,
+      _ => false,
+    }
+  }
+  
+  fn is_empty(&self) -> bool {
+        false
+    }
+}
+
 impl GoatRodeoCluster {
   /// get the cluster file hash
   pub fn get_cluster_file_hash(&self) -> u64 {
     self.cluster_file_hash
-  }
-
-  /// get the number of items this cluster is managing
-  pub fn number_of_items(&self) -> usize {
-    self.number_of_items
   }
 
   /// Get the data file mapping
@@ -121,77 +204,11 @@ impl GoatRodeoCluster {
     self.name.clone()
   }
 
-  //   pub fn create_synthetic_with(
-  //     &self,
-  //     index: EitherItemOffsetVec,
-  //     data_files: HashMap<u64, Arc<DataFile>>,
-  //     index_files: Vec< Arc<IndexFile>>,
-  //     sub_clusters: HashMap<u64, GoatRodeoCluster>,
-  //     name: String,
-  //   ) -> Result<GoatRodeoCluster> {
-  //     if sub_clusters.len() == 0 {
-  //       bail!("A synthetic cluster must have at least one underlying real cluster")
-  //     }
-
-  //     let my_hash = {
-  //       let mut keys = sub_clusters
-  //         .keys()
-  //         .into_iter()
-  //         .map(|v| *v)
-  //         .collect::<Vec<u64>>();
-
-  //       keys.sort();
-  //       let mut merkle = vec![];
-  //       for k in keys {
-  //         merkle.append(&mut k.to_be_bytes().into_iter().collect());
-  //       }
-  //       byte_slice_to_u63(&sha256_for_slice(&mut merkle)).unwrap()
-  //     };
-
-  //     Ok(GoatRodeoCluster {
-  //       envelope: self.envelope.clone(),
-  //       cluster_root_path: self.cluster_root_path.clone(),
-  //       cluster_path: self.cluster_path.clone(),
-  //       data_files: data_files,
-  //       index_files: IndexFile::vec_of_index_files_to_hash_lookup(&index_files),
-  //       index_offset: Arc::new(IndexOffset::from_index_files(&index_files)),
-  //       index: Arc::new(ArcSwap::new(Arc::new(Some(Arc::new(index))))),
-  //       building_index: Arc::new(Mutex::new(false)),
-  //       cluster_file_hash: my_hash,
-  //       sub_clusters,
-  //       synthetic: true,
-  //       name: name,
-  //     })
-  //   }
-
   /// When clusters are merged, they must share a root path
   /// return the root path for the cluster
   pub fn get_root_path(&self) -> PathBuf {
     self.cluster_root_path.clone()
   }
-
-  /// Create a Goat Rodeo cluster with no contents
-  //   pub fn blank(root_dir: &PathBuf) -> GoatRodeoCluster {
-  //     GoatRodeoCluster {
-  //       envelope: ClusterFileEnvelope {
-  //         version: 2,
-  //         magic: ClusterFileMagicNumber,
-  //         data_files: vec![],
-  //         index_files: vec![],
-  //         info: BTreeMap::new(),
-  //       },
-  //       cluster_root_path: root_dir.clone(),
-  //       cluster_path: root_dir.clone(),
-  //       data_files: HashMap::new(),
-  //       index_files: HashMap::new(),
-  //       index: Arc::new(ArcSwap::new(Arc::new(None))),
-  //       building_index: Arc::new(Mutex::new(false)),
-  //       cluster_file_hash: 0,
-  //       sub_clusters: HashMap::new(),
-  //       synthetic: false,
-  //       name: format!("{:?}", root_dir),
-  //     }
-  //   }
 
   pub async fn new(
     root_dir: &PathBuf,
@@ -351,9 +368,7 @@ impl GoatRodeoCluster {
   /// the items are loaded. The load process can take a while (3+ minutes for 2B
   /// index entries). If there are multiple threads, waiting on the load,
   /// only one will actually do the load
-  async fn get_md5_to_item_offset_index_if_load_index_true(
-    &self,
-  ) -> Result<Arc<EitherItemOffsetVec>> {
+  async fn get_md5_to_item_offset_index_if_load_index_true(&self) -> Result<Arc<Vec<ItemOffset>>> {
     // get the index
     let tmp = self.index.load().clone();
 
@@ -474,7 +489,7 @@ impl GoatRodeoCluster {
       start.elapsed()
     );
 
-    let ret_arc: Arc<EitherItemOffsetVec> = Arc::new(ret.into());
+    let ret_arc: Arc<Vec<ItemOffset>> = Arc::new(ret.into());
     self.index.store(Arc::new(Some(ret_arc.clone())));
     // keep the lock alive
     *my_lock = false;
@@ -570,16 +585,16 @@ impl GoatRodeoCluster {
   /// given an identifier, convert it into a hash and then look up the hash in the
   /// index. This is a fast operation as it's just a binary search of the index which is
   /// in memory
-  pub fn identifier_to_item_offset(&self, identifier: &str) -> Result<Option<EitherItemOffset>> {
+  pub fn identifier_to_item_offset(&self, identifier: &str) -> Result<Option<ItemOffset>> {
     let hash = md5hash_str(identifier);
     Ok(self.hash_to_item_offset(hash)?)
   }
 
   /// from a hash, find the ItemOffset
-  pub fn hash_to_item_offset(&self, hash: MD5Hash) -> Result<Option<EitherItemOffset>> {
+  pub fn hash_to_item_offset(&self, hash: MD5Hash) -> Result<Option<ItemOffset>> {
     if self.load_index && self.index.load().is_some() {
       match &**self.index.load() {
-        Some(index) => Ok(index.find(hash)),
+        Some(index) => Ok(find_item_offset(hash, index)),
         None => bail!("Expected to load the index and failed"),
       }
     } else {
@@ -592,7 +607,7 @@ impl GoatRodeoCluster {
       while low <= hi {
         let mid = low + (hi - low) / 2;
         let entry = self.offset_from_pos(mid)?;
-        match entry.hash().cmp(&hash) {
+        match entry.hash.cmp(&hash) {
           Ordering::Less => low = mid + 1,
           Ordering::Equal => return Ok(Some(entry.clone())),
           Ordering::Greater => hi = mid - 1,
@@ -603,14 +618,14 @@ impl GoatRodeoCluster {
     }
   }
 
-  pub fn offset_from_pos(&self, pos: usize) -> Result<EitherItemOffset> {
+  pub fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
     if self.load_index && self.index.load().is_some() {
       match &**self.index.load() {
         Some(index) => {
           if pos < index.len() {
-            Ok(index.item_at(pos))
+            Ok(index[pos])
           } else {
-            bail!("Pos {} outside index len {}", pos, index.len());
+            panic!("Pos {} outside index len {}", pos, index.len());
           }
         }
         None => bail!("Expected to load the index and failed"),
@@ -636,13 +651,8 @@ impl GoatRodeoCluster {
     }
   }
 
-  pub fn item_from_either_item_offset(
-    &self,
-    either_item_offset: &EitherItemOffset,
-  ) -> Result<Item> {
-    let loc = either_item_offset.loc();
-
-    Ok(self.item_from_index_loc(&loc)?)
+  pub fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item> {
+    Ok(self.item_from_index_loc(&item_offset.loc)?)
   }
 
   /// given a hash, find an item
@@ -661,233 +671,8 @@ impl GoatRodeoCluster {
     }
   }
 
-  /// create a stream for the flattened items. If any of the `gitoids` cannot
-  /// be found, an `Err` is put in the stream and the flattening is completed.
-  ///
-  /// If `source` is true, the flattening includes "built from" and the returned
-  /// items are the items that the code was built from
-  pub async fn stream_flattened_items(
-    self: Arc<GoatRodeoCluster>,
-    gitoids: Vec<String>,
-    source: bool,
-  ) -> Result<Receiver<serde_json::Value>> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
-    let mut to_find = HashSet::new();
-    let mut not_found = vec![];
-
-    for s in gitoids {
-      match self.identifier_to_item_offset(&s) {
-        Ok(Some(_)) => {
-          to_find.insert(s);
-        }
-        _ => {
-          not_found.push(s);
-        }
-      }
-    }
-
-    if !not_found.is_empty() {
-      bail!("The following items are not found {:?}", not_found);
-    }
-
-    // populate the channel
-    tokio::spawn(async move {
-      let mut processed = HashSet::new();
-      while !to_find.is_empty() {
-        let mut new_to_find = HashSet::new();
-        for identifier in to_find.clone() {
-          match self.item_for_identifier(&identifier) {
-            Ok(Some(item)) => {
-              // deal with anti-aliasing
-              item
-                .connections
-                .iter()
-                .filter(|a| a.0.is_alias_to())
-                .for_each(|s| {
-                  if !to_find.contains(&s.1) && !processed.contains(&s.1) {
-                    new_to_find.insert(s.1.clone());
-                  }
-                });
-
-              // process
-              for s in item
-                .connections
-                .iter()
-                .filter(|a| a.0.is_contains_down() || (source && a.0.is_built_from()))
-              {
-                if !to_find.contains(&s.1) && !processed.contains(&s.1) {
-                  new_to_find.insert(s.1.clone());
-
-                  // if we are looking at source only, only include build sources
-                  if !source || s.0.is_built_from() {
-                    let _ = tx.send(s.1.clone().into()).await;
-                  }
-                }
-              }
-            }
-            _ => {}
-          }
-          processed.insert(identifier);
-        }
-
-        to_find = new_to_find;
-      }
-    });
-
-    Ok(rx)
-  }
-  pub async fn north_send(
-    &self,
-    gitoids: Vec<String>,
-    purls_only: bool,
-    tx: Sender<serde_json::Value>,
-    start: Instant,
-  ) -> Result<()> {
-    let mut found = HashSet::new();
-    let mut to_find = HashSet::new();
-    let mut found_purls = HashSet::<String>::new();
-    to_find.extend(gitoids);
-
-    let cnt = AtomicU32::new(0);
-
-    defer! {
-      info!("North: Sent {} items in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
-      start.elapsed());
-    }
-
-    fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
-      let mut ret = a.clone();
-      for i in b.iter() {
-        ret.remove(i);
-      }
-      ret
-    }
-
-    loop {
-      let to_search = less(&to_find, &found);
-
-      if to_search.len() == 0 {
-        break;
-      }
-      for this_oid in to_search {
-        found.insert(this_oid.clone());
-        match self.item_for_identifier(&this_oid) {
-          Ok(Some(item)) => {
-            let and_then = item.contained_by();
-            if purls_only {
-              for purl in item.find_purls() {
-                if !found_purls.contains(&purl) {
-                  tx.send(purl.clone().into()).await?;
-
-                  found_purls.insert(purl);
-                }
-              }
-            } else {
-              tx.send(item.to_json()).await?;
-            }
-
-            to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
-          }
-          _ => {}
-        }
-        cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-      }
-    }
-    Ok(())
-  }
-
-  pub fn antialias_for(&self, data: &str) -> Result<Option<Item>> {
-    let mut ret = match self.item_for_identifier(data)? {
-      Some(i) => i,
-      _ => return Ok(None),
-    };
-    while ret.is_alias() {
-      match ret.connections.iter().find(|x| x.0.is_alias_to()) {
-        Some(v) => {
-          ret = match self.item_for_identifier(&v.1)? {
-            Some(v) => v,
-            _ => bail!(
-              "Expecting to traverse from {}, but no aliases found",
-              ret.identifier
-            ),
-          };
-        }
-        None => {
-          bail!("Unexpected situation");
-        }
-      }
-    }
-
-    Ok(Some(ret))
-  }
-
-  pub fn item_from_index_loc(&self, index_loc: &IndexLoc) -> Result<Item> {
-    match index_loc {
-      loc @ IndexLoc::Loc(_) => {
-        Ok(self.item_for_file_and_offset(loc.get_file_hash(), loc.get_offset())?)
-      }
-      IndexLoc::Chain(offsets) => {
-        let mut ret: Vec<Item> = vec![];
-        for offset in offsets {
-          let some = self.item_from_index_loc(&offset)?;
-          ret.push(some);
-        }
-        if ret.len() == 0 {
-          bail!("Got a location chain with zero entries!!");
-        } else if ret.len() == 1 {
-          Ok(ret.pop().unwrap()) // we know this is okay because we just tested length
-        } else {
-          let base = ret.pop().unwrap(); // we know this is okay because ret has more than 1 element
-          let mut to_merge = vec![];
-          for item in ret {
-            to_merge.push(item);
-          }
-          let mut final_base = base.clone();
-
-          for m2 in to_merge {
-            final_base = final_base.merge(m2);
-          }
-          Ok(final_base)
-        }
-      }
-    }
-  }
-
-  pub fn vec_for_entry_offset(&self, index_loc: &IndexLoc) -> Result<Vec<Item>> {
-    match index_loc {
-      loc @ IndexLoc::Loc(_) => {
-        Ok(vec![self.item_for_file_and_offset(
-          loc.get_file_hash(),
-          loc.get_offset(),
-        )?])
-      }
-      IndexLoc::Chain(offsets) => {
-        let mut ret = vec![];
-        for offset in offsets {
-          let mut some = self.vec_for_entry_offset(&offset)?;
-          ret.append(&mut some);
-        }
-        Ok(ret)
-      }
-    }
-  }
-
-  pub fn item_for_hash(&self, hash: MD5Hash, original: Option<&str>) -> Result<Option<Item>> {
-    match self.hash_to_item_offset(hash)? {
-      Some(eo) => Ok(Some(self.item_from_index_loc(&eo.loc())?)),
-      _ => match original {
-        Some(id) => bail!(format!(
-          "Could not find `Item` for identifier {} hash {:x?}",
-          id, hash
-        )),
-        _ => bail!(format!("Could not find `Item` for hash {:x?}", hash)),
-      },
-    }
-  }
-
-  pub fn item_for_identifier(&self, data: &str) -> Result<Option<Item>> {
-    let md5_hash = md5hash_str(data);
-    self.item_for_hash(md5_hash, Some(data))
+  pub fn item_from_index_loc(&self, index_loc: &ItemLoc) -> Result<Item> {
+    Ok(self.item_for_file_and_offset(index_loc.get_file_hash(), index_loc.get_offset())?)
   }
 }
 
@@ -918,13 +703,12 @@ async fn test_antialias() {
   let index = cluster
     .get_md5_to_item_offset_index_if_load_index_true()
     .await
-    .expect("To be able to get the index")
-    .flatten();
+    .expect("To be able to get the index");
 
   let mut aliases = vec![];
   for v in index.iter() {
     let item = cluster
-      .item_for_hash(*v.hash(), None)
+      .item_for_hash(*crate::rodeo::index::HasHash::hash(v))
       .expect("Should get an item")
       .expect("And it should be a Some");
     if item.is_alias() {
@@ -1009,8 +793,11 @@ async fn test_generated_cluster() {
       );
       info!("Index size {}", complete_index.len());
 
-      for i in complete_index.deref().flatten() {
-        cluster.hash_to_item_offset(*i.hash()).unwrap().unwrap();
+      for i in complete_index.deref() {
+        cluster
+          .hash_to_item_offset(*crate::rodeo::index::HasHash::hash(i))
+          .unwrap()
+          .unwrap();
       }
     }
   }
@@ -1133,7 +920,7 @@ async fn test_generated_cluster_no_index() {
           .offset_from_pos(i)
           .expect("Should be able to get the ItemOffset");
         cluster
-          .hash_to_item_offset(*offset.hash())
+          .hash_to_item_offset(*crate::rodeo::index::HasHash::hash(&offset))
           .unwrap()
           .unwrap();
       }

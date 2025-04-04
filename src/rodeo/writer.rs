@@ -1,22 +1,26 @@
+use log::error;
 #[cfg(not(test))]
-use log::{info, trace};
+use log::info;
 use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
 
+#[cfg(test)]
+use std::println as info;
 use std::{
   collections::{BTreeMap, BTreeSet, HashSet},
   mem::{self, swap},
   path::PathBuf,
-  sync::{atomic::AtomicU64, Arc},
-  time::Instant,
+  sync::{
+    atomic::{AtomicU64, AtomicUsize},
+    Arc,
+  },
+  time::{Duration, Instant},
 };
-#[cfg(test)]
-use std::{println as info, println as trace};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::{
-  rodeo::index::{IndexEnvelope, IndexFileMagicNumber},
   item::Item,
+  rodeo::index::{IndexEnvelope, IndexFileMagicNumber},
   util::{
     byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope, write_int,
     write_long, write_short_signed, write_usize_sync, MD5Hash,
@@ -24,7 +28,7 @@ use crate::{
 };
 
 use super::{
-  cluster::{ClusterFileEnvelope, ClusterFileMagicNumber},
+  cluster::{ClusterFileEnvelope, ClusterFileMagicNumber, CLUSTER_VERSION},
   data::{DataFileEnvelope, DataFileMagicNumber},
 };
 
@@ -43,6 +47,7 @@ pub struct ClusterWriter {
   seen_data_files: Arc<Mutex<BTreeSet<u64>>>,
   index_files: Arc<Mutex<BTreeSet<u64>>>,
   items_written: usize,
+  current_write_cnt: Arc<AtomicUsize>,
 }
 
 impl ClusterWriter {
@@ -85,6 +90,7 @@ impl ClusterWriter {
       seen_data_files: Arc::new(Mutex::new(BTreeSet::new())),
       index_files: Arc::new(Mutex::new(BTreeSet::new())),
       items_written: 0,
+      current_write_cnt: Arc::new(AtomicUsize::new(0)),
     };
 
     my_writer.write_data_envelope_start().await?;
@@ -135,13 +141,23 @@ impl ClusterWriter {
   pub async fn finalize_cluster(&mut self) -> Result<PathBuf> {
     if self.previous_position != 0 {
       self.write_data_and_index().await?;
+      info!("Waiting for data and index file write to complete");
+      while self
+        .current_write_cnt
+        .load(std::sync::atomic::Ordering::Relaxed)
+        > 0
+      {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+      }
+      info!("Data and index file write complete");
     }
+
     let mut cluster_file = vec![];
     {
       let cluster_writer = &mut cluster_file;
       write_int(cluster_writer, ClusterFileMagicNumber).await?;
       let cluster_env = ClusterFileEnvelope {
-        version: 2,
+        version: CLUSTER_VERSION,
         magic: ClusterFileMagicNumber,
         info: BTreeMap::new(),
         data_files: self
@@ -179,6 +195,16 @@ impl ClusterWriter {
   }
 
   pub async fn write_data_and_index(&mut self) -> Result<()> {
+    // spin lock on writing... only one of these can run at once
+
+    while self
+      .current_write_cnt
+      .load(std::sync::atomic::Ordering::Relaxed)
+      > 0
+    {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     if self.previous_position != 0 {
       let mut new_index_info = ClusterWriter::make_index_buffer();
       swap(&mut self.index_info, &mut new_index_info);
@@ -196,126 +222,134 @@ impl ClusterWriter {
       let seen_data_files = self.seen_data_files.clone();
 
       let index_files = self.index_files.clone();
-
+      let counter = self.current_write_cnt.clone();
+      counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // increment the write count
       tokio::task::spawn(async move {
         info!(
           "computing grd sha {:?}",
           Instant::now().duration_since(self_start)
         );
-        let data_ref = data.clone();
-        let sha256 = tokio::task::spawn_blocking(move || sha256_for_slice(&data_ref))
-          .await
-          .expect("Should compute SHA256");
-        let grd_sha = byte_slice_to_u63(&sha256).expect("Should be able to shorten sha");
-        let grd_file_path = self_dir.join(format!("{:016x}.grd", grd_sha));
-        let mut grd_file = File::create(grd_file_path)
-          .await
-          .expect("Should create the grd file");
-        grd_file
-          .write_all(&data)
-          .await
-          .expect("Should write the .grd file");
-        grd_file.flush().await.expect("Should flush .grd file");
+        async fn perform_write(
+          data: Arc<Vec<u8>>,
+          self_dir: PathBuf,
+          self_start: Instant,
+          previous_hash: Arc<AtomicU64>,
+          new_index_info: Vec<IndexInfo>,
+          seen_data_files: Arc<Mutex<BTreeSet<u64>>>,
+          index_files: Arc<Mutex<BTreeSet<u64>>>,
+        ) -> Result<()> {
+          let data_ref = data.clone();
+          let sha256 = tokio::task::spawn_blocking(move || sha256_for_slice(&data_ref)).await?;
+          let grd_sha = byte_slice_to_u63(&sha256).context("Should be able to shorten sha")?;
+          let grd_file_path = self_dir.join(format!("{:016x}.grd", grd_sha));
+          let mut grd_file = File::create(grd_file_path).await?;
+          grd_file.write_all(&data).await?;
+          grd_file.flush().await.context("Should flush .grd file")?;
 
-        info!(
-          "computed grd sha and wrote at {:?}",
-          Instant::now().duration_since(self_start)
-        );
+          info!(
+            "computed grd sha and wrote at {:?}",
+            Instant::now().duration_since(self_start)
+          );
 
-        previous_hash.store(grd_sha, std::sync::atomic::Ordering::Relaxed);
+          previous_hash.store(grd_sha, std::sync::atomic::Ordering::Relaxed);
 
-        let mut found_hashes = HashSet::new();
-        if grd_sha != 0 {
-          found_hashes.insert(grd_sha);
-        }
-        for v in &new_index_info {
-          if v.file_hash != 0 {
-            found_hashes.insert(v.file_hash);
+          let mut found_hashes = HashSet::new();
+          if grd_sha != 0 {
+            found_hashes.insert(grd_sha);
           }
-        }
-        seen_data_files.lock().await.insert(grd_sha);
-
-        let mut index_file = vec![];
-        {
-          let index_writer = &mut index_file;
-          write_int(index_writer, IndexFileMagicNumber).await?;
-          let index_env = IndexEnvelope {
-            version: 1,
-            magic: IndexFileMagicNumber,
-            size: new_index_info.len() as u32,
-            data_files: found_hashes.clone(),
-            encoding: "MD5/Long/Long".into(),
-            info: BTreeMap::new(),
-          };
-          write_envelope(index_writer, &index_env).await?;
           for v in &new_index_info {
-            std::io::Write::write_all(index_writer, &v.hash)?;
-            write_long(
-              index_writer,
-              if v.file_hash == 0 {
-                if grd_sha == 0 {
-                  bail!("Got an index with a zero marker file_hash, but no file was written?!?");
-                }
-                grd_sha
-              } else {
-                v.file_hash
-              },
-            )
-            .await?;
-            write_usize_sync(index_writer, v.offset)?;
+            if v.file_hash != 0 {
+              found_hashes.insert(v.file_hash);
+            }
+          }
+          seen_data_files.lock().await.insert(grd_sha);
+
+          let mut index_file = vec![];
+          {
+            let index_writer = &mut index_file;
+            write_int(index_writer, IndexFileMagicNumber).await?;
+            let index_env = IndexEnvelope {
+              version: 1,
+              magic: IndexFileMagicNumber,
+              size: new_index_info.len() as u32,
+              data_files: found_hashes.clone(),
+              encoding: "MD5/Long/Long".into(),
+              info: BTreeMap::new(),
+            };
+            write_envelope(index_writer, &index_env).await?;
+            for v in &new_index_info {
+              std::io::Write::write_all(index_writer, &v.hash)?;
+              write_long(
+                index_writer,
+                if v.file_hash == 0 {
+                  if grd_sha == 0 {
+                    bail!("Got an index with a zero marker file_hash, but no file was written?!?");
+                  }
+                  grd_sha
+                } else {
+                  v.file_hash
+                },
+              )
+              .await?;
+              write_usize_sync(index_writer, v.offset)?;
+            }
+          }
+
+          info!(
+            "computing gri sha {:?}",
+            Instant::now().duration_since(self_start)
+          );
+
+          // compute sha256 of index
+          let index_arc = Arc::new(index_file);
+          let index_reader = index_arc.clone();
+          let gri_sha = tokio::task::spawn_blocking(move || {
+            byte_slice_to_u63(&sha256_for_slice(&index_reader))
+          })
+          .await??;
+          {
+            let mut owned_index_file = index_files.lock().await;
+            owned_index_file.insert(gri_sha);
+          }
+          // write the .gri file
+          {
+            let gri_file_path = self_dir.join(format!("{:016x}.gri", gri_sha));
+            let mut gri_file = File::create(gri_file_path).await?;
+            gri_file.write_all(&index_arc).await?;
+            gri_file.flush().await?;
+          }
+          info!(
+            "computed gri sha and wrote index file {:?}",
+            Instant::now().duration_since(self_start)
+          );
+          seen_data_files.lock().await.extend(found_hashes);
+          Ok(())
+        }
+        let ret = perform_write(
+          data,
+          self_dir,
+          self_start,
+          previous_hash,
+          new_index_info,
+          seen_data_files,
+          index_files,
+        )
+        .await;
+        match &ret {
+          Ok(_) => {}
+          Err(e) => {
+            error!("Failed to write the data envelope! {:?}", e);
           }
         }
-
-        info!(
-          "computing gri sha {:?}",
-          Instant::now().duration_since(self_start)
-        );
-
-        // compute sha256 of index
-        let index_arc = Arc::new(index_file);
-        let index_reader = index_arc.clone();
-        let gri_sha = tokio::task::spawn_blocking(move || {
-          byte_slice_to_u63(&sha256_for_slice(&index_reader)).expect("Should compute sha256")
-        })
-        .await
-        .expect("Should compute sha 256");
-        {
-          let mut owned_index_file = index_files.lock().await;
-          owned_index_file.insert(gri_sha);
-        }
-        // write the .gri file
-        {
-          let gri_file_path = self_dir.join(format!("{:016x}.gri", gri_sha));
-          let mut gri_file = File::create(gri_file_path).await?;
-          gri_file.write_all(&index_arc).await?;
-          gri_file.flush().await?;
-        }
-        info!(
-          "computed gri sha and wrote index file {:?}",
-          Instant::now().duration_since(self_start)
-        );
-        seen_data_files.lock().await.extend(found_hashes);
-        Ok(())
+        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        ret
       });
       self.previous_position = 0;
 
       self.write_data_envelope_start().await?;
     }
 
-    self.dump_file_names().await;
     Ok(())
-  }
-
-  async fn dump_file_names(&self) {
-    trace!("Data");
-    for d in self.seen_data_files.lock().await.iter() {
-      trace!("{:016x}", d);
-    }
-
-    trace!("Index");
-    for d in self.index_files.lock().await.iter() {
-      trace!("{:016x}", d);
-    }
   }
 
   pub async fn add_index(&mut self, hash: MD5Hash, file_hash: u64, offset: usize) -> Result<()> {
@@ -336,7 +370,7 @@ impl ClusterWriter {
     write_int(&mut self.dest_data, DataFileMagicNumber).await?;
 
     let data_envelope = DataFileEnvelope {
-      version: 1,
+      version: DATA_FILE_ENVELOPE_VERSION,
       magic: DataFileMagicNumber,
       previous: self
         .previous_hash
@@ -352,3 +386,5 @@ impl ClusterWriter {
     Ok(())
   }
 }
+
+pub const DATA_FILE_ENVELOPE_VERSION: u32 = 1u32;

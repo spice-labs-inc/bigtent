@@ -1,7 +1,7 @@
 #[cfg(not(test))]
 use log::info;
 use std::{
-  collections::{HashMap, HashSet},
+  collections::{BTreeSet, HashMap},
   fs::{self, File},
   io::{BufWriter, Write},
   path::PathBuf,
@@ -14,8 +14,13 @@ use std::{
 use std::println as info;
 
 use crate::{
-  rodeo::{goat::GoatRodeoCluster, index::EitherItemOffset, writer::ClusterWriter},
   item::Item,
+  rodeo::{
+    goat::GoatRodeoCluster,
+    goat_trait::GoatRodeoTrait,
+    index::{HasHash, ItemOffset},
+    writer::ClusterWriter,
+  },
   util::{MD5Hash, NiceDurationDisplay},
 };
 use anyhow::Result;
@@ -29,13 +34,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
   let dest: PathBuf = dest_directory.into();
 
   fs::create_dir_all(dest.clone())?;
-
-  let mut purl_file = BufWriter::new(File::create({
-    let mut dest = dest.clone();
-
-    dest.push("purls.txt");
-    dest
-  })?);
+  let mut seen_purls = BTreeSet::new();
 
   info!(
     "Created target dir at {:?}",
@@ -104,7 +103,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         let mut purls = vec![];
         for (offset, cluster) in &items_to_merge {
           let merge_final = cluster
-            .item_from_either_item_offset(offset)
+            .item_from_item_offset(offset)
             .expect("Should get the item");
           merge_final
             .connections
@@ -126,7 +125,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         tx.send(ItemOrPurl::Item {
           pos: position,
           item: top,
-cbor_bytes,
+          cbor_bytes,
           merged: items_to_merge.len() - 1,
           purls,
         })
@@ -149,7 +148,7 @@ cbor_bytes,
 
   let mut next_expected = 0usize;
   let mut holding_pen = HashMap::new();
-  let mut seen_purls = HashSet::new();
+
   while let Ok(item_or_purl) = merged_rx.recv_async().await {
     match item_or_purl {
       ItemOrPurl::Item {
@@ -161,7 +160,7 @@ cbor_bytes,
       } => {
         for p in purls {
           if !seen_purls.contains(&p) {
-            purl_file.write(format!("{}\n", p).as_bytes())?;
+            //purl_file.write(format!("{}\n", p).as_bytes())?;
             seen_purls.insert(p);
           }
         }
@@ -207,6 +206,27 @@ cbor_bytes,
       holding_pen
     );
   }
+
+  info!("Writing pURLs");
+  tokio::task::spawn_blocking(move || {
+    fn do_thing(dest: PathBuf, seen_purls: BTreeSet<String>) -> Result<()> {
+      let mut purl_file = BufWriter::new(File::create({
+        let mut dest = dest.clone();
+
+        dest.push("purls.txt");
+        dest
+      })?);
+      for purl in &seen_purls {
+        purl_file.write_fmt(format_args!("{}\n", purl))?;
+      }
+      purl_file.flush()?;
+      Ok(())
+    }
+
+    do_thing(dest, seen_purls)
+  })
+  .await??;
+  info!("Wrote pURLs");
 
   cluster_writer.finalize_cluster().await?;
   info!(
@@ -359,11 +379,11 @@ struct ClusterPos {
   pub cluster: Arc<GoatRodeoCluster>,
   pub pos: usize,
   pub len: usize,
-  pub cache: Option<EitherItemOffset>,
+  pub cache: Option<ItemOffset>,
 }
 
 impl ClusterPos {
-  pub fn this_item(&mut self) -> Option<EitherItemOffset> {
+  pub fn this_item(&mut self) -> Option<ItemOffset> {
     if self.pos >= self.len {
       None
     } else {
@@ -388,7 +408,7 @@ impl ClusterPos {
 
 fn next_hash_of_item_to_merge(
   index_holder: &mut Vec<ClusterPos>,
-) -> Option<Vec<(EitherItemOffset, Arc<GoatRodeoCluster>)>> {
+) -> Option<Vec<(ItemOffset, Arc<GoatRodeoCluster>)>> {
   let mut lowest: Option<MD5Hash> = None;
   let mut low_clusters = vec![];
 
