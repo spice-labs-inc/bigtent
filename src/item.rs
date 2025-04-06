@@ -193,6 +193,10 @@ pub trait EdgeType {
 
   fn is_to(&self) -> bool;
 
+  fn is_up(&self) -> bool;
+
+  fn is_down(&self) -> bool;
+
   fn is_contains_down(&self) -> bool;
 
   fn is_contained_by_up(&self) -> bool;
@@ -230,6 +234,10 @@ impl EdgeType for String {
     self.ends_with(TO)
   }
 
+  fn is_up(&self) -> bool {
+    self.ends_with(UP)
+  }
+
   fn is_contains_down(&self) -> bool {
     self.ends_with(CONTAINS)
   }
@@ -244,6 +252,10 @@ impl EdgeType for String {
 
   fn is_builds_to(&self) -> bool {
     self.ends_with(BUILDS_TO)
+  }
+
+  fn is_down(&self) -> bool {
+    self.ends_with(DOWN)
   }
 }
 
@@ -295,7 +307,7 @@ impl Item {
   pub fn contained_by(&self) -> HashSet<String> {
     let mut ret = HashSet::new();
     for edge in self.connections.iter() {
-      if edge.0.is_contained_by_up() || edge.0.is_to() {
+      if edge.0.is_to() || edge.0.is_up() {
         ret.insert(edge.1.clone());
       }
     }
