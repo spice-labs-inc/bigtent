@@ -14,6 +14,9 @@ jobs:
     name: Ensure Git tag matches Cargo.toml version
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Check Cargo version matches tag
         uses: spice-labs-inc/cargo-version-check@v0.0.2
 
