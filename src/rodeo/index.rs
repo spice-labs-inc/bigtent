@@ -1,7 +1,7 @@
 use crate::util::{
-  byte_slice_to_u63, read_len_and_cbor_sync, read_u32_sync, sha256_for_reader_sync, MD5Hash,
+  MD5Hash, byte_slice_to_u63, read_len_and_cbor_sync, read_u32_sync, sha256_for_reader_sync,
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -126,26 +126,6 @@ impl IndexFile {
   }
 }
 
-// #[repr(u8)]
-// #[derive(Debug, Clone, PartialEq)]
-// pub enum IndexLoc {
-//   Loc(ItemLoc),
-//   Chain(Vec<IndexLoc>),
-// }
-
-// impl IndexLoc {
-//   pub fn as_vec(&self) -> Vec<IndexLoc> {
-//     match self {
-//       IndexLoc::Chain(v) => v.clone(),
-//       il @ IndexLoc::Loc(_) => vec![il.clone()],
-//     }
-//   }
-// }
-
-// impl GetOffset for IndexLoc {
-
-// }
-
 pub trait GetOffset {
   fn get_offset(&self) -> usize;
   fn get_file_hash(&self) -> u64;
@@ -176,153 +156,11 @@ pub trait HasHash {
   fn hash<'a>(&'a self) -> &'a MD5Hash;
 }
 
-// #[derive(Debug, Clone, PartialEq)]
-// pub enum EitherItemOffset {
-//   Smol(ItemOffset<ItemLoc>),
-//   Big(ItemOffset<IndexLoc>),
-// }
-// impl Into<ItemOffset<IndexLoc>> for EitherItemOffset {
-//   fn into(self) -> ItemOffset<IndexLoc> {
-//     match self {
-//       EitherItemOffset::Smol(item_offset) => ItemOffset {
-//         hash: item_offset.hash,
-//         loc: IndexLoc::Loc(item_offset.loc),
-//       },
-//       EitherItemOffset::Big(item_offset) => item_offset,
-//     }
-//   }
-// }
-// impl EitherItemOffset {
-//   pub fn index_loc(&self) -> Vec<IndexLoc> {
-//     match self {
-//       EitherItemOffset::Smol(item_offset) => vec![IndexLoc::Loc(item_offset.loc)],
-//       EitherItemOffset::Big(item_offset) => item_offset.loc.as_vec(),
-//     }
-//   }
-//   #[inline(always)]
-//   pub fn loc(&self) -> IndexLoc {
-//     match self {
-//       EitherItemOffset::Smol(item_offset) => IndexLoc::Loc(item_offset.loc),
-//       EitherItemOffset::Big(item_offset) => item_offset.loc.clone(),
-//     }
-//   }
-//   #[inline(always)]
-//   pub fn hash(&self) -> &MD5Hash {
-//     match self {
-//       EitherItemOffset::Smol(item_offset) => &item_offset.hash,
-//       EitherItemOffset::Big(item_offset) => &item_offset.hash,
-//     }
-//   }
-// }
-
-// impl From<ItemOffset<ItemLoc>> for EitherItemOffset {
-//   fn from(value: ItemOffset<ItemLoc>) -> Self {
-//     EitherItemOffset::Smol(value)
-//   }
-// }
-
-// impl From<ItemOffset<IndexLoc>> for EitherItemOffset {
-//   fn from(value: ItemOffset<IndexLoc>) -> Self {
-//     EitherItemOffset::Big(value)
-//   }
-// }
-
 impl HasHash for ItemOffset {
   fn hash<'a>(&'a self) -> &'a MD5Hash {
     &self.hash
   }
 }
-
-// impl HasHash for ItemOffset<IndexLoc> {
-//   fn hash<'a>(&'a self) -> &'a MD5Hash {
-//     &self.hash
-//   }
-// }
-
-/// we have to reduce ItemOffset to a concrete type without
-/// type parameters on `GoatRodeoCluster`, so we have this
-/// enum that captures the two types we could use
-// #[derive(Debug, Clone, PartialEq)]
-// pub enum EitherItemOffsetVec {
-//   Smol(Vec<ItemOffset<ItemLoc>>),
-//   Big(Vec<ItemOffset<IndexLoc>>),
-// }
-
-// impl EitherItemOffsetVec {
-//   #[cfg(test)]
-//   pub fn flatten(&self) -> Vec<EitherItemOffset> {
-//     match self {
-//       EitherItemOffsetVec::Smol(item_offsets) => {
-//         item_offsets.iter().map(|i| i.clone().into()).collect()
-//       }
-//       EitherItemOffsetVec::Big(item_offsets) => {
-//         item_offsets.iter().map(|i| i.clone().into()).collect()
-//       }
-//     }
-//   }
-//   pub fn item_at(&self, pos: usize) -> EitherItemOffset {
-//     match self {
-//       EitherItemOffsetVec::Smol(item_offsets) => item_offsets[pos].clone().into(),
-//       EitherItemOffsetVec::Big(item_offsets) => item_offsets[pos].clone().into(),
-//     }
-//   }
-//   pub fn len(&self) -> usize {
-//     match self {
-//       EitherItemOffsetVec::Smol(item_offsets) => item_offsets.len(),
-//       EitherItemOffsetVec::Big(item_offsets) => item_offsets.len(),
-//     }
-//   }
-
-//   pub fn find(&self, hash: MD5Hash) -> Option<EitherItemOffset> {
-//     let ret = match self {
-//       EitherItemOffsetVec::Smol(item_offsets) => {
-//         EitherItemOffsetVec::find_item::<ItemOffset<ItemLoc>>(hash, item_offsets).map(|x| x.into())
-//       }
-//       EitherItemOffsetVec::Big(item_offsets) => {
-//         EitherItemOffsetVec::find_item::<ItemOffset<IndexLoc>>(hash, item_offsets).map(|x| x.into())
-//       }
-//     };
-//     ret
-//   }
-
-//   fn find_item<H: HasHash + Clone>(to_find: [u8; 16], offsets: &[H]) -> Option<H> {
-//     if offsets.len() == 0 {
-//       return None;
-//     }
-//     let mut low = 0;
-//     let mut hi = offsets.len() - 1;
-
-//     while low <= hi {
-//       let mid = low + (hi - low) / 2;
-//       match offsets.get(mid) {
-//         Some(entry) => {
-//           if entry.hash() == &to_find {
-//             return Some(entry.clone());
-//           } else if entry.hash() > &to_find {
-//             hi = mid - 1;
-//           } else {
-//             low = mid + 1;
-//           }
-//         }
-//         None => return None,
-//       }
-//     }
-
-//     None
-//   }
-// }
-
-// impl Into<EitherItemOffsetVec> for Vec<ItemOffset<ItemLoc>> {
-//   fn into(self) -> EitherItemOffsetVec {
-//     EitherItemOffsetVec::Smol(self)
-//   }
-// }
-
-// impl Into<EitherItemOffsetVec> for Vec<ItemOffset<IndexLoc>> {
-//   fn into(self) -> EitherItemOffsetVec {
-//     EitherItemOffsetVec::Big(self)
-//   }
-// }
 
 pub(crate) fn find_item_offset(to_find: [u8; 16], offsets: &[ItemOffset]) -> Option<ItemOffset> {
   if offsets.len() == 0 {
@@ -351,16 +189,6 @@ pub(crate) fn find_item_offset(to_find: [u8; 16], offsets: &[ItemOffset]) -> Opt
 }
 
 impl ItemOffset {
-  //   #[inline(always)]
-  //   fn get_offset(&self) -> usize {
-  //     self.loc.get_offset()
-  //   }
-
-  //   #[inline(always)]
-  //   fn get_file_hash(&self) -> u64 {
-  //     self.loc.get_file_hash()
-  //   }
-
   pub fn read<R: Read>(reader: &mut R) -> Result<ItemOffset> {
     let mut hash_bytes = u128::default().to_be_bytes();
     let mut file_bytes = u64::default().to_be_bytes();

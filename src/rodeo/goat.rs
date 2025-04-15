@@ -1,7 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use memmap2::Mmap;
-use tokio_util::either::Either;
 use std::{
   cmp::Ordering,
   collections::{HashMap, HashSet},
@@ -12,21 +11,22 @@ use std::{
   time::Instant,
 };
 use thousands::Separable;
+use tokio_util::either::Either;
 
 use tokio::{
-  fs::{read_dir, File as TokioFile},
+  fs::{File as TokioFile, read_dir},
   io::BufReader,
   sync::{
-    mpsc::{Receiver, Sender},
     Mutex,
+    mpsc::{Receiver, Sender},
   },
 };
 
 use crate::{
   item::{EdgeType, Item},
   util::{
-    byte_slice_to_u63, find_common_root_dir, hex_to_u64, is_child_dir, md5hash_str,
-    read_len_and_cbor, read_u32, sha256_for_reader, MD5Hash,
+    MD5Hash, byte_slice_to_u63, find_common_root_dir, hex_to_u64, is_child_dir, md5hash_str,
+    read_len_and_cbor, read_u32, sha256_for_reader,
   },
 };
 #[cfg(not(test))]
@@ -38,8 +38,8 @@ use std::println as info;
 use super::{
   cluster::{ClusterFileEnvelope, ClusterFileMagicNumber},
   data::{DataFile, GOAT_RODEO_CLUSTER_FILE_SUFFIX},
-  goat_trait::{impl_north_send, impl_stream_flattened_items, GoatRodeoTrait},
-  index::{find_item_offset, GetOffset, IndexFile, ItemLoc, ItemOffset},
+  goat_trait::{GoatRodeoTrait, impl_north_send, impl_stream_flattened_items},
+  index::{GetOffset, IndexFile, ItemLoc, ItemOffset, find_item_offset},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -177,10 +177,10 @@ impl GoatRodeoTrait for GoatRodeoCluster {
       _ => false,
     }
   }
-  
+
   fn is_empty(&self) -> bool {
-        false
-    }
+    false
+  }
 }
 
 impl GoatRodeoCluster {

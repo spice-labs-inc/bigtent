@@ -1,8 +1,6 @@
 pub mod config;
 pub mod fresh_merge;
-// mod mod_share;
 pub mod server;
-pub mod sha_writer;
 pub mod rodeo {
   pub mod cluster;
   pub mod data;

@@ -186,8 +186,8 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                 (merge_cnt / 1_000_000).separate_with_commas(),
                 td,
                 nd,
-                seen_purls.len().separate_with_commas()
-                ,holding_pen.len()
+                seen_purls.len().separate_with_commas(),
+                holding_pen.len()
               );
             }
 

@@ -2,11 +2,11 @@ use std::{
   collections::HashSet,
   future::Future,
   path::PathBuf,
-  sync::{atomic::AtomicU32, Arc},
+  sync::{Arc, atomic::AtomicU32},
   time::Instant,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use log::info;
 use scopeguard::defer;
 use thousands::Separable;

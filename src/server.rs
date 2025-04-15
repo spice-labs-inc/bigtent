@@ -2,12 +2,12 @@ use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use axum::{
+  Json, Router,
   extract::{Path, Request as ExtractRequest, State},
   http::{StatusCode, Uri},
   middleware::{self, Next},
   response::{IntoResponse, Response},
   routing::{get, post},
-  Json, Router,
 };
 use axum_streams::*;
 

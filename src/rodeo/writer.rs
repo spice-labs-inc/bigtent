@@ -10,25 +10,25 @@ use std::{
   mem::{self, swap},
   path::PathBuf,
   sync::{
-    atomic::{AtomicU64, AtomicUsize},
     Arc,
+    atomic::{AtomicU64, AtomicUsize},
   },
   time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::{
   item::Item,
   rodeo::index::{IndexEnvelope, IndexFileMagicNumber},
   util::{
-    byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope, write_int,
-    write_long, write_short_signed, write_usize_sync, MD5Hash,
+    MD5Hash, byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope,
+    write_int, write_long, write_short_signed, write_usize_sync,
   },
 };
 
 use super::{
-  cluster::{ClusterFileEnvelope, ClusterFileMagicNumber, CLUSTER_VERSION},
+  cluster::{CLUSTER_VERSION, ClusterFileEnvelope, ClusterFileMagicNumber},
   data::{DataFileEnvelope, DataFileMagicNumber},
 };
 
@@ -60,9 +60,6 @@ impl ClusterWriter {
   fn make_dest_buffer() -> Vec<u8> {
     Vec::with_capacity(20_000_000_000)
   }
-  //   fn make_dest_buffer() -> ShaWriter {
-  //     ShaWriter::new(10_000_000)
-  //   }
 
   #[inline]
   fn make_index_buffer() -> Vec<IndexInfo> {

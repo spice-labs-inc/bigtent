@@ -1,27 +1,35 @@
 use anyhow::Result;
+use std::{
+  fs::File,
+  io::{Read, Write},
+  path::PathBuf,
+  sync::Arc,
+};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::either::Either;
 use uuid::Uuid;
-use std::{fs::File, io::{Read, Write}, path::PathBuf, sync::Arc};
-use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::item::Item;
 
 use super::{
   goat::GoatRodeoCluster,
-  goat_trait::{impl_north_send, impl_stream_flattened_items, GoatRodeoTrait},
+  goat_trait::{GoatRodeoTrait, impl_north_send, impl_stream_flattened_items},
 };
 
 /// a collection of goat rodeo instances
 #[derive(Debug, Clone)]
 pub struct GoatHerd {
   herd: Vec<Arc<GoatRodeoCluster>>,
-  uuid: String
+  uuid: String,
 }
 
 impl GoatHerd {
   /// create a new herd
   pub fn new(herd: Vec<Arc<GoatRodeoCluster>>) -> GoatHerd {
-    GoatHerd { herd, uuid: Uuid::new_v4().to_string() }
+    GoatHerd {
+      herd,
+      uuid: Uuid::new_v4().to_string(),
+    }
   }
 
   /// get the herd
@@ -35,15 +43,15 @@ impl GoatRodeoTrait for GoatHerd {
     let filename = format!("{}.txt", self.uuid);
     let ret = PathBuf::from(filename).canonicalize()?;
     if ret.exists() && ret.is_file() {
-        return Ok(ret);
+      return Ok(ret);
     }
 
     let mut dest = File::create(&ret)?;
     for grc in &self.herd {
-        let mut from = File::open(grc.get_purl()?)?;
-        let mut buf = vec![];
-        from.read_to_end(&mut buf)?;
-        dest.write_all(&buf)?
+      let mut from = File::open(grc.get_purl()?)?;
+      let mut buf = vec![];
+      from.read_to_end(&mut buf)?;
+      dest.write_all(&buf)?
     }
 
     dest.flush()?;
@@ -126,8 +134,8 @@ impl GoatRodeoTrait for GoatHerd {
     }
     false
   }
-  
+
   fn is_empty(&self) -> bool {
-        self.herd.is_empty()
-    }
+    self.herd.is_empty()
+  }
 }

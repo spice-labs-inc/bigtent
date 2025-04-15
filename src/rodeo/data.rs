@@ -2,7 +2,7 @@ use crate::{
   item::Item,
   util::{read_cbor_sync, read_len_and_cbor_sync, read_u32_sync},
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::{
