@@ -1,52 +1,68 @@
 use std::sync::Arc;
-
-use im::OrdMap;
-
-use crate::index_file::{EitherItemOffset, EitherItemOffsetVec};
+use crate::{
+  rodeo::{goat::GoatRodeoCluster, index::EitherItemOffset},
+  util::MD5Hash,
+};
 
 pub struct ClusterPos {
-  pub cluster: Arc<EitherItemOffsetVec>,
+  pub cluster: Arc<GoatRodeoCluster>,
   pub pos: usize,
   pub len: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct ItemOffsetPlusWhich {
-  pub item_offset: EitherItemOffset,
-  pub which: usize,
+impl ClusterPos {
+  pub async fn this_item(&self) -> Option<EitherItemOffset> {
+    if self.pos >= self.len {
+      None
+    } else {
+      match self.cluster.offset_from_pos(self.pos).await {
+        Ok(v) => Some(v),
+        _ => None,
+      }
+    }
+  }
+
+  pub fn next(&mut self) {
+    self.pos += 1
+  }
 }
 
-pub fn update_top<I: IntoIterator<Item = usize>>(
-  top: &mut OrdMap<[u8; 16], Vec<ItemOffsetPlusWhich>>,
+pub async fn next_hash_of_item_to_merge(
   index_holder: &mut Vec<ClusterPos>,
-  what: I,
-) {
-  for j in what {
-    let tmp = &mut index_holder[j];
-    if tmp.pos < tmp.len {
-      let v = &tmp.cluster.item_at(tmp.pos);
-      tmp.pos += 1;
-      match top.get(v.hash()) {
-        None => {
-          top.insert(
-            *v.hash(),
-            vec![ItemOffsetPlusWhich {
-              item_offset: v.clone(),
-              which: j,
-            }],
-          );
-        }
-        Some(vec) => {
-          top.insert(*v.hash(), {
-            let mut vec = vec.clone();
-            vec.push(ItemOffsetPlusWhich {
-              item_offset: v.clone(),
-              which: j,
-            });
-            vec
-          });
-        }
+) -> Option<Vec<(EitherItemOffset, Arc<GoatRodeoCluster>)>> {
+  let mut lowest: Option<MD5Hash> = None;
+  let mut low_clusters = vec![];
+
+  for holder in index_holder {
+    let this_item = holder.this_item().await;
+    match (&lowest, this_item) {
+      (None, Some(either)) => {
+        // found the first
+        lowest = Some(*either.hash());
+        low_clusters.push((either, holder));
       }
+      // it's the lowe
+      (Some(low), Some(either)) if low == either.hash() => {
+        low_clusters.push((either, holder));
+      }
+      (Some(low), Some(either)) if low > either.hash() => {
+        lowest = Some(*either.hash());
+        low_clusters.clear();
+        low_clusters.push((either,holder));
+      }
+      _ => {}
+    }
+  }
+
+  match lowest {
+    None => None,
+    Some(_) => {
+      let mut clusters = vec![];
+      for (offset, holder) in low_clusters {
+        clusters.push((offset, holder.cluster.clone()));
+        holder.next();
+      }
+      Some(clusters)
     }
   }
 }
