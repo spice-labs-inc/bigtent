@@ -166,26 +166,11 @@ pub(crate) fn find_item_offset(to_find: [u8; 16], offsets: &[ItemOffset]) -> Opt
   if offsets.len() == 0 {
     return None;
   }
-  let mut low = 0;
-  let mut hi = offsets.len() - 1;
 
-  while low <= hi {
-    let mid = low + (hi - low) / 2;
-    match offsets.get(mid) {
-      Some(entry) => {
-        if entry.hash == to_find {
-          return Some(entry.clone());
-        } else if entry.hash() > &to_find {
-          hi = mid - 1;
-        } else {
-          low = mid + 1;
-        }
-      }
-      None => return None,
-    }
+  match offsets.binary_search_by_key(&to_find, |i| i.hash) {
+    Ok(v) => Some(offsets[v]),
+    _ => None,
   }
-
-  None
 }
 
 impl ItemOffset {
