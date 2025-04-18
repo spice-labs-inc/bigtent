@@ -10,7 +10,7 @@ on:
 
 jobs:   
   check-version:
-    if: startsWith(github.ref, 'refs/tags/v')  # Run only on tag pushes
+    if: startsWith(github.ref, 'refs/tags/v')
     name: Ensure GitHub Release & Cargo.toml Version Numbers Match
     runs-on: ubuntu-24.04
     steps:
@@ -21,7 +21,7 @@ jobs:
         uses: spice-labs-inc/actions/cargo_version_check@main
 
   push_to_registry:
-    name: Push Docker Image to Docker Hub and GHCR
+    name: Push Docker image to Docker Hub and GHCR
     runs-on: ubuntu-24.04
     needs: check-version
 
@@ -40,13 +40,13 @@ jobs:
         with:
           lfs: true
 
-      - name: Set up Rust Toolchain
+      - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo Dependencies
+      - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Project
+      - name: Build project
         run: cargo build --release
 
       - name: Log in to Docker Hub
@@ -62,25 +62,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GH_TOKEN }}
 
-      - name: Extract Metadata (tags, labels) for Docker
+      - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/spice-labs-inc/${{ github.event.repository.name }}
-            spicelabs/${{ github.event.repository.name }}
+            ghcr.io/spice-labs-inc/bigtent
+            spicelabs/bigtent
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest
 
-      - name: Extract Version from Tag
+      - name: Extract version from tag
         if: startsWith(github.ref, 'refs/tags/v')
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Build and Push Docker Image
+      - name: Build and Push Docker image
         id: push
         uses: docker/build-push-action@v6
         with:
@@ -96,7 +96,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${{ github.workspace }}/target/release"
-          docker save ghcr.io/spice-labs-inc/${{ github.event.repository.name }}:${{ steps.version.outputs.version }} > "${{ github.workspace }}/target/release/bigtent.oci.${{ steps.version.outputs.version }}.tar"
+          docker save ghcr.io/spice-labs-inc/bigtent:${{ steps.version.outputs.version }} > "${{ github.workspace }}/target/release/bigtent.oci.${{ steps.version.outputs.version }}.tar"
 
       - name: Run Spice Grinder Scan
         if: steps.version.outputs.version != ''
@@ -104,10 +104,10 @@ jobs:
         with:
           token: ${{ secrets.GRINDER_JWT }}
           file_path: "${{ github.workspace }}/target/release/"
-          
+
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
         with:
-          subject-name: ghcr.io/spice-labs-inc/${{ github.event.repository.name }}
+          subject-name: ghcr.io/spice-labs-inc/bigtent
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
