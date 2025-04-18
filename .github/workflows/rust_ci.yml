@@ -2,6 +2,8 @@ name: Rust Build & Test
 
 on:
   push:
+    branches: [ "**" ]
+    tags:     [ 'v*.*.*' ]
   pull_request:
     branches: [ "main" ]
 
@@ -16,8 +18,13 @@ jobs:
     name: Build and Test Rust Code
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: RUST_BACKTRACE=1 cargo test --verbose --lib
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: RUST_BACKTRACE=1 cargo test --verbose --lib
