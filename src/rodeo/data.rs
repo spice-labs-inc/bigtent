@@ -1,9 +1,9 @@
 use crate::{
-  rodeo::{DataFileMagicNumber, GoatRodeoCluster},
-  structs::Item,
-  util::{read_cbor_sync, read_len_and_cbor, read_u32, read_u32_sync},
+  item::Item,
+  util::{read_cbor_sync, read_len_and_cbor_sync, read_u32_sync},
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, bail};
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -12,7 +12,8 @@ use std::{
   path::PathBuf,
   sync::Arc,
 };
-use tokio::{fs::File, io::AsyncSeekExt, sync::Mutex};
+
+use super::goat::GoatRodeoCluster;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct DataFileEnvelope {
@@ -31,8 +32,8 @@ impl DataReader for SyncBufReader<SyncFile> {}
 #[derive(Debug, Clone)]
 pub struct DataFile {
   pub envelope: DataFileEnvelope,
-  pub file: Arc<Mutex<Box<dyn DataReader>>>,
-  pub data_offset: u64,
+  pub file: Arc<Mmap>,
+  pub data_offset: usize,
 }
 
 pub const GOAT_RODEO_DATA_FILE_SUFFIX: &str = "grd";
@@ -45,8 +46,8 @@ impl DataFile {
       GoatRodeoCluster::find_data_or_index_file_from_sha256(dir, hash, GOAT_RODEO_DATA_FILE_SUFFIX)
         .await?;
 
-    let dfp: &mut File = &mut data_file;
-    let magic = read_u32(dfp).await?;
+    let dfp = &mut data_file;
+    let magic = read_u32_sync(dfp)?;
     if magic != DataFileMagicNumber {
       bail!(
         "Unexpected magic number {:x}, expecting {:x} for data file {:016x}.{}",
@@ -57,51 +58,32 @@ impl DataFile {
       );
     }
 
-    let env: DataFileEnvelope = read_len_and_cbor(dfp).await?;
+    let env: DataFileEnvelope = read_len_and_cbor_sync(dfp)?;
 
-    let cur_pos: u64 = data_file.stream_position().await?;
+    let cur_pos: u64 = data_file.stream_position()?;
     // FIXME do additional validation of the envelope
-    let data_file = data_file
-      .try_into_std()
-      .map_err(|e| anyhow!(format!("Couldn't convert file {:?}", e)))?;
+
+    let mmap: Mmap = unsafe { Mmap::map(&data_file)? };
+
     Ok(DataFile {
       envelope: env,
-      file: Arc::new(Mutex::new(Box::new(SyncBufReader::with_capacity(
-        16384, data_file,
-      )))),
-      data_offset: cur_pos,
+      file: Arc::new(mmap),
+      data_offset: cur_pos as usize,
     })
-  }
-
-  /// Seek to a position in the DataReader which should be a SyncBufReader<SyncFile>
-  /// Avoid absolute seeking which always blows away cache, but do relative seeking
-  /// which may preserve cache
-  fn seek_to(file: &mut Box<dyn DataReader>, desired_pos: u64) -> Result<()> {
-    let pos = file.stream_position()?;
-    if pos == desired_pos {
-      return Ok(());
-    }
-
-    let rel_seek = (desired_pos as i64) - (pos as i64);
-
-    file.seek(std::io::SeekFrom::Current(rel_seek))?;
-    Ok(())
   }
 
   /// read the item. This is a mixture of synchronous and async code. Why?
   /// Turns out the async BufReader is freakin' slow, so we're doing synchronous
   /// BufReader. Ideally, we'd put this on a blocking Tokio thread, but, sigh
   /// async closures are not in mainline Rust right now, so "no thread-friendly soup for you!"
-  pub async fn read_item_at(&self, pos: u64) -> Result<Item> {
-    let mut my_file = self.file.lock().await;
-    let my_reader: &mut Box<dyn DataReader> = &mut my_file;
+  pub fn read_item_at(&self, pos: usize) -> Result<Item> {
+    let mut my_reader: &[u8] = &self.file[pos..];
 
-    tokio::task::block_in_place(move || {
-      DataFile::seek_to(my_reader, pos)?;
-
-      let item_len = read_u32_sync(my_reader)?;
-      let item = read_cbor_sync(my_reader, item_len as usize)?;
-      Ok(item)
-    })
+    let item_len = read_u32_sync(&mut my_reader)?;
+    let item = read_cbor_sync(&mut my_reader, item_len as usize)?;
+    Ok(item)
   }
 }
+
+#[allow(non_upper_case_globals)]
+pub const DataFileMagicNumber: u32 = 0x00be1100; // Bell
