@@ -39,6 +39,16 @@ impl GoatHerd {
 }
 
 impl GoatRodeoTrait for GoatHerd {
+    /// Get the history for the cluster
+    fn read_history(&self) -> Result<Vec<serde_json::Value>> {
+      let mut ret = vec![];
+      for cluster in &self.herd {
+        let mut history = cluster.read_history()?;
+        ret.append(&mut history);
+      }
+      Ok(ret)
+    }
+
   fn get_purl(&self) -> Result<std::path::PathBuf> {
     let filename = format!("{}.txt", self.uuid);
     let ret = PathBuf::from(filename).canonicalize()?;

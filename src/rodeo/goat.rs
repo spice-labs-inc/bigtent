@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use memmap2::Mmap;
+use serde_jsonlines::json_lines;
 use std::{
   cmp::Ordering,
   collections::{HashMap, HashSet},
@@ -181,6 +182,28 @@ impl GoatRodeoTrait for GoatRodeoCluster {
   fn is_empty(&self) -> bool {
     false
   }
+  
+  fn read_history(&self) -> Result<Vec<serde_json::Value>>{
+    
+      let history_path = self
+        .cluster_path
+        .canonicalize()?
+        .with_file_name("history.jsonl");
+
+
+      if !history_path.exists() || !history_path.is_file() {
+        return Ok(vec![]);
+      }
+
+      let lines = json_lines::<serde_json::Value, _>(&history_path)?;
+      let mut ret = vec![];
+      for line in lines {
+        ret.push(line?);
+      }
+
+      Ok(ret)
+    
+    }
 }
 
 impl GoatRodeoCluster {
