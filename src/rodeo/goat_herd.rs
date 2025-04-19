@@ -1,4 +1,5 @@
 use anyhow::Result;
+use log::info;
 use std::{
   fs::File,
   io::{Read, Write},
@@ -51,14 +52,15 @@ impl GoatRodeoTrait for GoatHerd {
 
   fn get_purl(&self) -> Result<std::path::PathBuf> {
     let filename = format!("{}.txt", self.uuid);
-    let ret = PathBuf::from(filename).canonicalize()?;
+    let ret = PathBuf::from(&filename);
     if ret.exists() && ret.is_file() {
       return Ok(ret);
     }
 
     let mut dest = File::create(&ret)?;
     for grc in &self.herd {
-      let mut from = File::open(grc.get_purl()?)?;
+      let the_purl = grc.get_purl()?;
+      let mut from = File::open(the_purl)?;
       let mut buf = vec![];
       from.read_to_end(&mut buf)?;
       dest.write_all(&buf)?
@@ -148,4 +150,15 @@ impl GoatRodeoTrait for GoatHerd {
   fn is_empty(&self) -> bool {
     self.herd.is_empty()
   }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn test_purls_and_merge() {
+  let path = PathBuf::from("test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc");
+  let cluster_a = GoatRodeoCluster::new(&path.parent().unwrap().to_path_buf(), &path, false).await.expect("Should get first cluster");
+  let path2 = PathBuf::from("test_data/cluster_b/2025_04_19_17_10_40_09ebe9a7137ee100.grc");
+  let cluster_b = GoatRodeoCluster::new(&path2.parent().unwrap().to_path_buf(), &path2, false).await.expect("Should load cluster b");
+  let herd = GoatHerd::new(vec![cluster_a.clone(), cluster_b.clone()]);
+  let purls = herd.get_purl().expect("Should get purls");
+
 }
