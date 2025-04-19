@@ -1,5 +1,7 @@
 #[cfg(not(test))]
 use log::info;
+use serde_json::json;
+use serde_jsonlines::write_json_lines;
 use std::{
   collections::{BTreeSet, HashMap},
   fs::{self, File},
@@ -21,7 +23,7 @@ use crate::{
     index::{HasHash, ItemOffset},
     writer::ClusterWriter,
   },
-  util::{MD5Hash, NiceDurationDisplay},
+  util::{MD5Hash, NiceDurationDisplay, iso8601_now},
 };
 use anyhow::Result;
 use thousands::Separable;
@@ -228,7 +230,38 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
   .await??;
   info!("Wrote pURLs");
 
-  cluster_writer.finalize_cluster().await?;
+  let cluster_file = cluster_writer.finalize_cluster().await?;
+
+  let mut cluster_names = vec![];
+  let mut history = vec![];
+  for cluster in &clusters {
+    cluster_names.push(cluster.name());
+    let mut cluster_history = cluster.read_history()?;
+    history.append(&mut cluster_history);
+  }
+  let iso_time = iso8601_now();
+  let cluster_name = format!(
+    "{}",
+    cluster_file
+      .file_name()
+      .and_then(|v| v.to_str())
+      .unwrap_or("unknown")
+  );
+  let last_json = json!({"date": iso_time,
+    "big_tent_commit": env!("VERGEN_GIT_SHA"),
+  "cluster_name": cluster_name,  "operation": "merge_clusters",
+  "merged_clusters": cluster_names});
+
+  history.push(last_json);
+
+  let history_file = cluster_file
+    .canonicalize()?
+    .parent()
+    .expect("Should have cluster parent dir")
+    .join("history.jsonl");
+
+  write_json_lines(&history_file, &history)?;
+
   info!(
     "Finished {} loops at {:?}",
     loop_cnt.separate_with_commas(),

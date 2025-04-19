@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 #[cfg(not(test))]
 use log::info;
 use serde::{Serialize, de::DeserializeOwned};
@@ -152,6 +153,12 @@ async fn test_sha256() {
     res,
     hex!("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
   );
+}
+
+pub fn iso8601_now() -> String {
+  let dt: DateTime<Utc> = SystemTime::now().into();
+  format!("{}", dt.format("%+"))
+  // formats like "2001-07-08T00:34:60.026490+09:30"
 }
 
 pub fn current_date_string() -> String {

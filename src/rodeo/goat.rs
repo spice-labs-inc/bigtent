@@ -182,28 +182,25 @@ impl GoatRodeoTrait for GoatRodeoCluster {
   fn is_empty(&self) -> bool {
     false
   }
-  
-  fn read_history(&self) -> Result<Vec<serde_json::Value>>{
-    
-      let history_path = self
-        .cluster_path
-        .canonicalize()?
-        .with_file_name("history.jsonl");
 
+  fn read_history(&self) -> Result<Vec<serde_json::Value>> {
+    let history_path = self
+      .cluster_path
+      .canonicalize()?
+      .with_file_name("history.jsonl");
 
-      if !history_path.exists() || !history_path.is_file() {
-        return Ok(vec![]);
-      }
-
-      let lines = json_lines::<serde_json::Value, _>(&history_path)?;
-      let mut ret = vec![];
-      for line in lines {
-        ret.push(line?);
-      }
-
-      Ok(ret)
-    
+    if !history_path.exists() || !history_path.is_file() {
+      return Ok(vec![]);
     }
+
+    let lines = json_lines::<serde_json::Value, _>(&history_path)?;
+    let mut ret = vec![];
+    for line in lines {
+      ret.push(line?);
+    }
+
+    Ok(ret)
+  }
 }
 
 impl GoatRodeoCluster {
@@ -358,7 +355,13 @@ impl GoatRodeoCluster {
       building_index: Arc::new(Mutex::new(false)),
       cluster_file_hash: sha_u64,
       number_of_items,
-      name: format!("{:?}", cluster_path),
+      name: format!(
+        "{}",
+        cluster_path
+          .file_name()
+          .and_then(|n| n.to_str())
+          .unwrap_or("unknown_cluster_name")
+      ),
       load_index,
       index_offset: IndexOffset::from_index_files(&index_vec),
     });

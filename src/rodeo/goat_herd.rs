@@ -1,5 +1,4 @@
 use anyhow::Result;
-use log::info;
 use std::{
   fs::File,
   io::{Read, Write},
@@ -40,15 +39,15 @@ impl GoatHerd {
 }
 
 impl GoatRodeoTrait for GoatHerd {
-    /// Get the history for the cluster
-    fn read_history(&self) -> Result<Vec<serde_json::Value>> {
-      let mut ret = vec![];
-      for cluster in &self.herd {
-        let mut history = cluster.read_history()?;
-        ret.append(&mut history);
-      }
-      Ok(ret)
+  /// Get the history for the cluster
+  fn read_history(&self) -> Result<Vec<serde_json::Value>> {
+    let mut ret = vec![];
+    for cluster in &self.herd {
+      let mut history = cluster.read_history()?;
+      ret.append(&mut history);
     }
+    Ok(ret)
+  }
 
   fn get_purl(&self) -> Result<std::path::PathBuf> {
     let filename = format!("{}.txt", self.uuid);
@@ -155,10 +154,41 @@ impl GoatRodeoTrait for GoatHerd {
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_purls_and_merge() {
   let path = PathBuf::from("test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc");
-  let cluster_a = GoatRodeoCluster::new(&path.parent().unwrap().to_path_buf(), &path, false).await.expect("Should get first cluster");
+  let cluster_a = GoatRodeoCluster::new(&path.parent().unwrap().to_path_buf(), &path, false)
+    .await
+    .expect("Should get first cluster");
   let path2 = PathBuf::from("test_data/cluster_b/2025_04_19_17_10_40_09ebe9a7137ee100.grc");
-  let cluster_b = GoatRodeoCluster::new(&path2.parent().unwrap().to_path_buf(), &path2, false).await.expect("Should load cluster b");
+  let cluster_b = GoatRodeoCluster::new(&path2.parent().unwrap().to_path_buf(), &path2, false)
+    .await
+    .expect("Should load cluster b");
   let herd = GoatHerd::new(vec![cluster_a.clone(), cluster_b.clone()]);
   let purls = herd.get_purl().expect("Should get purls");
+  let all_purls = std::fs::read_to_string(&purls).expect("Should read string");
 
+  assert!(
+    all_purls.len() > 200,
+    "Should have some characters in the purls"
+  );
+
+  let dest_dir =
+    <PathBuf as std::str::FromStr>::from_str("merge_out").expect("Should create a directory");
+  let _ = std::fs::remove_dir_all(&dest_dir);
+
+  crate::fresh_merge::merge_fresh(herd.herd, &dest_dir)
+    .await
+    .expect("Should do a merge");
+
+  let mut clusters = GoatRodeoCluster::cluster_files_in_dir(dest_dir.clone(), false)
+    .await
+    .expect("Should get cluster files");
+
+  let cluster = clusters.pop().expect("Should have found a cluster");
+
+  let history = cluster.read_history().expect("Should read history");
+
+  assert!(
+    history.len() >= 3,
+    "Expecting some history, got {:?}",
+    history
+  );
 }

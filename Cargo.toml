@@ -8,6 +8,7 @@ description = "An opinionated Graph Database"
 readme = "README.md"
 repository = "https://bigtent.cc"
 license = "Apache 2.0"
+build = "build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -71,3 +72,11 @@ rand = "0.9.1"
 [features]
 
 longtest = [] # feature has no explicit dependencies
+
+
+
+[build-dependencies]
+# All features enabled
+vergen = { version = "9", features = ["build", "cargo", "rustc", "si"] }
+vergen-git2 = {version = "1.0.7"}
+
