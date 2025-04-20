@@ -50,7 +50,7 @@ impl GoatRodeoTrait for GoatHerd {
   }
 
   fn get_purl(&self) -> Result<std::path::PathBuf> {
-    let filename = format!("{}.txt", self.uuid);
+    let filename = format!("/tmp/{}.txt", self.uuid);
     let ret = PathBuf::from(&filename);
     if ret.exists() && ret.is_file() {
       return Ok(ret);
