@@ -28,6 +28,9 @@ pub trait GoatRodeoTrait: Clone + Send + Sync {
   /// get the number of items this cluster is managing
   fn number_of_items(&self) -> usize;
 
+  /// Get the history for the cluster
+  fn read_history(&self) -> Result<Vec<serde_json::Value>> ;
+
   /// given a `Vec` of identifiers, find all the items that contain those
   /// items, etc. until there's no contents left.
   fn north_send(
@@ -65,6 +68,8 @@ pub trait GoatRodeoTrait: Clone + Send + Sync {
   /// no clusters
   fn is_empty(&self) -> bool;
 }
+
+
 
 pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
   the_self: Arc<GRT>,

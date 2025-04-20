@@ -1,4 +1,5 @@
 /target
+/merge_out
 
 /foo.txt
 /info*.txt
