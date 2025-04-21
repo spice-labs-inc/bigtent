@@ -85,3 +85,36 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
+      - name: Save Docker image to tar
+        run: |
+          image_tag=$(echo "${{ steps.meta.outputs.tags }}" | cut -d',' -f1)
+          image_tag=${image_tag:-ghcr.io/spice-labs-inc/${{ github.event.repository.name }}:latest}
+          docker pull "$image_tag"
+          docker save "$image_tag" -o bigtent.tar
+
+      - name: Generate SBOM using CycloneDX
+        run: |
+          cargo install cyclonedx-bom || true
+          cyclonedx-bom --output-format json --output-file sbom.json
+
+      - name: Compute SHA256 of image
+        run: sha256sum bigtent.tar > bigtent.tar.sha256
+
+      - name: Upload docker image tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-tar
+          path: bigtent.tar
+
+      - name: Upload tarball signature
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-sha256
+          path: bigtent.tar.sha256
+
+      - name: Upload SBOM JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-json
+          path: sbom.json
+
