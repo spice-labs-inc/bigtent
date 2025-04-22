@@ -1,0 +1,37 @@
+name: Scan Docker Image with Spice Grinder
+
+on:
+  workflow_run:
+    workflows: ["Publish Rust Container Images"]
+    types:
+      - completed
+
+jobs:
+  scan:
+    name: Scan Docker image tarball
+    runs-on: ubuntu-24.04
+
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-tar
+          path: ./artifacts
+
+      - name: Run Spice Grinder scan
+        uses: spice-labs-inc/actions/spice_grinder_scan@main
+        with:
+          docker-image-tar-path: ./artifacts/bigtent.tar
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: spice-grinder-report
+          path: spice_grinder_report.json
+
+
