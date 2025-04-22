@@ -17,18 +17,18 @@ jobs:
       security-events: write
 
     steps:
-      - name: Download Docker image artifact
+     - name: Download Docker Image Artifact
         uses: actions/download-artifact@v4
         with:
           name: docker-image-tar
           path: ./artifacts
 
-      - name: Run Spice Grinder scan
+      - name: Run Spice Grinder Scan
         uses: spice-labs-inc/actions/spice_grinder_scan@main
         with:
           docker-image-tar-path: ./artifacts/bigtent.tar
 
-      - name: Upload scan results
+      - name: Upload Scan Results
         uses: actions/upload-artifact@v4
         with:
           name: spice-grinder-report
