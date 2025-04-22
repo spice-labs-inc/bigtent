@@ -20,7 +20,7 @@ jobs:
       - name: Download Docker Image Artifact
         uses: actions/download-artifact@v4
         with:
-          name: docker-image-tar
+          name: docker-image
           path: ./artifacts
 
       - name: Run Spice Grinder Scan
