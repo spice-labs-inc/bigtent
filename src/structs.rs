@@ -181,15 +181,12 @@ impl Item {
   pub fn is_alias(&self) -> bool {
     self.connections.iter().any(|v| v.0.is_alias_to())
   }
-  // pub fn remove_references(&mut self) {
-  //   self.reference = Item::NOOP;
-  // }
 
-  /// get all the connections that are either `contained_by_up` or `is_to_right`
+  /// get all the connections that are either `contained_by_up` or `is_to` or `is_builds_to`
   pub fn contained_by(&self) -> HashSet<String> {
     let mut ret = HashSet::new();
     for edge in self.connections.iter() {
-      if edge.0.is_contained_by_up() || edge.0.is_to() {
+      if edge.0.is_contained_by_up() || edge.0.is_to() || edge.0.is_builds_to() {
         ret.insert(edge.1.clone());
       }
     }
