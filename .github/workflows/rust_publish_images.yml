@@ -15,11 +15,11 @@ jobs:
     name: Ensure GitHub Release & Cargo.toml Version Numbers Match
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Check Cargo version matches tag
-        uses: spice-labs-inc/actions/cargo_version_check@main
+      - name: Check Cargo Version Matches Tag
+        uses: spice-labs-inc/action-check-version@main
 
   push_to_registry:
     name: Push Docker image to Docker Hub and GHCR
