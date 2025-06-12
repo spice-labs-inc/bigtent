@@ -88,7 +88,11 @@ async fn serve_bulk<GRT: GoatRodeoTrait + 'static>(
 fn compute_package(maybe_gitoid: &str, uri: &Uri) -> String {
   if let Some(pq) = uri.path_and_query() {
     let path = pq.as_str();
-    let offset = path.find(&maybe_gitoid[0..10]);
+    let offset = if maybe_gitoid.len() > 10 {
+      path.find(&maybe_gitoid[0..10])
+    } else {
+      None
+    };
 
     if let Some(actual_offset) = offset {
       path[actual_offset..].to_string()
@@ -100,6 +104,11 @@ fn compute_package(maybe_gitoid: &str, uri: &Uri) -> String {
   }
 }
 
+async fn node_count<GRT: GoatRodeoTrait + 'static>(
+  State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+) -> Result<Json<serde_json::Value>, Json<serde_json::Value>> {
+  Ok(Json(rodeo.get_cluster().node_count().into()))
+}
 // #[axum::debug_handler]
 async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
@@ -299,6 +308,7 @@ pub fn build_route<GRT: GoatRodeoTrait + 'static>(state: Arc<ClusterHolder<GRT>>
     .route("/flatten", post(serve_flatten_bulk))
     .route("/north_purls", post(serve_north_purls_bulk))
     .route("/purls", get(gimme_purls))
+    .route("/node_count", get(node_count))
     .with_state(state.clone());
 
   app

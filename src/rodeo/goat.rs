@@ -54,7 +54,19 @@ impl IndexOffset {
   pub fn from_index_files(index_files: &Vec<Arc<IndexFile>>) -> Arc<Vec<IndexOffset>> {
     let mut ret = vec![];
     let mut total_offset = 0usize;
-    for f in index_files {
+
+    let mut sorted_index_files = index_files.clone();
+    sorted_index_files.sort_by(|a, b| {
+      a.read_index_at_byte_offset(0)
+        .expect("Should be able to load index")
+        .hash
+        .cmp(
+          &b.read_index_at_byte_offset(0)
+            .expect("Should be able to load index")
+            .hash,
+        )
+    });
+    for f in &sorted_index_files {
       ret.push(IndexOffset {
         index_file: f.hash_for_file_lookup,
         start: total_offset,
@@ -201,6 +213,14 @@ impl GoatRodeoTrait for GoatRodeoCluster {
 
     Ok(ret)
   }
+
+  fn node_count(&self) -> u64 {
+    let mut ret = 0;
+    for io in self.index_offset.iter() {
+      ret += io.len as u64;
+    }
+    ret
+  }
 }
 
 impl GoatRodeoCluster {
@@ -233,8 +253,9 @@ impl GoatRodeoCluster {
   pub async fn new(
     root_dir: &PathBuf,
     cluster_path: &PathBuf,
-    load_index: bool,
+    pre_cache_index: bool,
   ) -> Result<Arc<GoatRodeoCluster>> {
+    let load_index = pre_cache_index;
     let start = Instant::now();
     if !is_child_dir(root_dir, cluster_path)? {
       bail!(
@@ -349,7 +370,7 @@ impl GoatRodeoCluster {
       envelope: env,
       cluster_root_path: root_dir.clone(),
       cluster_path: cluster_path.clone(),
-      data_files: data_files,
+      data_files,
       index_files: IndexFile::vec_of_index_files_to_hash_lookup(&index_vec),
       index: Arc::new(ArcSwap::new(Arc::new(None))),
       building_index: Arc::new(Mutex::new(false)),
@@ -576,7 +597,7 @@ impl GoatRodeoCluster {
   /// Given a path, find all the `.grc` files in the path
   pub async fn cluster_files_in_dir(
     path: PathBuf,
-    load_index: bool,
+    pre_cache_index: bool,
   ) -> Result<Vec<Arc<GoatRodeoCluster>>> {
     let mut the_dir = read_dir(path.clone()).await?;
     let mut ret = vec![];
@@ -593,12 +614,12 @@ impl GoatRodeoCluster {
       let file_type = file.file_type().await?;
 
       if file_type.is_file() && file_extn == Some(GOAT_RODEO_CLUSTER_FILE_SUFFIX.into()) {
-        let walker = GoatRodeoCluster::new(&path, &file.path(), load_index).await?;
+        let walker = GoatRodeoCluster::new(&path, &file.path(), pre_cache_index).await?;
         ret.push(walker)
       } else if file_type.is_dir() {
         let mut more = Box::pin(GoatRodeoCluster::cluster_files_in_dir(
           file.path().clone(),
-          load_index,
+          pre_cache_index,
         ))
         .await?;
         ret.append(&mut more);
