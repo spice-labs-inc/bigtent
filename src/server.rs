@@ -88,7 +88,9 @@ async fn serve_bulk<GRT: GoatRodeoTrait + 'static>(
 fn compute_package(maybe_gitoid: &str, uri: &Uri) -> String {
   if let Some(pq) = uri.path_and_query() {
     let path = pq.as_str();
-    let offset = path.find(&maybe_gitoid[0..10]);
+    let offset = path.find(&maybe_gitoid[0..10]); // FIXME
+    // thread 'tokio-runtime-worker' panicked at /src/bigtent/src/server.rs:91:41:
+    // byte index 10 is out of bounds of `a`
 
     if let Some(actual_offset) = offset {
       path[actual_offset..].to_string()

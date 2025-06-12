@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check Cargo Version Matches Tag
-        uses: spice-labs-inc/action-check-version@main
+        uses: spice-labs-inc/action-check-version@v1
 
   push_to_registry:
     name: Push Docker image to Docker Hub and GHCR
