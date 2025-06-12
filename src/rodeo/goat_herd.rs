@@ -149,6 +149,14 @@ impl GoatRodeoTrait for GoatHerd {
   fn is_empty(&self) -> bool {
     self.herd.is_empty()
   }
+
+  fn node_count(&self) -> u64 {
+    let mut ret = 0;
+    for goat in &self.herd {
+      ret += goat.node_count();
+    }
+    ret
+  }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]

@@ -100,6 +100,11 @@ fn compute_package(maybe_gitoid: &str, uri: &Uri) -> String {
   }
 }
 
+async fn node_count<GRT: GoatRodeoTrait + 'static>(
+  State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+) -> Result<Json<serde_json::Value>, Json<serde_json::Value>> {
+  Ok(Json(rodeo.get_cluster().node_count().into()))
+}
 // #[axum::debug_handler]
 async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
@@ -299,6 +304,7 @@ pub fn build_route<GRT: GoatRodeoTrait + 'static>(state: Arc<ClusterHolder<GRT>>
     .route("/flatten", post(serve_flatten_bulk))
     .route("/north_purls", post(serve_north_purls_bulk))
     .route("/purls", get(gimme_purls))
+    .route("/node_count", get(node_count))
     .with_state(state.clone());
 
   app
