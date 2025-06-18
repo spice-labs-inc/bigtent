@@ -1,13 +1,18 @@
-# Github Actions Workflows
+# GitHub Actions Workflows
 
-This folder contains Github Actions workflows
+This folder contains GitHub Actions workflows.
 
-- `rust-ci.yml` uses cargo to run a build & test job 
-  - This automatically triggers on the following events:
+- `rust-ci.yml` uses Cargo to build and test the Rust project  
+  - This workflow automatically triggers on:
     1. Push to any branch (`**`)
-    2. Pull requests to `main` branch
-- `rust_container_publishing.yml` publishes container images to docker hub and ghcr (github container repo) with attestations
-  - This will automatically trigger on the following events:
-    1. Push to the 'main' branch (which should only happen with a merge)
-    2. Setting of tags on `main` with semver tags 
-    3. The Rust Build & Test (`rust-ci.yml`) job runs successfully
+    2. Pull requests targeting the `main` branch
+
+- `rust_container_publishing.yml` publishes Docker images to [Docker Hub](https://hub.docker.com/u/spicelabs) as `spicelabs/bigtent`  
+  - The image includes:
+    - Provenance attestations
+    - Software Bill of Materials (SBOM)
+    - Multi-format semver tags (e.g. `v1.2.3`, `v1.2`, `v1`)
+  - This workflow triggers automatically on:
+    1. Push of a semantic version tag (e.g. `v1.2.3`)
+    2. Manual invocation via the GitHub Actions UI
+
