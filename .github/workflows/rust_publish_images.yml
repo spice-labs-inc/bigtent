@@ -1,5 +1,8 @@
 name: Publish Rust Container Image
 
+env:
+  PLATFORMS: linux/amd64, linux/arm64
+
 on:
   push:
     tags: [ 'v*.*.*' ]  # Trigger only on semantic version tags
@@ -28,8 +31,13 @@ jobs:
       id-token: write
 
     steps:
-      - name: Set up Docker Buildx
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+            platforms: ${{env.PLATFORMS}}
 
       - name: Checkout with LFS
         uses: actions/checkout@v4
@@ -69,6 +77,7 @@ jobs:
         id: push
         uses: docker/build-push-action@v6
         with:
+          platforms: ${{env.PLATFORMS}}
           context: .
           push: true
           provenance: mode=max
