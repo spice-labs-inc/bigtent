@@ -1,9 +1,9 @@
-use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use axum::{
   Json, Router,
-  extract::{Path, Request as ExtractRequest, State},
+  extract::{Path, Query, Request as ExtractRequest, State},
   http::{StatusCode, Uri},
   middleware::{self, Next},
   response::{IntoResponse, Response},
@@ -85,11 +85,16 @@ async fn serve_bulk<GRT: GoatRodeoTrait + 'static>(
 
 /// compute the package from either uri which will include query parameters (which are part of)
 /// a pURL or the path that was passed in
-fn compute_package(maybe_gitoid: &str, uri: &Uri) -> String {
+fn compute_package(query: &HashMap<String, String>, maybe_gitoid: &str, uri: &Uri) -> String {
+  if maybe_gitoid.len() == uri.path().len() || maybe_gitoid.len() == uri.path().len() - 1 {
+    if let Some(value) = query.get("identifier") {
+      return value.clone();
+    }
+  }
   if let Some(pq) = uri.path_and_query() {
     let path = pq.as_str();
-    let offset = if maybe_gitoid.len() > 10 {
-      path.find(&maybe_gitoid[0..10])
+    let offset = if maybe_gitoid.len() > 3 {
+      path.find(&maybe_gitoid[0..3])
     } else {
       None
     };
@@ -113,9 +118,10 @@ async fn node_count<GRT: GoatRodeoTrait + 'static>(
 async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
+  Query(query): Query<HashMap<String, String>>,
   uri: Uri,
 ) -> Result<Json<serde_json::Value>, impl IntoResponse> {
-  let to_find = compute_package(&gitoid, &uri);
+  let to_find = compute_package(&query, &gitoid, &uri);
   let ret = rodeo.get_cluster().item_for_identifier(&to_find);
 
   match ret {
@@ -130,9 +136,10 @@ async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
 async fn serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
+  Query(query): Query<HashMap<String, String>>,
   uri: Uri,
 ) -> Result<Json<serde_json::Value>, impl IntoResponse> {
-  let to_find = compute_package(&gitoid, &uri);
+  let to_find = compute_package(&query, &gitoid, &uri);
   let ret = rodeo.get_cluster().antialias_for(&to_find);
 
   match ret {
@@ -176,9 +183,10 @@ async fn serve_flatten_both<GRT: GoatRodeoTrait + 'static>(
 async fn serve_flatten_source<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
+  Query(query): Query<HashMap<String, String>>,
   uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&gitoid, &uri);
+  let to_find = compute_package(&query, &gitoid, &uri);
   serve_flatten_both(rodeo, vec![to_find], true).await
 }
 
@@ -194,9 +202,10 @@ async fn serve_flatten_source_bulk<GRT: GoatRodeoTrait + 'static>(
 async fn serve_flatten<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
+  Query(query): Query<HashMap<String, String>>,
   uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&gitoid, &uri);
+  let to_find = compute_package(&query, &gitoid, &uri);
   serve_flatten_both(rodeo, vec![to_find], false).await
 }
 
@@ -212,18 +221,20 @@ async fn serve_flatten_bulk<GRT: GoatRodeoTrait + 'static>(
 async fn serve_north<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
+  Query(query): Query<HashMap<String, String>>,
   uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&gitoid, &uri);
+  let to_find = compute_package(&query, &gitoid, &uri);
   do_north(rodeo, vec![to_find], false).await
 }
 
 async fn serve_north_purls<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
+  Query(query): Query<HashMap<String, String>>,
   uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&gitoid, &uri);
+  let to_find = compute_package(&query, &gitoid, &uri);
   do_north(rodeo, vec![to_find], true).await
 }
 
