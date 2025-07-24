@@ -228,4 +228,9 @@ async fn test_purls_and_merge() {
     .collect();
 
   assert_eq!(tagged.len(), 2, "Expecting 2 tags, got {:?}", tagged);
+  assert_ne!(
+    tagged[0], tagged[1],
+    "Tags should be different, but got {:?}",
+    tagged
+  );
 }
