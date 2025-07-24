@@ -204,6 +204,10 @@ pub trait EdgeType {
   fn is_built_from(&self) -> bool;
 
   fn is_builds_to(&self) -> bool;
+
+  fn is_tag_to(&self) -> bool;
+
+  fn is_tag_from(&self) -> bool;
 }
 
 pub const TO: &str = ":to";
@@ -217,6 +221,9 @@ pub const ALIAS_TO: &str = "alias:to";
 pub const ALIAS_FROM: &str = "alias:from";
 pub const BUILDS_TO: &str = "build:up";
 pub const BUILT_FROM: &str = "build:down";
+pub const TAG_FROM: &str = "tag:from";
+pub const TAG_TO: &str = "tag:to";
+
 impl EdgeType for String {
   fn is_alias_from(&self) -> bool {
     self == ALIAS_FROM
@@ -256,6 +263,14 @@ impl EdgeType for String {
 
   fn is_down(&self) -> bool {
     self.ends_with(DOWN)
+  }
+
+  fn is_tag_to(&self) -> bool {
+    self == TAG_TO
+  }
+
+  fn is_tag_from(&self) -> bool {
+    self == TAG_FROM
   }
 }
 

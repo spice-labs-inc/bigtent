@@ -1,0 +1,6 @@
+pkg:maven/org.scala-sbt/librarymanagement-ivy_2.12@1.9.3
+pkg:maven/org.scala-sbt/librarymanagement-ivy_2.12@1.9.3?packaging=sources
+pkg:maven/org.scala-sbt/librarymanagement-ivy_2.12@1.9.3?type=pom
+pkg:maven/org.slf4j/slf4j-simple@1.6.1
+pkg:maven/org.slf4j/slf4j-simple@1.6.1?packaging=sources
+pkg:maven/org.slf4j/slf4j-simple@1.6.1?type=pom

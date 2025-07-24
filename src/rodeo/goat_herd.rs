@@ -161,6 +161,7 @@ impl GoatRodeoTrait for GoatHerd {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_purls_and_merge() {
+  use crate::item::EdgeType;
   let path = PathBuf::from("test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc");
   let cluster_a = GoatRodeoCluster::new(&path.parent().unwrap().to_path_buf(), &path, false)
     .await
@@ -169,7 +170,20 @@ async fn test_purls_and_merge() {
   let cluster_b = GoatRodeoCluster::new(&path2.parent().unwrap().to_path_buf(), &path2, false)
     .await
     .expect("Should load cluster b");
-  let herd = GoatHerd::new(vec![cluster_a.clone(), cluster_b.clone()]);
+  let path_c = PathBuf::from("test_data/cluster_c/2025_07_24_14_43_36_68a489f4fd40c5e2.grc");
+  let cluster_c = GoatRodeoCluster::new(&path_c.parent().unwrap().to_path_buf(), &path_c, false)
+    .await
+    .expect("Should get cluster c");
+  let path_d = PathBuf::from("test_data/cluster_d/2025_07_24_14_44_14_2b39577cd0a58701.grc");
+  let cluster_d = GoatRodeoCluster::new(&path_d.parent().unwrap().to_path_buf(), &path_d, false)
+    .await
+    .expect("Should get cluster d");
+  let herd = GoatHerd::new(vec![
+    cluster_a.clone(),
+    cluster_b.clone(),
+    cluster_c.clone(),
+    cluster_d.clone(),
+  ]);
   let purls = herd.get_purl().expect("Should get purls");
   let all_purls = std::fs::read_to_string(&purls).expect("Should read string");
 
@@ -181,6 +195,8 @@ async fn test_purls_and_merge() {
   let dest_dir =
     <PathBuf as std::str::FromStr>::from_str("merge_out").expect("Should create a directory");
   let _ = std::fs::remove_dir_all(&dest_dir);
+
+  let herd2 = herd.clone();
 
   crate::fresh_merge::merge_fresh(herd.herd, &dest_dir)
     .await
@@ -198,5 +214,23 @@ async fn test_purls_and_merge() {
     history.len() >= 3,
     "Expecting some history, got {:?}",
     history
+  );
+
+  let tags = herd2
+    .item_for_identifier("tags")
+    .expect("Should get tags")
+    .expect("Should get tags from option");
+  let tagged: Vec<String> = tags
+    .connections
+    .iter()
+    .filter(|conn| conn.0.is_tag_to())
+    .map(|conn| conn.1.clone())
+    .collect();
+
+  assert_eq!(tagged.len(), 2, "Expecting 2 tags, got {:?}", tagged);
+  assert_ne!(
+    tagged[0], tagged[1],
+    "Tags should be different, but got {:?}",
+    tagged
   );
 }
