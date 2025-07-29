@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use log::info;
 use scopeguard::defer;
 use thousands::Separable;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 use tokio_util::either::Either;
 
 use crate::{
@@ -22,7 +22,7 @@ use crate::{
 /// multiple small clusters means having a trait that can
 /// be implemented for a single cluster or for something holding
 /// a group of clusters
-pub trait GoatRodeoTrait: Clone + Send + Sync {
+pub trait GoatRodeoTrait: Send + Sync {
   /// get the number of nodes
   fn node_count(&self) -> u64;
   /// get the purls.txt file
@@ -36,12 +36,17 @@ pub trait GoatRodeoTrait: Clone + Send + Sync {
   /// given a `Vec` of identifiers, find all the items that contain those
   /// items, etc. until there's no contents left.
   fn north_send(
-    &self,
+    self: Arc<Self>,
     gitoids: Vec<String>,
     purls_only: bool,
-    tx: Sender<Either<Item, String>>,
     start: Instant,
-  ) -> impl Future<Output = Result<()>> + Send;
+  ) -> impl Future<Output = Result<Receiver<Either<Item, String>>>> + Send;
+
+  /// Find all the Identifiers for all the items that either have no `contained:up` and
+  /// `builds:up` or has a `tag:from`. These are the "root" `Item`s. This is
+  /// and *INSANELY EXPENSIVE* operations... It's O(n) where n is the number
+  /// of Items in the cluster
+  fn roots(self: Arc<Self>) -> impl Future<Output = Receiver<Item>> + Send;
 
   /// given an identifier, return the associated item
   fn item_for_identifier(&self, data: &str) -> Result<Option<Item>>;
@@ -50,7 +55,7 @@ pub trait GoatRodeoTrait: Clone + Send + Sync {
   fn item_for_hash(&self, hash: MD5Hash) -> Result<Option<Item>>;
 
   /// given an identifier, traverse the graph to find the anti-aliased Item
-  fn antialias_for(&self, data: &str) -> Result<Option<Item>>;
+  fn antialias_for(self: Arc<Self>, data: &str) -> Result<Option<Item>>;
 
   /// create a stream for the flattened items. If any of the `gitoids` cannot
   /// be found, an `Err` is put in the stream and the flattening is completed.
@@ -142,62 +147,93 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
   Ok(rx)
 }
 
-pub async fn impl_north_send<GRT: GoatRodeoTrait>(
-  the_self: &GRT,
+pub fn impl_antialias_for<GRT: GoatRodeoTrait + 'static>(
+  the_self: Arc<GRT>,
+  data: &str,
+) -> Result<Option<Item>> {
+  let mut ret = match the_self.item_for_identifier(data)? {
+    Some(i) => i,
+    _ => return Ok(None),
+  };
+  while ret.is_alias() {
+    match ret.connections.iter().find(|x| x.0.is_alias_to()) {
+      Some(v) => {
+        ret = match the_self.item_for_identifier(&v.1)? {
+          Some(v) => v,
+          _ => bail!(
+            "Expecting to traverse from {}, but no aliases found",
+            ret.identifier
+          ),
+        };
+      }
+      None => {
+        bail!("Unexpected situation");
+      }
+    }
+  }
+
+  Ok(Some(ret))
+}
+pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
+  the_self: Arc<GRT>,
   gitoids: Vec<String>,
   purls_only: bool,
-  tx: Sender<Either<Item, String>>,
   start: Instant,
-) -> Result<()> {
-  let mut found = HashSet::new();
-  let mut to_find = HashSet::new();
-  let mut found_purls = HashSet::<String>::new();
-  to_find.extend(gitoids);
+) -> Result<Receiver<Either<Item, String>>> {
+  let (tx, rx) = tokio::sync::mpsc::channel::<Either<Item, String>>(256);
 
-  let cnt = AtomicU32::new(0);
+  // populate the channel
+  tokio::spawn(async move {
+    let mut found = HashSet::new();
+    let mut to_find = HashSet::new();
+    let mut found_purls = HashSet::<String>::new();
+    to_find.extend(gitoids);
 
-  defer! {
-    info!("North: Sent {} items in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
-    start.elapsed());
-  }
+    let cnt = AtomicU32::new(0);
 
-  fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
-    let mut ret = a.clone();
-    for i in b.iter() {
-      ret.remove(i);
+    defer! {
+      info!("North: Sent {} items in {:?}", cnt.load(std::sync::atomic::Ordering::Relaxed).separate_with_commas(),
+      start.elapsed());
     }
-    ret
-  }
 
-  loop {
-    let to_search = less(&to_find, &found);
-
-    if to_search.len() == 0 {
-      break;
-    }
-    for this_oid in to_search {
-      found.insert(this_oid.clone());
-      match the_self.item_for_identifier(&this_oid) {
-        Ok(Some(item)) => {
-          let and_then = item.contained_by();
-          if purls_only {
-            for purl in item.find_purls() {
-              if !found_purls.contains(&purl) {
-                tx.send(Either::Right(purl.clone())).await?;
-
-                found_purls.insert(purl);
-              }
-            }
-          } else {
-            tx.send(Either::Left(item)).await?;
-          }
-
-          to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
-        }
-        _ => {}
+    fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
+      let mut ret = a.clone();
+      for i in b.iter() {
+        ret.remove(i);
       }
-      cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      ret
     }
-  }
-  Ok(())
+
+    loop {
+      let to_search = less(&to_find, &found);
+
+      if to_search.len() == 0 {
+        break;
+      }
+      for this_oid in to_search {
+        found.insert(this_oid.clone());
+        match the_self.item_for_identifier(&this_oid) {
+          Ok(Some(item)) => {
+            let and_then = item.contained_by();
+            if purls_only {
+              for purl in item.find_purls() {
+                if !found_purls.contains(&purl) {
+                  let _ = tx.send(Either::Right(purl.clone())).await;
+
+                  found_purls.insert(purl);
+                }
+              }
+            } else {
+              let _ = tx.send(Either::Left(item)).await;
+            }
+
+            to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
+          }
+          _ => {}
+        }
+        cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      }
+    }
+  });
+  Ok(rx)
 }

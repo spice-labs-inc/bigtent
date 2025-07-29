@@ -18,9 +18,9 @@ use std::println as info;
 use crate::{
   item::Item,
   rodeo::{
-    goat::GoatRodeoCluster,
     goat_trait::GoatRodeoTrait,
     index::{HasHash, ItemOffset},
+    member::HerdMember,
     writer::ClusterWriter,
   },
   util::{MD5Hash, NiceDurationDisplay, iso8601_now},
@@ -29,7 +29,7 @@ use anyhow::Result;
 use thousands::Separable;
 
 pub async fn merge_fresh<PB: Into<PathBuf>>(
-  clusters: Vec<Arc<GoatRodeoCluster>>,
+  clusters: Vec<Arc<HerdMember>>,
   dest_directory: PB,
 ) -> Result<()> {
   let start = Instant::now();
@@ -409,7 +409,7 @@ fn test_merge() {
 }
 
 struct ClusterPos {
-  pub cluster: Arc<GoatRodeoCluster>,
+  pub cluster: Arc<HerdMember>,
   pub pos: usize,
   pub len: usize,
   pub cache: Option<ItemOffset>,
@@ -441,7 +441,7 @@ impl ClusterPos {
 
 fn next_hash_of_item_to_merge(
   index_holder: &mut Vec<ClusterPos>,
-) -> Option<Vec<(ItemOffset, Arc<GoatRodeoCluster>)>> {
+) -> Option<Vec<(ItemOffset, Arc<HerdMember>)>> {
   let mut lowest: Option<MD5Hash> = None;
   let mut low_clusters = vec![];
 

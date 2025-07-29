@@ -5,27 +5,26 @@ use std::{
   path::PathBuf,
   sync::Arc,
 };
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 use tokio_util::either::Either;
 use uuid::Uuid;
 
 use crate::item::Item;
 
 use super::{
-  goat::GoatRodeoCluster,
-  goat_trait::{GoatRodeoTrait, impl_north_send, impl_stream_flattened_items},
+  goat_trait::{GoatRodeoTrait, impl_antialias_for, impl_north_send, impl_stream_flattened_items},
+  member::HerdMember,
 };
-
 /// a collection of goat rodeo instances
 #[derive(Debug, Clone)]
 pub struct GoatHerd {
-  herd: Vec<Arc<GoatRodeoCluster>>,
+  herd: Vec<Arc<HerdMember>>,
   uuid: String,
 }
 
 impl GoatHerd {
   /// create a new herd
-  pub fn new(herd: Vec<Arc<GoatRodeoCluster>>) -> GoatHerd {
+  pub fn new(herd: Vec<Arc<HerdMember>>) -> GoatHerd {
     GoatHerd {
       herd,
       uuid: Uuid::new_v4().to_string(),
@@ -33,7 +32,7 @@ impl GoatHerd {
   }
 
   /// get the herd
-  pub fn get_herd(&self) -> &Vec<Arc<GoatRodeoCluster>> {
+  pub fn get_herd(&self) -> &Vec<Arc<HerdMember>> {
     &self.herd
   }
 }
@@ -49,7 +48,7 @@ impl GoatRodeoTrait for GoatHerd {
     Ok(ret)
   }
 
-  fn get_purl(&self) -> Result<std::path::PathBuf> {
+  fn get_purl(&self) -> Result<PathBuf> {
     let filename = format!("/tmp/{}.txt", self.uuid);
     let ret = PathBuf::from(&filename);
     if ret.exists() && ret.is_file() {
@@ -78,13 +77,12 @@ impl GoatRodeoTrait for GoatHerd {
   }
 
   async fn north_send(
-    &self,
+    self: Arc<Self>,
     gitoids: Vec<String>,
     purls_only: bool,
-    tx: Sender<Either<Item, String>>,
     start: std::time::Instant,
-  ) -> Result<()> {
-    impl_north_send(self, gitoids, purls_only, tx, start).await
+  ) -> Result<Receiver<Either<Item, String>>> {
+    impl_north_send(self, gitoids, purls_only, start).await
   }
 
   fn item_for_identifier(&self, data: &str) -> Result<Option<Item>> {
@@ -115,18 +113,8 @@ impl GoatRodeoTrait for GoatHerd {
     Ok(Item::merge_items(items))
   }
 
-  fn antialias_for(&self, data: &str) -> Result<Option<Item>> {
-    let mut items = vec![];
-    for grc in &self.herd {
-      match grc.antialias_for(data)? {
-        None => {}
-        Some(item) => {
-          items.push(item);
-        }
-      }
-    }
-
-    Ok(Item::merge_items(items))
+  fn antialias_for(self: Arc<Self>, data: &str) -> Result<Option<Item>> {
+    impl_antialias_for(self, data)
   }
 
   async fn stream_flattened_items(
@@ -157,11 +145,34 @@ impl GoatRodeoTrait for GoatHerd {
     }
     ret
   }
+
+  async fn roots(self: Arc<GoatHerd>) -> Receiver<Item> {
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+    let _ = tokio::spawn(async move {
+      for goat in &self.herd {
+        let mut real_rx: Receiver<Item> = call_root(goat).await;
+        while let Some(v) = real_rx.recv().await {
+          match tx.send(v).await {
+            Ok(_) => (),
+            Err(_) => break,
+          }
+        }
+      }
+    })
+    .await;
+    rx
+  }
+}
+
+async fn call_root(hm: &Arc<HerdMember>) -> Receiver<Item> {
+  hm.clone().roots().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_purls_and_merge() {
   use crate::item::EdgeType;
+  use crate::rodeo::goat::GoatRodeoCluster;
   let path = PathBuf::from("test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc");
   let cluster_a = GoatRodeoCluster::new(&path.parent().unwrap().to_path_buf(), &path, false)
     .await
@@ -179,10 +190,10 @@ async fn test_purls_and_merge() {
     .await
     .expect("Should get cluster d");
   let herd = GoatHerd::new(vec![
-    cluster_a.clone(),
-    cluster_b.clone(),
-    cluster_c.clone(),
-    cluster_d.clone(),
+    crate::rodeo::member::member_core(cluster_a),
+    crate::rodeo::member::member_core(cluster_b),
+    crate::rodeo::member::member_core(cluster_c),
+    crate::rodeo::member::member_core(cluster_d),
   ]);
   let purls = herd.get_purl().expect("Should get purls");
   let all_purls = std::fs::read_to_string(&purls).expect("Should read string");
@@ -232,5 +243,58 @@ async fn test_purls_and_merge() {
     tagged[0], tagged[1],
     "Tags should be different, but got {:?}",
     tagged
+  );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 5)]
+async fn test_roots() {
+  let to_test = vec![
+    (
+      "test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc",
+      1,
+    ),
+    (
+      "test_data/cluster_b/2025_04_19_17_10_40_09ebe9a7137ee100.grc",
+      1,
+    ),
+    (
+      "test_data/cluster_c/2025_07_24_14_43_36_68a489f4fd40c5e2.grc",
+      1,
+    ),
+    (
+      "test_data/cluster_d/2025_07_24_14_44_14_2b39577cd0a58701.grc",
+      5,
+    ),
+  ];
+  let mut herd = vec![];
+  let mut total_cnt = 0;
+
+  for (file, cnt) in to_test {
+    total_cnt += cnt;
+    let path = PathBuf::from(file);
+    println!("Getting cluster {}", file);
+    let cluster = crate::rodeo::goat::GoatRodeoCluster::new(
+      &path.parent().unwrap().to_path_buf(),
+      &path,
+      false,
+    )
+    .await
+    .expect("Should get cluster");
+    herd.push(crate::rodeo::member::member_core(cluster));
+  }
+  let goat_herd = Arc::new(GoatHerd::new(herd));
+
+  let mut rx = goat_herd.roots().await;
+  let mut info = vec![];
+  while let Some(item) = rx.recv().await {
+    info.push(item);
+  }
+
+  assert!(
+    info.len() == total_cnt,
+    "expected {}, actual len {} and filenames {:?}",
+    total_cnt,
+    info.len(),
+    info
   );
 }
