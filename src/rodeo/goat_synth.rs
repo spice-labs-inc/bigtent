@@ -188,14 +188,13 @@ impl GoatRodeoTrait for GoatSynth {
 
   async fn roots(self: Arc<Self>) -> Receiver<Item> {
     let (tx, rx) = tokio::sync::mpsc::channel(256);
-    let _ = tokio::spawn(async move {
+    tokio::spawn(async move {
       for item in &self.items {
         if item.is_root_item() {
           let _ = tx.send(item.clone()).await;
         }
       }
-    })
-    .await;
+    });
     rx
   }
 
