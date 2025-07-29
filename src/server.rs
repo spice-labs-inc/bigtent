@@ -275,7 +275,7 @@ async fn do_north<GRT>(
   rodeo: Arc<ClusterHolder<GRT>>,
   gitoids: Vec<String>,
   purls_only: bool,
-) -> impl IntoResponse
+) -> Result<impl IntoResponse, (StatusCode, String)>
 where
   GRT: GoatRodeoTrait + 'static,
 {
@@ -285,23 +285,21 @@ where
     info!("Served North for {:?} in {:?}", gitoid_clone,
     start.elapsed());
   }
-  let (mtx, mrx) = tokio::sync::mpsc::channel::<Either<Item, String>>(32);
 
-  tokio::spawn(async move {
-    match rodeo
-      .get_cluster()
-      .north_send(gitoids, purls_only, mtx, start)
-      .await
-    {
-      Ok(_) => {}
-      Err(e) => log::error!("Failed to do `north_send` {:?}", e),
-    }
-  });
-
-  StreamBodyAs::json_array(TokioReceiverToStream { receiver: mrx }.map(|v| match v {
-    Either::Left(item) => Into::<serde_json::Value>::into(item),
-    Either::Right(string) => string.into(),
-  }))
+  let mrx = match rodeo
+    .get_cluster()
+    .north_send(gitoids, purls_only, start)
+    .await
+  {
+    Ok(mrx) => mrx,
+    Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e))),
+  };
+  Ok(StreamBodyAs::json_array(
+    TokioReceiverToStream { receiver: mrx }.map(|v| match v {
+      Either::Left(item) => Into::<serde_json::Value>::into(item),
+      Either::Right(string) => string.into(),
+    }),
+  ))
 }
 
 /// Build up the routes for the default Big Tent features

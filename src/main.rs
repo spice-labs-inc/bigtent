@@ -3,7 +3,11 @@ use arc_swap::ArcSwap;
 use bigtent::{
   config::Args,
   fresh_merge::merge_fresh,
-  rodeo::{goat::GoatRodeoCluster, holder::ClusterHolder},
+  rodeo::{
+    goat::GoatRodeoCluster,
+    holder::ClusterHolder,
+    member::{HerdMember, member_core},
+  },
   server::run_web_server,
 };
 use clap::{CommandFactory, Parser};
@@ -56,10 +60,10 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
   let start = Instant::now();
 
   info!("Loading clusters...");
-  let mut clusters: Vec<Arc<GoatRodeoCluster>> = vec![];
+  let mut clusters: Vec<Arc<HerdMember>> = vec![];
   for p in &paths {
     for b in GoatRodeoCluster::cluster_files_in_dir(p.clone(), false).await? {
-      clusters.push(b);
+      clusters.push(member_core(b));
     }
   }
   info!(

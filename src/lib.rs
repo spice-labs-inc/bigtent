@@ -9,6 +9,8 @@ pub mod rodeo {
   pub mod goat_trait;
   pub mod holder;
   pub mod index;
+  pub mod member;
+  pub mod robo_goat;
   pub mod writer;
 }
 pub mod item;

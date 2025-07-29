@@ -297,6 +297,28 @@ impl From<&Item> for serde_json::Value {
 }
 
 impl Item {
+  /// is the item a "root" item... no "up" or "tag:from"
+  pub fn is_root_item(&self) -> bool {
+    if self.body_mime_type != Some("application/vnd.cc.goatrodeo".to_string()) {
+      return false;
+    }
+    if self.identifier == "tags" {
+      return false;
+    }
+
+    for v in &self.connections {
+      if v.0.is_alias_to() {
+        return false;
+      }
+      if v.0.is_contained_by_up() {
+        return false;
+      }
+      if v.0.is_tag_from() {
+        return true;
+      }
+    }
+    true
+  }
   /// Find all the aliases that are package URLs
   pub fn find_purls(&self) -> Vec<String> {
     self

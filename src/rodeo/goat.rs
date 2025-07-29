@@ -17,14 +17,11 @@ use tokio_util::either::Either;
 use tokio::{
   fs::{File as TokioFile, read_dir},
   io::BufReader,
-  sync::{
-    Mutex,
-    mpsc::{Receiver, Sender},
-  },
+  sync::{Mutex, mpsc::Receiver},
 };
 
 use crate::{
-  item::{EdgeType, Item},
+  item::Item,
   util::{
     MD5Hash, byte_slice_to_u63, find_common_root_dir, hex_to_u64, is_child_dir, md5hash_str,
     read_len_and_cbor, read_u32, sha256_for_reader,
@@ -39,8 +36,9 @@ use std::println as info;
 use super::{
   cluster::{ClusterFileEnvelope, ClusterFileMagicNumber},
   data::{DataFile, GOAT_RODEO_CLUSTER_FILE_SUFFIX},
-  goat_trait::{GoatRodeoTrait, impl_north_send, impl_stream_flattened_items},
+  goat_trait::{GoatRodeoTrait, impl_antialias_for, impl_north_send, impl_stream_flattened_items},
   index::{GetOffset, IndexFile, ItemLoc, ItemOffset, find_item_offset},
+  robo_goat::ClusterRoboMember,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -138,13 +136,12 @@ impl GoatRodeoTrait for GoatRodeoCluster {
   }
 
   async fn north_send(
-    &self,
+    self: Arc<GoatRodeoCluster>,
     gitoids: Vec<String>,
     purls_only: bool,
-    tx: Sender<Either<Item, String>>,
     start: Instant,
-  ) -> Result<()> {
-    impl_north_send(self, gitoids, purls_only, tx, start).await
+  ) -> Result<Receiver<Either<Item, String>>> {
+    impl_north_send(self, gitoids, purls_only, start).await
   }
 
   fn item_for_identifier(&self, data: &str) -> Result<Option<Item>> {
@@ -159,29 +156,8 @@ impl GoatRodeoTrait for GoatRodeoCluster {
     }
   }
 
-  fn antialias_for(&self, data: &str) -> Result<Option<Item>> {
-    let mut ret = match self.item_for_identifier(data)? {
-      Some(i) => i,
-      _ => return Ok(None),
-    };
-    while ret.is_alias() {
-      match ret.connections.iter().find(|x| x.0.is_alias_to()) {
-        Some(v) => {
-          ret = match self.item_for_identifier(&v.1)? {
-            Some(v) => v,
-            _ => bail!(
-              "Expecting to traverse from {}, but no aliases found",
-              ret.identifier
-            ),
-          };
-        }
-        None => {
-          bail!("Unexpected situation");
-        }
-      }
-    }
-
-    Ok(Some(ret))
+  fn antialias_for(self: Arc<Self>, data: &str) -> Result<Option<Item>> {
+    impl_antialias_for(self, data)
   }
 
   fn has_identifier(&self, identifier: &str) -> bool {
@@ -221,8 +197,68 @@ impl GoatRodeoTrait for GoatRodeoCluster {
     }
     ret
   }
-}
 
+  async fn roots(self: Arc<Self>) -> Receiver<Item> {
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+    let _ = tokio::spawn(async move {
+      for offset in 0..self.number_of_items {
+        if let Ok(item_offset) = self.offset_from_pos(offset) {
+          if let Ok(item) = self.item_from_item_offset(&item_offset) {
+            if item.is_root_item() {
+              let _ = tx.send(item).await;
+            }
+          }
+        }
+      }
+    });
+
+    rx
+  }
+}
+impl ClusterRoboMember for GoatRodeoCluster {
+  /// get the name of the cluster
+  fn name(&self) -> String {
+    self.name.clone()
+  }
+
+  fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
+    if self.load_index && self.index.load().is_some() {
+      match &**self.index.load() {
+        Some(index) => {
+          if pos < index.len() {
+            Ok(index[pos])
+          } else {
+            panic!("Pos {} outside index len {}", pos, index.len());
+          }
+        }
+        None => bail!("Expected to load the index and failed"),
+      }
+    } else {
+      let byte_pos = pos * 32;
+      match IndexOffset::find(&self.index_offset, byte_pos) {
+        Some(index_hash) => {
+          match self.index_files.get(&index_hash.index_file) {
+            Some(index) => {
+              let relative_byte_pos = byte_pos - index_hash.start; // get the item
+              Ok(index.read_index_at_byte_offset(relative_byte_pos)?.into())
+            }
+            None => bail!(
+              "Pos {} lead to index file {:x} which can't be found",
+              pos,
+              index_hash.index_file
+            ),
+          }
+        }
+        None => bail!("Pos {} outside index len {}", pos, self.number_of_items),
+      }
+    }
+  }
+
+  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item> {
+    Ok(self.item_from_index_loc(&item_offset.loc)?)
+  }
+}
 impl GoatRodeoCluster {
   /// get the cluster file hash
   pub fn get_cluster_file_hash(&self) -> u64 {
@@ -237,11 +273,6 @@ impl GoatRodeoCluster {
   /// Get the index file mapping
   pub fn get_index_files<'a>(&'a self) -> &'a HashMap<u64, Arc<IndexFile>> {
     &self.index_files
-  }
-
-  /// get the name of the cluster
-  pub fn name(&self) -> String {
-    self.name.clone()
   }
 
   /// When clusters are merged, they must share a root path
@@ -665,43 +696,6 @@ impl GoatRodeoCluster {
     }
   }
 
-  pub fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
-    if self.load_index && self.index.load().is_some() {
-      match &**self.index.load() {
-        Some(index) => {
-          if pos < index.len() {
-            Ok(index[pos])
-          } else {
-            panic!("Pos {} outside index len {}", pos, index.len());
-          }
-        }
-        None => bail!("Expected to load the index and failed"),
-      }
-    } else {
-      let byte_pos = pos * 32;
-      match IndexOffset::find(&self.index_offset, byte_pos) {
-        Some(index_hash) => {
-          match self.index_files.get(&index_hash.index_file) {
-            Some(index) => {
-              let relative_byte_pos = byte_pos - index_hash.start; // get the item
-              Ok(index.read_index_at_byte_offset(relative_byte_pos)?.into())
-            }
-            None => bail!(
-              "Pos {} lead to index file {:x} which can't be found",
-              pos,
-              index_hash.index_file
-            ),
-          }
-        }
-        None => bail!("Pos {} outside index len {}", pos, self.number_of_items),
-      }
-    }
-  }
-
-  pub fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item> {
-    Ok(self.item_from_index_loc(&item_offset.loc)?)
-  }
-
   /// given a hash, find an item
   pub fn item_for_file_and_offset(&self, file_hash: u64, offset: usize) -> Result<Item> {
     let data_files = &self.data_files;
@@ -768,6 +762,7 @@ async fn test_antialias() {
   for ai in aliases.iter().take(20) {
     println!("Antialias for {}", ai.identifier);
     let new_item = cluster
+      .clone()
       .antialias_for(&ai.identifier)
       .expect("Expect to get the antialiased thing")
       .expect("And it's not a None");
@@ -911,6 +906,51 @@ async fn test_files_in_dir() {
     "must read at least 7,000 items, but only got {}",
     total_index_size
   );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 5)]
+async fn test_roots() {
+  let to_test = vec![
+    (
+      "test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc",
+      1,
+    ),
+    (
+      "test_data/cluster_b/2025_04_19_17_10_40_09ebe9a7137ee100.grc",
+      1,
+    ),
+    (
+      "test_data/cluster_c/2025_07_24_14_43_36_68a489f4fd40c5e2.grc",
+      1,
+    ),
+    (
+      "test_data/cluster_d/2025_07_24_14_44_14_2b39577cd0a58701.grc",
+      5,
+    ),
+  ];
+  for (file, cnt) in to_test {
+    let path = PathBuf::from(file);
+    println!("Getting cluster {}", file);
+    let cluster = GoatRodeoCluster::new(&path.parent().unwrap().to_path_buf(), &path, false)
+      .await
+      .expect("Should get cluster");
+    println!("Goat cluster {}", file);
+    let mut rx = cluster.roots().await;
+    let mut info = vec![];
+    while let Some(item) = rx.recv().await {
+      info.push(item);
+    }
+    println!("Pushed {} items for {}", info.len(), file);
+
+    assert!(
+      info.len() == cnt,
+      "for {} expected {}, actual len {} and filenames {:?}",
+      file,
+      cnt,
+      info.len(),
+      info
+    );
+  }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
