@@ -21,6 +21,7 @@ use crate::{
     goat_trait::GoatRodeoTrait,
     index::{HasHash, ItemOffset},
     member::HerdMember,
+    robo_goat::ClusterRoboMember,
     writer::ClusterWriter,
   },
   util::{MD5Hash, NiceDurationDisplay, iso8601_now},

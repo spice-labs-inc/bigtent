@@ -38,6 +38,7 @@ use super::{
   data::{DataFile, GOAT_RODEO_CLUSTER_FILE_SUFFIX},
   goat_trait::{GoatRodeoTrait, impl_antialias_for, impl_north_send, impl_stream_flattened_items},
   index::{GetOffset, IndexFile, ItemLoc, ItemOffset, find_item_offset},
+  robo_goat::ClusterRoboMember,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -215,7 +216,49 @@ impl GoatRodeoTrait for GoatRodeoCluster {
     rx
   }
 }
+impl ClusterRoboMember for GoatRodeoCluster {
+  /// get the name of the cluster
+  fn name(&self) -> String {
+    self.name.clone()
+  }
 
+  fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
+    if self.load_index && self.index.load().is_some() {
+      match &**self.index.load() {
+        Some(index) => {
+          if pos < index.len() {
+            Ok(index[pos])
+          } else {
+            panic!("Pos {} outside index len {}", pos, index.len());
+          }
+        }
+        None => bail!("Expected to load the index and failed"),
+      }
+    } else {
+      let byte_pos = pos * 32;
+      match IndexOffset::find(&self.index_offset, byte_pos) {
+        Some(index_hash) => {
+          match self.index_files.get(&index_hash.index_file) {
+            Some(index) => {
+              let relative_byte_pos = byte_pos - index_hash.start; // get the item
+              Ok(index.read_index_at_byte_offset(relative_byte_pos)?.into())
+            }
+            None => bail!(
+              "Pos {} lead to index file {:x} which can't be found",
+              pos,
+              index_hash.index_file
+            ),
+          }
+        }
+        None => bail!("Pos {} outside index len {}", pos, self.number_of_items),
+      }
+    }
+  }
+
+  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item> {
+    Ok(self.item_from_index_loc(&item_offset.loc)?)
+  }
+}
 impl GoatRodeoCluster {
   /// get the cluster file hash
   pub fn get_cluster_file_hash(&self) -> u64 {
@@ -230,11 +273,6 @@ impl GoatRodeoCluster {
   /// Get the index file mapping
   pub fn get_index_files<'a>(&'a self) -> &'a HashMap<u64, Arc<IndexFile>> {
     &self.index_files
-  }
-
-  /// get the name of the cluster
-  pub fn name(&self) -> String {
-    self.name.clone()
   }
 
   /// When clusters are merged, they must share a root path
@@ -656,43 +694,6 @@ impl GoatRodeoCluster {
 
       Ok(None)
     }
-  }
-
-  pub fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
-    if self.load_index && self.index.load().is_some() {
-      match &**self.index.load() {
-        Some(index) => {
-          if pos < index.len() {
-            Ok(index[pos])
-          } else {
-            panic!("Pos {} outside index len {}", pos, index.len());
-          }
-        }
-        None => bail!("Expected to load the index and failed"),
-      }
-    } else {
-      let byte_pos = pos * 32;
-      match IndexOffset::find(&self.index_offset, byte_pos) {
-        Some(index_hash) => {
-          match self.index_files.get(&index_hash.index_file) {
-            Some(index) => {
-              let relative_byte_pos = byte_pos - index_hash.start; // get the item
-              Ok(index.read_index_at_byte_offset(relative_byte_pos)?.into())
-            }
-            None => bail!(
-              "Pos {} lead to index file {:x} which can't be found",
-              pos,
-              index_hash.index_file
-            ),
-          }
-        }
-        None => bail!("Pos {} outside index len {}", pos, self.number_of_items),
-      }
-    }
-  }
-
-  pub fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item> {
-    Ok(self.item_from_index_loc(&item_offset.loc)?)
   }
 
   /// given a hash, find an item

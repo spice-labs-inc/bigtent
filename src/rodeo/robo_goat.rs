@@ -12,9 +12,14 @@ use tokio::sync::mpsc::Receiver;
 use tokio_util::either::Either;
 use uuid::Uuid;
 
+pub trait ClusterRoboMember {
+  fn name(&self) -> String;
+  fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset>;
+  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item>;
+}
 use super::{goat_trait::GoatRodeoTrait, index::ItemOffset};
 #[derive(Debug, Clone)]
-pub struct GoatSynth {
+pub struct RoboticGoat {
   name: String,
   items: Vec<Item>,
   uuid: String,
@@ -22,18 +27,18 @@ pub struct GoatSynth {
   history: serde_json::Value,
 }
 
-impl GoatSynth {
-  pub fn name(&self) -> String {
+impl ClusterRoboMember for RoboticGoat {
+  fn name(&self) -> String {
     self.name.clone()
   }
-  pub fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
+  fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
     if pos >= self.items.len() {
       bail!("Offset out of bounds {} vs. {}", pos, self.items.len());
     }
 
     Ok(self.offsets[pos])
   }
-  pub fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item> {
+  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item> {
     let pos = item_offset.loc.0;
     if pos >= self.items.len() {
       bail!("Invalid offset {}", pos);
@@ -41,7 +46,10 @@ impl GoatSynth {
 
     Ok(self.items[pos].clone())
   }
-  pub fn new(name: &str, items: Vec<Item>, history: serde_json::Value) -> Arc<GoatSynth> {
+}
+
+impl RoboticGoat {
+  pub fn new(name: &str, items: Vec<Item>, history: serde_json::Value) -> Arc<RoboticGoat> {
     let uuid = Uuid::new_v4().to_string();
     let mut offsets = vec![];
     for (idx, item) in items.iter().enumerate() {
@@ -51,7 +59,7 @@ impl GoatSynth {
       });
     }
     offsets.sort_by_key(|v| v.hash);
-    Arc::new(GoatSynth {
+    Arc::new(RoboticGoat {
       name: name.to_string(),
       items,
       uuid,
@@ -63,7 +71,7 @@ impl GoatSynth {
   pub fn new_tags(
     tag_name: &str,
     tags: Vec<(String, serde_json::Value)>,
-  ) -> Result<Arc<GoatSynth>> {
+  ) -> Result<Arc<RoboticGoat>> {
     let mut items = vec![];
     for (name, json) in tags {
       let mut map = match json {
@@ -107,7 +115,7 @@ impl GoatSynth {
     };
     items.push(tags);
 
-    Ok(GoatSynth::new(
+    Ok(RoboticGoat::new(
       tag_name,
       items,
       json!({"date": iso8601_now(), "operation": "synthetic tag"}),
@@ -129,7 +137,7 @@ async fn test_synthetic() {
     root_ids.push((item.identifier.clone(), json!({"hello": 42})));
   }
 
-  let synth = GoatSynth::new_tags("test test", root_ids).expect("Should get a synthetic goat");
+  let synth = RoboticGoat::new_tags("test test", root_ids).expect("Should get a synthetic goat");
 
   let herd = GoatHerd::new(vec![
     crate::rodeo::member::member_core(cluster_a),
@@ -151,7 +159,7 @@ async fn test_synthetic() {
   assert_eq!(tagged.len(), 1, "Expecting 1 tag, got {:?}", tagged);
 }
 
-impl GoatRodeoTrait for GoatSynth {
+impl GoatRodeoTrait for RoboticGoat {
   fn node_count(&self) -> u64 {
     self.items.len() as u64
   }
