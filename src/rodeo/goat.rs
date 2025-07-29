@@ -210,8 +210,7 @@ impl GoatRodeoTrait for GoatRodeoCluster {
           }
         }
       }
-    })
-    .await;
+    });
 
     rx
   }
