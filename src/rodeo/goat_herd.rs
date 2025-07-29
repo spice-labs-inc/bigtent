@@ -159,8 +159,7 @@ impl GoatRodeoTrait for GoatHerd {
           }
         }
       }
-    })
-    .await;
+    });
     rx
   }
 }
