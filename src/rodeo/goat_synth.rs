@@ -206,7 +206,7 @@ impl GoatRodeoTrait for GoatSynth {
   fn item_for_hash(&self, hash: MD5Hash) -> Result<Option<Item>> {
     let found = match self.offsets.binary_search_by_key(&hash, |v| v.hash) {
       Ok(v) => v,
-      Err(_) => bail!("Key not found"),
+      Err(_) => bail!("Key not found: {} during binary search in offsets", hash),
     };
     let res = match self.item_from_item_offset(&self.offsets[found]) {
       Ok(v) => Some(v),
