@@ -69,7 +69,7 @@ impl RoboticGoat {
   }
 
   /// Create a robo cluster with a base name (e.g., "tags" or "uploads")
-  /// where the tag name is particular string and the specific items are a
+  /// where the tag name is a particular string and the specific items are a
   /// `Vec<(String, Value)>`
   pub fn new_cluster(
     base_name: &str,
