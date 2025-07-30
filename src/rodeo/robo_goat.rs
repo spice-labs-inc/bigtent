@@ -68,12 +68,16 @@ impl RoboticGoat {
     })
   }
 
-  pub fn new_tags(
+  /// Create a robo cluster with a base name (e.g., "tags" or "uploads")
+  /// where the tag name is particular string and the specific items are a
+  /// `Vec<(String, Value)>`
+  pub fn new_cluster(
+    base_name: &str,
     tag_name: &str,
-    tags: Vec<(String, serde_json::Value)>,
+    items: Vec<(String, serde_json::Value)>,
   ) -> Result<Arc<RoboticGoat>> {
-    let mut items = vec![];
-    for (name, json) in tags {
+    let mut robo_items = vec![];
+    for (name, json) in items {
       let mut map = match json {
         serde_json::Value::Object(m) => m,
         v => {
@@ -95,29 +99,29 @@ impl RoboticGoat {
       let i = Item {
         identifier,
         connections: BTreeSet::from([
-          (TAG_FROM.to_string(), "tags".to_string()),
+          (TAG_FROM.to_string(), base_name.to_string()),
           (TAG_TO.to_string(), name),
         ]),
         body_mime_type: Some("application/vnd.cc.goatrodeo.tag".to_string()),
         body: Some(body),
       };
-      items.push(i);
+      robo_items.push(i);
     }
     let mut connections = BTreeSet::new();
-    for i in &items {
+    for i in &robo_items {
       connections.insert((TAG_TO.to_string(), i.identifier.to_string()));
     }
     let tags = Item {
-      identifier: "tags".to_string(),
+      identifier: base_name.to_string(),
       connections,
       body_mime_type: None,
       body: None,
     };
-    items.push(tags);
+    robo_items.push(tags);
 
     Ok(RoboticGoat::new(
       tag_name,
-      items,
+      robo_items,
       json!({"date": iso8601_now(), "operation": "synthetic tag"}),
     ))
   }
@@ -137,7 +141,8 @@ async fn test_synthetic() {
     root_ids.push((item.identifier.clone(), json!({"hello": 42})));
   }
 
-  let synth = RoboticGoat::new_tags("test test", root_ids).expect("Should get a synthetic goat");
+  let synth =
+    RoboticGoat::new_cluster("tags", "test test", root_ids).expect("Should get a synthetic goat");
 
   let herd = GoatHerd::new(vec![
     crate::rodeo::member::member_core(cluster_a),
