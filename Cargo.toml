@@ -1,48 +1,33 @@
-[package]
-name = "bigtent"
-version = "0.11.0"
-edition = "2024"
-authors = ["David Pollak <feeder.of.the.bears@gmail.com>"]
-rust-version = "1.85.0"
-description = "An opinionated Graph Database"
-readme = "README.md"
-repository = "https://bigtent.cc"
-license = "Apache 2.0"
-build = "build.rs"
+[workspace]
+resolver = "3"
+members = [
+      "bintent", # database executable
+      "libgoat", # parsing 
+]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace.dependencies]
 
-[lib]
-name = "bigtent"
-path = "src/lib.rs"
-
-[[bin]]
-name = "bigtent"
-path = "src/main.rs"
-
-[dependencies]
+# Fault management
 anyhow = "1.0"
+thiserror = "1.0"
+# todo: investigate whether error/fault separation makes sense here
+
+# Data encoding & parsing
 regex = "1.11"
+bytes = "1.10"
+hex = "0.4.3"
+hex-literal = "1"
+serde_json = "1.0"
+
+# Hashing
 md5 = "0.7.0"
 sha2 = "0.10.8"
-hex = "0.4.3"
-bytes = "1.10"
-hex-literal = "1"
+
+# Kitchen sink
 shellexpand = "3.1"
 chrono = "0.4"
 
-# Web Framework stuff
-url = "2.5"
-serde = { version = "1.0", features = ["std", "derive"] }
-serde_json = "1.0"
-serde_cbor = "0.11.2"
-axum = { version = "0.8", features = ["json", "macros"] }
-axum-streams = { version = "0.21", features = ["json", "csv"] }
-tower-http = { version = "0.6", features = ["full"] }
-futures = "0.3"
-serde-jsonlines = {version = "0.7"}
-
-# Execution stuff
+# Futures runtime & utils
 tokio = { version = "1.44", features = [
     "macros",
     "rt-multi-thread",
@@ -60,23 +45,23 @@ uuid = { version = "1.16", features = ["v4"] }
 flume = { version = "0.11", features = ["spin", "async"] }
 scopeguard = "1.2.0"
 
+url = "2.5"
+serde = { version = "1.0", features = ["std", "derive"] }
+serde_json = "1.0"
+serde_cbor = "0.11.2"
+axum = { version = "0.8", features = ["json", "macros"] }
+axum-streams = { version = "0.21", features = ["json", "csv"] }
+tower-http = { version = "0.6", features = ["full"] }
+futures = "0.3"
+serde-jsonlines = {version = "0.7"}
+
+
 # Logging
 log = "0.4"
 env_logger = "0.11"
 
 utoipa = { version = "5", features = ["axum_extras"] }
 memmap2 = { version = "0.9" }
-[dev-dependencies]
+
+[workspace.dev-dependencies]
 rand = "0.9.1"
-
-[features]
-
-longtest = [] # feature has no explicit dependencies
-
-
-
-[build-dependencies]
-# All features enabled
-vergen = { version = "9", features = ["build", "cargo", "rustc", "si"] }
-vergen-git2 = {version = "1.0.7"}
-

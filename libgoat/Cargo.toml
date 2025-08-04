@@ -1,0 +1,21 @@
+[package]
+name = "libgoat" # alternative name: libtent
+version = "0.11.0"
+edition = "2024"
+authors = [
+    "Aria Stewart ari@spicelabs.io",
+    "Katharina Fey <kookie@spacekookie.de",
+    "David Pollak <feeder.of.the.bears@gmail.com>",	
+]
+rust-version = "1.85.0"
+description = "The backend library for bigtent, the opinionated graph database"
+readme = "README.md"
+repository = "https://bigtent.cc"
+license = "Apache 2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+serde_cbor = { workspace = true }
+hex = { workspace = true }
