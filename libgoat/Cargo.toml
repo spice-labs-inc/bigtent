@@ -9,13 +9,32 @@ authors = [
 ]
 rust-version = "1.85.0"
 description = "The backend library for bigtent, the opinionated graph database"
-readme = "README.md"
+readme = "../README.md"
 repository = "https://bigtent.cc"
 license = "Apache 2.0"
 
 [dependencies]
+clap = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-serde_json = { workspace = true }
-serde_cbor = { workspace = true }
+arc-swap = { workspace = true }
+chrono = { workspace = true }
 hex = { workspace = true }
+log = { workspace = true }
+md5 = { workspace = true }
+serde = { workspace = true }
+serde_cbor = { workspace = true }
+serde_json = { workspace = true }
+serde-jsonlines = { workspace = true }
+scopeguard = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+thousands = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+memmap2 = { workspace = true }
+flume = { workspace = true }
+
+[build-dependencies]
+vergen = { workspace = true }
+vergen-git2 = { workspace = true }

@@ -1,5 +1,5 @@
 use std::{collections::BTreeSet, fmt::Debug, fs::File, io::Write, path::PathBuf, sync::Arc};
-
+use super::{goat_trait::GoatRodeoTrait, index::ItemOffset};
 use crate::{
   item::{Item, TAG_FROM, TAG_TO},
   rodeo::goat_trait::{impl_antialias_for, impl_north_send, impl_stream_flattened_items},
@@ -17,7 +17,7 @@ pub trait ClusterRoboMember {
   fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset>;
   fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item>;
 }
-use super::{goat_trait::GoatRodeoTrait, index::ItemOffset};
+
 #[derive(Debug, Clone)]
 pub struct RoboticGoat {
   name: String,

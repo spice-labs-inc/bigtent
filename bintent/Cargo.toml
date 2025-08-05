@@ -41,13 +41,5 @@ shellexpand = { workspace = true }
 # Web Framework stuff
 
 [features]
-
 longtest = [] # feature has no explicit dependencies
-
-
-
-[build-dependencies]
-# All features enabled
-vergen = { version = "9", features = ["build", "cargo", "rustc", "si"] }
-vergen-git2 = {version = "1.0.7"}
 

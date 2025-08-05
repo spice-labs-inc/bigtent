@@ -18,6 +18,8 @@ bytes = "1.10"
 hex = "0.4.3"
 hex-literal = "1"
 serde_json = "1.0"
+serde = { version = "1.0", features = ["std", "derive"] }
+serde_cbor = "0.11.2"
 
 # Hashing
 md5 = "0.7.0"
@@ -28,13 +30,7 @@ shellexpand = "3.1"
 chrono = "0.4"
 
 # Futures runtime & utils
-tokio = { version = "1.44", features = [
-    "macros",
-    "rt-multi-thread",
-    "io-util",
-    "fs",
-    "net",
-] }
+tokio = { version = "1.44", features = [ "full" ] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = { version = "0.1" }
 signal-hook = "0.3.17"
@@ -43,17 +39,15 @@ clap = { version = "4.5", features = ["derive"] }
 thousands = "0.2.0"
 uuid = { version = "1.16", features = ["v4"] }
 flume = { version = "0.11", features = ["spin", "async"] }
+futures = "0.3"
 scopeguard = "1.2.0"
 
-url = "2.5"
-serde = { version = "1.0", features = ["std", "derive"] }
-serde_json = "1.0"
-serde_cbor = "0.11.2"
+# Web stack
 axum = { version = "0.8", features = ["json", "macros"] }
 axum-streams = { version = "0.21", features = ["json", "csv"] }
+serde-jsonlines = { version = "0.7" }
 tower-http = { version = "0.6", features = ["full"] }
-futures = "0.3"
-serde-jsonlines = {version = "0.7"}
+url = "2.5"
 
 
 # Logging
@@ -62,6 +56,9 @@ env_logger = "0.11"
 
 utoipa = { version = "5", features = ["axum_extras"] }
 memmap2 = { version = "0.9" }
+
+vergen = { version = "9", features = ["build", "cargo", "rustc", "si"] }
+vergen-git2 = {version = "1.0.7"}
 
 [workspace.dev-dependencies]
 rand = "0.9.1"
