@@ -6,6 +6,7 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::{
   collections::{BTreeMap, HashMap, HashSet},
+  hash::Hash,
   io::Read,
   path::PathBuf,
   sync::Arc,

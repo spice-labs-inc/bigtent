@@ -1,0 +1,42 @@
+[package]
+name = "bigtent"
+version = "0.11.0"
+edition = "2024"
+authors = [
+    "Aria Stewart ari@spicelabs.io",
+    "Katharina Fey <kookie@spacekookie.de",
+    "David Pollak <feeder.of.the.bears@gmail.com>",	
+]
+rust-version = "1.85.0"
+description = "An opinionated Graph Database"
+readme = "README.md"
+repository = "https://bigtent.cc"
+license = "Apache 2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+axum = { workspace = true }
+axum-streams = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+hex-literal = { workspace = true }
+libgoat = { workspace = true }
+log = { workspace = true }
+md5 = { workspace = true }
+regex = { workspace = true }
+scopeguard = { workspace = true }
+serde = { workspace = true }
+serde_cbor = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+shellexpand = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tower-http = { workspace = true }
+

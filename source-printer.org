@@ -1,0 +1,25 @@
+#+Title: Bigtent graph database
+
+* Entrypoints
+
+#+INCLUDE: src/lib.rs src rust
+
+#+INCLUDE: src/main.rs src rust
+
+* Goatrodeo structures
+
+** Cluster data
+
+#+INCLUDE: src/rodeo/cluster.rs src rust
+
+** Data files
+
+#+INCLUDE: src/rodeo/data.rs src rust
+
+** Index files
+
+#+INCLUDE: src/rodeo/index.rs src rust
+
+#+INCLUDE: src/rodeo/goat.rs src rust
+
+** 

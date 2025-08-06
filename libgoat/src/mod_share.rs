@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use crate::{
-  rodeo::{goat::GoatRodeoCluster, index::EitherItemOffset},
+  rodeo::{goat::GoatRodeoCluster, index::EitherItemOffset, robo_goat::ClusterRoboMember},
   util::MD5Hash,
 };
+use std::sync::Arc;
 
 pub struct ClusterPos {
   pub cluster: Arc<GoatRodeoCluster>,
@@ -15,7 +15,7 @@ impl ClusterPos {
     if self.pos >= self.len {
       None
     } else {
-      match self.cluster.offset_from_pos(self.pos).await {
+      match self.cluster.offset_from_pos(self.pos) {
         Ok(v) => Some(v),
         _ => None,
       }
@@ -48,7 +48,7 @@ pub async fn next_hash_of_item_to_merge(
       (Some(low), Some(either)) if low > either.hash() => {
         lowest = Some(*either.hash());
         low_clusters.clear();
-        low_clusters.push((either,holder));
+        low_clusters.push((either, holder));
       }
       _ => {}
     }
