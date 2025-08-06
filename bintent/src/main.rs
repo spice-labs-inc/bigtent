@@ -7,8 +7,11 @@ pub extern crate tower_http;
 
 mod server;
 
+use crate::server::run_web_server;
 use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
+use clap::{CommandFactory, Parser};
+use env_logger::Env;
 use libgoat::{
   config::Args,
   fresh_merge::merge_fresh,
@@ -18,9 +21,6 @@ use libgoat::{
     member::{HerdMember, member_core},
   },
 };
-use crate::server::run_web_server;
-use clap::{CommandFactory, Parser};
-use env_logger::Env;
 
 #[cfg(not(test))]
 use log::info; // Use log crate when building application

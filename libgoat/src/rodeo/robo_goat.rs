@@ -1,4 +1,3 @@
-use std::{collections::BTreeSet, fmt::Debug, fs::File, io::Write, path::PathBuf, sync::Arc};
 use super::{goat_trait::GoatRodeoTrait, index::ItemOffset};
 use crate::{
   item::{Item, TAG_FROM, TAG_TO},
@@ -7,6 +6,7 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use serde_json::{Map, json};
+use std::{collections::BTreeSet, fmt::Debug, fs::File, io::Write, path::PathBuf, sync::Arc};
 use thousands::Separable;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::either::Either;
