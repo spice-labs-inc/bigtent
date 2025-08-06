@@ -13,6 +13,9 @@ readme = "../README.md"
 repository = "https://bigtent.cc"
 license = "Apache 2.0"
 
+[features]
+longtest = [] # feature has no explicit dependencies
+
 [dependencies]
 clap = { workspace = true }
 anyhow = { workspace = true }

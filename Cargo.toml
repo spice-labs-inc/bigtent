@@ -6,6 +6,8 @@ members = [
 ]
 
 [workspace.dependencies]
+# Allow other crates from this workspace to access lib components
+libgoat = { path = "libgoat" }
 
 # Fault management
 anyhow = "1.0"
@@ -28,6 +30,7 @@ sha2 = "0.10.8"
 # Kitchen sink
 shellexpand = "3.1"
 chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
 
 # Futures runtime & utils
 tokio = { version = "1.44", features = [ "full" ] }
@@ -35,7 +38,6 @@ tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = { version = "0.1" }
 signal-hook = "0.3.17"
 arc-swap = "1.7.1"
-clap = { version = "4.5", features = ["derive"] }
 thousands = "0.2.0"
 uuid = { version = "1.16", features = ["v4"] }
 flume = { version = "0.11", features = ["spin", "async"] }
@@ -47,14 +49,13 @@ axum = { version = "0.8", features = ["json", "macros"] }
 axum-streams = { version = "0.21", features = ["json", "csv"] }
 serde-jsonlines = { version = "0.7" }
 tower-http = { version = "0.6", features = ["full"] }
+utoipa = { version = "5", features = ["axum_extras"] }
 url = "2.5"
-
 
 # Logging
 log = "0.4"
 env_logger = "0.11"
 
-utoipa = { version = "5", features = ["axum_extras"] }
 memmap2 = { version = "0.9" }
 
 vergen = { version = "9", features = ["build", "cargo", "rustc", "si"] }

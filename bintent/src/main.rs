@@ -1,6 +1,15 @@
+pub extern crate arc_swap;
+pub extern crate axum;
+pub extern crate serde_cbor;
+pub extern crate tokio;
+pub extern crate tokio_util;
+pub extern crate tower_http;
+
+mod server;
+
 use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
-use bigtent::{
+use libgoat::{
   config::Args,
   fresh_merge::merge_fresh,
   rodeo::{
@@ -8,10 +17,11 @@ use bigtent::{
     holder::ClusterHolder,
     member::{HerdMember, member_core},
   },
-  server::run_web_server,
 };
+use crate::server::run_web_server;
 use clap::{CommandFactory, Parser};
 use env_logger::Env;
+
 #[cfg(not(test))]
 use log::info; // Use log crate when building application
 
