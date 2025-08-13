@@ -49,13 +49,13 @@ pub trait GoatRodeoTrait: Send + Sync {
   fn roots(self: Arc<Self>) -> impl Future<Output = Receiver<Item>> + Send;
 
   /// given an identifier, return the associated item
-  fn item_for_identifier(&self, data: &str) -> Result<Option<Item>>;
+  fn item_for_identifier(&self, data: &str) -> Option<Item>;
 
   /// given an MD5 hash, find the item for the hash
-  fn item_for_hash(&self, hash: MD5Hash) -> Result<Option<Item>>;
+  fn item_for_hash(&self, hash: MD5Hash) -> Option<Item>;
 
   /// given an identifier, traverse the graph to find the anti-aliased Item
-  fn antialias_for(self: Arc<Self>, data: &str) -> Result<Option<Item>>;
+  fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item>;
 
   /// create a stream for the flattened items. If any of the `gitoids` cannot
   /// be found, an `Err` is put in the stream and the flattening is completed.
@@ -107,7 +107,7 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
       let mut new_to_find = HashSet::new();
       for identifier in to_find.clone() {
         match the_self.item_for_identifier(&identifier) {
-          Ok(Some(item)) => {
+          Some(item) => {
             // deal with anti-aliasing
             item
               .connections
@@ -150,29 +150,26 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
 pub fn impl_antialias_for<GRT: GoatRodeoTrait + 'static>(
   the_self: Arc<GRT>,
   data: &str,
-) -> Result<Option<Item>> {
-  let mut ret = match the_self.item_for_identifier(data)? {
+) -> Option<Item> {
+  let mut ret = match the_self.item_for_identifier(data) {
     Some(i) => i,
-    _ => return Ok(None),
+    _ => return None,
   };
   while ret.is_alias() {
     match ret.connections.iter().find(|x| x.0.is_alias_to()) {
       Some(v) => {
-        ret = match the_self.item_for_identifier(&v.1)? {
+        ret = match the_self.item_for_identifier(&v.1) {
           Some(v) => v,
-          _ => bail!(
-            "Expecting to traverse from {}, but no aliases found",
-            ret.identifier
-          ),
+          _ => return None,
         };
       }
       None => {
-        bail!("Unexpected situation");
+        return None;
       }
     }
   }
 
-  Ok(Some(ret))
+  Some(ret)
 }
 pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
   the_self: Arc<GRT>,
@@ -213,7 +210,7 @@ pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
       for this_oid in to_search {
         found.insert(this_oid.clone());
         match the_self.item_for_identifier(&this_oid) {
-          Ok(Some(item)) => {
+          Some(item) => {
             let and_then = item.contained_by();
             if purls_only {
               for purl in item.find_purls() {

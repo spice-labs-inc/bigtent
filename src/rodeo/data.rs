@@ -3,6 +3,7 @@ use crate::{
   util::{read_cbor_sync, read_len_and_cbor_sync, read_u32_sync},
 };
 use anyhow::{Result, bail};
+use log::error;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -76,12 +77,24 @@ impl DataFile {
   /// Turns out the async BufReader is freakin' slow, so we're doing synchronous
   /// BufReader. Ideally, we'd put this on a blocking Tokio thread, but, sigh
   /// async closures are not in mainline Rust right now, so "no thread-friendly soup for you!"
-  pub fn read_item_at(&self, pos: usize) -> Result<Item> {
+  pub fn read_item_at(&self, pos: usize) -> Option<Item> {
     let mut my_reader: &[u8] = &self.file[pos..];
 
-    let item_len = read_u32_sync(&mut my_reader)?;
-    let item = read_cbor_sync(&mut my_reader, item_len as usize)?;
-    Ok(item)
+    let item_len = match read_u32_sync(&mut my_reader) {
+      Ok(v) => v,
+      Err(e) => {
+        error!("Failed to read at offset {} err {:?}", pos, e);
+        return None;
+      }
+    };
+    let item = match read_cbor_sync(&mut my_reader, item_len as usize) {
+      Ok(i) => i,
+      Err(e) => {
+        error!("Failed to read CBOR at offset {} error {:?}", pos, e);
+        return None;
+      }
+    };
+    Some(item)
   }
 }
 

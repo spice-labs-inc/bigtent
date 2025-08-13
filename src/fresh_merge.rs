@@ -424,7 +424,7 @@ impl ClusterPos {
       match &self.cache {
         Some(v) => Some(v.clone()),
         None => match self.cluster.offset_from_pos(self.pos) {
-          Ok(v) => {
+          Some(v) => {
             self.cache = Some(v.clone());
             Some(v)
           }

@@ -85,10 +85,10 @@ impl GoatRodeoTrait for GoatHerd {
     impl_north_send(self, gitoids, purls_only, start).await
   }
 
-  fn item_for_identifier(&self, data: &str) -> Result<Option<Item>> {
+  fn item_for_identifier(&self, data: &str) -> Option<Item> {
     let mut items = vec![];
     for grc in &self.herd {
-      match grc.item_for_identifier(data)? {
+      match grc.item_for_identifier(data) {
         None => {}
         Some(item) => {
           items.push(item);
@@ -96,13 +96,13 @@ impl GoatRodeoTrait for GoatHerd {
       }
     }
 
-    Ok(Item::merge_items(items))
+    Item::merge_items(items)
   }
 
-  fn item_for_hash(&self, hash: crate::util::MD5Hash) -> Result<Option<Item>> {
+  fn item_for_hash(&self, hash: crate::util::MD5Hash) -> Option<Item> {
     let mut items = vec![];
     for grc in &self.herd {
-      match grc.item_for_hash(hash)? {
+      match grc.item_for_hash(hash) {
         None => {}
         Some(item) => {
           items.push(item);
@@ -110,10 +110,10 @@ impl GoatRodeoTrait for GoatHerd {
       }
     }
 
-    Ok(Item::merge_items(items))
+    Item::merge_items(items)
   }
 
-  fn antialias_for(self: Arc<Self>, data: &str) -> Result<Option<Item>> {
+  fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item> {
     impl_antialias_for(self, data)
   }
 
@@ -228,7 +228,6 @@ async fn test_purls_and_merge() {
 
   let tags = herd2
     .item_for_identifier("tags")
-    .expect("Should get tags")
     .expect("Should get tags from option");
   let tagged: Vec<String> = tags
     .connections

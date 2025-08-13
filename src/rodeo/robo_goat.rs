@@ -5,7 +5,8 @@ use crate::{
   rodeo::goat_trait::{impl_antialias_for, impl_north_send, impl_stream_flattened_items},
   util::{MD5Hash, iso8601_now, md5hash_str, sha256_for_slice},
 };
-use anyhow::{Result, bail};
+use anyhow::Result;
+use log::error;
 use serde_json::{Map, json};
 use thousands::Separable;
 use tokio::sync::mpsc::Receiver;
@@ -14,8 +15,8 @@ use uuid::Uuid;
 
 pub trait ClusterRoboMember {
   fn name(&self) -> String;
-  fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset>;
-  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item>;
+  fn offset_from_pos(&self, pos: usize) -> Option<ItemOffset>;
+  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Option<Item>;
 }
 use super::{goat_trait::GoatRodeoTrait, index::ItemOffset};
 #[derive(Debug, Clone)]
@@ -31,20 +32,22 @@ impl ClusterRoboMember for RoboticGoat {
   fn name(&self) -> String {
     self.name.clone()
   }
-  fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
+  fn offset_from_pos(&self, pos: usize) -> Option<ItemOffset> {
     if pos >= self.items.len() {
-      bail!("Offset out of bounds {} vs. {}", pos, self.items.len());
+      error!("Offset out of bounds {} vs. {}", pos, self.items.len());
+      return None;
     }
 
-    Ok(self.offsets[pos])
+    Some(self.offsets[pos])
   }
-  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item> {
+  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Option<Item> {
     let pos = item_offset.loc.0;
     if pos >= self.items.len() {
-      bail!("Invalid offset {}", pos);
+      error!("Invalid offset {}", pos);
+      return None;
     }
 
-    Ok(self.items[pos].clone())
+    Some(self.items[pos].clone())
   }
 }
 
@@ -151,7 +154,6 @@ async fn test_synthetic() {
 
   let tags = herd
     .item_for_identifier("tags")
-    .expect("Should get tags")
     .expect("Should get tags from option");
 
   let tagged: Vec<String> = tags
@@ -211,23 +213,20 @@ impl GoatRodeoTrait for RoboticGoat {
     rx
   }
 
-  fn item_for_identifier(&self, data: &str) -> Result<Option<Item>> {
+  fn item_for_identifier(&self, data: &str) -> Option<Item> {
     self.item_for_hash(md5hash_str(data))
   }
 
-  fn item_for_hash(&self, hash: MD5Hash) -> Result<Option<Item>> {
+  fn item_for_hash(&self, hash: MD5Hash) -> Option<Item> {
     let found = match self.offsets.binary_search_by_key(&hash, |v| v.hash) {
       Ok(v) => v,
-      Err(_) => bail!("Key not found: {:?} during binary search in offsets", hash),
+      Err(_) => return None,
     };
-    let res = match self.item_from_item_offset(&self.offsets[found]) {
-      Ok(v) => Some(v),
-      Err(_) => None,
-    };
-    Ok(res)
+    let res = self.item_from_item_offset(&self.offsets[found]);
+    res
   }
 
-  fn antialias_for(self: Arc<Self>, data: &str) -> Result<Option<Item>> {
+  fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item> {
     impl_antialias_for(self, data)
   }
 
