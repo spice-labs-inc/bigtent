@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
+use log::error;
 use memmap2::Mmap;
 use serde_jsonlines::json_lines;
 use std::{
@@ -144,25 +145,25 @@ impl GoatRodeoTrait for GoatRodeoCluster {
     impl_north_send(self, gitoids, purls_only, start).await
   }
 
-  fn item_for_identifier(&self, data: &str) -> Result<Option<Item>> {
+  fn item_for_identifier(&self, data: &str) -> Option<Item> {
     let md5_hash = md5hash_str(data);
     self.item_for_hash(md5_hash)
   }
 
-  fn item_for_hash(&self, hash: MD5Hash) -> Result<Option<Item>> {
-    match self.hash_to_item_offset(hash)? {
-      Some(eo) => Ok(Some(self.item_from_index_loc(&eo.loc)?)),
-      None => Ok(None),
+  fn item_for_hash(&self, hash: MD5Hash) -> Option<Item> {
+    match self.hash_to_item_offset(hash) {
+      Some(eo) => self.item_from_index_loc(&eo.loc),
+      None => None,
     }
   }
 
-  fn antialias_for(self: Arc<Self>, data: &str) -> Result<Option<Item>> {
+  fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item> {
     impl_antialias_for(self, data)
   }
 
   fn has_identifier(&self, identifier: &str) -> bool {
     match self.identifier_to_item_offset(identifier) {
-      Ok(Some(_)) => true,
+      Some(_) => true,
       _ => false,
     }
   }
@@ -203,8 +204,8 @@ impl GoatRodeoTrait for GoatRodeoCluster {
 
     let _ = tokio::spawn(async move {
       for offset in 0..self.number_of_items {
-        if let Ok(item_offset) = self.offset_from_pos(offset) {
-          if let Ok(item) = self.item_from_item_offset(&item_offset) {
+        if let Some(item_offset) = self.offset_from_pos(offset) {
+          if let Some(item) = self.item_from_item_offset(&item_offset) {
             if item.is_root_item() {
               let _ = tx.send(item).await;
             }
@@ -222,17 +223,19 @@ impl ClusterRoboMember for GoatRodeoCluster {
     self.name.clone()
   }
 
-  fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
+  fn offset_from_pos(&self, pos: usize) -> Option<ItemOffset> {
     if self.load_index && self.index.load().is_some() {
       match &**self.index.load() {
         Some(index) => {
           if pos < index.len() {
-            Ok(index[pos])
+            Some(index[pos])
           } else {
             panic!("Pos {} outside index len {}", pos, index.len());
           }
         }
-        None => bail!("Expected to load the index and failed"),
+        None => {
+          return None;
+        }
       }
     } else {
       let byte_pos = pos * 32;
@@ -241,22 +244,33 @@ impl ClusterRoboMember for GoatRodeoCluster {
           match self.index_files.get(&index_hash.index_file) {
             Some(index) => {
               let relative_byte_pos = byte_pos - index_hash.start; // get the item
-              Ok(index.read_index_at_byte_offset(relative_byte_pos)?.into())
+              match index.read_index_at_byte_offset(relative_byte_pos) {
+                Ok(v) => return Some(v),
+                Err(e) => {
+                  error!("Unable to read at {} error {:?}", relative_byte_pos, e);
+                  return None;
+                }
+              }
             }
-            None => bail!(
-              "Pos {} lead to index file {:x} which can't be found",
-              pos,
-              index_hash.index_file
-            ),
+            None => {
+              error!(
+                "Pos {} lead to index file {:x} which can't be found",
+                pos, index_hash.index_file
+              );
+              return None;
+            }
           }
         }
-        None => bail!("Pos {} outside index len {}", pos, self.number_of_items),
+        None => {
+          error!("Pos {} outside index len {}", pos, self.number_of_items);
+          return None;
+        }
       }
     }
   }
 
-  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Result<Item> {
-    Ok(self.item_from_index_loc(&item_offset.loc)?)
+  fn item_from_item_offset(&self, item_offset: &ItemOffset) -> Option<Item> {
+    self.item_from_index_loc(&item_offset.loc)
   }
 }
 impl GoatRodeoCluster {
@@ -663,21 +677,21 @@ impl GoatRodeoCluster {
   /// given an identifier, convert it into a hash and then look up the hash in the
   /// index. This is a fast operation as it's just a binary search of the index which is
   /// in memory
-  pub fn identifier_to_item_offset(&self, identifier: &str) -> Result<Option<ItemOffset>> {
+  pub fn identifier_to_item_offset(&self, identifier: &str) -> Option<ItemOffset> {
     let hash = md5hash_str(identifier);
-    Ok(self.hash_to_item_offset(hash)?)
+    self.hash_to_item_offset(hash)
   }
 
   /// from a hash, find the ItemOffset
-  pub fn hash_to_item_offset(&self, hash: MD5Hash) -> Result<Option<ItemOffset>> {
+  pub fn hash_to_item_offset(&self, hash: MD5Hash) -> Option<ItemOffset> {
     if self.load_index && self.index.load().is_some() {
       match &**self.index.load() {
-        Some(index) => Ok(find_item_offset(hash, index)),
-        None => bail!("Expected to load the index and failed"),
+        Some(index) => find_item_offset(hash, index),
+        None => return None,
       }
     } else {
       if self.number_of_items() == 0 {
-        return Ok(None);
+        return None;
       }
       let mut low = 0;
       let mut hi = self.number_of_items() - 1;
@@ -687,24 +701,24 @@ impl GoatRodeoCluster {
         let entry = self.offset_from_pos(mid)?;
         match entry.hash.cmp(&hash) {
           Ordering::Less => low = mid + 1,
-          Ordering::Equal => return Ok(Some(entry.clone())),
+          Ordering::Equal => return Some(entry.clone()),
           Ordering::Greater => hi = mid - 1,
         }
       }
 
-      Ok(None)
+      None
     }
   }
 
   /// given a hash, find an item
-  pub fn item_for_file_and_offset(&self, file_hash: u64, offset: usize) -> Result<Item> {
+  pub fn item_for_file_and_offset(&self, file_hash: u64, offset: usize) -> Option<Item> {
     let data_files = &self.data_files;
     let data_file = data_files.get(&file_hash);
     match data_file {
       Some(df) => {
         let item = df.read_item_at(offset)?;
 
-        Ok(item)
+        Some(item)
       }
       None => {
         panic!("Couldn't find file for hash {:x}", file_hash);
@@ -712,8 +726,8 @@ impl GoatRodeoCluster {
     }
   }
 
-  pub fn item_from_index_loc(&self, index_loc: &ItemLoc) -> Result<Item> {
-    Ok(self.item_for_file_and_offset(index_loc.get_file_hash(), index_loc.get_offset())?)
+  pub fn item_from_index_loc(&self, index_loc: &ItemLoc) -> Option<Item> {
+    Some(self.item_for_file_and_offset(index_loc.get_file_hash(), index_loc.get_offset())?)
   }
 }
 
@@ -750,7 +764,6 @@ async fn test_antialias() {
   for v in index.iter() {
     let item = cluster
       .item_for_hash(*crate::rodeo::index::HasHash::hash(v))
-      .expect("Should get an item")
       .expect("And it should be a Some");
     if item.is_alias() {
       aliases.push(item);
@@ -764,8 +777,7 @@ async fn test_antialias() {
     let new_item = cluster
       .clone()
       .antialias_for(&ai.identifier)
-      .expect("Expect to get the antialiased thing")
-      .expect("And it's not a None");
+      .expect("Expect to get the antialiased thing");
     assert!(!new_item.is_alias(), "Expecting a non-aliased thing");
     assert!(
       new_item
@@ -838,7 +850,6 @@ async fn test_generated_cluster() {
       for i in complete_index.deref() {
         cluster
           .hash_to_item_offset(*crate::rodeo::index::HasHash::hash(i))
-          .unwrap()
           .unwrap();
       }
     }
@@ -1008,7 +1019,6 @@ async fn test_generated_cluster_no_index() {
           .expect("Should be able to get the ItemOffset");
         cluster
           .hash_to_item_offset(*crate::rodeo::index::HasHash::hash(&offset))
-          .unwrap()
           .unwrap();
       }
     }

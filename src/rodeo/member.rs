@@ -32,14 +32,14 @@ impl ClusterRoboMember for HerdMember {
     }
   }
 
-  fn offset_from_pos(&self, pos: usize) -> Result<ItemOffset> {
+  fn offset_from_pos(&self, pos: usize) -> Option<ItemOffset> {
     match self {
       HerdMember::Robo(goat_synth) => goat_synth.offset_from_pos(pos),
       HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.offset_from_pos(pos),
     }
   }
 
-  fn item_from_item_offset(&self, offset: &ItemOffset) -> Result<Item> {
+  fn item_from_item_offset(&self, offset: &ItemOffset) -> Option<Item> {
     match self {
       HerdMember::Robo(goat_synth) => goat_synth.item_from_item_offset(offset),
       HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.item_from_item_offset(offset),
@@ -105,21 +105,21 @@ impl GoatRodeoTrait for HerdMember {
     }
   }
 
-  fn item_for_identifier(&self, data: &str) -> Result<Option<Item>> {
+  fn item_for_identifier(&self, data: &str) -> Option<Item> {
     match self {
       HerdMember::Robo(goat_synth) => goat_synth.item_for_identifier(data),
       HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.item_for_identifier(data),
     }
   }
 
-  fn item_for_hash(&self, hash: MD5Hash) -> Result<Option<Item>> {
+  fn item_for_hash(&self, hash: MD5Hash) -> Option<Item> {
     match self {
       HerdMember::Robo(goat_synth) => goat_synth.item_for_hash(hash),
       HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.item_for_hash(hash),
     }
   }
 
-  fn antialias_for(self: Arc<Self>, data: &str) -> Result<Option<Item>> {
+  fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item> {
     match &*self {
       HerdMember::Robo(goat_synth) => goat_synth.clone().antialias_for(data),
       HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.clone().antialias_for(data),

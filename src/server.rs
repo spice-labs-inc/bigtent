@@ -36,7 +36,7 @@ async fn stream_items<GRT: GoatRodeoTrait + 'static>(
   tokio::spawn(async move {
     for item_id in items {
       match rodeo.get_cluster().item_for_identifier(&item_id) {
-        Ok(Some(i)) => {
+        Some(i) => {
           if !mtx.is_closed() {
             let _ = mtx.send(i).await;
           }
@@ -125,7 +125,7 @@ async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
   let ret = rodeo.get_cluster().item_for_identifier(&to_find);
 
   match ret {
-    Ok(Some(item)) => Ok(Json(item.to_json())),
+    Some(item) => Ok(Json(item.to_json())),
     _ => Err((
       StatusCode::NOT_FOUND,
       format!("No item found for key {}", to_find),
@@ -143,7 +143,7 @@ async fn serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
   let ret = rodeo.get_cluster().antialias_for(&to_find);
 
   match ret {
-    Ok(Some(item)) => Ok(Json(item.to_json())),
+    Some(item) => Ok(Json(item.to_json())),
     _ => Err((
       StatusCode::NOT_FOUND,
       format!("No item found for key {}", to_find),
