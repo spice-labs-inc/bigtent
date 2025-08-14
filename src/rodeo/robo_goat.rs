@@ -8,7 +8,6 @@ use crate::{
 use anyhow::Result;
 use log::error;
 use serde_json::{Map, json};
-use thousands::Separable;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::either::Either;
 use uuid::Uuid;
@@ -92,27 +91,39 @@ impl RoboticGoat {
       map.insert("tag".to_string(), tag_name.into());
       map.insert("date".to_string(), iso8601_now().into());
 
-      let ser = serde_cbor::to_vec(&serde_json::Value::separate_with_spaces(
-        &serde_json::Value::Object(map),
-      ))?;
+      // there's gotta be a better way to convert from serde_json to serde_cbor///
+      let ser = serde_cbor::to_vec(&serde_json::Value::Object(map))?;
 
-      let identifier = hex::encode(&sha256_for_slice(&ser));
+      let body: serde_cbor::Value = serde_cbor::from_reader(&ser[..])?;
 
-      let body: serde_cbor::Value = serde_cbor::from_reader(&ser[..])?; // serde_cbor::Value::deserialize(deserializer)json.into();
+      let identifier = format!("tag:sha256:{}", hex::encode(&sha256_for_slice(&ser)));
+
       let i = Item {
-        identifier,
+        identifier: identifier.clone(),
         connections: BTreeSet::from([
           (TAG_FROM.to_string(), base_name.to_string()),
-          (TAG_TO.to_string(), name),
+          (TAG_TO.to_string(), name.clone()),
         ]),
         body_mime_type: Some("application/vnd.cc.goatrodeo.tag".to_string()),
         body: Some(body),
       };
       robo_items.push(i);
+      // create the "back link"
+      robo_items.push(Item {
+        identifier: name,
+        connections: BTreeSet::from([(TAG_FROM.to_string(), identifier)]),
+        body_mime_type: None,
+        body: None,
+      });
     }
     let mut connections = BTreeSet::new();
+
+    // backlinks from the tags to the root tag
     for i in &robo_items {
-      connections.insert((TAG_TO.to_string(), i.identifier.to_string()));
+      // only for the actual tags, not for the synthetic back-link
+      if i.body.is_some() {
+        connections.insert((TAG_TO.to_string(), i.identifier.to_string()));
+      }
     }
     let tags = Item {
       identifier: base_name.to_string(),
@@ -144,6 +155,12 @@ async fn test_synthetic() {
     root_ids.push((item.identifier.clone(), json!({"hello": 42})));
   }
 
+  assert!(
+    root_ids.len() == 1,
+    "Expected 1 root ids, got {}",
+    root_ids.len()
+  );
+
   let synth =
     RoboticGoat::new_cluster("tags", "test test", root_ids).expect("Should get a synthetic goat");
 
@@ -164,6 +181,26 @@ async fn test_synthetic() {
     .collect();
 
   assert_eq!(tagged.len(), 1, "Expecting 1 tag, got {:?}", tagged);
+
+  for t in &tagged {
+    let the_tag = herd.item_for_identifier(&t).expect("Get tag");
+    let the_tag_id = &the_tag.identifier;
+    for (t, v) in &the_tag.connections {
+      if t.is_tag_to() {
+        let tagged_item = herd
+          .item_for_identifier(v)
+          .expect(&format!("Should load {}", v));
+        assert_eq!(
+          1,
+          tagged_item
+            .connections
+            .iter()
+            .filter(|c| c.0.is_tag_from() && the_tag_id == &c.1)
+            .count()
+        );
+      }
+    }
+  }
 }
 
 impl GoatRodeoTrait for RoboticGoat {
