@@ -1,9 +1,9 @@
 [package]
 name = "bigtent"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2024"
 authors = ["David Pollak <feeder.of.the.bears@gmail.com>"]
-rust-version = "1.85.0"
+rust-version = "1.86.0"
 description = "An opinionated Graph Database"
 readme = "README.md"
 repository = "https://bigtent.cc"

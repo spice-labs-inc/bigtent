@@ -146,7 +146,7 @@ async fn test_synthetic() {
   use super::{goat::GoatRodeoCluster, goat_herd::GoatHerd};
   use crate::item::EdgeType;
   let path = PathBuf::from("test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc");
-  let cluster_a = GoatRodeoCluster::new(&path.parent().unwrap().to_path_buf(), &path, false)
+  let cluster_a = GoatRodeoCluster::new(&path, false)
     .await
     .expect("Should get first cluster");
   let mut roots = cluster_a.clone().roots().await;
