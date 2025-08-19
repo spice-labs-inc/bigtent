@@ -29,7 +29,7 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
     );
     let index_build_start = Instant::now();
     let cluster = Arc::new(ArcSwap::new(
-      GoatRodeoCluster::new(&dir_path, &whole_path, args.pre_cache_index()).await?,
+      GoatRodeoCluster::new(&whole_path, args.pre_cache_index()).await?,
     ));
 
     let cluster_holder = ClusterHolder::new_from_cluster(cluster, Some(args.clone())).await?;

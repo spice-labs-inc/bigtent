@@ -24,8 +24,8 @@ use tokio::{
 use crate::{
   item::Item,
   util::{
-    MD5Hash, byte_slice_to_u63, find_common_root_dir, hex_to_u64, is_child_dir, md5hash_str,
-    read_len_and_cbor, read_u32, sha256_for_reader,
+    MD5Hash, byte_slice_to_u63, find_common_root_dir, hex_to_u64, md5hash_str, read_len_and_cbor,
+    read_u32, sha256_for_reader,
   },
 };
 #[cfg(not(test))]
@@ -96,7 +96,6 @@ impl IndexOffset {
 pub struct GoatRodeoCluster {
   envelope: ClusterFileEnvelope,
   cluster_file_hash: u64,
-  cluster_root_path: PathBuf,
   cluster_path: PathBuf,
   data_files: HashMap<u64, Arc<DataFile>>,
   index_files: HashMap<u64, Arc<IndexFile>>,
@@ -230,7 +229,13 @@ impl ClusterRoboMember for GoatRodeoCluster {
           if pos < index.len() {
             Some(index[pos])
           } else {
-            panic!("Pos {} outside index len {}", pos, index.len());
+            error!(
+              "for {:?} in offset_from_pos: Pos {} outside index len {}",
+              self.cluster_path,
+              pos,
+              index.len()
+            );
+            return None;
           }
         }
         None => {
@@ -254,15 +259,18 @@ impl ClusterRoboMember for GoatRodeoCluster {
             }
             None => {
               error!(
-                "Pos {} lead to index file {:x} which can't be found",
-                pos, index_hash.index_file
+                "for {:?} in offset_from_pos: Pos {} lead to index file {:x} which can't be found",
+                self.cluster_path, pos, index_hash.index_file
               );
               return None;
             }
           }
         }
         None => {
-          error!("Pos {} outside index len {}", pos, self.number_of_items);
+          error!(
+            "for {:?} in offset_from_pos 2: Pos {} outside index len {}",
+            self.cluster_path, pos, self.number_of_items
+          );
           return None;
         }
       }
@@ -289,26 +297,9 @@ impl GoatRodeoCluster {
     &self.index_files
   }
 
-  /// When clusters are merged, they must share a root path
-  /// return the root path for the cluster
-  pub fn get_root_path(&self) -> PathBuf {
-    self.cluster_root_path.clone()
-  }
-
-  pub async fn new(
-    root_dir: &PathBuf,
-    cluster_path: &PathBuf,
-    pre_cache_index: bool,
-  ) -> Result<Arc<GoatRodeoCluster>> {
+  pub async fn new(cluster_path: &PathBuf, pre_cache_index: bool) -> Result<Arc<GoatRodeoCluster>> {
     let load_index = pre_cache_index;
     let start = Instant::now();
-    if !is_child_dir(root_dir, cluster_path)? {
-      bail!(
-        "The cluster path {:?} must be in the root dir {:?}",
-        cluster_path,
-        root_dir
-      );
-    }
     let file_path = cluster_path.clone();
     let file_name = match file_path.file_name().map(|e| e.to_str()).flatten() {
       Some(n) => n.to_string(),
@@ -363,11 +354,16 @@ impl GoatRodeoCluster {
     //let mut index_files = HashMap::new();
     let mut indexed_hashes: HashSet<u64> = HashSet::new();
 
+    let parent = cluster_path
+      .parent()
+      .ok_or(anyhow::anyhow!("Couldn't get parent directory"))?
+      .to_path_buf();
+
     let mut index_vec = vec![];
     let mut number_of_items = 0usize;
     for index_file in &env.index_files {
       let the_file = IndexFile::new(
-        &root_dir,
+        &parent,
         *index_file,
         false, /*TODO -- optional testing of index hash */
       )
@@ -384,7 +380,7 @@ impl GoatRodeoCluster {
 
     let mut data_files = HashMap::new();
     for data_file in &env.data_files {
-      let the_file = Arc::new(DataFile::new(&root_dir, *data_file).await?);
+      let the_file = Arc::new(DataFile::new(&parent, *data_file).await?);
       data_files.insert(*data_file, the_file);
     }
 
@@ -413,7 +409,6 @@ impl GoatRodeoCluster {
 
     let ret = Arc::new(GoatRodeoCluster {
       envelope: env,
-      cluster_root_path: root_dir.clone(),
       cluster_path: cluster_path.clone(),
       data_files,
       index_files: IndexFile::vec_of_index_files_to_hash_lookup(&index_vec),
@@ -659,7 +654,7 @@ impl GoatRodeoCluster {
       let file_type = file.file_type().await?;
 
       if file_type.is_file() && file_extn == Some(GOAT_RODEO_CLUSTER_FILE_SUFFIX.into()) {
-        let walker = GoatRodeoCluster::new(&path, &file.path(), pre_cache_index).await?;
+        let walker = GoatRodeoCluster::new(&file.path(), pre_cache_index).await?;
         ret.push(walker)
       } else if file_type.is_dir() {
         let mut more = Box::pin(GoatRodeoCluster::cluster_files_in_dir(
@@ -942,7 +937,7 @@ async fn test_roots() {
   for (file, cnt) in to_test {
     let path = PathBuf::from(file);
     println!("Getting cluster {}", file);
-    let cluster = GoatRodeoCluster::new(&path.parent().unwrap().to_path_buf(), &path, false)
+    let cluster = GoatRodeoCluster::new(&path, false)
       .await
       .expect("Should get cluster");
     println!("Goat cluster {}", file);
