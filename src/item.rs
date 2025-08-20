@@ -340,11 +340,11 @@ impl Item {
   //   self.reference = Item::NOOP;
   // }
 
-  /// get all the connections that are either `contained_by_up` or `is_to_right`
+  /// get all the connections that are either `contained_by_up` or `is_alias_to` or `is_tag_from`
   pub fn contained_by(&self) -> HashSet<String> {
     let mut ret = HashSet::new();
     for edge in self.connections.iter() {
-      if edge.0.is_to() || edge.0.is_up() {
+      if edge.0.is_alias_to() || edge.0.is_tag_from() || edge.0.is_up() {
         ret.insert(edge.1.clone());
       }
     }
