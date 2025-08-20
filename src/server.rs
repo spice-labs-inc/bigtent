@@ -85,7 +85,7 @@ async fn serve_bulk<GRT: GoatRodeoTrait + 'static>(
 
 /// compute the package from either uri which will include query parameters (which are part of)
 /// a pURL or the path that was passed in
-fn compute_package(query: &HashMap<String, String>, maybe_gitoid: &str, uri: &Uri) -> String {
+pub fn compute_package(query: &HashMap<String, String>, maybe_gitoid: &str, uri: &Uri) -> String {
   if maybe_gitoid.len() == uri.path().len() || maybe_gitoid.len() == uri.path().len() - 1 {
     if let Some(value) = query.get("identifier") {
       return value.clone();
