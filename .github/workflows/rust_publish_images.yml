@@ -6,6 +6,7 @@ env:
 on:
   push:
     tags: [ 'v*.*.*' ]  # Trigger only on semantic version tags
+  workflow_dispatch: {}  # Manual trigger for testing
 
 jobs:
   check-version:
