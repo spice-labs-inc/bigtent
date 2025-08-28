@@ -24,7 +24,7 @@ jobs:
         uses: spice-labs-inc/action-check-version@main
 
   push_to_dockerhub:
-    name: Build and (conditionally) Push Docker Image
+    name: Build, Scan, and (conditionally) Push Docker Image
     runs-on: ubuntu-24.04
     needs: check-version
 
@@ -57,31 +57,19 @@ jobs:
       - name: Build project
         run: cargo build --release
 
-      # --- Minimal guard: publish only if semver tag AND commit is on main ---
-      - name: Compute publish guard
-        id: guard
+      - name: Check if tag commit is on main
+        id: is_main
         shell: bash
         run: |
-          IS_SEMVER=false
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            IS_SEMVER=true
-          fi
-
           git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
           if git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
-            IS_ON_MAIN=true
+            echo "result=true" >> "$GITHUB_OUTPUT"
           else
-            IS_ON_MAIN=false
-          fi
-
-          if [[ "$IS_SEMVER" == true && "$IS_ON_MAIN" == true ]]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "result=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Log in to Docker Hub
-        if: steps.guard.outputs.publish == 'true'
+        if: ${{ github.ref_type == 'tag' && (github.ref_name matches '^v[0-9]+\\.[0-9]+\\.[0-9]+$') && steps.is_main.outputs.result == 'true' }}
         uses: docker/login-action@v3
         with:
           username: "${{ secrets.DOCKER_USERNAME }}"
@@ -101,13 +89,21 @@ jobs:
           flavor: |
             latest=auto
 
-      - name: Build and Push Docker image (conditional push)
+      - name: Build Docker image (always build, conditionally push)
         uses: docker/build-push-action@v6
         with:
           platforms: ${{ env.PLATFORMS }}
           context: .
-          push: ${{ steps.guard.outputs.publish == 'true' }}  # <-- only pushes when allowed
+          push: ${{ github.ref_type == 'tag' && (github.ref_name matches '^v[0-9]+\\.[0-9]+\\.[0-9]+$') && steps.is_main.outputs.result == 'true' }}
           provenance: mode=max
           sbom: true
           tags: "${{ steps.meta.outputs.tags }}"
           labels: "${{ steps.meta.outputs.labels }}"
+          outputs: type=oci,dest=artifacts/docker/bigtent-${{ github.sha }}.oci.tar
+
+      - name: Scan & upload ADG (Docker artifacts)
+        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
+        with:
+          file_path: artifacts/docker
+          spice_pass: ${{ secrets.SPICE_PASS }}
+          tag: docker-${{ github.ref_name }}
