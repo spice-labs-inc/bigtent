@@ -13,18 +13,17 @@ jobs:
     name: Ensure GitHub Release & Cargo.toml Version Numbers Match
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check Cargo Version Matches Tag
+      - name: Check Cargo version matches tag
         uses: spice-labs-inc/action-check-version@main
 
-  push_to_dockerhub:
-    name: Build, Scan, and (conditionally) Push Docker Image
+  build_scan_publish:
+    name: Build, Scan, Save Artifacts, Conditionally Push
     runs-on: ubuntu-24.04
     needs: check-version
 
@@ -34,19 +33,19 @@ jobs:
       id-token: write
 
     steps:
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set Up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          platforms: ${{ env.PLATFORMS }}
-
       - name: Checkout with LFS and full history
         uses: actions/checkout@v4
         with:
           lfs: true
           fetch-depth: 0  # needed for main ancestry check
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: ${{ env.PLATFORMS }}
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,8 +53,16 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build project
+      - name: Build project (Rust)
         run: cargo build --release
+
+      - name: Save binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bigtent-binary-${{ github.sha }}
+          path: target/release/bigtent
+          if-no-files-found: error
+          retention-days: 7
 
       # Guard 1: is the tagged commit on main?
       - name: Check if tag commit is on main
@@ -80,7 +87,18 @@ jobs:
             echo "result=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Log in to Docker Hub
+      # Compute a friendly scan tag for ADG uploads
+      - name: Compute scan tag
+        id: scantag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Docker Hub (only for publish)
         if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
         uses: docker/login-action@v3
         with:
@@ -101,7 +119,10 @@ jobs:
           flavor: |
             latest=auto
 
-      - name: Build image (always), push only when allowed, and export OCI tar for scans
+      - name: Prepare artifact directories
+        run: mkdir -p artifacts/docker
+
+      - name: Build image (always), push only when allowed, and export OCI tar
         uses: docker/build-push-action@v6
         with:
           platforms: ${{ env.PLATFORMS }}
@@ -113,10 +134,27 @@ jobs:
           labels: "${{ steps.meta.outputs.labels }}"
           outputs: type=oci,dest=artifacts/docker/bigtent-${{ github.sha }}.oci.tar
 
-      # Spice Labs CLI scan and upload (always)
-      - name: Scan & upload ADG (Docker artifacts)
+      - name: Upload OCI tar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-image-${{ github.sha }}
+          path: artifacts/docker/*.oci.tar
+          if-no-files-found: error
+          retention-days: 7
+
+      # --- Spice Labs CLI scans: scan ALL artifacts produced in this run ---
+      # 1) Scan the exported OCI image tar(s)
+      - name: Scan & upload ADG (Docker OCI tars)
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
           file_path: artifacts/docker
           spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: docker-${{ github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/') && github.ref_name || format('sha-{0}', github.sha) }}
+          tag: docker-${{ steps.scantag.outputs.value }}
+
+      # 2) Scan the compiled binaries in target/release
+      - name: Scan & upload ADG (Rust target/release)
+        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
+        with:
+          file_path: target/release
+          spice_pass: ${{ secrets.SPICE_PASS }}
+          tag: binary-${{ steps.scantag.outputs.value }}
