@@ -123,7 +123,7 @@ jobs:
             latest=auto
 
       - name: Prepare artifact directories
-        run: mkdir -p "${{ github.workspace }}/artifacts/docker"
+        run: mkdir -p artifacts/docker
 
       - name: Build image (always), push only when allowed, and export OCI tar
         uses: docker/build-push-action@v6
@@ -135,13 +135,14 @@ jobs:
           sbom: true
           tags: "${{ steps.meta.outputs.tags }}"
           labels: "${{ steps.meta.outputs.labels }}"
+          # Buildx requires an ABSOLUTE path for dest:
           outputs: type=oci,dest=${{ github.workspace }}/artifacts/docker/bigtent-${{ github.sha }}.oci.tar
 
       - name: Upload OCI tar artifact
         uses: actions/upload-artifact@v4
         with:
           name: oci-image-${{ github.sha }}
-          path: ${{ github.workspace }}/artifacts/docker/*.oci.tar
+          path: artifacts/docker/*.oci.tar
           if-no-files-found: error
           retention-days: 7
 
@@ -150,7 +151,7 @@ jobs:
       - name: Scan & upload ADG (Docker OCI tars)
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
-          file_path: ${{ github.workspace }}/artifacts/docker
+          file_path: artifacts/docker
           spice_pass: ${{ secrets.SPICE_PASS }}
           tag: docker-${{ steps.scantag.outputs.value }}
 
