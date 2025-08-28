@@ -1,18 +1,19 @@
-name: Publish Rust Container Image (Test)
+name: Publish Rust Container Image
 
 env:
-  PLATFORMS: linux/amd64,linux/arm64
+  PLATFORMS: linux/amd64, linux/arm64
 
 on:
   push:
-    tags: [ 'v*.*.*' ]
-  workflow_dispatch: {}
+    tags: [ 'v*.*.*' ]  # Trigger only on semantic version tags
+  workflow_dispatch: {}  # Manual trigger
 
 jobs:
   check-version:
     name: Ensure GitHub Release & Cargo.toml Version Numbers Match
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -22,9 +23,10 @@ jobs:
       - name: Check Cargo Version Matches Tag
         uses: spice-labs-inc/action-check-version@main
 
-  build_and_scan:
-    name: Build, Export/Push Image per Rules, Always Run CLI Scans
+  push_to_dockerhub:
+    name: Build and (conditionally) Push Docker Image
     runs-on: ubuntu-24.04
+    needs: check-version
 
     permissions:
       contents: read
@@ -32,19 +34,19 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          lfs: true
-          fetch-depth: 0
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
+      - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           platforms: ${{ env.PLATFORMS }}
+
+      - name: Checkout with LFS and full history
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0  # needed for main ancestry check
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -52,94 +54,60 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build project (Rust)
+      - name: Build project
         run: cargo build --release
 
-      - name: Compute build tag + publish guard
+      # --- Minimal guard: publish only if semver tag AND commit is on main ---
+      - name: Compute publish guard
         id: guard
         shell: bash
         run: |
-          # Derive image/tag used throughout
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            TAG="${GITHUB_REF_NAME}"
-          else
-            TAG="test-${GITHUB_SHA::7}"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-
-          # Is the ref a SemVer tag vX.Y.Z?
+          IS_SEMVER=false
           if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "is_semver_tag=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_semver_tag=false" >> "$GITHUB_OUTPUT"
+            IS_SEMVER=true
           fi
 
-          # Is the current commit reachable from origin/main?
           git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
           if git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
-            echo "is_on_main=true" >> "$GITHUB_OUTPUT"
+            IS_ON_MAIN=true
           else
-            echo "is_on_main=false" >> "$GITHUB_OUTPUT"
+            IS_ON_MAIN=false
           fi
 
-          # Publish only when both are true
-          if [[ "$(cat "$GITHUB_OUTPUT")" == *"is_semver_tag=true"* && "$(cat "$GITHUB_OUTPUT")" == *"is_on_main=true"* ]]; then
+          if [[ "$IS_SEMVER" == true && "$IS_ON_MAIN" == true ]]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Prepare artifact directories
-        run: mkdir -p artifacts/docker
-
-      # Login only if we are going to publish
-      - name: Docker Hub login
+      - name: Log in to Docker Hub
         if: steps.guard.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: "${{ secrets.DOCKER_USERNAME }}"
+          password: "${{ secrets.DOCKER_TOKEN }}"
 
-      # Non-publish path: export OCI tar (no push)
-      - name: Build Docker image to OCI tar (no push)
-        if: steps.guard.outputs.publish != 'true'
-        uses: docker/build-push-action@v6
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          platforms: ${{ env.PLATFORMS }}
-          context: .
-          push: false
-          tags: spicelabs/bigtent:${{ steps.guard.outputs.tag }}
-          outputs: type=oci,dest=artifacts/docker/bigtent-${{ steps.guard.outputs.tag }}.oci.tar
-
-      # Publish path: push image to registry (no tar export here)
-      - name: Build and push Docker image (publish path)
-        if: steps.guard.outputs.publish == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          platforms: ${{ env.PLATFORMS }}
-          context: .
-          push: true
+          images: spicelabs/bigtent
           tags: |
-            spicelabs/bigtent:${{ steps.guard.outputs.tag }}
-            spicelabs/bigtent:latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+            type=raw,value=sha-${{ github.sha }}
+          flavor: |
+            latest=auto
 
-      # Optional Maven build: 
-      - name: Build with Maven if pom.xml present
-        if: hashFiles('pom.xml') != ''
-        run: mvn -B -ntp -DskipTests package
-
-      # CLI scans always run; tags reflect artifact type
-      - name: Scan & upload ADG (Docker artifacts)
-        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
+      - name: Build and Push Docker image (conditional push)
+        uses: docker/build-push-action@v6
         with:
-          file_path: artifacts/docker
-          spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: docker-${{ steps.guard.outputs.tag }}
-
-      - name: Scan & upload ADG (Maven target/)
-        if: hashFiles('pom.xml') != ''
-        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
-        with:
-          file_path: target
-          spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: maven-${{ steps.guard.outputs.tag }}
+          platforms: ${{ env.PLATFORMS }}
+          context: .
+          push: ${{ steps.guard.outputs.publish == 'true' }}  # <-- only pushes when allowed
+          provenance: mode=max
+          sbom: true
+          tags: "${{ steps.meta.outputs.tags }}"
+          labels: "${{ steps.meta.outputs.labels }}"
