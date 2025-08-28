@@ -57,6 +57,7 @@ jobs:
       - name: Build project
         run: cargo build --release
 
+      # Guard 1: is the tagged commit on main?
       - name: Check if tag commit is on main
         id: is_main
         shell: bash
@@ -68,8 +69,19 @@ jobs:
             echo "result=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Guard 2: is the ref a SemVer tag vX.Y.Z ?
+      - name: Check if ref is SemVer vX.Y.Z
+        id: is_semver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "result=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Log in to Docker Hub
-        if: ${{ github.ref_type == 'tag' && (github.ref_name matches '^v[0-9]+\\.[0-9]+\\.[0-9]+$') && steps.is_main.outputs.result == 'true' }}
+        if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
         uses: docker/login-action@v3
         with:
           username: "${{ secrets.DOCKER_USERNAME }}"
@@ -89,21 +101,22 @@ jobs:
           flavor: |
             latest=auto
 
-      - name: Build Docker image (always build, conditionally push)
+      - name: Build image (always), push only when allowed, and export OCI tar for scans
         uses: docker/build-push-action@v6
         with:
           platforms: ${{ env.PLATFORMS }}
           context: .
-          push: ${{ github.ref_type == 'tag' && (github.ref_name matches '^v[0-9]+\\.[0-9]+\\.[0-9]+$') && steps.is_main.outputs.result == 'true' }}
+          push: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
           provenance: mode=max
           sbom: true
           tags: "${{ steps.meta.outputs.tags }}"
           labels: "${{ steps.meta.outputs.labels }}"
           outputs: type=oci,dest=artifacts/docker/bigtent-${{ github.sha }}.oci.tar
 
+      # Spice Labs CLI scan and upload (always)
       - name: Scan & upload ADG (Docker artifacts)
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
           file_path: artifacts/docker
           spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: docker-${{ github.ref_name }}
+          tag: docker-${{ github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/') && github.ref_name || format('sha-{0}', github.sha) }}
