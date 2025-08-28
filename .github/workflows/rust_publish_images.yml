@@ -23,7 +23,7 @@ jobs:
         uses: spice-labs-inc/action-check-version@main
 
   build_and_scan:
-    name: Build, Export OCI tar, Conditionally Upload ADGs
+    name: Build, Export/Push Image per Rules, Always Run CLI Scans
     runs-on: ubuntu-24.04
 
     permissions:
@@ -32,7 +32,7 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout with full history (needed for branch check)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           lfs: true
@@ -41,7 +41,7 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set Up Docker Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           platforms: ${{ env.PLATFORMS }}
@@ -55,10 +55,11 @@ jobs:
       - name: Build project (Rust)
         run: cargo build --release
 
-      - name: Compute build tag
-        id: tag
+      - name: Compute build tag + publish guard
+        id: guard
         shell: bash
         run: |
+          # Derive image/tag used throughout
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             TAG="${GITHUB_REF_NAME}"
           else
@@ -66,50 +67,79 @@ jobs:
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
+          # Is the ref a SemVer tag vX.Y.Z?
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "is_semver_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_semver_tag=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Is the current commit reachable from origin/main?
+          git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
+          if git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "is_on_main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_on_main=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Publish only when both are true
+          if [[ "$(cat "$GITHUB_OUTPUT")" == *"is_semver_tag=true"* && "$(cat "$GITHUB_OUTPUT")" == *"is_on_main=true"* ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Prepare artifact directories
         run: mkdir -p artifacts/docker
 
+      # Login only if we are going to publish
+      - name: Docker Hub login
+        if: steps.guard.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Non-publish path: export OCI tar (no push)
       - name: Build Docker image to OCI tar (no push)
+        if: steps.guard.outputs.publish != 'true'
         uses: docker/build-push-action@v6
         with:
           platforms: ${{ env.PLATFORMS }}
           context: .
           push: false
-          tags: spicelabs/bigtent:${{ steps.tag.outputs.tag }}
-          outputs: type=oci,dest=artifacts/docker/bigtent-${{ steps.tag.outputs.tag }}.oci.tar
+          tags: spicelabs/bigtent:${{ steps.guard.outputs.tag }}
+          outputs: type=oci,dest=artifacts/docker/bigtent-${{ steps.guard.outputs.tag }}.oci.tar
 
-      # Optional Maven build: local only
+      # Publish path: push image to registry (no tar export here)
+      - name: Build and push Docker image (publish path)
+        if: steps.guard.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          platforms: ${{ env.PLATFORMS }}
+          context: .
+          push: true
+          tags: |
+            spicelabs/bigtent:${{ steps.guard.outputs.tag }}
+            spicelabs/bigtent:latest
+
+      # Optional Maven build: 
       - name: Build with Maven if pom.xml present
         if: hashFiles('pom.xml') != ''
         run: mvn -B -ntp -DskipTests package
 
-      # ---- Branch gate: only upload when commit is on main ----
-      - name: Determine if commit is on main
-        id: branch_guard
-        shell: bash
-        run: |
-          git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
-          COMMIT="${GITHUB_SHA}"
-          if git merge-base --is-ancestor "$COMMIT" origin/main; then
-            echo "is_main=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_main=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Commit $COMMIT on main? ${{ steps.branch_guard.outputs.is_main }}"
-
-      # Upload only when commit is on main
-      - name: Scan & upload ADG (Docker OCI tar)
-        if: steps.branch_guard.outputs.is_main == 'true'
+      # CLI scans always run; tags reflect artifact type
+      - name: Scan & upload ADG (Docker artifacts)
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
           file_path: artifacts/docker
           spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: docker-${{ steps.tag.outputs.tag }}
+          tag: docker-${{ steps.guard.outputs.tag }}
 
       - name: Scan & upload ADG (Maven target/)
-        if: steps.branch_guard.outputs.is_main == 'true' && hashFiles('pom.xml') != ''
+        if: hashFiles('pom.xml') != ''
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
           file_path: target
           spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: maven-${{ steps.tag.outputs.tag }}
+          tag: maven-${{ steps.guard.outputs.tag }}
