@@ -151,7 +151,7 @@ jobs:
       - name: Scan & upload ADG (Docker OCI tars)
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
-          file_path: artifacts/docker
+          file_path: ${{ github.workspace }}/artifacts/docker
           spice_pass: ${{ secrets.SPICE_PASS }}
           tag: docker-${{ steps.scantag.outputs.value }}
 
@@ -159,6 +159,7 @@ jobs:
       - name: Scan & upload ADG (Rust target/release)
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
-          file_path: target/release
+          file_path: ${{ github.workspace }}/target/release
           spice_pass: ${{ secrets.SPICE_PASS }}
           tag: binary-${{ steps.scantag.outputs.value }}
+
