@@ -90,17 +90,6 @@ jobs:
             echo "result=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Compute a friendly scan tag for ADG uploads
-      - name: Compute scan tag
-        id: scantag
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Log in to Docker Hub (only for publish)
         if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
         uses: docker/login-action@v3
@@ -146,20 +135,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # --- Spice Labs CLI scans ---
-      # Scan the exported OCI image tar(s)
+      # --- Spice Labs CLI scans with stable tags ---
       - name: Scan & upload ADG (Docker OCI tars)
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
           file_path: ${{ github.workspace }}/artifacts/docker
           spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: docker-${{ steps.scantag.outputs.value }}
-
-      # Scan the compiled binaries in target/release
-      - name: Scan & upload ADG (Rust target/release)
-        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
-        with:
-          file_path: ${{ github.workspace }}/target/release
-          spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: binary-${{ steps.scantag.outputs.value }}
-
+          tag: bigtent-docker
