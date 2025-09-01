@@ -57,7 +57,7 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build project (Rust)
+      - name: Build project
         run: cargo build --release
 
       - name: Save binary artifact
