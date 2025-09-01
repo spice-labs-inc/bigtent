@@ -31,7 +31,8 @@ jobs:
     if: ${{ needs.check-version.result == 'success' || needs.check-version.result == 'skipped' }}
 
     permissions:
-      contents: read
+      contents: write
+      packages: write
       attestations: write
       id-token: write
 
@@ -67,6 +68,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Collect build outputs into artifacts/
+        run: |
+          mkdir -p artifacts/binaries artifacts/docker
+          cp target/release/bigtent artifacts/binaries/
+
       # Guard 1: is the tagged commit on main?
       - name: Check if tag commit is on main
         id: is_main
@@ -94,8 +100,8 @@ jobs:
         if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
         uses: docker/login-action@v3
         with:
-          username: "${{ secrets.DOCKER_USERNAME }}"
-          password: "${{ secrets.DOCKER_TOKEN }}"
+          username: ${{ secrets.DOCKERHUB_USERNAME || secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKER_TOKEN }}
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
@@ -111,21 +117,48 @@ jobs:
           flavor: |
             latest=auto
 
-      - name: Prepare artifact directories
-        run: mkdir -p artifacts/docker
-
-      - name: Build image (always), push only when allowed, and export OCI tar
+      # Build and push on allowed publishes
+      - name: Build and push image
+        if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
+        id: build_push
         uses: docker/build-push-action@v6
         with:
           platforms: ${{ env.PLATFORMS }}
           context: .
-          push: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
+          push: true
           provenance: mode=max
           sbom: true
           tags: "${{ steps.meta.outputs.tags }}"
           labels: "${{ steps.meta.outputs.labels }}"
+
+      # Save pushed image as OCI (pull what we just pushed)
+      - name: Save pushed image as OCI tar
+        if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
+        run: |
+          image_tag=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          docker pull "$image_tag"
+          docker save "$image_tag" > artifacts/docker/bigtent-${{ github.sha }}.oci.tar
+
+      # Build without push and export OCI tar on test/pre-release runs
+      - name: Build image (no push) and export OCI tar
+        if: ${{ !(steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true') }}
+        uses: docker/build-push-action@v6
+        with:
+          platforms: ${{ env.PLATFORMS }}
+          context: .
+          push: false
+          tags: "${{ steps.meta.outputs.tags }}"
+          labels: "${{ steps.meta.outputs.labels }}"
           # Buildx requires an ABSOLUTE path for dest:
           outputs: type=oci,dest=${{ github.workspace }}/artifacts/docker/bigtent-${{ github.sha }}.oci.tar
+
+      - name: Generate artifact attestation
+        if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          subject-digest: ${{ steps.build_push.outputs.digest }}
+          push-to-registry: true
 
       - name: Upload OCI tar artifact
         uses: actions/upload-artifact@v4
@@ -135,10 +168,18 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # --- Spice Labs CLI scans with stable tags ---
-      - name: Scan & upload ADG (Docker OCI tars)
+      - name: Upload combined build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ github.sha }}
+          path: artifacts/**
+          if-no-files-found: warn
+          retention-days: 7
+
+      # --- Spice Labs CLI scan across ALL artifacts ---
+      - name: Scan & upload ADG (all artifacts)
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
-          file_path: ${{ github.workspace }}/artifacts/docker
+          file_path: ${{ github.workspace }}/artifacts
           spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: bigtent-docker
+          tag: bigtent
