@@ -7,8 +7,11 @@ env:
 
 on:
   push:
-    tags: [ 'v*.*.*' ]  # Trigger only on semantic version tags
-  workflow_dispatch: {}  # Manual trigger
+    branches:
+      - main
+      - mj/cli-scan        # temporary test branch; remove before merging
+    tags:
+      - "v*.*.*"           # releases on semantic version tags
 
 jobs:
   check-version:
