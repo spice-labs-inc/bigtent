@@ -1,17 +1,15 @@
 name: Publish Rust Container Image
 
 env:
-  # canonical format is comma-separated with no spaces
-  PLATFORMS: linux/amd64,linux/arm64
-  REPO: ${{ github.event.repository.name }}
+  PLATFORMS: linux/amd64, linux/arm64
 
 on:
   push:
     branches:
       - main
-      - mj/cli-scan        # temporary test branch; remove before merging
+      - mj/cli-scan
     tags:
-      - "v*.*.*"           # releases on semantic version tags
+      - "v*.*.*"
 
 permissions:
   contents: write
