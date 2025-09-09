@@ -31,10 +31,10 @@ jobs:
         uses: spice-labs-inc/action-check-version@main
 
   push_to_dockerhub:
-    name: Build, Scan, and (if on main) Push Docker Image to Docker Hub
+    name: Build, Scan, and (if tag is on main) Push Docker Image to Docker Hub
     runs-on: ubuntu-24.04
     needs: check-version
-    if: startsWith(github.ref, 'refs/tags/v')  # only act on semver tags
+    # This job only runs for semver tags because check-version is gated by startsWith(..., 'refs/tags/v')
 
     permissions:
       contents: read
@@ -64,45 +64,6 @@ jobs:
       - name: Build project
         run: cargo build --release
 
-      # --- Short SHA snippet (reusable in future workflows) ---
-      - name: Compute short SHA
-        id: vars
-        shell: bash
-        run: echo "short_sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Extract version from tag
-        id: version
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF}" =~ ^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          else
-            echo "Not a semver tag" >&2
-            exit 1
-          fi
-
-      - name: Determine scan tag
-        id: scantag
-        shell: bash
-        env:
-          SHORT_SHA: "${{ steps.vars.outputs.short_sha }}"
-        run: |
-          # Scan tag follows project standard:
-          #   <repo>-<version> for tags, <repo>-<shortsha> for non-tags
-          REPO_NAME="${GITHUB_REPOSITORY##*/}"
-          if [[ "${GITHUB_REF}" =~ ^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "tag=${REPO_NAME}-${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${REPO_NAME}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Scan built artifacts with Spice-Labs CLI
-        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
-        with:
-          spice_pass: "${{ secrets.SPICE_PASS }}"
-          file_path: "${{ github.workspace }}/target"
-          tag: "${{ steps.scantag.outputs.tag }}"
-
       - name: Ensure tag commit is on main
         id: onmain
         shell: bash
@@ -114,6 +75,13 @@ jobs:
           else
             echo "on_main=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Scan built artifacts with Spice-Labs CLI
+        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
+        with:
+          spice_pass: "${{ secrets.SPICE_PASS }}"
+          file_path: "${{ github.workspace }}/target"
+          tag: "${{ github.event.repository.name }}"  # stable group tag, e.g., "bigtent"
 
       - name: Log in to Docker Hub
         if: steps.onmain.outputs.on_main == 'true'
@@ -131,7 +99,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}   # publish only :<version>
           flavor: |
-            latest=false                      # prohibit :latest
+            latest=false                      # never publish :latest
 
       - name: Build and Push Docker image
         id: push
@@ -145,4 +113,3 @@ jobs:
           sbom: true
           tags: "${{ steps.meta.outputs.tags }}"
           labels: "${{ steps.meta.outputs.labels }}"
-          
