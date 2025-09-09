@@ -13,47 +13,49 @@ on:
     tags:
       - "v*.*.*"           # releases on semantic version tags
 
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
 jobs:
   check-version:
     name: Ensure GitHub Release & Cargo.toml Version Numbers Match
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Check Cargo version matches tag
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Check Cargo Version Matches Tag
         uses: spice-labs-inc/action-check-version@main
 
-  build_scan_publish:
-    name: Build, Scan, Save Artifacts, Conditionally Push
+  push_to_dockerhub:
+    name: Build, Scan, and (if on main) Push Docker Image to Docker Hub
     runs-on: ubuntu-24.04
     needs: check-version
-    # run if check-version succeeded OR was skipped (e.g., manual runs); still skip on failure/cancel
-    if: ${{ needs.check-version.result == 'success' || needs.check-version.result == 'skipped' }}
+    if: startsWith(github.ref, 'refs/tags/v')  # only act on semver tags
 
     permissions:
-      contents: write
-      packages: write
+      contents: read
       attestations: write
       id-token: write
 
     steps:
-      - name: Checkout with LFS and full history
-        uses: actions/checkout@v4
-        with:
-          lfs: true
-          fetch-depth: 0  # needed for main ancestry check
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
+      - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           platforms: ${{ env.PLATFORMS }}
+
+      - name: Checkout with LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -64,138 +66,85 @@ jobs:
       - name: Build project
         run: cargo build --release
 
-      - name: Save binary artifact
-        uses: actions/upload-artifact@v4
+      # --- Short SHA snippet (reusable in future workflows) ---
+      - name: Compute short SHA
+        id: vars
+        shell: bash
+        run: echo "short_sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" =~ ^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not a semver tag" >&2
+            exit 1
+          fi
+
+      - name: Determine scan tag
+        id: scantag
+        shell: bash
+        env:
+          SHORT_SHA: "${{ steps.vars.outputs.short_sha }}"
+        run: |
+          # Scan tag follows project standard:
+          #   <repo>-<version> for tags, <repo>-<shortsha> for non-tags
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          if [[ "${GITHUB_REF}" =~ ^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "tag=${REPO_NAME}-${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${REPO_NAME}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan built artifacts with Spice-Labs CLI
+        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
-          name: ${{ env.REPO }}-binary-${{ github.run_id }}
-          path: target/release/bigtent
-          if-no-files-found: error
-          retention-days: 7
+          spice_pass: "${{ secrets.SPICE_PASS }}"
+          file_path: "${{ github.workspace }}/target"
+          tag: "${{ steps.scantag.outputs.tag }}"
 
-      - name: Collect build outputs into artifacts/
-        run: |
-          mkdir -p artifacts/binaries artifacts/docker
-          cp target/release/bigtent artifacts/binaries/
-
-      # Guard 1: is the tagged commit on main?
-      - name: Check if tag commit is on main
-        id: is_main
+      - name: Ensure tag commit is on main
+        id: onmain
         shell: bash
         run: |
-          git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
-          if git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
-            echo "result=true" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if git merge-base --is-ancestor "${GITHUB_SHA}" "origin/main"; then
+            echo "on_main=true" >> "$GITHUB_OUTPUT"
           else
-            echo "result=false" >> "$GITHUB_OUTPUT"
+            echo "on_main=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Guard 2: is the ref a SemVer tag vX.Y.Z ?
-      - name: Check if ref is SemVer vX.Y.Z
-        id: is_semver
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "result=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "result=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Log in to Docker Hub (only for publish)
-        if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
+      - name: Log in to Docker Hub
+        if: steps.onmain.outputs.on_main == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME || secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKER_TOKEN }}
+          username: "${{ secrets.DOCKERHUB_USERNAME }}"
+          password: "${{ secrets.DOCKERHUB_TOKEN }}"
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
+        if: steps.onmain.outputs.on_main == 'true'
         uses: docker/metadata-action@v5
         with:
-          images: |
-            spicelabs/${{ env.REPO }}
+          images: spicelabs/bigtent
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha
-            type=raw,value=sha-${{ github.sha }}
+            type=semver,pattern={{version}}   # publish only :<version>
           flavor: |
-            latest=auto
+            latest=false                      # prohibit :latest
 
-      # Build and push on allowed publishes (public repo policy)
-      - name: Build and push image
-        if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
-        id: build_push
+      - name: Build and Push Docker image
+        id: push
+        if: steps.onmain.outputs.on_main == 'true'
         uses: docker/build-push-action@v6
         with:
           platforms: ${{ env.PLATFORMS }}
           context: .
           push: true
-          provenance: mode=max
+          provenance: true
           sbom: true
           tags: "${{ steps.meta.outputs.tags }}"
           labels: "${{ steps.meta.outputs.labels }}"
-
-      # Save pushed image as OCI (pull what we just pushed)
-      - name: Save pushed image as OCI tar
-        if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
-        run: |
-          image_tag=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
-          docker pull "$image_tag"
-          mkdir -p "${{ github.workspace }}/artifacts/docker"
-          docker save "$image_tag" > "${{ github.workspace }}/artifacts/docker/${{ env.REPO }}-${{ github.run_id }}.oci.tar"
-
-      # Build without push and export OCI tar on test/pre-release runs
-      - name: Build image (no push) and export OCI tar
-        if: ${{ !(steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true') }}
-        uses: docker/build-push-action@v6
-        with:
-          platforms: ${{ env.PLATFORMS }}
-          context: .
-          push: false
-          tags: "${{ steps.meta.outputs.tags }}"
-          labels: "${{ steps.meta.outputs.labels }}"
-          # Buildx requires an ABSOLUTE path for dest:
-          outputs: type=oci,dest=${{ github.workspace }}/artifacts/docker/${{ env.REPO }}-${{ github.run_id }}.oci.tar
-
-      - name: Generate artifact attestation
-        if: ${{ steps.is_main.outputs.result == 'true' && steps.is_semver.outputs.result == 'true' }}
-        uses: actions/attest-build-provenance@v1
-        with:
-          subject-name: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
-          subject-digest: ${{ steps.build_push.outputs.digest }}
-          push-to-registry: true
-
-      - name: Upload OCI tar artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.REPO }}-oci-${{ github.run_id }}
-          path: artifacts/docker/*.oci.tar
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload combined build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.REPO }}-build-${{ github.run_id }}
-          path: artifacts/**
-          if-no-files-found: warn
-          retention-days: 7
-
-      # --- Spice Labs CLI scan across ALL artifacts ---
-      - name: Scan & upload ADG (all artifacts)
-        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
-        with:
-          file_path: ${{ github.workspace }}/artifacts
-          spice_pass: ${{ secrets.SPICE_PASS }}
-          tag: ${{ env.REPO }}
-
-      # Optional: capture local ADG files if produced by the scan step
-      - name: Upload scan outputs (if present)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.REPO }}-scan-${{ github.run_id }}
-          path: artifacts/**/*.adg.json
-          if-no-files-found: ignore
-          retention-days: 7
+          
