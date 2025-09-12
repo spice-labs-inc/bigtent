@@ -3,3 +3,4 @@ hex_literal_case = "Lower"
 imports_granularity ="Crate"
 reorder_impl_items = true
 tab_spaces = 2
+edition = "2024"

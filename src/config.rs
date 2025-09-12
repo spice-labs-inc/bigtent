@@ -41,6 +41,11 @@ pub struct Args {
   /// full index read/cache can take a long time and uses a lot of memory
   #[arg(long)]
   pub cache_index: Option<bool>,
+
+  /// Applies to `fresh_merge` jobs: set a limit for the number of concurrent items in the merge
+  /// queue.  Adjust this according to your system's memory limits.
+  #[arg(long, short, default_value_t = 10_000)]
+  pub buffer_limit: usize,
 }
 
 impl Args {
