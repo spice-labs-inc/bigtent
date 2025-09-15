@@ -208,9 +208,12 @@ async fn test_purls_and_merge() {
 
   let herd2 = herd.clone();
 
-  crate::fresh_merge::merge_fresh(herd.herd, &dest_dir)
-    .await
-    .expect("Should do a merge");
+  crate::fresh_merge::merge_fresh(
+    herd.herd, 10_000, /* a nice round limit for the merge buffer */
+    &dest_dir,
+  )
+  .await
+  .expect("Should do a merge");
 
   let mut clusters = GoatRodeoCluster::cluster_files_in_dir(dest_dir.clone(), false)
     .await

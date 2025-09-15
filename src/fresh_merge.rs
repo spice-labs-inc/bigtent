@@ -7,8 +7,11 @@ use std::{
   fs::{self, File},
   io::{BufWriter, Write},
   path::PathBuf,
-  sync::Arc,
-  thread,
+  sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  },
+  thread::{self, Thread},
   time::Instant,
 }; // Use log crate when building application
 
@@ -31,6 +34,7 @@ use thousands::Separable;
 
 pub async fn merge_fresh<PB: Into<PathBuf>>(
   clusters: Vec<Arc<HerdMember>>,
+  merge_buffer_limit: usize,
   dest_directory: PB,
 ) -> Result<()> {
   let start = Instant::now();
@@ -80,25 +84,56 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 
   let (offset_tx, offset_rx) = flume::bounded(200_000);
 
+  let holding_pen_gate = Arc::new(AtomicUsize::new(0));
+  let mut coord_threads = vec![];
   let mut threads = vec![];
 
+  /// Returns true if atomic gate is ushel the limit
+  fn check_limit(gate: &AtomicUsize, limit: usize) -> bool {
+    gate.load(Ordering::Acquire) < limit
+  }
+
+  /// Trigger parked coordinator threads to continue running
+  fn unpark_coords(coords: &Vec<Thread>) {
+    for t in coords {
+      Thread::unpark(&t);
+    }
+  }
+
+  let hpg = Arc::clone(&holding_pen_gate);
   let coorindator_handle = thread::spawn(move || {
     let mut pos = 0usize;
-    while let Some(items_to_merge) = next_hash_of_item_to_merge(&mut index_holder) {
-      offset_tx
-        .send((pos, items_to_merge))
-        .expect("Should be able to send the message");
-      pos += 1;
+    loop {
+      // Queue items for work until the buffer limit is reached
+      if check_limit(&hpg, merge_buffer_limit) {
+        match next_hash_of_item_to_merge(&mut index_holder) {
+          Some(items_to_merge) => {
+            offset_tx
+              .send((pos, items_to_merge))
+              .expect("Should be able to send the message");
+            pos += 1;
+          }
+          // No more work left to do!
+          None => break,
+        }
+      }
+      // Park this coordinator when the limit is reached
+      else {
+        std::thread::park();
+      }
     }
   });
 
+  coord_threads.push(coorindator_handle.thread().clone());
   threads.push(coorindator_handle);
 
+  //// Worker thread section
+  ////
   let (merged_tx, merged_rx) = flume::bounded(200_000);
-
   for thread_num in 0..20 {
     let rx = offset_rx.clone();
     let tx = merged_tx.clone();
+
     let processor_handle = thread::spawn(move || {
       let mut cnt = 0usize;
       while let Ok((position, items_to_merge)) = rx.recv() {
@@ -149,6 +184,9 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
   drop(merged_tx);
   drop(offset_rx); // make sure no more copies exist
 
+  //// Main thread section
+  ////
+
   let mut next_expected = 0usize;
   let mut holding_pen = HashMap::new();
 
@@ -168,13 +206,18 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
           }
         }
         merge_cnt += merged;
-        if position == next_expected {
-          holding_pen.insert(position, (item, cbor_bytes));
-          while let Some((item, cbor_bytes)) = holding_pen.remove(&next_expected) {
-            cluster_writer.write_item(item, cbor_bytes).await?;
 
+        if position == next_expected {
+          // Insert new position into holding pen and increment atomic gate
+          holding_pen.insert(position, (item, cbor_bytes));
+
+          while let Some((item, cbor_bytes)) = holding_pen.remove(&next_expected) {
             loop_cnt += 1;
 
+            // Decrement atomic gate for every item removed
+            cluster_writer.write_item(item, cbor_bytes).await?;
+
+            // Log, but only occasionally
             if loop_cnt % 2_500_000 == 0 {
               let diff = merge_start.elapsed();
               let items_per_second = (loop_cnt as f64) / diff.as_secs_f64();
@@ -197,7 +240,16 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
             next_expected += 1;
           }
         } else {
+          // Insert an unexpected position into the holding pen
           holding_pen.insert(position, (item, cbor_bytes));
+        }
+
+        // Store the current length of the holding pen
+        holding_pen_gate.store(holding_pen.len(), Ordering::Release);
+
+        // If the merge buffer is below the limit, unpark coordinators
+        if holding_pen.len() < merge_buffer_limit {
+          unpark_coords(&coord_threads);
         }
       }
     }

@@ -78,7 +78,7 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
     );
   }
 
-  let ret = merge_fresh(clusters, dest).await;
+  let ret = merge_fresh(clusters, args.buffer_limit, dest).await;
   info!(
     "Finished merging at {:?}",
     Instant::now().duration_since(start)
