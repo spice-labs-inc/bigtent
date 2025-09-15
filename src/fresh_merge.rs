@@ -210,13 +210,11 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         if position == next_expected {
           // Insert new position into holding pen and increment atomic gate
           holding_pen.insert(position, (item, cbor_bytes));
-          holding_pen_gate.fetch_add(1, Ordering::AcqRel);
 
           while let Some((item, cbor_bytes)) = holding_pen.remove(&next_expected) {
             loop_cnt += 1;
 
             // Decrement atomic gate for every item removed
-            holding_pen_gate.fetch_sub(1, Ordering::AcqRel);
             cluster_writer.write_item(item, cbor_bytes).await?;
 
             // Log, but only occasionally
@@ -244,11 +242,13 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         } else {
           // Insert an unexpected position into the holding pen
           holding_pen.insert(position, (item, cbor_bytes));
-          holding_pen_gate.fetch_add(1, Ordering::AcqRel);
         }
 
+        // Store the current length of the holding pen
+        holding_pen_gate.store(holding_pen.len(), Ordering::Release);
+
         // If the merge buffer is below the limit, unpark coordinators
-        if check_limit(&holding_pen_gate, merge_buffer_limit) {
+        if holding_pen.len() < merge_buffer_limit {
           unpark_coords(&coord_threads);
         }
       }
