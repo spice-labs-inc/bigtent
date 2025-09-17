@@ -18,6 +18,18 @@ env:
   PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
+  check-version:
+    name: Ensure Cargo version matches tag
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check Cargo version matches tag
+        uses: spice-labs-inc/action-check-version@main
+
   build_and_scan:
     name: Build (branch) and scan artifacts
     if: ${{ github.ref_type == 'branch' }}
