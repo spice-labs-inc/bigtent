@@ -31,22 +31,18 @@ jobs:
         uses: spice-labs-inc/action-check-version@main
 
   build_and_scan:
-    name: Build (branch) and scan artifacts
-    if: ${{ github.ref_type == 'branch' }}
+    name: Build on main and scan artifacts
+    if: ${{ github.ref_type == 'branch' && github.ref_name == 'main' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
-
       - name: Build
         run: cargo build --release
-
-      - name: Run Spice-Labs CLI scan (branch build)
+      - name: Run Spice-Labs CLI scan
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
           spice_pass: "${{ secrets.SPICE_PASS }}"
