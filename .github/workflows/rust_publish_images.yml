@@ -50,18 +50,16 @@ jobs:
           tag: "${{ github.event.repository.name }}"
 
   release_build_push:
-    name: Build (tag), conditionally push to Docker Hub, attest, and scan
+    name: Build on tag and push to Docker Hub
     if: ${{ github.ref_type == 'tag' }}
     runs-on: ubuntu-24.04
+    needs: check-version
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Ensure Cargo.toml version matches tag
-        uses: spice-labs-inc/action-check-version@main
-
-      - name: Check if tag commit is on main (required for public releases)
+      - name: Check if tag commit is on main
         id: on_main
         shell: bash
         run: |
@@ -97,7 +95,7 @@ jobs:
           username: "${{ secrets.DOCKERHUB_USERNAME }}"
           password: "${{ secrets.DOCKERHUB_TOKEN }}"
 
-      - name: Extract Docker image metadata (release tags only)
+      - name: Extract Docker image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -107,19 +105,19 @@ jobs:
           flavor: |
             latest=false
 
-      - name: Build image (push only if tag is on main)
+      - name: Build and push Docker image
         id: build_image
         uses: docker/build-push-action@v6
         with:
           platforms: ${{ env.PLATFORMS }}
           context: .
           push: ${{ steps.on_main.outputs.ok == 'true' }}
-          provenance: true
           sbom: true
+          provenance: true
           tags: "${{ steps.meta.outputs.tags }}"
           labels: "${{ steps.meta.outputs.labels }}"
 
-      - name: Generate build provenance attestation (Docker Hub)
+      - name: Generate build provenance attestation
         if: ${{ steps.on_main.outputs.ok == 'true' }}
         uses: actions/attest-build-provenance@v1
         with:
@@ -127,28 +125,13 @@ jobs:
           subject-digest: ${{ steps.build_image.outputs.digest }}
           push-to-registry: true
 
-      - name: Gather artifacts for scan
+      - name: Gather build outputs for scanning
         run: |
           set -euo pipefail
-          mkdir -p artifacts/docker artifacts/target
-          # Copy built binaries and outputs
+          mkdir -p artifacts/target
           rsync -a --delete "target/release/" "artifacts/target/"
-          # Save the image as OCI tar if we actually pushed (available to pull)
-          if [ "${{ steps.on_main.outputs.ok }}" = "true" ]; then
-            IMAGE_TAG="$(echo "${{ steps.meta.outputs.tags }}" | head -n1)"
-            docker pull "$IMAGE_TAG"
-            docker save "$IMAGE_TAG" > "artifacts/docker/${{ env.REPO }}-${{ github.run_id }}.oci.tar"
-          fi
 
-      - name: Upload artifacts (for audit/debug)
-        uses: actions/upload-artifact@v4
-        with:
-          name: "${{ env.REPO }}-artifacts-${{ github.run_id }}"
-          path: artifacts
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Run Spice-Labs CLI scan (release build)
+      - name: Run Spice-Labs CLI scan
         uses: spice-labs-inc/action-spice-labs-cli-scan@v3
         with:
           spice_pass: "${{ secrets.SPICE_PASS }}"
