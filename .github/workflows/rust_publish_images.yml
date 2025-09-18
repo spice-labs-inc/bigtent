@@ -84,3 +84,10 @@ jobs:
           sbom: true
           tags: "${{ steps.meta.outputs.tags }}"
           labels: "${{ steps.meta.outputs.labels }}"
+
+      - name: Index and upload ADG
+        uses: spice-labs-inc/action-spice-labs-cli-scan@v3
+        with:
+          token: ${{ secrets.SPICE_PASS }}
+          input: target
+          tag: ${{ github.event.repository.name }}
