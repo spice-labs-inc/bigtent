@@ -698,7 +698,7 @@ impl GoatRodeoCluster {
           Ordering::Less => low = mid + 1,
           Ordering::Equal => return Some(entry.clone()),
           Ordering::Greater if mid != 0 => hi = mid - 1,
-	  Ordering::Greater /* mid == 0 */ => return None,
+          Ordering::Greater /* mid == 0 */ => return None,
         }
       }
 
