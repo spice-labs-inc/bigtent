@@ -103,6 +103,11 @@ impl IndexFile {
     self.file.len() - self.data_offset
   }
 
+  /// compute the number of nodes in this gri
+  pub fn node_count(&self) -> u64 {
+    (self.data_len() / 32) as u64 // the amount of data divided by 32 -- 16 bytes for hash, 8 bytes for offset, 8 bytes for data file
+  }
+
   pub fn read_index(&self) -> Result<Vec<ItemOffset>> {
     let mut ret = Vec::with_capacity(self.envelope.size as usize);
     let mut last = [0u8; 16];

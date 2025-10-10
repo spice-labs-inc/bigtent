@@ -192,8 +192,8 @@ impl GoatRodeoTrait for GoatRodeoCluster {
 
   fn node_count(&self) -> u64 {
     let mut ret = 0;
-    for io in self.index_offset.iter() {
-      ret += io.len as u64;
+    for index_file in self.index_files.values() {
+      ret += index_file.node_count();
     }
     ret
   }
