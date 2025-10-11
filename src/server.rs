@@ -4,7 +4,7 @@ use anyhow::Result;
 use axum::{
   Json, Router,
   extract::{Path, Query, Request as ExtractRequest, State},
-  http::{StatusCode, Uri},
+  http::StatusCode,
   middleware::{self, Next},
   response::{IntoResponse, Response},
   routing::{get, post},
@@ -83,72 +83,98 @@ async fn serve_bulk<GRT: GoatRodeoTrait + 'static>(
   })
 }
 
-/// compute the package from either uri which will include query parameters (which are part of)
-/// a pURL or the path that was passed in
-pub fn compute_package(query: &HashMap<String, String>, maybe_gitoid: &str, uri: &Uri) -> String {
-  if maybe_gitoid.len() == uri.path().len() || maybe_gitoid.len() == uri.path().len() - 1 {
-    if let Some(value) = query.get("identifier") {
-      return value.clone();
-    }
-  }
-  if let Some(pq) = uri.path_and_query() {
-    let path = pq.as_str();
-    let offset = if maybe_gitoid.len() > 3 {
-      path.find(&maybe_gitoid[0..3])
-    } else {
-      None
-    };
-
-    if let Some(actual_offset) = offset {
-      path[actual_offset..].to_string()
-    } else {
-      path.to_string()
-    }
-  } else {
-    maybe_gitoid.to_string()
-  }
-}
-
 async fn node_count<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
-) -> Result<Json<serde_json::Value>, Json<serde_json::Value>> {
-  Ok(Json(rodeo.get_cluster().node_count().into()))
+) -> Result<Json<u64>, Json<serde_json::Value>> {
+  Ok(Json(rodeo.get_cluster().node_count()))
+}
+
+async fn do_serve_gitoid<GRT: GoatRodeoTrait + 'static>(
+  rodeo: Arc<ClusterHolder<GRT>>,
+  maybe_gitoid: Option<&String>,
+) -> Result<Json<Item>, (StatusCode, Json<String>)> {
+  if let Some(gitoid) = maybe_gitoid {
+    let ret = rodeo.get_cluster().item_for_identifier(&gitoid);
+
+    match ret {
+      Some(item) => Ok(Json(item)),
+      _ => Err((
+        StatusCode::NOT_FOUND,
+        Json(format!("No item found for key {}", gitoid)),
+      )),
+    }
+  } else {
+    Err((
+      StatusCode::NOT_FOUND,
+      Json(format!("No 'identifier' supplied")),
+    ))
+  }
 }
 // #[axum::debug_handler]
 async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
+) -> Result<Json<Item>, (StatusCode, Json<String>)> {
+  do_serve_gitoid(rodeo, Some(&gitoid)).await
+}
+async fn serve_gitoid_query<GRT: GoatRodeoTrait + 'static>(
+  State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Query(query): Query<HashMap<String, String>>,
-  uri: Uri,
-) -> Result<Json<serde_json::Value>, impl IntoResponse> {
-  let to_find = compute_package(&query, &gitoid, &uri);
-  let ret = rodeo.get_cluster().item_for_identifier(&to_find);
-
-  match ret {
-    Some(item) => Ok(Json(item.to_json())),
-    _ => Err((
-      StatusCode::NOT_FOUND,
-      format!("No item found for key {}", to_find),
-    )),
-  }
+) -> Result<Json<Item>, (StatusCode, Json<String>)> {
+  do_serve_gitoid(rodeo, query.get("identifier")).await
 }
 
+/// Do a bulk set of anti-alias transforms
+async fn anti_alias_bulk<GRT: GoatRodeoTrait + 'static>(
+  State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+  Json(payload): Json<Vec<String>>,
+) -> Result<Json<HashMap<String, Item>>, (StatusCode, Json<String>)> {
+  let mut ret = HashMap::new();
+  let cluster = rodeo.get_cluster();
+  for key in payload {
+    match cluster.clone().antialias_for(&key) {
+      Some(item) => {
+        ret.insert(key, item);
+      }
+      None => {}
+    }
+  }
+
+  Ok(Json(ret))
+}
+async fn do_serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
+  rodeo: Arc<ClusterHolder<GRT>>,
+  gitoid: Option<&String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<String>)> {
+  if let Some(to_find) = gitoid {
+    let ret = rodeo.get_cluster().antialias_for(&to_find);
+
+    match ret {
+      Some(item) => Ok(Json(item.to_json())),
+      _ => Err((
+        StatusCode::NOT_FOUND,
+        Json(format!("No item found for key {}", to_find)),
+      )),
+    }
+  } else {
+    Err((
+      StatusCode::NOT_FOUND,
+      Json(format!("No 'identifier' supplied")),
+    ))
+  }
+}
 async fn serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
-  Query(query): Query<HashMap<String, String>>,
-  uri: Uri,
-) -> Result<Json<serde_json::Value>, impl IntoResponse> {
-  let to_find = compute_package(&query, &gitoid, &uri);
-  let ret = rodeo.get_cluster().antialias_for(&to_find);
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<String>)> {
+  do_serve_anti_alias(rodeo, Some(&gitoid)).await
+}
 
-  match ret {
-    Some(item) => Ok(Json(item.to_json())),
-    _ => Err((
-      StatusCode::NOT_FOUND,
-      format!("No item found for key {}", to_find),
-    )),
-  }
+async fn serve_anti_alias_query<GRT: GoatRodeoTrait + 'static>(
+  State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+  Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<String>)> {
+  do_serve_anti_alias(rodeo, query.get("identifier")).await
 }
 
 async fn serve_flatten_both<GRT: GoatRodeoTrait + 'static>(
@@ -169,7 +195,7 @@ async fn serve_flatten_both<GRT: GoatRodeoTrait + 'static>(
     .await
   {
     Ok(s) => s,
-    Err(e) => return Err((StatusCode::NOT_FOUND, format!("{}", e))),
+    Err(e) => return Err((StatusCode::NOT_FOUND, Json(format!("{}", e)))),
   };
 
   let tok_stream = TokioReceiverToStream { receiver: stream };
@@ -183,11 +209,22 @@ async fn serve_flatten_both<GRT: GoatRodeoTrait + 'static>(
 async fn serve_flatten_source<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
-  Query(query): Query<HashMap<String, String>>,
-  uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&query, &gitoid, &uri);
-  serve_flatten_both(rodeo, vec![to_find], true).await
+  serve_flatten_both(rodeo, vec![gitoid], true).await
+}
+async fn serve_flatten_source_query<GRT: GoatRodeoTrait + 'static>(
+  State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+  Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+  serve_flatten_both(
+    rodeo,
+    match query.get("identifier") {
+      Some(id) => vec![id.to_string()],
+      None => vec![],
+    },
+    true,
+  )
+  .await
 }
 
 /// Serve all the "contains" gitoids for a given Item
@@ -202,11 +239,22 @@ async fn serve_flatten_source_bulk<GRT: GoatRodeoTrait + 'static>(
 async fn serve_flatten<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
-  Query(query): Query<HashMap<String, String>>,
-  uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&query, &gitoid, &uri);
-  serve_flatten_both(rodeo, vec![to_find], false).await
+  serve_flatten_both(rodeo, vec![gitoid], false).await
+}
+async fn serve_flatten_query<GRT: GoatRodeoTrait + 'static>(
+  State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+  Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+  serve_flatten_both(
+    rodeo,
+    match query.get("identifier") {
+      Some(id) => vec![id.to_string()],
+      None => vec![],
+    },
+    false,
+  )
+  .await
 }
 
 /// Serve all the "contains" gitoids for a given Item
@@ -221,21 +269,43 @@ async fn serve_flatten_bulk<GRT: GoatRodeoTrait + 'static>(
 async fn serve_north<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
-  Query(query): Query<HashMap<String, String>>,
-  uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&query, &gitoid, &uri);
-  do_north(rodeo, vec![to_find], false).await
+  do_north(rodeo, vec![gitoid], false).await
+}
+async fn serve_north_query<GRT: GoatRodeoTrait + 'static>(
+  State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+  Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+  do_north(
+    rodeo,
+    match query.get("identifier") {
+      Some(id) => vec![id.to_string()],
+      None => vec![],
+    },
+    false,
+  )
+  .await
 }
 
 async fn serve_north_purls<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   Path(gitoid): Path<String>,
-  Query(query): Query<HashMap<String, String>>,
-  uri: Uri,
 ) -> impl IntoResponse {
-  let to_find = compute_package(&query, &gitoid, &uri);
-  do_north(rodeo, vec![to_find], true).await
+  do_north(rodeo, vec![gitoid], true).await
+}
+async fn serve_north_purls_query<GRT: GoatRodeoTrait + 'static>(
+  State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+  Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+  do_north(
+    rodeo,
+    match query.get("identifier") {
+      Some(id) => vec![id.to_string()],
+      None => vec![],
+    },
+    true,
+  )
+  .await
 }
 
 async fn serve_north_bulk<GRT: GoatRodeoTrait + 'static>(
@@ -256,16 +326,16 @@ async fn serve_north_purls_bulk<GRT: GoatRodeoTrait + 'static>(
 async fn gimme_purls<GRT: GoatRodeoTrait + 'static>(
   State(rodeo): State<Arc<ClusterHolder<GRT>>>,
   req: ExtractRequest,
-) -> Result<Response<ServeFileSystemResponseBody>, (StatusCode, String)> {
+) -> Result<Response<ServeFileSystemResponseBody>, (StatusCode, Json<String>)> {
   match rodeo.get_purl() {
-    Err(_) => Err((StatusCode::NOT_FOUND, "no purls.txt".to_string())),
+    Err(_) => Err((StatusCode::NOT_FOUND, Json("no purls.txt".into()))),
     Ok(path) => {
       match tower_http::services::ServeFile::new(path)
         .try_call(req)
         .await
       {
         Ok(v) => Ok(v),
-        Err(_) => Err((StatusCode::NOT_FOUND, "no purls.txt".to_string())),
+        Err(_) => Err((StatusCode::NOT_FOUND, Json("no purls.txt".into()))),
       }
     }
   }
@@ -275,7 +345,7 @@ async fn do_north<GRT>(
   rodeo: Arc<ClusterHolder<GRT>>,
   gitoids: Vec<String>,
   purls_only: bool,
-) -> Result<impl IntoResponse, (StatusCode, String)>
+) -> Result<impl IntoResponse, (StatusCode, Json<String>)>
 where
   GRT: GoatRodeoTrait + 'static,
 {
@@ -292,7 +362,7 @@ where
     .await
   {
     Ok(mrx) => mrx,
-    Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e))),
+    Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(format!("{:?}", e)))),
   };
   Ok(StreamBodyAs::json_array(
     TokioReceiverToStream { receiver: mrx }.map(|v| match v {
@@ -306,18 +376,27 @@ where
 pub fn build_route<GRT: GoatRodeoTrait + 'static>(state: Arc<ClusterHolder<GRT>>) -> Router {
   let app: Router<()> = Router::new()
     .route("/bulk", post(serve_bulk))
-    .route("/{*gitoid}", get(serve_gitoid))
+    .route("/item/{*gitoid}", get(serve_gitoid))
+    .route("/item", get(serve_gitoid_query))
     .route("/aa/{*gitoid}", get(serve_anti_alias))
+    .route("/aa", get(serve_anti_alias_query))
+    .route("/aa", post(anti_alias_bulk))
+    .route("/north", get(serve_north_query))
     .route("/north/{*gitoid}", get(serve_north))
-    .route("/north_purls/{*gitoid}", get(serve_north_purls))
     .route("/north", post(serve_north_bulk))
+    .route("/north_purls/{*gitoid}", get(serve_north_purls))
+    .route("/north_purls", get(serve_north_purls_query))
+    .route("/north_purls", post(serve_north_purls_bulk))
     .route("/flatten_source/{*gitoid}", get(serve_flatten_source))
+    .route("/flatten_source", get(serve_flatten_source_query))
     .route("/flatten_source", post(serve_flatten_source_bulk))
     .route("/flatten/{*gitoid}", get(serve_flatten))
+    .route("/flatten", get(serve_flatten_query))
     .route("/flatten", post(serve_flatten_bulk))
-    .route("/north_purls", post(serve_north_purls_bulk))
     .route("/purls", get(gimme_purls))
     .route("/node_count", get(node_count))
+    .route("/", get(serve_gitoid_query))
+    .route("/{*gitoid}", get(serve_gitoid))
     .with_state(state.clone());
 
   app
