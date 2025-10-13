@@ -28,11 +28,10 @@ async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
       whole_path, dir_path
     );
     let index_build_start = Instant::now();
-    let cluster = Arc::new(ArcSwap::new(
-      GoatRodeoCluster::new(&whole_path, args.pre_cache_index()).await?,
-    ));
+    let cluster = ArcSwap::new(GoatRodeoCluster::new(&whole_path, args.pre_cache_index()).await?);
 
-    let cluster_holder = ClusterHolder::new_from_cluster(cluster, Some(args.clone())).await?;
+    let cluster_holder =
+      ClusterHolder::new_from_cluster(cluster, Some(Arc::new(args.clone()))).await?;
 
     info!(
       "Initial index build in {:?}",
