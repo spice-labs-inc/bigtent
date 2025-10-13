@@ -6,7 +6,7 @@ use crate::config::Args;
 
 use super::goat_trait::GoatRodeoTrait;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ClusterHolder<GRT: GoatRodeoTrait> {
   cluster: Arc<ArcSwap<GRT>>,
   args: Args,
