@@ -6,10 +6,10 @@ use crate::config::Args;
 
 use super::goat_trait::GoatRodeoTrait;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ClusterHolder<GRT: GoatRodeoTrait> {
-  cluster: Arc<ArcSwap<GRT>>,
-  args: Args,
+  cluster: ArcSwap<GRT>,
+  args: Arc<Args>,
 }
 
 impl<GRT: GoatRodeoTrait> ClusterHolder<GRT> {
@@ -23,7 +23,7 @@ impl<GRT: GoatRodeoTrait> ClusterHolder<GRT> {
     self.cluster.load().clone()
   }
 
-  pub fn the_args(&self) -> Args {
+  pub fn the_args(&self) -> Arc<Args> {
     self.args.clone()
   }
 
@@ -36,8 +36,8 @@ impl<GRT: GoatRodeoTrait> ClusterHolder<GRT> {
   /// and an optional set of args. This is meant to be used to create an Index without
   /// a well defined set of Args
   pub async fn new_from_cluster(
-    cluster: Arc<ArcSwap<GRT>>,
-    args_opt: Option<Args>,
+    cluster: ArcSwap<GRT>,
+    args_opt: Option<Arc<Args>>,
   ) -> Result<Arc<ClusterHolder<GRT>>> {
     let args = args_opt.unwrap_or_default();
 
