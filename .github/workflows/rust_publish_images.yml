@@ -85,9 +85,9 @@ jobs:
           tags: "${{ steps.meta.outputs.tags }}"
           labels: "${{ steps.meta.outputs.labels }}"
 
-      - name: Index and upload ADG
-        uses: spice-labs-inc/action-spice-labs-surveyor@v3
+      - name: Index and Upload ADG
+        uses: spice-labs-inc/action-spice-labs-surveyor@v4
         with:
           spice_pass: "${{ secrets.SPICE_PASS }}"
-          file_path: "${{ github.workspace }}"
+          input: "./target"
           tag: "${{ github.event.repository.name }}"
