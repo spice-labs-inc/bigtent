@@ -5,8 +5,10 @@ use bigtent::{
   fresh_merge::merge_fresh,
   rodeo::{
     goat::GoatRodeoCluster,
+    goat_herd::GoatHerd,
     holder::ClusterHolder,
     member::{HerdMember, member_core},
+    robo_goat::ClusterRoboMember,
   },
   server::run_web_server,
 };
@@ -19,29 +21,27 @@ use log::info; // Use log crate when building application
 use std::println as info;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
-async fn run_rodeo(path: &PathBuf, args: &Args) -> Result<()> {
-  if path.exists() && path.is_file() {
-    let whole_path = path.clone().canonicalize()?;
-    let dir_path = whole_path.parent().unwrap().to_path_buf();
-    info!(
-      "Single cluster server for {:?} with dir_path {:?}",
-      whole_path, dir_path
-    );
-    let index_build_start = Instant::now();
-    let cluster = ArcSwap::new(GoatRodeoCluster::new(&whole_path, args.pre_cache_index()).await?);
-
-    let cluster_holder =
-      ClusterHolder::new_from_cluster(cluster, Some(Arc::new(args.clone()))).await?;
-
-    info!(
-      "Initial index build in {:?}",
-      Instant::now().duration_since(index_build_start)
-    );
-
-    run_web_server(cluster_holder).await?;
-  } else {
-    bail!("Path to `.grc` does not point to a file: {:?}", path)
+async fn run_rodeo(path_vec: &Vec<PathBuf>, args: &Args) -> Result<()> {
+  let mut clusters: Vec<Arc<HerdMember>> = vec![];
+  for path in path_vec.iter() {
+    if path.exists() {
+      for b in GoatRodeoCluster::cluster_files_in_dir(path.clone(), args.pre_cache_index()).await? {
+        info!("Loaded cluster {}", b.name());
+        clusters.push(member_core(b));
+      }
+    } else {
+      bail!("Path to `.grc` does not point to a file: {:?}", path)
+    }
   }
+
+  let herd = GoatHerd::new(clusters);
+  let cluster_holder =
+    ClusterHolder::new_from_cluster(ArcSwap::new(Arc::new(herd)), Some(Arc::new(args.clone())))
+      .await?;
+
+  info!("Build cluster... about to run it",);
+
+  run_web_server(cluster_holder).await?;
   Ok(())
 }
 

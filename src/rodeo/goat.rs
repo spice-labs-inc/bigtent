@@ -639,7 +639,15 @@ impl GoatRodeoCluster {
     path: PathBuf,
     pre_cache_index: bool,
   ) -> Result<Vec<Arc<GoatRodeoCluster>>> {
-    let mut the_dir = read_dir(path.clone()).await?;
+    let mut the_dir = read_dir(if path.is_file() {
+      path
+        .parent()
+        .map(|v| v.to_path_buf())
+        .unwrap_or(path.clone())
+    } else {
+      path.clone()
+    })
+    .await?;
     let mut ret = vec![];
 
     while let Some(f) = the_dir.next_entry().await? {

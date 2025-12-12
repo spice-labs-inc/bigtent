@@ -17,7 +17,7 @@ pub struct Args {
 
   /// if there's just a single Goat Rodeo Cluster `.grc` file to serve, use this option
   #[arg(long, short)]
-  pub rodeo: Option<PathBuf>,
+  pub rodeo: Option<Vec<PathBuf>>,
 
   /// to merge many directories containing `.grc` files into
   /// an entirely new cluster without preserving history.

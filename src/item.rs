@@ -1,7 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use serde::{Deserialize, Serialize};
-use serde_cbor::Value;
+use serde::{
+  Deserialize, Serialize,
+  de::{self, Visitor},
+  ser::SerializeSeq,
+};
+use serde_cbor::{
+  Value,
+  value::{from_value, to_value},
+};
 
 /// Merge two values
 fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
@@ -297,6 +304,15 @@ impl From<&Item> for serde_json::Value {
 }
 
 impl Item {
+  /// Make a list of all the gitoids that this Item contains
+  pub fn list_contains(&self) -> Vec<String> {
+    self
+      .connections
+      .iter()
+      .filter(|v| v.0.is_contained_by_up())
+      .map(|v| v.1.clone())
+      .collect()
+  }
   /// is the item a "root" item... no "up" or "tag:from"
   pub fn is_root_item(&self) -> bool {
     if self.body_mime_type != Some("application/vnd.cc.goatrodeo".to_string()) {
@@ -389,12 +405,31 @@ impl Item {
   pub fn merge(&self, other: Item) -> Item {
     let (body, mime_type) = match (
       &self.body,
-      other.body,
+      other.body.clone(),
       self.body_mime_type == other.body_mime_type,
     ) {
       (None, None, _) => (None, None),
       (None, Some(a), _) => (Some(a), other.body_mime_type.clone()),
       (Some(a), None, _) => (Some(a.clone()), self.body_mime_type.clone()),
+      (Some(a), Some(b), true)
+        if self.body_mime_type.iter().map(|mt| mt as &str).last()
+          == Some(ITEM_METADATA_MIME_TYPE) =>
+      {
+        match (from_value(a.clone()), from_value(b.clone())) {
+          (Ok::<ItemMetaData, _>(ai), Ok::<ItemMetaData, _>(bi)) => {
+            let merged = ai.merge(bi, &self, &other);
+            (to_value(merged).ok(), self.body_mime_type.clone())
+          }
+
+          // if we can't deserialize, then try merging the CBOR
+          _ => (
+            Some(merge_values(a, &b, 0, &|| self.list_contains(), &|| {
+              other.list_contains()
+            })),
+            self.body_mime_type.clone(),
+          ),
+        }
+      }
       (Some(a), Some(b), true) => (
         Some(merge_values(
           a,
@@ -432,6 +467,165 @@ impl Item {
       },
       body_mime_type: mime_type,
       body: body,
+    }
+  }
+}
+
+pub const ITEM_METADATA_MIME_TYPE: &str = "application/vnd.cc.goatrodeo";
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub enum StringOrPair {
+  Str(String),
+  Pair(String, String),
+}
+
+struct StringOrPairVisitor;
+impl<'de> Visitor<'de> for StringOrPairVisitor {
+  type Value = StringOrPair;
+
+  fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+    formatter.write_str("Expecting a string or an array of string")
+  }
+
+  fn visit_str<E>(self, cmd_str: &str) -> std::result::Result<Self::Value, E>
+  where
+    E: de::Error,
+  {
+    Ok(StringOrPair::Str(cmd_str.into()))
+  }
+
+  fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+  where
+    E: de::Error,
+  {
+    Ok(StringOrPair::Str(v))
+  }
+
+  fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+  where
+    A: de::SeqAccess<'de>,
+  {
+    match (seq.next_element(), seq.next_element()) {
+      (Ok(Some::<String>(s1)), Ok(Some::<String>(s2))) => Ok(StringOrPair::Pair(s1, s2)),
+      _ => Err(de::Error::custom("Expecting a tuple of strings")),
+    }
+  }
+}
+impl<'de> Deserialize<'de> for StringOrPair {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    let res = deserializer.deserialize_any(StringOrPairVisitor)?;
+    Ok(res)
+  }
+}
+
+impl Serialize for StringOrPair {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    match self {
+      StringOrPair::Str(v) => serializer.serialize_str(v),
+      StringOrPair::Pair(a, b) => {
+        let mut seq = serializer.serialize_seq(Some(2))?;
+        seq.serialize_element(a)?;
+        seq.serialize_element(b)?;
+
+        seq.end()
+      }
+    }
+  }
+}
+
+#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
+pub struct ItemMetaData {
+  pub file_names: BTreeSet<String>,
+  pub file_size: u64,
+  pub mime_type: BTreeSet<String>,
+  pub extra: BTreeMap<String, BTreeSet<StringOrPair>>,
+}
+
+impl ItemMetaData {
+  pub fn merge(&self, other: ItemMetaData, self_item: &Item, other_item: &Item) -> ItemMetaData {
+    fn fix(filename: String, gitoids: Vec<String>) -> BTreeSet<String> {
+      let mut ret: BTreeSet<String> = gitoids
+        .iter()
+        .map(|go| format!("{go}!${filename}"))
+        .collect();
+
+      ret.insert(filename);
+
+      ret
+    }
+
+    let mut merged_filenames = self.file_names.clone();
+    merged_filenames.append(&mut other.file_names.clone());
+
+    let resolved_filenames = match (
+      merged_filenames.len(),
+      self.file_names.len(),
+      other.file_names.len(),
+    ) {
+      // if there's only one filename, then it's a clean merge
+      (1, _, _) => merged_filenames,
+
+      // if both have already done the filename to gitoid mapping, then it's safe to merge
+      (_, tsize, osize) if tsize > 1 && osize > 1 => merged_filenames,
+
+      // create the mapping
+      (_, tsize, osize) => {
+        let mut this_with_mapping: BTreeSet<String> = if tsize > 1 {
+          self.file_names.clone()
+        } else if tsize == 0 {
+          BTreeSet::new()
+        } else {
+          fix(
+            self.file_names.first().expect("Just tested").clone(),
+            self_item.list_contains(),
+          )
+        };
+        let mut other_with_mapping = if osize > 1 {
+          other.file_names.clone()
+        } else if osize == 0 {
+          BTreeSet::new()
+        } else {
+          fix(
+            other.file_names.first().expect("Just tested").clone(),
+            other_item.list_contains(),
+          )
+        };
+        this_with_mapping.append(&mut other_with_mapping);
+        this_with_mapping
+      }
+    };
+
+    ItemMetaData {
+      file_names: resolved_filenames,
+      mime_type: {
+        let mut it = self.mime_type.clone();
+        it.extend(other.mime_type.clone());
+        it
+      },
+      file_size: self.file_size,
+      extra: {
+        let mut it = self.extra.clone();
+        for (k, v) in other.extra.iter() {
+          let v = v.clone();
+          let the_val = match it.get(k) {
+            Some(mine) => {
+              let mut tmp = mine.clone();
+              tmp.extend(v);
+              tmp
+            }
+            None => v,
+          };
+
+          it.insert(k.clone(), the_val);
+        }
+        it
+      },
     }
   }
 }

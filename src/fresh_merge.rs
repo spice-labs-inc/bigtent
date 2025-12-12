@@ -3,531 +3,535 @@ use log::info;
 use serde_json::json;
 use serde_jsonlines::write_json_lines;
 use std::{
-  collections::{BTreeSet, HashMap},
-  fs::{self, File},
-  io::{BufWriter, Write},
-  path::PathBuf,
-  sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-  },
-  thread::{self, Thread},
-  time::Instant,
+    collections::{BTreeSet, HashMap},
+    fs::{self, File},
+    io::{BufWriter, Write},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread::{self},
+    time::{Duration, Instant},
 }; // Use log crate when building application
 
 #[cfg(test)]
 use std::println as info;
 
 use crate::{
-  item::Item,
-  rodeo::{
-    goat_trait::GoatRodeoTrait,
-    index::{HasHash, ItemOffset},
-    member::HerdMember,
-    robo_goat::ClusterRoboMember,
-    writer::ClusterWriter,
-  },
-  util::{MD5Hash, NiceDurationDisplay, iso8601_now},
+    item::Item,
+    rodeo::{
+        goat_trait::GoatRodeoTrait,
+        index::{HasHash, ItemOffset},
+        member::HerdMember,
+        robo_goat::ClusterRoboMember,
+        writer::ClusterWriter,
+    },
+    util::{MD5Hash, NiceDurationDisplay, iso8601_now},
 };
 use anyhow::Result;
 use thousands::Separable;
 
 pub async fn merge_fresh<PB: Into<PathBuf>>(
-  clusters: Vec<Arc<HerdMember>>,
-  merge_buffer_limit: usize,
-  dest_directory: PB,
+    clusters: Vec<Arc<HerdMember>>,
+    merge_buffer_limit: usize,
+    dest_directory: PB,
 ) -> Result<()> {
-  let start = Instant::now();
-  let dest: PathBuf = dest_directory.into();
+    let start = Instant::now();
+    let dest: PathBuf = dest_directory.into();
 
-  fs::create_dir_all(dest.clone())?;
-  let mut seen_purls = BTreeSet::new();
-
-  info!(
-    "Created target dir at {:?}",
-    Instant::now().duration_since(start)
-  );
-
-  let mut loop_cnt = 0usize;
-  let mut merge_cnt = 0usize;
-  let mut max_merge_len = 0usize;
-
-  let mut index_holder = vec![];
-
-  for (idx, cluster) in clusters.iter().enumerate() {
-    let index_len = cluster.number_of_items();
-
-    index_holder.push(ClusterPos {
-      cluster: cluster.clone(),
-      pos: 0,
-      cache: None,
-      len: index_len,
-    });
+    fs::create_dir_all(dest.clone())?;
+    let mut seen_purls = BTreeSet::new();
 
     info!(
-      "Loaded cluster {} of {}, from {}",
-      idx + 1,
-      clusters.len(),
-      cluster.name()
+        "Created target dir at {:?}",
+        Instant::now().duration_since(start)
     );
 
-    max_merge_len += index_len;
-  }
+    let mut loop_cnt = 0usize;
+    let mut merge_cnt = 0usize;
+    let mut max_merge_len = 0usize;
 
-  info!(
-    "Read indicies at {:?}",
-    Instant::now().duration_since(start)
-  );
+    let mut index_holder = vec![];
 
-  let mut cluster_writer = ClusterWriter::new(&dest).await?;
-  let merge_start = Instant::now();
+    for (idx, cluster) in clusters.iter().enumerate() {
+        let index_len = cluster.number_of_items();
 
-  let (offset_tx, offset_rx) = flume::bounded(200_000);
+        index_holder.push(ClusterPos {
+            cluster: cluster.clone(),
+            pos: 0,
+            cache: None,
+            len: index_len,
+        });
 
-  let holding_pen_gate = Arc::new(AtomicUsize::new(0));
-  let mut coord_threads = vec![];
-  let mut threads = vec![];
+        info!(
+            "Loaded cluster {} of {}, from {}",
+            idx + 1,
+            clusters.len(),
+            cluster.name()
+        );
 
-  /// Returns true if atomic gate is ushel the limit
-  fn check_limit(gate: &AtomicUsize, limit: usize) -> bool {
-    gate.load(Ordering::Acquire) < limit
-  }
-
-  /// Trigger parked coordinator threads to continue running
-  fn unpark_coords(coords: &Vec<Thread>) {
-    for t in coords {
-      Thread::unpark(&t);
+        max_merge_len += index_len;
     }
-  }
 
-  let hpg = Arc::clone(&holding_pen_gate);
-  let coorindator_handle = thread::spawn(move || {
-    let mut pos = 0usize;
-    loop {
-      // Queue items for work until the buffer limit is reached
-      if check_limit(&hpg, merge_buffer_limit) {
-        match next_hash_of_item_to_merge(&mut index_holder) {
-          Some(items_to_merge) => {
-            offset_tx
-              .send((pos, items_to_merge))
-              .expect("Should be able to send the message");
-            pos += 1;
-          }
-          // No more work left to do!
-          None => break,
-        }
-      }
-      // Park this coordinator when the limit is reached
-      else {
-        std::thread::park();
-      }
+    info!(
+        "Read indicies at {:?}",
+        Instant::now().duration_since(start)
+    );
+
+    let mut cluster_writer = ClusterWriter::new(&dest).await?;
+    let merge_start = Instant::now();
+
+    let (offset_tx, offset_rx) = flume::bounded(200_000);
+
+    let holding_pen_gate = Arc::new(AtomicUsize::new(0));
+    let mut threads = vec![];
+
+    /// Returns true if atomic gate is ushel the limit
+    fn check_limit(gate: &AtomicUsize, limit: usize) -> bool {
+        gate.load(Ordering::Acquire) < limit
     }
-  });
 
-  coord_threads.push(coorindator_handle.thread().clone());
-  threads.push(coorindator_handle);
-
-  //// Worker thread section
-  ////
-  let (merged_tx, merged_rx) = flume::bounded(200_000);
-  for thread_num in 0..20 {
-    let rx = offset_rx.clone();
-    let tx = merged_tx.clone();
-
-    let processor_handle = thread::spawn(move || {
-      let mut cnt = 0usize;
-      while let Ok((position, items_to_merge)) = rx.recv() {
-        let mut to_merge = vec![];
-        let mut purls = vec![];
-        for (offset, cluster) in &items_to_merge {
-          let merge_final = cluster
-            .item_from_item_offset(offset)
-            .expect("Should get the item");
-          merge_final
-            .connections
-            .iter()
-            .filter(|v| v.1.starts_with("pkg:"))
-            .for_each(|v| purls.push(v.1.to_string()));
-
-          to_merge.push(merge_final);
-        }
-
-        let mut top = to_merge.pop().unwrap();
-
-        for i in to_merge {
-          top = top.merge(i);
-        }
-
-        let cbor_bytes = serde_cbor::to_vec(&top).expect("Should be able to encode an item");
-
-        tx.send(ItemOrPurl::Item {
-          pos: position,
-          item: top,
-          cbor_bytes,
-          merged: items_to_merge.len() - 1,
-          purls,
-        })
-        .expect("Should send message");
-        cnt += 1;
-        if false && cnt % 500_000 == 0 {
-          info!(
-            "Thread {} at cnt {}",
-            thread_num,
-            cnt.separate_with_commas()
-          );
-        }
-      }
-    });
-    threads.push(processor_handle);
-  }
-
-  drop(merged_tx);
-  drop(offset_rx); // make sure no more copies exist
-
-  //// Main thread section
-  ////
-
-  let mut next_expected = 0usize;
-  let mut holding_pen = HashMap::new();
-
-  while let Ok(item_or_purl) = merged_rx.recv_async().await {
-    match item_or_purl {
-      ItemOrPurl::Item {
-        pos: position,
-        item,
-        merged,
-        cbor_bytes,
-        purls,
-      } => {
-        for p in purls {
-          if !seen_purls.contains(&p) {
-            //purl_file.write(format!("{}\n", p).as_bytes())?;
-            seen_purls.insert(p);
-          }
-        }
-        merge_cnt += merged;
-
-        if position == next_expected {
-          // Insert new position into holding pen and increment atomic gate
-          holding_pen.insert(position, (item, cbor_bytes));
-
-          while let Some((item, cbor_bytes)) = holding_pen.remove(&next_expected) {
-            loop_cnt += 1;
-
-            // Decrement atomic gate for every item removed
-            cluster_writer.write_item(item, cbor_bytes).await?;
-
-            // Log, but only occasionally
-            if loop_cnt % 2_500_000 == 0 {
-              let diff = merge_start.elapsed();
-              let items_per_second = (loop_cnt as f64) / diff.as_secs_f64();
-              let remaining = (((max_merge_len - merge_cnt) - loop_cnt) as f64) / items_per_second;
-
-              let nd: NiceDurationDisplay = remaining.into();
-              let td: NiceDurationDisplay = merge_start.elapsed().into();
-              info!(
-                "Merge cnt {}m of {}m merge cnt {}m at {} estimated end {} written pURLs {} holding pen cnt {}",
-                (loop_cnt / 1_000_000).separate_with_commas(),
-                ((max_merge_len - merge_cnt) / 1_000_000).separate_with_commas(),
-                (merge_cnt / 1_000_000).separate_with_commas(),
-                td,
-                nd,
-                seen_purls.len().separate_with_commas(),
-                holding_pen.len()
-              );
+    let hpg = Arc::clone(&holding_pen_gate);
+    let coorindator_handle = thread::spawn(move || {
+        let mut pos = 0usize;
+        loop {
+            // Queue items for work until the buffer limit is reached
+            if check_limit(&hpg, merge_buffer_limit) {
+                match next_hash_of_item_to_merge(&mut index_holder) {
+                    Some(items_to_merge) => {
+                        offset_tx
+                            .send((pos, items_to_merge))
+                            .expect("Should be able to send the message");
+                        pos += 1;
+                    }
+                    // No more work left to do!
+                    None => break,
+                }
             }
-
-            next_expected += 1;
-          }
-        } else {
-          // Insert an unexpected position into the holding pen
-          holding_pen.insert(position, (item, cbor_bytes));
+            // Park this coordinator when the limit is reached
+            else {
+                while !check_limit(&hpg, merge_buffer_limit) {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
         }
+    });
 
-        // Store the current length of the holding pen
-        holding_pen_gate.store(holding_pen.len(), Ordering::Release);
+    threads.push(coorindator_handle);
 
-        // If the merge buffer is below the limit, unpark coordinators
-        if holding_pen.len() < merge_buffer_limit {
-          unpark_coords(&coord_threads);
-        }
-      }
+    //// Worker thread section
+    ////
+    let (merged_tx, merged_rx) = flume::bounded(200_000);
+    for thread_num in 0..20 {
+        let rx = offset_rx.clone();
+        let tx = merged_tx.clone();
+
+        let processor_handle = thread::spawn(move || {
+            let mut cnt = 0usize;
+            while let Ok((position, items_to_merge)) = rx.recv() {
+                let mut to_merge = vec![];
+                let mut purls = vec![];
+                for (offset, cluster) in &items_to_merge {
+                    let merge_final = cluster
+                        .item_from_item_offset(offset)
+                        .expect("Should get the item");
+                    merge_final
+                        .connections
+                        .iter()
+                        .filter(|v| v.1.starts_with("pkg:"))
+                        .for_each(|v| purls.push(v.1.to_string()));
+
+                    to_merge.push(merge_final);
+                }
+
+                let mut top = to_merge.pop().unwrap();
+
+                for i in to_merge {
+                    top = top.merge(i);
+                }
+
+                let cbor_bytes =
+                    serde_cbor::to_vec(&top).expect("Should be able to encode an item");
+
+                tx.send(ItemOrPurl::Item {
+                    pos: position,
+                    item: top,
+                    cbor_bytes,
+                    merged: items_to_merge.len() - 1,
+                    purls,
+                })
+                .expect("Should send message");
+                cnt += 1;
+                if false && cnt % 500_000 == 0 {
+                    info!(
+                        "Thread {} at cnt {}",
+                        thread_num,
+                        cnt.separate_with_commas()
+                    );
+                }
+            }
+        });
+        threads.push(processor_handle);
     }
-  }
 
-  if !holding_pen.is_empty() {
-    panic!(
-      "Finished receiving, but holding pen is not empty {:?}",
-      holding_pen
+    drop(merged_tx);
+    drop(offset_rx); // make sure no more copies exist
+
+    //// Main thread section
+    ////
+
+    let mut next_expected = 0usize;
+    let mut holding_pen = HashMap::new();
+
+    while let Ok(item_or_purl) = merged_rx.recv_async().await {
+        match item_or_purl {
+            ItemOrPurl::Item {
+                pos: position,
+                item,
+                merged,
+                cbor_bytes,
+                purls,
+            } => {
+                for p in purls {
+                    if !seen_purls.contains(&p) {
+                        //purl_file.write(format!("{}\n", p).as_bytes())?;
+                        seen_purls.insert(p);
+                    }
+                }
+                merge_cnt += merged;
+
+                if position == next_expected {
+                    // Insert new position into holding pen and increment atomic gate
+                    holding_pen.insert(position, (item, cbor_bytes));
+
+                    while let Some((item, cbor_bytes)) = holding_pen.remove(&next_expected) {
+                        loop_cnt += 1;
+
+                        // Decrement atomic gate for every item removed
+                        cluster_writer.write_item(item, cbor_bytes).await?;
+
+                        // Log, but only occasionally
+                        if loop_cnt % 2_500_000 == 0 {
+                            let diff = merge_start.elapsed();
+                            let items_per_second = (loop_cnt as f64) / diff.as_secs_f64();
+                            let remaining = (((max_merge_len - merge_cnt) - loop_cnt) as f64)
+                                / items_per_second;
+
+                            let nd: NiceDurationDisplay = remaining.into();
+                            let td: NiceDurationDisplay = merge_start.elapsed().into();
+                            info!(
+                                "Merge cnt {}m of {}m merge cnt {}m at {} estimated end {} written pURLs {} holding pen cnt {}",
+                                (loop_cnt / 1_000_000).separate_with_commas(),
+                                ((max_merge_len - merge_cnt) / 1_000_000).separate_with_commas(),
+                                (merge_cnt / 1_000_000).separate_with_commas(),
+                                td,
+                                nd,
+                                seen_purls.len().separate_with_commas(),
+                                holding_pen.len()
+                            );
+                        }
+
+                        next_expected += 1;
+                    }
+                } else {
+                    // Insert an unexpected position into the holding pen
+                    holding_pen.insert(position, (item, cbor_bytes));
+                }
+
+                // Store the current length of the holding pen
+                holding_pen_gate.store(holding_pen.len(), Ordering::Release);
+            }
+        }
+    }
+
+    if !holding_pen.is_empty() {
+        panic!(
+            "Finished receiving, but holding pen is not empty {:?}",
+            holding_pen
+        );
+    }
+
+    info!("Writing pURLs");
+    tokio::task::spawn_blocking(move || {
+        fn do_thing(dest: PathBuf, seen_purls: BTreeSet<String>) -> Result<()> {
+            let mut purl_file = BufWriter::new(File::create({
+                let mut dest = dest.clone();
+
+                dest.push("purls.txt");
+                dest
+            })?);
+            for purl in &seen_purls {
+                purl_file.write_fmt(format_args!("{}\n", purl))?;
+            }
+            purl_file.flush()?;
+            Ok(())
+        }
+
+        do_thing(dest, seen_purls)
+    })
+    .await??;
+    info!("Wrote pURLs");
+
+    let cluster_file = cluster_writer.finalize_cluster().await?;
+
+    let mut cluster_names = vec![];
+    let mut history = vec![];
+    for cluster in &clusters {
+        cluster_names.push(cluster.name());
+        let mut cluster_history = cluster.read_history()?;
+        history.append(&mut cluster_history);
+    }
+    let iso_time = iso8601_now();
+    let cluster_name = format!(
+        "{}",
+        cluster_file
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("unknown")
     );
-  }
+    let last_json = json!({"date": iso_time,
+			   "big_tent_commit": env!("VERGEN_GIT_SHA"),
+			   "cluster_name": cluster_name,  "operation": "merge_clusters",
+			   "merged_clusters": cluster_names});
 
-  info!("Writing pURLs");
-  tokio::task::spawn_blocking(move || {
-    fn do_thing(dest: PathBuf, seen_purls: BTreeSet<String>) -> Result<()> {
-      let mut purl_file = BufWriter::new(File::create({
-        let mut dest = dest.clone();
+    history.push(last_json);
 
-        dest.push("purls.txt");
-        dest
-      })?);
-      for purl in &seen_purls {
-        purl_file.write_fmt(format_args!("{}\n", purl))?;
-      }
-      purl_file.flush()?;
-      Ok(())
-    }
+    let history_file = cluster_file
+        .canonicalize()?
+        .parent()
+        .expect("Should have cluster parent dir")
+        .join("history.jsonl");
 
-    do_thing(dest, seen_purls)
-  })
-  .await??;
-  info!("Wrote pURLs");
+    write_json_lines(&history_file, &history)?;
 
-  let cluster_file = cluster_writer.finalize_cluster().await?;
-
-  let mut cluster_names = vec![];
-  let mut history = vec![];
-  for cluster in &clusters {
-    cluster_names.push(cluster.name());
-    let mut cluster_history = cluster.read_history()?;
-    history.append(&mut cluster_history);
-  }
-  let iso_time = iso8601_now();
-  let cluster_name = format!(
-    "{}",
-    cluster_file
-      .file_name()
-      .and_then(|v| v.to_str())
-      .unwrap_or("unknown")
-  );
-  let last_json = json!({"date": iso_time,
-    "big_tent_commit": env!("VERGEN_GIT_SHA"),
-  "cluster_name": cluster_name,  "operation": "merge_clusters",
-  "merged_clusters": cluster_names});
-
-  history.push(last_json);
-
-  let history_file = cluster_file
-    .canonicalize()?
-    .parent()
-    .expect("Should have cluster parent dir")
-    .join("history.jsonl");
-
-  write_json_lines(&history_file, &history)?;
-
-  info!(
-    "Finished {} loops at {:?}",
-    loop_cnt.separate_with_commas(),
-    start.elapsed()
-  );
-  Ok(())
+    info!(
+        "Finished {} loops at {:?}",
+        loop_cnt.separate_with_commas(),
+        start.elapsed()
+    );
+    Ok(())
 }
 
 enum ItemOrPurl {
-  // Purl(Vec<String>),
-  Item {
-    pos: usize,
-    item: Item,
-    cbor_bytes: Vec<u8>,
-    merged: usize,
-    purls: Vec<String>,
-  },
+    // Purl(Vec<String>),
+    Item {
+        pos: usize,
+        item: Item,
+        cbor_bytes: Vec<u8>,
+        merged: usize,
+        purls: Vec<String>,
+    },
 }
 
-#[cfg(feature = "longtest")]
-#[test]
-fn test_merge() {
-  use rand::Rng;
-  let mut rng = rand::thread_rng();
+// TODO: update or remove test
+// #[ignore = "Out of date and weird"]
+// #[cfg(feature = "longtest")]
+// #[tokio::test]
+// async fn test_merge() {
+//   use std::thread::JoinHandle;
 
-  let target_path = "/tmp/bt_merge_test";
-  // delete the dest dir
-  let _ = fs::remove_dir_all(target_path);
+//   use rand::Rng;
+//   use tokio::task::JoinSet;
+//   let mut rng = rand::thread_rng();
 
-  info!("Removed directory");
+//   let target_path = "/tmp/bt_merge_test";
+//   // delete the dest dir
+//   let _ = fs::remove_dir_all(target_path);
 
-  let test_paths: Vec<String> = vec![
-    "../../tmp/oc_dest/result_aa",
-    "../../tmp/oc_dest/result_ab",
-    // "../../tmp/oc_dest/result_ac",
-    // "../../tmp/oc_dest/result_ad",
-    // "../../tmp/oc_dest/result_ae",
-    // "../../tmp/oc_dest/result_af",
-    // "../../tmp/oc_dest/result_ag",
-    // "../../tmp/oc_dest/result_ah",
-    // "../../tmp/oc_dest/result_ai",
-    // "../../tmp/oc_dest/result_aj",
-    // "../../tmp/oc_dest/result_ak",
-    // "../../tmp/oc_dest/result_al",
-    // "../../tmp/oc_dest/result_am",
-    // "../../tmp/oc_dest/result_an",
-    // "../../tmp/oc_dest/result_ao",
-    // "../../tmp/oc_dest/result_ap",
-  ]
-  .into_iter()
-  .filter(|p| {
-    let pb: PathBuf = p.into();
-    pb.exists() && pb.is_dir()
-  })
-  .map(|v| v.to_string())
-  .collect();
+//   info!("Removed directory");
 
-  if test_paths.len() < 2 {
-    return;
-  }
-  let test_clusters: Vec<GoatRodeoCluster> = test_paths
-    .iter()
-    .flat_map(|v| GoatRodeoCluster::cluster_files_in_dir(v.into()).unwrap())
-    .collect();
+//   let test_paths: Vec<String> = vec![
+//     "../../tmp/oc_dest/result_aa",
+//     "../../tmp/oc_dest/result_ab",
+//     // "../../tmp/oc_dest/result_ac",
+//     // "../../tmp/oc_dest/result_ad",
+//     // "../../tmp/oc_dest/result_ae",
+//     // "../../tmp/oc_dest/result_af",
+//     // "../../tmp/oc_dest/result_ag",
+//     // "../../tmp/oc_dest/result_ah",
+//     // "../../tmp/oc_dest/result_ai",
+//     // "../../tmp/oc_dest/result_aj",
+//     // "../../tmp/oc_dest/result_ak",
+//     // "../../tmp/oc_dest/result_al",
+//     // "../../tmp/oc_dest/result_am",
+//     // "../../tmp/oc_dest/result_an",
+//     // "../../tmp/oc_dest/result_ao",
+//     // "../../tmp/oc_dest/result_ap",
+//   ]
+//   .into_iter()
+//   .filter(|p| {
+//     let pb: PathBuf = p.into();
+//     pb.exists() && pb.is_dir()
+//   })
+//   .map(|v| v.to_string())
+//   .collect();
 
-  info!("Got test clusters");
+//   if test_paths.len() < 2 {
+//     return;
+//   }
 
-  for should_thread in vec![true, false] {
-    let cluster_copy = test_clusters.clone();
+//   let mut set = JoinSet::new();
+//   test_paths.iter().for_each(|v| {
+//     set.spawn(async move { GoatRodeoCluster::cluster_files_in_dir(v.into(), false).await });
+//   });
 
-    merge_fresh(test_clusters.clone(), should_thread, &target_path)
-      .expect("Should merge correctly");
+//   let mut test_clusters = vec![];
+//   while let Some(res) = set.join_next().await {}
 
-    // a block so the file gets closed
-    {
-      let mut purl_path = PathBuf::from(target_path);
-      purl_path.push("purls.txt");
-      let mut purl_file = BufReader::new(File::open(purl_path).expect("Should have purls"));
-      let mut read = String::new();
-      purl_file.read_line(&mut read).expect("Must read a line");
-      assert!(read.len() > 4, "Expected to read a pURL");
-    }
+//   info!("Got test clusters");
 
-    let dest_cluster = GoatRodeoCluster::cluster_files_in_dir(target_path.into())
-      .expect("Got a valid cluster in test directory")
-      .pop()
-      .expect("And it should have at least 1 element");
+//   for should_thread in vec![true, false] {
+//     let cluster_copy = test_clusters.clone();
 
-    let mut loop_cnt = 0usize;
-    let start = Instant::now();
-    for test_cluster in cluster_copy {
-      let index = test_cluster.get_index().unwrap();
-      for item in index.iter() {
-        if rng.gen_range(0..1000) == 42 {
-          let old = test_cluster.data_for_hash(item.hash).unwrap().1;
-          let new = dest_cluster.data_for_hash(item.hash).unwrap().1;
-          assert_eq!(
-            old.identifier, new.identifier,
-            "Expecting the same identifiers"
-          );
+//     merge_fresh(test_clusters.clone(), 10_000, &target_path)
+//       .await
+//       .expect("Should merge correctly");
 
-          for i in old.connections.iter() {
-            assert!(
-              new.connections.contains(i),
-              "Expecting {} to contain {:?}",
-              new.identifier,
-              i
-            );
-          }
+//     // a block so the file gets closed
+//     async {
+//       use std::io::BufReader;
 
-          match (&new.metadata, &old.metadata) {
-            (None, Some(omd)) => assert!(
-              false,
-              "for {} new did not contain metadata, old did {:?}",
-              new.identifier, omd
-            ),
-            (Some(nmd), Some(omd)) => {
-              for file_name in omd.file_names.iter() {
-                assert!(
-                  nmd.file_names.contains(file_name),
-                  "Expected new to contain filenames id {} old filenames {:?} new filenames {:?}",
-                  new.identifier,
-                  omd.file_names,
-                  nmd.file_names
-                );
-              }
-            }
-            _ => {}
-          }
-        }
+//       let mut purl_path = PathBuf::from(target_path);
+//       purl_path.push("purls.txt");
+//       let mut purl_file = BufReader::new(File::open(purl_path).expect("Should have purls"));
+//       let mut read = String::new();
+//       purl_file.read_line(&mut read).expect("Must read a line");
+//       assert!(read.len() > 4, "Expected to read a pURL");
+//     }
+//     .await;
 
-        loop_cnt += 1;
-        if loop_cnt % 500_000 == 0 {
-          info!(
-            "MTesting Loop {} at {:?} cluster {:?} threaded {}",
-            loop_cnt,
-            Instant::now().duration_since(start),
-            test_cluster.cluster_path,
-            should_thread
-          );
-        }
-      }
-    }
-  }
-}
+//     let dest_cluster = GoatRodeoCluster::cluster_files_in_dir(target_path.into(), false)
+//       .await
+//       .expect("Got a valid cluster in test directory")
+//       .pop()
+//       .expect("And it should have at least 1 element");
+
+//     let mut loop_cnt = 0usize;
+//     let start = Instant::now();
+//     for test_cluster in cluster_copy {
+//       let index = test_cluster.get_index().unwrap();
+//       for item in index.iter() {
+//         if rng.gen_range(0..1000) == 42 {
+//           let old = test_cluster.item_for_hash(item.hash).unwrap();
+//           let new = dest_cluster.item_for_hash(item.hash).unwrap();
+//           assert_eq!(
+//             old.identifier, new.identifier,
+//             "Expecting the same identifiers"
+//           );
+
+//           for i in old.connections.iter() {
+//             assert!(
+//               new.connections.contains(i),
+//               "Expecting {} to contain {:?}",
+//               new.identifier,
+//               i
+//             );
+//           }
+
+//           match (&new.identifier, &old.identifier) {
+//             (None, Some(omd)) => assert!(
+//               false,
+//               "for {} new did not contain metadata, old did {:?}",
+//               new.identifier, omd
+//             ),
+//             (Some(nmd), Some(omd)) => {
+//               for file_name in omd.file_names.iter() {
+//                 assert!(
+//                   nmd.file_names.contains(file_name),
+//                   "Expected new to contain filenames id {} old filenames {:?} new filenames {:?}",
+//                   new.identifier,
+//                   omd.file_names,
+//                   nmd.file_names
+//                 );
+//               }
+//             }
+//             _ => {}
+//           }
+//         }
+
+//         loop_cnt += 1;
+//         if loop_cnt % 500_000 == 0 {
+//           info!(
+//             "MTesting Loop {} at {:?} cluster {:?} threaded {}",
+//             loop_cnt,
+//             Instant::now().duration_since(start),
+//             test_cluster.cluster_path,
+//             should_thread
+//           );
+//         }
+//       }
+//     }
+//   }
+// }
 
 struct ClusterPos {
-  pub cluster: Arc<HerdMember>,
-  pub pos: usize,
-  pub len: usize,
-  pub cache: Option<ItemOffset>,
+    pub cluster: Arc<HerdMember>,
+    pub pos: usize,
+    pub len: usize,
+    pub cache: Option<ItemOffset>,
 }
 
 impl ClusterPos {
-  pub fn this_item(&mut self) -> Option<ItemOffset> {
-    if self.pos >= self.len {
-      None
-    } else {
-      match &self.cache {
-        Some(v) => Some(v.clone()),
-        None => match self.cluster.offset_from_pos(self.pos) {
-          Some(v) => {
-            self.cache = Some(v.clone());
-            Some(v)
-          }
-          _ => None,
-        },
-      }
+    pub fn this_item(&mut self) -> Option<ItemOffset> {
+        if self.pos >= self.len {
+            None
+        } else {
+            match &self.cache {
+                Some(v) => Some(v.clone()),
+                None => match self.cluster.offset_from_pos(self.pos) {
+                    Some(v) => {
+                        self.cache = Some(v.clone());
+                        Some(v)
+                    }
+                    _ => None,
+                },
+            }
+        }
     }
-  }
 
-  pub fn next(&mut self) {
-    self.cache = None;
-    self.pos += 1
-  }
+    pub fn next(&mut self) {
+        self.cache = None;
+        self.pos += 1
+    }
 }
 
 fn next_hash_of_item_to_merge(
-  index_holder: &mut Vec<ClusterPos>,
+    index_holder: &mut Vec<ClusterPos>,
 ) -> Option<Vec<(ItemOffset, Arc<HerdMember>)>> {
-  let mut lowest: Option<MD5Hash> = None;
-  let mut low_clusters = vec![];
+    let mut lowest: Option<MD5Hash> = None;
+    let mut low_clusters = vec![];
 
-  for holder in index_holder {
-    let this_item = holder.this_item();
-    match (&lowest, this_item) {
-      (None, Some(either)) => {
-        // found the first
-        lowest = Some(*either.hash());
-        low_clusters.push((either, holder));
-      }
-      // it's the lowe
-      (Some(low), Some(either)) if low == either.hash() => {
-        low_clusters.push((either, holder));
-      }
-      (Some(low), Some(either)) if low > either.hash() => {
-        lowest = Some(*either.hash());
-        low_clusters.clear();
-        low_clusters.push((either, holder));
-      }
-      _ => {}
+    for holder in index_holder {
+        let this_item = holder.this_item();
+        match (&lowest, this_item) {
+            (None, Some(either)) => {
+                // found the first
+                lowest = Some(*either.hash());
+                low_clusters.push((either, holder));
+            }
+            // it's the lowe
+            (Some(low), Some(either)) if low == either.hash() => {
+                low_clusters.push((either, holder));
+            }
+            (Some(low), Some(either)) if low > either.hash() => {
+                lowest = Some(*either.hash());
+                low_clusters.clear();
+                low_clusters.push((either, holder));
+            }
+            _ => {}
+        }
     }
-  }
 
-  match lowest {
-    None => None,
-    Some(_) => {
-      let mut clusters = vec![];
-      for (offset, holder) in low_clusters {
-        clusters.push((offset, holder.cluster.clone()));
-        holder.next();
-      }
-      Some(clusters)
+    match lowest {
+        None => None,
+        Some(_) => {
+            let mut clusters = vec![];
+            for (offset, holder) in low_clusters {
+                clusters.push((offset, holder.cluster.clone()));
+                holder.next();
+            }
+            Some(clusters)
+        }
     }
-  }
 }
