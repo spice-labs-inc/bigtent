@@ -37,7 +37,7 @@ jobs:
       - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
-            platforms: ${{env.PLATFORMS}}
+          platforms: ${{ env.PLATFORMS }}
 
       - name: Checkout with LFS
         uses: actions/checkout@v4
@@ -77,7 +77,7 @@ jobs:
         id: push
         uses: docker/build-push-action@v6
         with:
-          platforms: ${{env.PLATFORMS}}
+          platforms: ${{ env.PLATFORMS }}
           context: .
           push: true
           provenance: mode=max
