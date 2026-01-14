@@ -175,19 +175,19 @@ async fn test_purls_and_merge() {
     use crate::item::EdgeType;
     use crate::rodeo::goat::GoatRodeoCluster;
     let path = PathBuf::from("test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc");
-    let cluster_a = GoatRodeoCluster::new(&path, false)
+    let cluster_a = GoatRodeoCluster::new(&path, false, None)
         .await
         .expect("Should get first cluster");
     let path2 = PathBuf::from("test_data/cluster_b/2025_04_19_17_10_40_09ebe9a7137ee100.grc");
-    let cluster_b = GoatRodeoCluster::new(&path2, false)
+    let cluster_b = GoatRodeoCluster::new(&path2, false, None)
         .await
         .expect("Should load cluster b");
     let path_c = PathBuf::from("test_data/cluster_c/2025_07_24_14_43_36_68a489f4fd40c5e2.grc");
-    let cluster_c = GoatRodeoCluster::new(&path_c, false)
+    let cluster_c = GoatRodeoCluster::new(&path_c, false, None)
         .await
         .expect("Should get cluster c");
     let path_d = PathBuf::from("test_data/cluster_d/2025_07_24_14_44_14_2b39577cd0a58701.grc");
-    let cluster_d = GoatRodeoCluster::new(&path_d, false)
+    let cluster_d = GoatRodeoCluster::new(&path_d, false, None)
         .await
         .expect("Should get cluster d");
     let herd = GoatHerd::new(vec![
@@ -276,7 +276,7 @@ async fn test_roots() {
         total_cnt += cnt;
         let path = PathBuf::from(file);
         println!("Getting cluster {}", file);
-        let cluster = crate::rodeo::goat::GoatRodeoCluster::new(&path, false)
+        let cluster = crate::rodeo::goat::GoatRodeoCluster::new(&path, false, None)
             .await
             .expect("Should get cluster");
         herd.push(crate::rodeo::member::member_core(cluster));

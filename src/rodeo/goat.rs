@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use log::error;
 use memmap2::Mmap;
@@ -105,6 +105,8 @@ pub struct GoatRodeoCluster {
     index: Arc<ArcSwap<Option<Arc<Vec<ItemOffset>>>>>,
     building_index: Arc<Mutex<bool>>,
     name: String,
+    directory: PathBuf,
+    blob: Option<String>,
     number_of_items: usize,
     load_index: bool,
 }
@@ -297,9 +299,17 @@ impl GoatRodeoCluster {
         &self.index_files
     }
 
+    pub fn get_directory(&self) -> PathBuf {
+        self.directory.clone()
+    }
+
+    pub fn get_blob(&self) -> Option<String> {
+        self.blob.clone()
+    }
     pub async fn new(
         cluster_path: &PathBuf,
         pre_cache_index: bool,
+        blob: Option<String>,
     ) -> Result<Arc<GoatRodeoCluster>> {
         let load_index = pre_cache_index;
         let start = Instant::now();
@@ -420,6 +430,7 @@ impl GoatRodeoCluster {
             building_index: Arc::new(Mutex::new(false)),
             cluster_file_hash: sha_u64,
             number_of_items,
+            blob,
             name: format!(
                 "{}",
                 cluster_path
@@ -428,6 +439,7 @@ impl GoatRodeoCluster {
                     .unwrap_or("unknown_cluster_name")
             ),
             load_index,
+            directory: parent,
             index_offset: IndexOffset::from_index_files(&index_vec),
         });
 
@@ -667,7 +679,16 @@ impl GoatRodeoCluster {
             let file_type = file.file_type().await?;
 
             if file_type.is_file() && file_extn == Some(GOAT_RODEO_CLUSTER_FILE_SUFFIX.into()) {
-                let walker = GoatRodeoCluster::new(&file.path(), pre_cache_index).await?;
+                let walker = GoatRodeoCluster::new(
+                    &file.path(),
+                    pre_cache_index,
+                    Some(
+                        file.file_name()
+                            .into_string()
+                            .map_err(|os| anyhow!("Unable to convert {os:?} into a string"))?,
+                    ),
+                )
+                .await?;
                 ret.push(walker)
             } else if file_type.is_dir() {
                 let mut more = Box::pin(GoatRodeoCluster::cluster_files_in_dir(
@@ -951,7 +972,7 @@ async fn test_roots() {
     for (file, cnt) in to_test {
         let path = PathBuf::from(file);
         println!("Getting cluster {}", file);
-        let cluster = GoatRodeoCluster::new(&path, false)
+        let cluster = GoatRodeoCluster::new(&path, false, None)
             .await
             .expect("Should get cluster");
         println!("Goat cluster {}", file);

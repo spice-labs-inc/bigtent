@@ -24,6 +24,22 @@ pub fn member_synth(it: Arc<RoboticGoat>) -> Arc<HerdMember> {
     Arc::new(HerdMember::Robo(it))
 }
 
+impl HerdMember {
+    pub fn get_blob(&self) -> Option<String> {
+        match self {
+            HerdMember::Robo(_robotic_goat) => None,
+            HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.get_blob(),
+        }
+    }
+
+    pub fn get_directory(&self) -> Option<PathBuf> {
+        match self {
+            HerdMember::Robo(_robotic_goat) => None,
+            HerdMember::Cluster(goat_rodeo_cluster) => Some(goat_rodeo_cluster.get_directory()),
+        }
+    }
+}
+
 impl ClusterRoboMember for HerdMember {
     fn name(&self) -> String {
         match self {
