@@ -663,6 +663,7 @@ impl GoatRodeoCluster {
     pub async fn cluster_files_in_dir(
         path: PathBuf,
         pre_cache_index: bool,
+        sha: Option<[u8; 32]>,
     ) -> Result<Vec<Arc<GoatRodeoCluster>>> {
         let mut the_dir = read_dir(if path.is_file() {
             path.parent()
@@ -694,7 +695,7 @@ impl GoatRodeoCluster {
                             .into_string()
                             .map_err(|os| anyhow!("Unable to convert {os:?} into a string"))?,
                     ),
-                    None,
+                    sha,
                 )
                 .await?;
                 ret.push(walker)
@@ -702,6 +703,7 @@ impl GoatRodeoCluster {
                 let mut more = Box::pin(GoatRodeoCluster::cluster_files_in_dir(
                     file.path().clone(),
                     pre_cache_index,
+                    sha,
                 ))
                 .await?;
                 ret.append(&mut more);
@@ -779,16 +781,19 @@ async fn test_antialias() {
         return;
     }
 
-    let mut files =
-        match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into(), true)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                assert!(false, "Failure to read files {:?}", e);
-                return;
-            }
-        };
+    let mut files = match GoatRodeoCluster::cluster_files_in_dir(
+        "../goatrodeo/res_for_big_tent/".into(),
+        true,
+        None,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            assert!(false, "Failure to read files {:?}", e);
+            return;
+        }
+    };
     println!("Read cluster at {:?}", start.elapsed());
 
     assert!(files.len() > 0, "Need a cluster");
@@ -851,7 +856,8 @@ async fn test_generated_cluster() {
         }
 
         let start = Instant::now();
-        let files = match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), true).await {
+        let files = match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), true, None).await
+        {
             Ok(v) => v,
             Err(e) => {
                 assert!(false, "Failure to read files {:?}", e);
@@ -904,16 +910,19 @@ async fn test_files_in_dir() {
         return;
     }
 
-    let files =
-        match GoatRodeoCluster::cluster_files_in_dir("../goatrodeo/res_for_big_tent/".into(), true)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                assert!(false, "Failure to read files {:?}", e);
-                return;
-            }
-        };
+    let files = match GoatRodeoCluster::cluster_files_in_dir(
+        "../goatrodeo/res_for_big_tent/".into(),
+        true,
+        None,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            assert!(false, "Failure to read files {:?}", e);
+            return;
+        }
+    };
 
     assert!(files.len() > 0, "We should find some files");
     let mut total_index_size = 0;
@@ -1021,13 +1030,14 @@ async fn test_generated_cluster_no_index() {
         }
 
         let start = Instant::now();
-        let files = match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), false).await {
-            Ok(v) => v,
-            Err(e) => {
-                assert!(false, "Failure to read files {:?}", e);
-                return;
-            }
-        };
+        let files =
+            match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), false, None).await {
+                Ok(v) => v,
+                Err(e) => {
+                    assert!(false, "Failure to read files {:?}", e);
+                    return;
+                }
+            };
 
         info!(
             "Finding files took {:?}",
@@ -1076,6 +1086,7 @@ async fn test_files_in_dir_no_index_load() {
     let files = match GoatRodeoCluster::cluster_files_in_dir(
         "../goatrodeo/res_for_big_tent/".into(),
         false,
+        None,
     )
     .await
     {

@@ -217,7 +217,7 @@ async fn test_purls_and_merge() {
     .await
     .expect("Should do a merge");
 
-    let mut clusters = GoatRodeoCluster::cluster_files_in_dir(dest_dir.clone(), false)
+    let mut clusters = GoatRodeoCluster::cluster_files_in_dir(dest_dir.clone(), false, None)
         .await
         .expect("Should get cluster files");
 

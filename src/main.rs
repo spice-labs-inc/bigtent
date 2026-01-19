@@ -26,7 +26,8 @@ async fn run_rodeo(path_vec: &Vec<PathBuf>, args: &Args) -> Result<()> {
     for path in path_vec.iter() {
         if path.exists() {
             for b in
-                GoatRodeoCluster::cluster_files_in_dir(path.clone(), args.pre_cache_index()).await?
+                GoatRodeoCluster::cluster_files_in_dir(path.clone(), args.pre_cache_index(), None)
+                    .await?
             {
                 info!("Loaded cluster {}", b.name());
                 clusters.push(member_core(b));
@@ -63,7 +64,7 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
     info!("Loading clusters...");
     let mut clusters: Vec<Arc<HerdMember>> = vec![];
     for p in &paths {
-        for b in GoatRodeoCluster::cluster_files_in_dir(p.clone(), false).await? {
+        for b in GoatRodeoCluster::cluster_files_in_dir(p.clone(), false, None).await? {
             clusters.push(member_core(b));
         }
     }
