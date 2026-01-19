@@ -107,6 +107,7 @@ pub struct GoatRodeoCluster {
     name: String,
     directory: PathBuf,
     blob: Option<String>,
+    sha: Option<[u8; 32]>,
     number_of_items: usize,
     load_index: bool,
 }
@@ -306,10 +307,15 @@ impl GoatRodeoCluster {
     pub fn get_blob(&self) -> Option<String> {
         self.blob.clone()
     }
+
+    pub fn get_sha(&self) -> Option<[u8; 32]> {
+        self.sha.clone()
+    }
     pub async fn new(
         cluster_path: &PathBuf,
         pre_cache_index: bool,
         blob: Option<String>,
+        sha: Option<[u8; 32]>,
     ) -> Result<Arc<GoatRodeoCluster>> {
         let load_index = pre_cache_index;
         let start = Instant::now();
@@ -431,6 +437,7 @@ impl GoatRodeoCluster {
             cluster_file_hash: sha_u64,
             number_of_items,
             blob,
+            sha,
             name: format!(
                 "{}",
                 cluster_path
@@ -687,6 +694,7 @@ impl GoatRodeoCluster {
                             .into_string()
                             .map_err(|os| anyhow!("Unable to convert {os:?} into a string"))?,
                     ),
+                    None,
                 )
                 .await?;
                 ret.push(walker)
@@ -972,7 +980,7 @@ async fn test_roots() {
     for (file, cnt) in to_test {
         let path = PathBuf::from(file);
         println!("Getting cluster {}", file);
-        let cluster = GoatRodeoCluster::new(&path, false, None)
+        let cluster = GoatRodeoCluster::new(&path, false, None, None)
             .await
             .expect("Should get cluster");
         println!("Goat cluster {}", file);
