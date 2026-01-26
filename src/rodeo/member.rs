@@ -33,9 +33,9 @@ impl HerdMember {
     }
 
     /// if there's a SHA256 associate with the member, return it
-    pub fn get_sha(&self) -> Option<[u8; 32]> {
+    pub fn get_sha(&self) -> Vec<[u8; 32]> {
         match self {
-            HerdMember::Robo(_robotic_goat) => None,
+            HerdMember::Robo(_robotic_goat) => vec![],
             HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.get_sha(),
         }
     }

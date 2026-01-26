@@ -107,7 +107,7 @@ pub struct GoatRodeoCluster {
     name: String,
     directory: PathBuf,
     blob: Option<String>,
-    sha: Option<[u8; 32]>,
+    sha: Vec<[u8; 32]>,
     number_of_items: usize,
     load_index: bool,
 }
@@ -308,14 +308,14 @@ impl GoatRodeoCluster {
         self.blob.clone()
     }
 
-    pub fn get_sha(&self) -> Option<[u8; 32]> {
+    pub fn get_sha(&self) -> Vec<[u8; 32]> {
         self.sha.clone()
     }
     pub async fn new(
         cluster_path: &PathBuf,
         pre_cache_index: bool,
         blob: Option<String>,
-        sha: Option<[u8; 32]>,
+        sha: Vec<[u8; 32]>,
     ) -> Result<Arc<GoatRodeoCluster>> {
         let load_index = pre_cache_index;
         let start = Instant::now();
@@ -663,7 +663,7 @@ impl GoatRodeoCluster {
     pub async fn cluster_files_in_dir(
         path: PathBuf,
         pre_cache_index: bool,
-        sha: Option<[u8; 32]>,
+        sha: Vec<[u8; 32]>,
     ) -> Result<Vec<Arc<GoatRodeoCluster>>> {
         let mut the_dir = read_dir(if path.is_file() {
             path.parent()
@@ -695,7 +695,7 @@ impl GoatRodeoCluster {
                             .into_string()
                             .map_err(|os| anyhow!("Unable to convert {os:?} into a string"))?,
                     ),
-                    sha,
+                    sha.clone(),
                 )
                 .await?;
                 ret.push(walker)
@@ -703,7 +703,7 @@ impl GoatRodeoCluster {
                 let mut more = Box::pin(GoatRodeoCluster::cluster_files_in_dir(
                     file.path().clone(),
                     pre_cache_index,
-                    sha,
+                    sha.clone(),
                 ))
                 .await?;
                 ret.append(&mut more);
@@ -784,7 +784,7 @@ async fn test_antialias() {
     let mut files = match GoatRodeoCluster::cluster_files_in_dir(
         "../goatrodeo/res_for_big_tent/".into(),
         true,
-        None,
+        vec![],
     )
     .await
     {
@@ -856,14 +856,14 @@ async fn test_generated_cluster() {
         }
 
         let start = Instant::now();
-        let files = match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), true, None).await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                assert!(false, "Failure to read files {:?}", e);
-                return;
-            }
-        };
+        let files =
+            match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), true, vec![]).await {
+                Ok(v) => v,
+                Err(e) => {
+                    assert!(false, "Failure to read files {:?}", e);
+                    return;
+                }
+            };
 
         info!(
             "Finding files took {:?}",
@@ -913,7 +913,7 @@ async fn test_files_in_dir() {
     let files = match GoatRodeoCluster::cluster_files_in_dir(
         "../goatrodeo/res_for_big_tent/".into(),
         true,
-        None,
+        vec![],
     )
     .await
     {
@@ -989,7 +989,7 @@ async fn test_roots() {
     for (file, cnt) in to_test {
         let path = PathBuf::from(file);
         println!("Getting cluster {}", file);
-        let cluster = GoatRodeoCluster::new(&path, false, None, None)
+        let cluster = GoatRodeoCluster::new(&path, false, None, vec![])
             .await
             .expect("Should get cluster");
         println!("Goat cluster {}", file);
@@ -1031,7 +1031,7 @@ async fn test_generated_cluster_no_index() {
 
         let start = Instant::now();
         let files =
-            match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), false, None).await {
+            match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), false, vec![]).await {
                 Ok(v) => v,
                 Err(e) => {
                     assert!(false, "Failure to read files {:?}", e);
@@ -1086,7 +1086,7 @@ async fn test_files_in_dir_no_index_load() {
     let files = match GoatRodeoCluster::cluster_files_in_dir(
         "../goatrodeo/res_for_big_tent/".into(),
         false,
-        None,
+        vec![],
     )
     .await
     {
