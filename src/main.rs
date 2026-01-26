@@ -89,13 +89,9 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 100)]
 async fn main() -> Result<()> {
+    // use tracing_subscriber in JSON mode
+    // rather than the previous env logger
     tracing_subscriber::fmt().json().init();
-
-    // let env = Env::default()
-    //     .filter_or("MY_LOG_LEVEL", "info")
-    //     .write_style_or("MY_LOG_STYLE", "always");
-
-    // env_logger::init_from_env(env);
 
     info!("Starting big tent git sha {}", env!("VERGEN_GIT_SHA"));
     let args = Args::parse();
