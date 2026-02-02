@@ -58,7 +58,15 @@ impl ClusterWriter {
 
     #[inline]
     fn make_dest_buffer() -> Vec<u8> {
-        Vec::with_capacity(20_000_000_000)
+        // tests can run on small RAM machines, allocate a smaller buffer for tests
+        if cfg!(test) {
+            Vec::with_capacity(20_000_000)
+        } else if cfg!(not(test)) {
+            // and a bigger buffer for runtime
+            Vec::with_capacity(20_000_000_000)
+        } else {
+            panic!("How can this be both not test and test?!");
+        }
     }
 
     #[inline]
