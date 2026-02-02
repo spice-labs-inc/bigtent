@@ -24,6 +24,30 @@ pub fn member_synth(it: Arc<RoboticGoat>) -> Arc<HerdMember> {
     Arc::new(HerdMember::Robo(it))
 }
 
+impl HerdMember {
+    pub fn get_blob(&self) -> Option<String> {
+        match self {
+            HerdMember::Robo(_robotic_goat) => None,
+            HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.get_blob(),
+        }
+    }
+
+    /// if there's a SHA256 associate with the member, return it
+    pub fn get_sha(&self) -> Vec<[u8; 32]> {
+        match self {
+            HerdMember::Robo(_robotic_goat) => vec![],
+            HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.get_sha(),
+        }
+    }
+
+    pub fn get_directory(&self) -> Option<PathBuf> {
+        match self {
+            HerdMember::Robo(_robotic_goat) => None,
+            HerdMember::Cluster(goat_rodeo_cluster) => Some(goat_rodeo_cluster.get_directory()),
+        }
+    }
+}
+
 impl ClusterRoboMember for HerdMember {
     fn name(&self) -> String {
         match self {

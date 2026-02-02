@@ -13,7 +13,6 @@ use bigtent::{
     server::run_web_server,
 };
 use clap::{CommandFactory, Parser};
-use env_logger::Env;
 #[cfg(not(test))]
 use log::info; // Use log crate when building application
 
@@ -26,7 +25,8 @@ async fn run_rodeo(path_vec: &Vec<PathBuf>, args: &Args) -> Result<()> {
     for path in path_vec.iter() {
         if path.exists() {
             for b in
-                GoatRodeoCluster::cluster_files_in_dir(path.clone(), args.pre_cache_index()).await?
+                GoatRodeoCluster::cluster_files_in_dir(path.clone(), args.pre_cache_index(), vec![])
+                    .await?
             {
                 info!("Loaded cluster {}", b.name());
                 clusters.push(member_core(b));
@@ -63,7 +63,7 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
     info!("Loading clusters...");
     let mut clusters: Vec<Arc<HerdMember>> = vec![];
     for p in &paths {
-        for b in GoatRodeoCluster::cluster_files_in_dir(p.clone(), false).await? {
+        for b in GoatRodeoCluster::cluster_files_in_dir(p.clone(), false, vec![]).await? {
             clusters.push(member_core(b));
         }
     }
@@ -89,13 +89,11 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 100)]
 async fn main() -> Result<()> {
-    let env = Env::default()
-        .filter_or("MY_LOG_LEVEL", "info")
-        .write_style_or("MY_LOG_STYLE", "always");
+    // use tracing_subscriber in JSON mode
+    // rather than the previous env logger
+    tracing_subscriber::fmt().json().init();
 
-    env_logger::init_from_env(env);
-
-    info!("Starting");
+    info!("Starting big tent git sha {}", env!("VERGEN_GIT_SHA"));
     let args = Args::parse();
 
     match (&args.rodeo, &args.fresh_merge) {
