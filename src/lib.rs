@@ -1,3 +1,57 @@
+//! # BigTent - An Opinionated Graph Database for Software Artifacts
+//!
+//! BigTent is a high-performance graph database designed to serve millions of GitOIDs
+//! (Git Object Identifiers) representing software artifacts and their relationships.
+//!
+//! ## Overview
+//!
+//! The database stores software artifacts as **Items** connected by typed **Edges**.
+//! Items are identified by GitOIDs (content-addressable hashes) and can represent
+//! source files, packages, builds, or any software artifact.
+//!
+//! ## Architecture
+//!
+//! BigTent is organized into several key modules:
+//!
+//! - **[`rodeo`]** - The core graph database implementation ("Goat Rodeo")
+//!   - [`rodeo::goat`] - File-backed cluster implementation
+//!   - [`rodeo::goat_herd`] - Multi-cluster aggregation
+//!   - [`rodeo::goat_trait`] - Core trait defining graph operations
+//!   - [`rodeo::robo_goat`] - In-memory synthetic clusters
+//!
+//! - **[`item`]** - Core data model (Item, Edge types, metadata)
+//! - **[`server`]** - REST API layer (Axum-based HTTP server)
+//! - **[`fresh_merge`]** - Cluster merging functionality
+//! - **[`config`]** - CLI configuration and arguments
+//! - **[`util`]** - Shared utilities (hashing, I/O, serialization)
+//!
+//! ## Usage Modes
+//!
+//! BigTent operates in two primary modes:
+//!
+//! 1. **Rodeo Mode** (`--rodeo`): Load and serve existing cluster files
+//! 2. **Fresh Merge Mode** (`--fresh-merge`): Merge multiple clusters into one
+//!
+//! ## Example
+//!
+//! ```rust,ignore
+//! use bigtent::{ApiDoc, item::Item};
+//! use utoipa::OpenApi;
+//!
+//! // Access the OpenAPI specification
+//! let spec = ApiDoc::openapi();
+//!
+//! // Items are the core data structure
+//! // Retrieved via the REST API at /item/{gitoid}
+//! ```
+//!
+//! ## File Formats
+//!
+//! BigTent uses three file types (see `info/files_and_formats.md`):
+//! - `.grc` - Cluster files (metadata and file references)
+//! - `.gri` - Index files (GitOID → data offset mapping)
+//! - `.grd` - Data files (CBOR-encoded Items)
+
 pub mod config;
 pub mod fresh_merge;
 pub mod server;
@@ -21,3 +75,7 @@ pub extern crate serde_cbor;
 pub extern crate tokio;
 pub extern crate tokio_util;
 pub extern crate tower_http;
+pub extern crate utoipa;
+
+// Re-export key types for convenience
+pub use server::ApiDoc;

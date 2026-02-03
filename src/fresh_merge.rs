@@ -1,3 +1,47 @@
+//! # Fresh Merge - Cluster Merging Algorithm
+//!
+//! This module implements the "fresh merge" algorithm for combining multiple
+//! BigTent clusters into a single new cluster without preserving merge history.
+//!
+//! ## Algorithm Overview
+//!
+//! The merge process works as follows:
+//!
+//! 1. **Initialization**: Load all source clusters and create position trackers
+//! 2. **Coordinator Thread**: Finds items with matching hashes across clusters
+//! 3. **Worker Threads**: Fetch and merge items in parallel (20 workers)
+//! 4. **Main Thread**: Writes merged items to the output cluster
+//!
+//! ## Threading Model
+//!
+//! ```text
+//! ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+//! │ Coordinator │────>│ Worker Pool  │────>│ Main Thread │
+//! │   Thread    │     │ (20 threads) │     │  (Writer)   │
+//! └─────────────┘     └──────────────┘     └─────────────┘
+//!       │                    │                    │
+//!       │ finds items        │ fetches &          │ writes to
+//!       │ to merge           │ merges items       │ output cluster
+//!       ▼                    ▼                    ▼
+//!   index_holder        flume channels      ClusterWriter
+//! ```
+//!
+//! ## Memory Management
+//!
+//! The `merge_buffer_limit` parameter controls backpressure:
+//! - Limits items queued for writing
+//! - Prevents memory exhaustion on large merges
+//! - Default: 10,000 items
+//!
+//! ## Output Files
+//!
+//! The merge produces:
+//! - `.grc` cluster file with metadata
+//! - `.gri` index files (GitOID → offset mapping)
+//! - `.grd` data files (CBOR-encoded Items)
+//! - `purls.txt` - Package URL listing
+//! - `cluster_info.jsonl` - Cluster metadata in JSON Lines format
+
 #[cfg(not(test))]
 use log::info;
 use serde_json::json;
@@ -32,6 +76,49 @@ use crate::{
 use anyhow::Result;
 use thousands::Separable;
 
+/// Merge multiple clusters into a single new cluster.
+///
+/// This is the main entry point for the "fresh merge" operation, which combines
+/// items from multiple source clusters into a single output cluster.
+///
+/// ## Algorithm Overview
+///
+/// 1. **Initialization Phase**
+///    - Create output directory
+///    - Load position trackers for all source clusters
+///    - Initialize the cluster writer
+///
+/// 2. **Coordinator Thread**
+///    - Iterates through all clusters in sorted order (by MD5 hash)
+///    - Finds items with matching hashes across clusters (need merging)
+///    - Sends work to worker threads via channel
+///    - Implements backpressure via `merge_buffer_limit`
+///
+/// 3. **Worker Threads (20 threads)**
+///    - Receive item offsets from coordinator
+///    - Fetch actual Items from source clusters
+///    - Merge items with same identifier
+///    - Extract PURLs for the purls.txt file
+///    - Send merged items to main thread
+///
+/// 4. **Main Thread (Writer)**
+///    - Receives merged items from workers
+///    - Writes to output cluster via ClusterWriter
+///    - Maintains ordering via position-based sorting
+///
+/// ## Parameters
+///
+/// - `clusters`: Source clusters to merge
+/// - `merge_buffer_limit`: Max items in processing queue (backpressure control)
+/// - `dest_directory`: Output directory for the merged cluster
+///
+/// ## Output Files
+///
+/// - `cluster_<timestamp>.grc` - Cluster metadata
+/// - `index_<hash>.gri` - Index file(s)
+/// - `data_<hash>.grd` - Data file(s)
+/// - `purls.txt` - All Package URLs found
+/// - `cluster_info.jsonl` - Merge metadata in JSON Lines format
 pub async fn merge_fresh<PB: Into<PathBuf>>(
     clusters: Vec<Arc<HerdMember>>,
     merge_buffer_limit: usize,
@@ -40,6 +127,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     let start = Instant::now();
     let dest: PathBuf = dest_directory.into();
 
+    // === PHASE 1: Initialization ===
     fs::create_dir_all(dest.clone())?;
     let mut seen_purls = BTreeSet::new();
 
@@ -48,10 +136,12 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         Instant::now().duration_since(start)
     );
 
-    let mut loop_cnt = 0usize;
-    let mut merge_cnt = 0usize;
-    let mut max_merge_len = 0usize;
+    // Statistics tracking
+    let mut loop_cnt = 0usize;      // Total items processed
+    let mut merge_cnt = 0usize;     // Items that required merging (appeared in multiple clusters)
+    let mut max_merge_len = 0usize; // Total items across all clusters (upper bound)
 
+    // Position trackers for each source cluster
     let mut index_holder = vec![];
 
     for (idx, cluster) in clusters.iter().enumerate() {
@@ -82,34 +172,45 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     let mut cluster_writer = ClusterWriter::new(&dest).await?;
     let merge_start = Instant::now();
 
+    // === PHASE 2: Set up threading infrastructure ===
+    //
+    // Channel for coordinator -> workers: sends (position, items_to_merge)
+    // Bounded to 200,000 to prevent unbounded memory growth
     let (offset_tx, offset_rx) = flume::bounded(200_000);
 
+    // Atomic counter for backpressure control
+    // Tracks how many items are currently being processed
     let holding_pen_gate = Arc::new(AtomicUsize::new(0));
     let mut threads = vec![];
 
-    /// Returns true if atomic gate is ushel the limit
+    /// Check if we're under the buffer limit (can accept more work)
     fn check_limit(gate: &AtomicUsize, limit: usize) -> bool {
         gate.load(Ordering::Acquire) < limit
     }
 
+    // === COORDINATOR THREAD ===
+    // Finds items to merge by iterating through sorted indices
     let hpg = Arc::clone(&holding_pen_gate);
     let coorindator_handle = thread::spawn(move || {
-        let mut pos = 0usize;
+        let mut pos = 0usize;  // Global position counter for ordering
         loop {
-            // Queue items for work until the buffer limit is reached
+            // Only send more work if we're under the buffer limit
             if check_limit(&hpg, merge_buffer_limit) {
+                // Find all clusters that have the item with the lowest hash
+                // Returns None when all clusters are exhausted
                 match next_hash_of_item_to_merge(&mut index_holder) {
                     Some(items_to_merge) => {
+                        // Send work to worker threads
                         offset_tx
                             .send((pos, items_to_merge))
                             .expect("Should be able to send the message");
                         pos += 1;
                     }
-                    // No more work left to do!
+                    // All clusters exhausted - we're done!
                     None => break,
                 }
             }
-            // Park this coordinator when the limit is reached
+            // Backpressure: wait for workers to catch up
             else {
                 while !check_limit(&hpg, merge_buffer_limit) {
                     thread::sleep(Duration::from_millis(20));
@@ -120,8 +221,9 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 
     threads.push(coorindator_handle);
 
-    //// Worker thread section
-    ////
+    // === WORKER THREADS ===
+    // 20 threads fetch items from clusters and merge them
+    // Channel for workers -> main thread: sends merged items
     let (merged_tx, merged_rx) = flume::bounded(200_000);
     for thread_num in 0..20 {
         let rx = offset_rx.clone();

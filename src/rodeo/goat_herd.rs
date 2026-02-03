@@ -1,3 +1,27 @@
+//! # GoatHerd - Multi-Cluster Aggregation
+//!
+//! This module implements aggregation of multiple clusters into a single
+//! logical view. A `GoatHerd` can contain multiple [`super::goat::GoatRodeoCluster`]
+//! instances and routes queries to the appropriate cluster(s).
+//!
+//! ## Use Cases
+//!
+//! - **Sharded Data**: Query across clusters that each contain different data
+//! - **Incremental Updates**: Add new clusters without rewriting existing ones
+//! - **Mixed Sources**: Combine file-backed clusters with synthetic clusters
+//!
+//! ## Query Routing
+//!
+//! When looking up an item:
+//! 1. Each cluster in the herd is checked for the identifier
+//! 2. First matching cluster's item is returned
+//! 3. For operations like `roots()`, results from all clusters are combined
+//!
+//! ## PURL Aggregation
+//!
+//! The herd creates a temporary combined `purls.txt` file by merging
+//! PURL listings from all member clusters.
+
 use anyhow::Result;
 use std::{
     fs::File,

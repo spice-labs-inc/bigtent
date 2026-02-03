@@ -1,3 +1,40 @@
+//! # GoatRodeoCluster - File-Backed Cluster Implementation
+//!
+//! This module implements the primary file-backed storage for BigTent clusters.
+//! A `GoatRodeoCluster` manages a set of related files that together form a
+//! complete graph database:
+//!
+//! ## File Structure
+//!
+//! ```text
+//! cluster_<timestamp>.grc  ─── Cluster file (metadata + file hashes)
+//!        │
+//!        ├── index_<hash>.gri  ─── Index file (MD5 hash → data offset)
+//!        │
+//!        └── data_<hash>.grd   ─── Data file (CBOR-encoded Items)
+//! ```
+//!
+//! ## Index Strategy
+//!
+//! The index maps MD5 hashes of identifiers to (data_file, offset) pairs.
+//! Two loading strategies are supported:
+//!
+//! - **Lazy Loading** (default): Index is memory-mapped and searched on-demand
+//! - **Pre-cached**: Entire index loaded into HashMap at startup (faster queries, more RAM)
+//!
+//! ## Binary Search
+//!
+//! Index files are sorted by MD5 hash, enabling O(log n) lookups via binary search
+//! over the memory-mapped file. Each index entry is 32 bytes:
+//! - 16 bytes: MD5 hash of identifier
+//! - 8 bytes: Data file hash reference
+//! - 8 bytes: Byte offset within data file
+//!
+//! ## Thread Safety
+//!
+//! `GoatRodeoCluster` is `Send + Sync` and uses memory-mapped files for
+//! thread-safe concurrent access without explicit locking.
+
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use log::error;
@@ -95,20 +132,51 @@ impl IndexOffset {
 }
 
 #[derive(Debug, Clone)]
+/// A file-backed cluster representing a collection of Items.
+///
+/// `GoatRodeoCluster` manages the relationship between cluster, index, and data files,
+/// providing efficient lookup and traversal operations.
 pub struct GoatRodeoCluster {
+    /// Metadata from the .grc cluster file
     envelope: ClusterFileEnvelope,
+
+    /// SHA256 hash of the cluster file (truncated to u64)
     cluster_file_hash: u64,
+
+    /// Path to the .grc cluster file
     cluster_path: PathBuf,
+
+    /// Memory-mapped data files, keyed by their SHA256 hash
     data_files: HashMap<u64, Arc<DataFile>>,
+
+    /// Memory-mapped index files, keyed by their SHA256 hash
     index_files: HashMap<u64, Arc<IndexFile>>,
+
+    /// Offset ranges for each index file (for binary search routing)
     index_offset: Arc<Vec<IndexOffset>>,
+
+    /// Pre-cached full index (Some if --cache-index true, None if lazy)
     index: Arc<ArcSwap<Option<Arc<Vec<ItemOffset>>>>>,
+
+    /// Lock to prevent concurrent index building
     building_index: Arc<Mutex<bool>>,
+
+    /// Human-readable name for logging
     name: String,
+
+    /// Directory containing cluster files
     directory: PathBuf,
+
+    /// Optional blob identifier from cluster info
     blob: Option<String>,
+
+    /// SHA256 hashes of source clusters (for provenance)
     sha: Vec<[u8; 32]>,
+
+    /// Total number of items in this cluster
     number_of_items: usize,
+
+    /// Whether to pre-load index into memory
     load_index: bool,
 }
 

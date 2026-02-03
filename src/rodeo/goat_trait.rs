@@ -1,3 +1,29 @@
+//! # GoatRodeoTrait - Core Graph Database Abstraction
+//!
+//! This module defines the primary trait for interacting with BigTent's graph database.
+//! The trait abstracts over different storage backends, allowing the same operations
+//! to work with single clusters, multi-cluster herds, or synthetic in-memory clusters.
+//!
+//! ## Trait Overview
+//!
+//! [`GoatRodeoTrait`] provides:
+//! - **Item Retrieval**: `item_for_identifier()` - fetch items by GitOID
+//! - **Alias Resolution**: `antialias_for()` - resolve alias chains to canonical items
+//! - **Graph Traversal**: `north_send()` - find containers/builders, `stream_flattened_items()` - find contents
+//! - **Root Discovery**: `roots()` - find top-level items (expensive O(n) operation)
+//!
+//! ## Implementations
+//!
+//! - [`super::goat::GoatRodeoCluster`] - File-backed single cluster
+//! - [`super::goat_herd::GoatHerd`] - Aggregates multiple clusters
+//! - [`super::robo_goat::RoboticGoat`] - In-memory synthetic cluster
+//!
+//! ## Graph Traversal Terminology
+//!
+//! - **North**: Upward traversal - find what contains/builds this item
+//! - **South/Flatten**: Downward traversal - find what this item contains
+//! - **Anti-alias**: Follow `alias:to` edges to find canonical identifier
+
 use std::{
     collections::HashSet,
     future::Future,
@@ -146,30 +172,87 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
     Ok(rx)
 }
 
+/// Resolve an identifier to its canonical (non-alias) item.
+///
+/// Aliases allow multiple identifiers to point to the same logical item.
+/// This function follows `alias:to` edges until it reaches an item that
+/// is not itself an alias.
+///
+/// ## Algorithm
+///
+/// 1. Look up the initial identifier
+/// 2. If the item has an `alias:to` edge, follow it
+/// 3. Repeat until finding an item without `alias:to`
+/// 4. Return the canonical item
+///
+/// ## Example
+///
+/// ```text
+/// pkg:npm/lodash@4.17.21 --[alias:to]--> gitoid:blob:sha256:abc123
+/// ```
+///
+/// Looking up the PURL returns the GitOID item.
+///
+/// ## Returns
+///
+/// - `Some(Item)` - The canonical item
+/// - `None` - If the identifier doesn't exist or alias chain is broken
 pub fn impl_antialias_for<GRT: GoatRodeoTrait + 'static>(
     the_self: Arc<GRT>,
     data: &str,
 ) -> Option<Item> {
+    // Start with the item for the given identifier
     let mut ret = match the_self.item_for_identifier(data) {
         Some(i) => i,
         _ => return None,
     };
+
+    // Follow alias:to edges until we find a non-alias item
     while ret.is_alias() {
         match ret.connections.iter().find(|x| x.0.is_alias_to()) {
             Some(v) => {
+                // Follow the alias to the target
                 ret = match the_self.item_for_identifier(&v.1) {
                     Some(v) => v,
-                    _ => return None,
+                    _ => return None,  // Broken alias chain
                 };
             }
             None => {
-                return None;
+                return None;  // Inconsistent: is_alias() true but no alias:to edge
             }
         }
     }
 
     Some(ret)
 }
+/// Traverse the graph "north" (upward) to find containers and builders.
+///
+/// Starting from the given GitOIDs, this function follows edges upward through
+/// the graph to find all items that contain or build the starting items.
+///
+/// ## Algorithm
+///
+/// Uses breadth-first search with deduplication:
+///
+/// 1. Start with initial GitOIDs in `to_find` set
+/// 2. For each unvisited item:
+///    - Mark as visited (`found` set)
+///    - Get the item and find its containers (`contained_by()`)
+///    - Add containers to `to_find` for next iteration
+///    - Stream the item (or its PURLs) to the response channel
+/// 3. Repeat until no new items to visit
+///
+/// ## Parameters
+///
+/// - `gitoids`: Starting points for the traversal
+/// - `purls_only`: If true, only stream Package URLs, not full Items
+/// - `start`: Timestamp for logging elapsed time
+///
+/// ## Returns
+///
+/// A channel receiver that streams either:
+/// - `Either::Left(Item)` - Full item (when `purls_only=false`)
+/// - `Either::Right(String)` - Package URL (when `purls_only=true`)
 pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
     the_self: Arc<GRT>,
     gitoids: Vec<String>,
@@ -178,11 +261,11 @@ pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
 ) -> Result<Receiver<Either<Item, String>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Either<Item, String>>(256);
 
-    // populate the channel
+    // Spawn async task to populate the channel
     tokio::spawn(async move {
-        let mut found = HashSet::new();
-        let mut to_find = HashSet::new();
-        let mut found_purls = HashSet::<String>::new();
+        let mut found = HashSet::new();       // Items we've already visited
+        let mut to_find = HashSet::new();     // Items we need to visit
+        let mut found_purls = HashSet::<String>::new();  // Dedupe PURLs
         to_find.extend(gitoids);
 
         let cnt = AtomicU32::new(0);
@@ -192,6 +275,7 @@ pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
           start.elapsed());
         }
 
+        // Set difference: a - b (items in a but not in b)
         fn less(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
             let mut ret = a.clone();
             for i in b.iter() {
@@ -200,32 +284,40 @@ pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
             ret
         }
 
+        // BFS loop: continue until no new items to visit
         loop {
+            // Get items we haven't visited yet
             let to_search = less(&to_find, &found);
 
             if to_search.len() == 0 {
-                break;
+                break;  // All reachable items visited
             }
+
             for this_oid in to_search {
-                found.insert(this_oid.clone());
+                found.insert(this_oid.clone());  // Mark as visited
+
                 match the_self.item_for_identifier(&this_oid) {
                     Some(item) => {
+                        // Find containers/builders of this item (upward edges)
                         let and_then = item.contained_by();
+
                         if purls_only {
+                            // Only stream unique PURLs
                             for purl in item.find_purls() {
                                 if !found_purls.contains(&purl) {
                                     let _ = tx.send(Either::Right(purl.clone())).await;
-
                                     found_purls.insert(purl);
                                 }
                             }
                         } else {
+                            // Stream the full item
                             let _ = tx.send(Either::Left(item)).await;
                         }
 
+                        // Add containers to next iteration's work
                         to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
                     }
-                    _ => {}
+                    _ => {}  // Item not found, skip
                 }
                 cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }

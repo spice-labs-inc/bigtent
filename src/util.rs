@@ -1,3 +1,31 @@
+//! # Utility Functions
+//!
+//! This module provides shared utility functions used throughout BigTent,
+//! organized into several categories:
+//!
+//! ## Hashing Functions
+//! - [`md5hash_str`] - Compute MD5 hash of a string (used for index keys)
+//! - [`sha256_for_slice`], [`sha256_for_reader`] - SHA256 hashing (file integrity)
+//! - [`hex_to_md5bytes`], [`hex_to_u64`] - Parse hex strings to bytes
+//!
+//! ## Binary I/O
+//! - [`read_u32`], [`read_u32_sync`] - Read 32-bit integers
+//! - [`write_int`], [`write_long`] - Write integers in various sizes
+//! - [`read_len_and_cbor`], [`write_envelope`] - CBOR envelope handling
+//!
+//! ## Path Utilities
+//! - [`find_common_root_dir`] - Find common parent directory
+//! - [`path_plus_timed`] - Generate timestamped filenames
+//! - [`is_child_dir`] - Check path containment
+//!
+//! ## Time Utilities
+//! - [`iso8601_now`] - Current time in ISO 8601 format
+//! - [`NiceDurationDisplay`] - Human-readable duration formatting
+//!
+//! ## CBOR Utilities
+//! - [`traverse_value`] - Walk CBOR value trees
+//! - [`read_cbor_sync`] - Deserialize CBOR from bytes
+
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 #[cfg(not(test))]
@@ -15,8 +43,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(test)]
 use std::println as info;
+
+/// Buffer size for streaming hash operations (4 KB)
 const BYTE_BUFFER_SIZE: usize = 4096;
 
+/// Parse a hex string into an MD5 hash (16 bytes).
+///
+/// # Arguments
+/// * `it` - A 32-character hex string representing the MD5 hash
+///
+/// # Returns
+/// * `Some(MD5Hash)` - The parsed 16-byte hash
+/// * `None` - If the string is not valid hex or too short
 pub fn hex_to_md5bytes(it: &str) -> Option<MD5Hash> {
     hex::decode(it)
         .map(|bytes| {
@@ -32,6 +70,14 @@ pub fn hex_to_md5bytes(it: &str) -> Option<MD5Hash> {
         .flatten()
 }
 
+/// Parse a hex string into a u64.
+///
+/// # Arguments
+/// * `it` - A 16-character hex string representing the u64
+///
+/// # Returns
+/// * `Some(u64)` - The parsed value (big-endian)
+/// * `None` - If the string is not valid hex or too short
 pub fn hex_to_u64(it: &str) -> Option<u64> {
     hex::decode(it)
         .map(|bytes| {
@@ -47,6 +93,17 @@ pub fn hex_to_u64(it: &str) -> Option<u64> {
         .flatten()
 }
 
+/// Convert the first 8 bytes of a slice to a u63 (63-bit unsigned integer).
+///
+/// The high bit is masked off to ensure the result fits in a signed i64
+/// when needed for compatibility with systems that don't support u64.
+///
+/// # Arguments
+/// * `it` - A byte slice with at least 8 bytes
+///
+/// # Returns
+/// * `Ok(u64)` - The 63-bit value (high bit always 0)
+/// * `Err` - If the slice has fewer than 8 bytes
 pub fn byte_slice_to_u63(it: &[u8]) -> Result<u64> {
     let mut buff = [0u8; 8];
     if it.len() < 8 {
@@ -59,9 +116,13 @@ pub fn byte_slice_to_u63(it: &[u8]) -> Result<u64> {
     for x in 0..8 {
         buff[x] = it[x];
     }
+    // Mask off high bit to get 63-bit value
     Ok(u64::from_be_bytes(buff) & 0x7fffffffffffffff)
 }
 
+/// Check if a string is a valid MD5 hash and parse it.
+///
+/// Handles both raw 32-char hex and filenames like "abc123...def.json".
 pub fn check_md5(it: Option<&String>) -> Option<MD5Hash> {
     match it {
         Some(v) if v.len() == 32 => hex_to_md5bytes(v),
@@ -70,6 +131,7 @@ pub fn check_md5(it: Option<&String>) -> Option<MD5Hash> {
     }
 }
 
+/// Get current time as milliseconds since Unix epoch.
 pub fn millis_now() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -77,14 +139,20 @@ pub fn millis_now() -> i64 {
         .as_millis() as i64
 }
 
+/// Compute MD5 hash of a string.
+///
+/// Used for index key generation. Note: MD5 is used for lookup efficiency,
+/// not security. Data integrity uses SHA256.
 pub fn md5hash_str(st: &str) -> MD5Hash {
     let res = md5::compute(st);
 
     res.into()
 }
 
+/// Compute SHA256 hash of a byte slice.
+///
+/// Returns a 32-byte hash used for file integrity and content addressing.
 pub fn sha256_for_slice(r: &[u8]) -> [u8; 32] {
-    // create a Sha256 object
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
 
@@ -574,4 +642,11 @@ impl std::fmt::Display for NiceDurationDisplay {
     }
 }
 
+/// A 16-byte MD5 hash used as index keys.
+///
+/// MD5 is used for index lookups due to its compact size (16 bytes vs 32 for SHA256).
+/// This is purely for efficiency - data integrity uses SHA256.
+///
+/// Note: MD5 is cryptographically broken and should never be used for security.
+/// Here it's used only as a fast hash function for identifier lookup.
 pub type MD5Hash = [u8; 16];

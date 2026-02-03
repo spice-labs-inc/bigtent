@@ -1,3 +1,33 @@
+//! # BigTent CLI Entry Point
+//!
+//! This module contains the main entry point for the BigTent binary.
+//!
+//! ## Execution Modes
+//!
+//! The binary supports two mutually exclusive modes:
+//!
+//! ### Rodeo Mode (`--rodeo <paths>`)
+//! Loads cluster files from the specified paths and starts an HTTP server
+//! to serve queries against the loaded data.
+//!
+//! ```bash
+//! bigtent --rodeo /path/to/clusters --port 3000
+//! ```
+//!
+//! ### Fresh Merge Mode (`--fresh-merge <paths>... --dest <output>`)
+//! Merges multiple clusters from different directories into a single new cluster.
+//! This is a batch operation that produces new cluster files without preserving
+//! merge history.
+//!
+//! ```bash
+//! bigtent --fresh-merge /path/to/cluster1 /path/to/cluster2 --dest /output
+//! ```
+//!
+//! ## Threading
+//!
+//! The binary runs on a Tokio multi-threaded runtime with 100 worker threads
+//! to handle concurrent requests and I/O operations efficiently.
+
 use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
 use bigtent::{

@@ -1,3 +1,32 @@
+//! # ClusterHolder - Runtime Cluster Management
+//!
+//! This module provides the [`ClusterHolder`] type which manages the runtime
+//! lifecycle of a cluster, including support for hot-reloading via `ArcSwap`.
+//!
+//! ## Hot Reload Support
+//!
+//! `ClusterHolder` uses [`arc_swap::ArcSwap`] to enable atomic cluster replacement
+//! without service interruption. When a SIGHUP signal is received, the cluster
+//! can be reloaded from disk and swapped in atomically.
+//!
+//! ## Thread Safety
+//!
+//! All operations on `ClusterHolder` are thread-safe:
+//! - `get_cluster()` - Returns an `Arc` to the current cluster
+//! - `update_cluster()` - Atomically swaps in a new cluster
+//!
+//! ## Usage
+//!
+//! ```rust,ignore
+//! let holder = ClusterHolder::new_from_cluster(
+//!     ArcSwap::new(Arc::new(cluster)),
+//!     Some(Arc::new(args))
+//! ).await?;
+//!
+//! // Later, to hot-reload:
+//! holder.update_cluster(Arc::new(new_cluster));
+//! ```
+
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use std::{path::PathBuf, sync::Arc};

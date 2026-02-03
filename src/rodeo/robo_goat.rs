@@ -1,3 +1,35 @@
+//! # RoboticGoat - In-Memory Synthetic Clusters
+//!
+//! This module provides [`RoboticGoat`], an in-memory cluster implementation
+//! for synthetic or computed data that doesn't need persistent storage.
+//!
+//! ## Use Cases
+//!
+//! - **Testing**: Create clusters for unit/integration tests without file I/O
+//! - **Computed Data**: Generate clusters dynamically from other sources
+//! - **Tag Clusters**: Create virtual "tags" cluster linking root items
+//!
+//! ## Tag Cluster Generation
+//!
+//! The [`RoboticGoat::new_cluster`] function creates a special "tags" cluster
+//! that provides an entry point for discovering all root items in a herd.
+//! It works by:
+//!
+//! 1. Finding all items with `tag:from` edges (root items)
+//! 2. Creating a synthetic "tags" item with `tag:to` edges to all roots
+//! 3. This enables efficient root discovery without O(n) scans
+//!
+//! ## Memory Model
+//!
+//! Unlike [`super::goat::GoatRodeoCluster`], `RoboticGoat` stores all items
+//! in memory as a `Vec<Item>`. This trades memory for simplicity and is
+//! appropriate for small synthetic clusters.
+//!
+//! ## Trait Implementations
+//!
+//! Implements both [`GoatRodeoTrait`] and [`ClusterRoboMember`] for full
+//! compatibility with the cluster ecosystem.
+
 use std::{collections::BTreeSet, fmt::Debug, fs::File, io::Write, path::PathBuf, sync::Arc};
 
 use crate::{

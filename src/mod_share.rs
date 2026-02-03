@@ -1,3 +1,20 @@
+//! # Shared Types for Cluster Operations
+//!
+//! This module provides shared types used across multiple modules for
+//! cluster traversal and merge operations.
+//!
+//! ## Key Types
+//!
+//! - [`ClusterPos`] - Tracks position within a cluster during iteration
+//! - [`next_hash_of_item_to_merge`] - Finds the next item(s) to merge across clusters
+//!
+//! ## Usage in Merging
+//!
+//! During a merge operation, multiple clusters are iterated in parallel.
+//! `ClusterPos` tracks the current position in each cluster, and
+//! `next_hash_of_item_to_merge` finds all items with the lowest hash
+//! across all clusters (items that need to be merged together).
+
 use std::sync::Arc;
 use crate::{
   rodeo::{goat::GoatRodeoCluster, index::EitherItemOffset},

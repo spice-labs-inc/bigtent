@@ -1,3 +1,33 @@
+//! # HerdMember - Unified Cluster Abstraction
+//!
+//! This module provides [`HerdMember`], an enum that unifies different cluster
+//! implementations behind a common interface, enabling polymorphic cluster handling.
+//!
+//! ## Variants
+//!
+//! - [`HerdMember::Cluster`] - Wraps a file-backed [`GoatRodeoCluster`]
+//! - [`HerdMember::Robo`] - Wraps an in-memory [`RoboticGoat`]
+//!
+//! ## Purpose
+//!
+//! `HerdMember` allows [`super::goat_herd::GoatHerd`] to manage heterogeneous
+//! collections of clusters. For example, a herd might contain:
+//! - Multiple file-backed clusters from different directories
+//! - Synthetic clusters generated at runtime
+//!
+//! ## Trait Implementations
+//!
+//! `HerdMember` implements both:
+//! - [`GoatRodeoTrait`] - Full query interface
+//! - [`ClusterRoboMember`] - Low-level item access
+//!
+//! Both delegate to the underlying variant.
+//!
+//! ## Helper Functions
+//!
+//! - [`member_core`] - Wrap a `GoatRodeoCluster` in a `HerdMember`
+//! - [`member_synth`] - Wrap a `RoboticGoat` in a `HerdMember`
+
 use crate::{item::Item, util::MD5Hash};
 
 use super::{
