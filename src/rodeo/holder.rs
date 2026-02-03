@@ -17,14 +17,20 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
-//! let holder = ClusterHolder::new_from_cluster(
-//!     ArcSwap::new(Arc::new(cluster)),
-//!     Some(Arc::new(args))
-//! ).await?;
+//! ```rust,no_run
+//! use bigtent::rodeo::goat_herd::GoatHerd;
+//! use bigtent::rodeo::holder::ClusterHolder;
+//! use arc_swap::ArcSwap;
+//! use std::sync::Arc;
 //!
-//! // Later, to hot-reload:
-//! holder.update_cluster(Arc::new(new_cluster));
+//! // Given a GoatHerd (created from loaded clusters):
+//! fn use_holder(holder: Arc<ClusterHolder<GoatHerd>>) {
+//!     // Get current cluster for queries
+//!     let current: Arc<GoatHerd> = holder.get_cluster();
+//!
+//!     // Hot-reload: atomically swap in a new cluster
+//!     // holder.update_cluster(Arc::new(new_herd));
+//! }
 //! ```
 
 use anyhow::Result;

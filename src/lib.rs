@@ -34,15 +34,13 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
-//! use bigtent::{ApiDoc, item::Item};
+//! ```rust,no_run
+//! use bigtent::ApiDoc;
 //! use utoipa::OpenApi;
 //!
 //! // Access the OpenAPI specification
 //! let spec = ApiDoc::openapi();
-//!
-//! // Items are the core data structure
-//! // Retrieved via the REST API at /item/{gitoid}
+//! println!("API version: {}", spec.info.version);
 //! ```
 //!
 //! ## File Formats

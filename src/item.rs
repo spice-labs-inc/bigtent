@@ -34,8 +34,8 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
-//! use bigtent::item::{Item, CONTAINED_BY, ALIAS_TO};
+//! ```rust,no_run
+//! use bigtent::item::{Item, CONTAINED_BY};
 //!
 //! // An item representing a source file contained in a package
 //! let item = Item {
@@ -44,7 +44,7 @@
 //!         (CONTAINED_BY.to_string(), "gitoid:blob:sha256:pkg456...".to_string())
 //!     ].into_iter().collect(),
 //!     body_mime_type: Some("application/vnd.cc.goatrodeo".to_string()),
-//!     body: Some(metadata_value),
+//!     body: None,
 //! };
 //! ```
 
