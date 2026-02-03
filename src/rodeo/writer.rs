@@ -1,3 +1,39 @@
+//! # ClusterWriter - Cluster File Generation
+//!
+//! This module handles writing new cluster files during merge operations.
+//! It manages the creation of `.grc`, `.gri`, and `.grd` files with proper
+//! formatting and checksums.
+//!
+//! ## Writing Process
+//!
+//! 1. **Initialize**: Create writer with destination directory
+//! 2. **Write Items**: Call `write_item()` for each Item
+//! 3. **Flush**: Periodically flush data and index files when size limits reached
+//! 4. **Finalize**: Generate final cluster file with all references
+//!
+//! ## File Size Limits
+//!
+//! To keep files manageable, the writer enforces size limits:
+//! - **Data files**: Max 15 GB (`MAX_DATA_FILE_SIZE`)
+//! - **Index files**: Max 25M entries (`MAX_INDEX_CNT`)
+//!
+//! When limits are reached, current files are finalized and new ones started.
+//!
+//! ## Buffer Management
+//!
+//! Data is buffered in memory (`dest_data`) before being written to disk.
+//! Index entries are accumulated in `index_info` and sorted before writing.
+//! This enables efficient sequential writes while maintaining sorted order.
+//!
+//! ## Output Files
+//!
+//! The writer produces:
+//! - `cluster_<timestamp>.grc` - Cluster metadata
+//! - `index_<hash>.gri` - Index files (multiple if data is large)
+//! - `data_<hash>.grd` - Data files (multiple if data is large)
+//!
+//! File names include SHA256 hashes for content-addressable storage.
+
 use log::error;
 #[cfg(not(test))]
 use log::info;
@@ -51,9 +87,16 @@ pub struct ClusterWriter {
 }
 
 impl ClusterWriter {
-    // 15GB
+    /// Maximum size of a single data file: 15 GB
+    ///
+    /// When the current data file exceeds this size, it's finalized and a new one is started.
+    /// This keeps individual files manageable and allows for parallel processing during reads.
     const MAX_DATA_FILE_SIZE: usize = 15 * 1024 * 1024 * 1024;
-    // 25M
+
+    /// Maximum number of index entries per index file: 25 million
+    ///
+    /// Each index entry is 32 bytes (16 MD5 + 8 file hash + 8 offset), so 25M entries
+    /// equals ~800 MB per index file. This limit ensures index files remain memory-mappable.
     const MAX_INDEX_CNT: usize = 25 * 1024 * 1024;
 
     #[inline]

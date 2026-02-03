@@ -1,3 +1,38 @@
+//! # Data File Format (.grd)
+//!
+//! This module handles `.grd` (Goat Rodeo Data) files which store the actual
+//! Item records in CBOR format.
+//!
+//! ## File Structure
+//!
+//! ```text
+//! ┌─────────────────────────────────────┐
+//! │ Magic Number (4 bytes): 0x00be1100  │  "Bell" - identifies data file
+//! ├─────────────────────────────────────┤
+//! │ Envelope Length (4 bytes)           │
+//! ├─────────────────────────────────────┤
+//! │ CBOR Envelope (DataFileEnvelope)    │  File metadata
+//! ├─────────────────────────────────────┤
+//! │ Item 1: [length][CBOR Item]         │
+//! │ Item 2: [length][CBOR Item]         │
+//! │ ...                                 │
+//! │ Item N: [length][CBOR Item]         │
+//! └─────────────────────────────────────┘
+//! ```
+//!
+//! ## Item Storage
+//!
+//! Each Item is stored as:
+//! - 4-byte length prefix (little-endian u32)
+//! - CBOR-encoded Item payload
+//!
+//! Items are accessed by byte offset (provided by the index file).
+//!
+//! ## Memory Mapping
+//!
+//! Data files are memory-mapped for efficient random access without
+//! loading the entire file into memory.
+
 use crate::{
     item::Item,
     util::{read_cbor_sync, read_len_and_cbor_sync, read_u32_sync},
@@ -16,13 +51,25 @@ use std::{
 
 use super::goat::GoatRodeoCluster;
 
+/// Metadata envelope stored at the beginning of .grd data files.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct DataFileEnvelope {
+    /// File format version
     pub version: u32,
+
+    /// Magic number for validation (should be `DataFileMagicNumber`)
     pub magic: u32,
+
+    /// Hash of the previous data file in the chain (for incremental updates)
     pub previous: u64,
+
+    /// Hashes of data files this file depends on
     pub depends_on: BTreeSet<u64>,
+
+    /// True if this file was created by a merge operation
     pub built_from_merge: bool,
+
+    /// Arbitrary metadata
     pub info: BTreeMap<String, String>,
 }
 
@@ -101,5 +148,9 @@ impl DataFile {
     }
 }
 
+/// Magic number identifying data (.grd) files: 0x00be1100 ("Bell" pepper)
+///
+/// BigTent uses food-themed magic numbers for file identification.
+/// Data files contain CBOR-encoded Items at specific byte offsets.
 #[allow(non_upper_case_globals)]
 pub const DataFileMagicNumber: u32 = 0x00be1100; // Bell

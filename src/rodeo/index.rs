@@ -1,3 +1,42 @@
+//! # Index File Format (.gri)
+//!
+//! This module handles `.gri` (Goat Rodeo Index) files which map GitOID identifiers
+//! to their locations in data files.
+//!
+//! ## File Structure
+//!
+//! ```text
+//! ┌─────────────────────────────────────┐
+//! │ Magic Number (4 bytes): 0x54154170  │  "Shishitō" - identifies index file
+//! ├─────────────────────────────────────┤
+//! │ Envelope Length (4 bytes)           │
+//! ├─────────────────────────────────────┤
+//! │ CBOR Envelope (IndexEnvelope)       │  Index metadata
+//! ├─────────────────────────────────────┤
+//! │ Index Entry 1 (32 bytes)            │
+//! │ Index Entry 2 (32 bytes)            │
+//! │ ...                                 │
+//! │ Index Entry N (32 bytes)            │
+//! └─────────────────────────────────────┘
+//! ```
+//!
+//! ## Index Entry Format (32 bytes)
+//!
+//! Each entry contains:
+//! - 16 bytes: MD5 hash of the identifier (used for fast lookup)
+//! - 8 bytes: SHA256 hash reference to the data file
+//! - 8 bytes: Byte offset within the data file
+//!
+//! ## Lookup Strategy
+//!
+//! Index entries are sorted by MD5 hash, enabling O(log n) binary search.
+//! The MD5 hash is used for lookup efficiency (smaller key size) while the
+//! actual data integrity relies on SHA256.
+//!
+//! ## Memory Mapping
+//!
+//! Like data files, index files are memory-mapped for efficient access.
+
 use crate::util::{
     MD5Hash, byte_slice_to_u63, read_len_and_cbor_sync, read_u32_sync, sha256_for_reader_sync,
 };
@@ -13,13 +52,25 @@ use std::{
 
 use super::{data::GOAT_RODEO_INDEX_FILE_SUFFIX, goat::GoatRodeoCluster};
 
+/// Metadata envelope stored at the beginning of .gri index files.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct IndexEnvelope {
+    /// File format version
     pub version: u32,
+
+    /// Magic number for validation (should be `IndexFileMagicNumber`)
     pub magic: u32,
+
+    /// Number of index entries in this file
     pub size: u32,
+
+    /// Hashes of data files referenced by this index
     pub data_files: HashSet<u64>,
+
+    /// Encoding format for index entries (e.g., "md5_u64_u64")
     pub encoding: String,
+
+    /// Arbitrary metadata
     pub info: BTreeMap<String, String>,
 }
 
@@ -199,5 +250,9 @@ impl ItemOffset {
     }
 }
 
+/// Magic number identifying index (.gri) files: 0x54154170 ("Shishito" pepper)
+///
+/// BigTent uses food-themed magic numbers for file identification.
+/// Index files map MD5 hashes of identifiers to data file locations.
 #[allow(non_upper_case_globals)]
 pub const IndexFileMagicNumber: u32 = 0x54154170; // Shishitō

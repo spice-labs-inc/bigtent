@@ -1,73 +1,130 @@
 # Big Tent
 
-It takes a lot to serve millions of GitOIDs.
+An opinionated Graph Database for serving millions of GitOIDs (Git Object Identifiers).
 
-It takes keeping the GitOID index in memory.
+Big Tent stores software artifacts as **Items** connected by typed **Edges**, enabling
+efficient queries about software composition, provenance, and dependencies.
 
-It takes a tad bit of being clever.
+## Quick Start
 
-And that's Big Tent.
+```bash
+# Build
+cargo build --release
+
+# Run server with a cluster
+./target/release/bigtent --rodeo /path/to/cluster/ --port 3000
+
+# Query an item
+curl http://localhost:3000/item/gitoid:blob:sha256:abc123...
+
+# Get OpenAPI documentation
+curl http://localhost:3000/openapi.json
+```
+
+For detailed setup instructions, see [GETTING_STARTED.md](GETTING_STARTED.md).
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [GETTING_STARTED.md](GETTING_STARTED.md) | Installation, building, and first steps |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | System design, components, and data flow |
+| [PERFORMANCE.md](PERFORMANCE.md) | Performance tuning and optimization |
+| [info/config.md](info/config.md) | Configuration reference |
+| [info/files_and_formats.md](info/files_and_formats.md) | File format specifications |
 
 ## Using BigTent
 
-Big Tent is both a rust crate, usable to read ADGs from files, and a server with an API for accessing that data.
+Big Tent is both a Rust crate (usable to read ADGs from files) and a server with a REST API.
 
-## Running as a server
+### As a Server
 
-Create a `config.toml` file pointing to the OmniBOR Corpus:
+```bash
+# Serve a cluster directory
+bigtent --rodeo /path/to/cluster/
 
-```toml
-# A string path to the root of the data storage
-root_dir = "/path/to/data/storage"
-# a string path to the cluster directory (parent of the cluster_path= `.grc` file) within the root data directory.
-cluster_path = "/path/to/data/storage/clustername"
+# With custom host and port
+bigtent --rodeo /path/to/cluster/ --host 0.0.0.0 --port 8080
+
+# Pre-cache index for faster queries (uses more memory)
+bigtent --rodeo /path/to/cluster/ --cache-index true
 ```
 
-Then run the service:
+### As a Library
 
-```shell
-cargo run -- -c config.toml -t 33 --host localhost --host 127.0.0.1
+```rust
+use bigtent::rodeo::goat::GoatRodeoCluster;
+use bigtent::rodeo::goat_trait::GoatRodeoTrait;
+
+let clusters = GoatRodeoCluster::cluster_files_in_dir(path, false, vec![]).await?;
+if let Some(item) = clusters[0].item_for_identifier("gitoid:blob:sha256:...") {
+    println!("Found: {:?}", item);
+}
 ```
 
-If you change the `config.toml` file, send a `SIGHUP` (`kill -HUP <big_tent_process>`).
+## API Endpoints
 
-To create an OmniBOR Corpus, use [Goat Rodeo](https://github.com/spice-labs-inc/goatrodeo).
+All endpoints are available at both `/` and `/omnibor/` prefixes.
 
+### OpenAPI Specification
 
-## Endpoints
+* `GET /openapi.json` - Full OpenAPI 3.1 specification (auto-generated from code)
 
-The following are Big Tent's endpoints:
+### Item Retrieval
 
-* `POST /omnibor/bulk` -- POST an array of Strings to get the bulk `Item`s.
-* `GET /omnibor/{*gitoid}` or `GET /omnibor/?identifier=gitoid"` -- get a single `Item`. Note
-   in the URL form, the identifier (`{*gitoid}`) is _not_ URL encoded. This allows for
-   copy/pasting of Package URLs without any escaping.
-* `GET /omnibor/aa/{*gitoid}` or `GET /omnibor/aa/?identifier=gitoid"` -- get a single `Item`. If the
-  `Item` contains an `alias:to` in its connection, follow the alias.
-   In the URL form, the identifier (`{*gitoid}`) is _not_ URL encoded. This allows for
-   copy/pasting of Package URLs without any escaping.
-* `GET /omnibor/north/{*gitoid}` or `GET /omnibor/north/?identifier=gitoid"` -- get all the `Items` connected to
-  the found item via `build:up`, `alias:to`, and `contained:up`. This can be a large list.
-  In the URL form, the identifier (`{*gitoid}`) is _not_ URL encoded. This allows for
-  copy/pasting of Package URLs without any escaping.
-* `POST /omnibor/north` -- The POST body contains a JSON array of Strings that are the identifiers of the
-  root `Item`s.  Get all the `Items` connected to
-  the found/root items via `build:up`, `alias:to`, and `contained:up`. This can be a large list.
-  In the URL form, the identifier (`{*gitoid}`) is _not_ URL encoded. This allows for
-  copy/pasting of Package URLs without any escaping.
-* `GET /omnibor/north_purls/{*gitoid}` or `GET /omnibor/north_purls/?identifier=gitoid"` -- get all the `Items` connected to
-  the found item via `build:up`, `alias:to`, and `contained:up`. Return only the `alias:from` connections
-  In the URL form, the identifier (`{*gitoid}`) is _not_ URL encoded. This allows for
-  copy/pasting of Package URLs without any escaping.
-* `GET /purls` -- return all the Package URLs in the Artifact Dependency Graph.
-* `GET /node_count` -- return the count of all the nodes in the Artifact Dependency Graph.
+* `GET /item/{gitoid}` or `GET /item?identifier=...` - Get a single Item
+* `POST /bulk` - Get multiple Items (POST array of GitOID strings)
 
-## Design docs
+### Alias Resolution
 
-In the [info](info/README.md) directory.
+* `GET /aa/{gitoid}` or `GET /aa?identifier=...` - Resolve alias to canonical Item
+* `POST /aa` - Bulk alias resolution
 
-## Stuff
+### Graph Traversal
 
-[Matrix Discussion](https://matrix.to/#/#spice-labs:matrix.org)
+* `GET /north/{gitoid}` - Find containers/builders (traverse upward via `build:up`, `alias:to`, `contained:up`)
+* `POST /north` - Bulk north traversal
+* `GET /north_purls/{gitoid}` - Same as north, but return only Package URLs
+* `GET /flatten/{gitoid}` - Find contained items (traverse downward)
+* `GET /flatten_source/{gitoid}` - Flatten with source information
 
-License: Apache 2.0
+### Metadata
+
+* `GET /node_count` - Total items in the cluster
+* `GET /purls` - Download all Package URLs as text file
+
+### URL Encoding Note
+
+In path parameters (`{gitoid}`), identifiers are **not** URL encoded. This allows
+copy/pasting Package URLs directly without escaping.
+
+## Merging Clusters
+
+Combine multiple clusters into one:
+
+```bash
+bigtent --fresh-merge /path/to/cluster1/ /path/to/cluster2/ --dest /output/
+```
+
+See [PERFORMANCE.md](PERFORMANCE.md) for tuning merge operations.
+
+## Creating Clusters
+
+To create an OmniBOR Corpus (cluster files), use [Goat Rodeo](https://github.com/spice-labs-inc/goatrodeo).
+
+## Hot Reload
+
+Send `SIGHUP` to reload cluster files without restarting:
+
+```bash
+kill -HUP <bigtent_pid>
+```
+
+## Community
+
+* [Matrix Discussion](https://matrix.to/#/#spice-labs:matrix.org)
+* [GitHub Issues](https://github.com/spice-labs-inc/bigtent/issues)
+
+## License
+
+Apache 2.0

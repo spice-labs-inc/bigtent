@@ -1,3 +1,53 @@
+//! # Item - Core Data Model
+//!
+//! This module defines the core data structures for BigTent's graph database:
+//! [`Item`], [`Edge`], and [`ItemMetaData`].
+//!
+//! ## Items
+//!
+//! An [`Item`] represents a node in the graph, identified by a GitOID (Git Object ID).
+//! Items can represent any software artifact: source files, packages, builds, etc.
+//!
+//! ## Edges
+//!
+//! Items are connected by typed edges. Each edge is a tuple of `(edge_type, target_id)`.
+//!
+//! ### Edge Types
+//!
+//! | Type | Direction | Meaning |
+//! |------|-----------|---------|
+//! | `alias:to` | → | This item is an alias for target |
+//! | `alias:from` | ← | Target is an alias for this item |
+//! | `contained:up` | ↑ | This item is contained by target |
+//! | `contained:down` | ↓ | This item contains target |
+//! | `build:up` | ↑ | This item was built into target |
+//! | `build:down` | ↓ | This item was built from target |
+//! | `tag:to` | → | This item tags target |
+//! | `tag:from` | ← | This item is tagged by target |
+//!
+//! ## Merging
+//!
+//! When the same GitOID appears in multiple clusters, Items are merged:
+//! - Connections are unioned
+//! - Metadata is recursively merged
+//! - Filename conflicts are resolved by prefixing with GitOID
+//!
+//! ## Example
+//!
+//! ```rust,no_run
+//! use bigtent::item::{Item, CONTAINED_BY};
+//!
+//! // An item representing a source file contained in a package
+//! let item = Item {
+//!     identifier: "gitoid:blob:sha256:abc123...".to_string(),
+//!     connections: [
+//!         (CONTAINED_BY.to_string(), "gitoid:blob:sha256:pkg456...".to_string())
+//!     ].into_iter().collect(),
+//!     body_mime_type: Some("application/vnd.cc.goatrodeo".to_string()),
+//!     body: None,
+//! };
+//! ```
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{
@@ -9,8 +59,35 @@ use serde_cbor::{
     Value,
     value::{from_value, to_value},
 };
+use utoipa::ToSchema;
 
-/// Merge two values
+/// Recursively merge two CBOR Values.
+///
+/// This function implements the merge semantics for Item metadata:
+///
+/// ## Merge Rules
+///
+/// - **Arrays**: Union of elements (deduplicated via BTreeSet)
+/// - **Maps**: Recursive merge of values with matching keys
+/// - **Scalars**: First value wins (v1 takes precedence)
+/// - **Null + X**: X wins
+///
+/// ## Special Case: file_names
+///
+/// The `file_names` field at the top level (depth=0) has special handling:
+///
+/// When the same GitOID has different filenames in different containers,
+/// we need to disambiguate. The solution is to prefix filenames with the
+/// container GitOID: `container_gitoid!filename`
+///
+/// This allows tracking which filename came from which container when
+/// an artifact appears in multiple places with different names.
+///
+/// ## Parameters
+///
+/// - `v1`, `v2`: The values to merge
+/// - `depth`: Current recursion depth (0 = top level)
+/// - `v1_contains`, `v2_contains`: Closures returning container GitOIDs for filename disambiguation
 fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
     v1: &Value,
     v2: &Value,
@@ -18,6 +95,8 @@ fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
     v1_contains: &F,
     v2_contains: &F2,
 ) -> Value {
+    // Expand a filename Value into prefixed versions with container GitOIDs
+    // e.g., "foo.rs" -> ["foo.rs", "gitoid123!foo.rs", "gitoid456!foo.rs"]
     fn fix(filename: &Value, gitoids: Vec<String>) -> Vec<String> {
         let expanded_filename = fix_uno(filename);
         let mut ret = vec![];
@@ -31,6 +110,7 @@ fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
         ret
     }
 
+    // Extract string(s) from a Value (handles both single strings and arrays)
     fn fix_uno(s: &Value) -> Vec<String> {
         match s {
             Value::Text(s) => vec![s.clone()],
@@ -38,6 +118,7 @@ fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
             _ => vec![],
         }
     }
+
     match (v1, v2) {
         (Value::Array(vec1), Value::Array(vec2)) => {
             let mut ret = BTreeSet::new();
@@ -285,11 +366,30 @@ impl EdgeType for String {
 
 pub type Edge = (String, String);
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+/// A node in the BigTent graph database representing a software artifact.
+///
+/// Items are identified by GitOIDs and connected to other items via typed edges.
+/// The `body` field contains optional metadata in CBOR format.
+#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
+#[schema(example = json!({
+    "identifier": "gitoid:blob:sha256:a1b2c3d4e5f6...",
+    "connections": [["contained:up", "gitoid:blob:sha256:parent..."]],
+    "body_mime_type": "application/vnd.cc.goatrodeo",
+    "body": {"file_names": ["example.rs"], "file_size": 1234}
+}))]
 pub struct Item {
+    /// The unique GitOID identifier for this item
     pub identifier: String,
+    /// Set of typed edges connecting this item to other items.
+    /// Each edge is a tuple of (edge_type, target_identifier).
+    /// Edge types include: "alias:to", "alias:from", "contained:up", "contained:down",
+    /// "build:up", "build:down", "tag:to", "tag:from"
+    #[schema(value_type = Vec<(String, String)>)]
     pub connections: BTreeSet<Edge>,
+    /// MIME type of the body content, typically "application/vnd.cc.goatrodeo" for metadata
     pub body_mime_type: Option<String>,
+    /// Optional metadata body in CBOR format, serialized as JSON in API responses
+    #[schema(value_type = Option<serde_json::Value>)]
     pub body: Option<Value>,
 }
 

@@ -1,3 +1,34 @@
+//! # CLI Configuration
+//!
+//! This module defines the command-line interface configuration for BigTent
+//! using the `clap` crate for argument parsing.
+//!
+//! ## Configuration Options
+//!
+//! BigTent supports two primary modes of operation, configured via CLI arguments:
+//!
+//! ### Server Mode (`--rodeo`)
+//! - `--rodeo <paths>` - Path(s) to `.grc` cluster files or directories
+//! - `--host <hostname>` - Hostname(s) to bind to (default: localhost)
+//! - `--port <port>` - Port to bind to (default: 3000)
+//! - `--cache-index` - Pre-load index into memory (uses more RAM but faster queries)
+//!
+//! ### Merge Mode (`--fresh-merge`)
+//! - `--fresh-merge <paths>...` - Directories containing clusters to merge
+//! - `--dest <path>` - Output directory for merged cluster
+//! - `--buffer-limit <n>` - Max items in merge queue (default: 10,000)
+//!
+//! ## Performance Tuning
+//!
+//! - **Memory vs Speed**: Use `--cache-index` for faster queries at the cost of
+//!   higher memory usage during startup.
+//! - **Merge Performance**: Adjust `--buffer-limit` based on available memory.
+//!   Higher values allow more parallel processing but use more RAM.
+//!
+//! ## Environment Variables
+//!
+//! - `RUST_LOG` - Controls log verbosity (e.g., `RUST_LOG=info`)
+
 use clap::Parser;
 use std::{
     net::{SocketAddr, ToSocketAddrs},
