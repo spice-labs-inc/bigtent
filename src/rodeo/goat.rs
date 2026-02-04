@@ -639,23 +639,25 @@ impl GoatRodeoCluster {
                         (None, None) => {
                             break;
                         }
-                        (None, Some(_)) => {
-                            dest.push(ni.unwrap()); // avoids a shared reference problem
+                        (None, Some(ni_val)) => {
+                            dest.push(*ni_val); // avoids a shared reference problem
                             ni = ip.next();
                         }
-                        (Some(_), None) => {
-                            dest.push(nr.unwrap()); // avoids a shared reference problem
+                        (Some(nr_val), None) => {
+                            dest.push(*nr_val); // avoids a shared reference problem
                             nr = rp.next();
                         }
                         (Some(v1), Some(v2)) if v1.hash < v2.hash => {
-                            dest.push(nr.unwrap()); // unwrap okay because tested in pattern match
+                            dest.push(*v1); // unwrap okay because tested in pattern match
                             nr = rp.next();
                         }
                         (Some(v1), Some(v2)) if v1.hash > v2.hash => {
-                            dest.push(ni.unwrap()); // unwrap okay because tested in pattern match
+                            dest.push(*v2); // unwrap okay because tested in pattern match
                             ni = ip.next();
                         }
-                        (Some(_), Some(_)) => todo!("Merge two entries"),
+                        (Some(_), Some(_)) => {
+                            bail!("Unable to merge with two identical hash values")
+                        }
                     }
                 }
 
@@ -829,7 +831,10 @@ impl GoatRodeoCluster {
                 Some(item)
             }
             None => {
-                panic!("Couldn't find file for hash {:x}", file_hash);
+                panic!(
+                    "Couldn't find file for hash {:x} this indicates a corrupted index file and justifies a panic!",
+                    file_hash
+                );
             }
         }
     }
