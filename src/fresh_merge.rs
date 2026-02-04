@@ -73,7 +73,7 @@ use crate::{
     },
     util::{MD5Hash, NiceDurationDisplay, iso8601_now},
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use thousands::Separable;
 
 /// Merge multiple clusters into a single new cluster.
@@ -137,8 +137,8 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     );
 
     // Statistics tracking
-    let mut loop_cnt = 0usize;      // Total items processed
-    let mut merge_cnt = 0usize;     // Items that required merging (appeared in multiple clusters)
+    let mut loop_cnt = 0usize; // Total items processed
+    let mut merge_cnt = 0usize; // Items that required merging (appeared in multiple clusters)
     let mut max_merge_len = 0usize; // Total items across all clusters (upper bound)
 
     // Position trackers for each source cluster
@@ -192,7 +192,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     // Finds items to merge by iterating through sorted indices
     let hpg = Arc::clone(&holding_pen_gate);
     let coorindator_handle = thread::spawn(move || {
-        let mut pos = 0usize;  // Global position counter for ordering
+        let mut pos = 0usize; // Global position counter for ordering
         loop {
             // Only send more work if we're under the buffer limit
             if check_limit(&hpg, merge_buffer_limit) {
@@ -247,7 +247,10 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                     to_merge.push(merge_final);
                 }
 
-                let mut top = to_merge.pop().unwrap();
+                let mut top = match to_merge.pop() {
+                    Some(v) => v,
+                    None => continue,
+                };
 
                 for i in to_merge {
                     top = top.merge(i);
@@ -348,7 +351,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     }
 
     if !holding_pen.is_empty() {
-        panic!(
+        bail!(
             "Finished receiving, but holding pen is not empty {:?}",
             holding_pen
         );
@@ -425,147 +428,6 @@ enum ItemOrPurl {
         purls: Vec<String>,
     },
 }
-
-// TODO: update or remove test
-// #[ignore = "Out of date and weird"]
-// #[cfg(feature = "longtest")]
-// #[tokio::test]
-// async fn test_merge() {
-//   use std::thread::JoinHandle;
-
-//   use rand::Rng;
-//   use tokio::task::JoinSet;
-//   let mut rng = rand::thread_rng();
-
-//   let target_path = "/tmp/bt_merge_test";
-//   // delete the dest dir
-//   let _ = fs::remove_dir_all(target_path);
-
-//   info!("Removed directory");
-
-//   let test_paths: Vec<String> = vec![
-//     "../../tmp/oc_dest/result_aa",
-//     "../../tmp/oc_dest/result_ab",
-//     // "../../tmp/oc_dest/result_ac",
-//     // "../../tmp/oc_dest/result_ad",
-//     // "../../tmp/oc_dest/result_ae",
-//     // "../../tmp/oc_dest/result_af",
-//     // "../../tmp/oc_dest/result_ag",
-//     // "../../tmp/oc_dest/result_ah",
-//     // "../../tmp/oc_dest/result_ai",
-//     // "../../tmp/oc_dest/result_aj",
-//     // "../../tmp/oc_dest/result_ak",
-//     // "../../tmp/oc_dest/result_al",
-//     // "../../tmp/oc_dest/result_am",
-//     // "../../tmp/oc_dest/result_an",
-//     // "../../tmp/oc_dest/result_ao",
-//     // "../../tmp/oc_dest/result_ap",
-//   ]
-//   .into_iter()
-//   .filter(|p| {
-//     let pb: PathBuf = p.into();
-//     pb.exists() && pb.is_dir()
-//   })
-//   .map(|v| v.to_string())
-//   .collect();
-
-//   if test_paths.len() < 2 {
-//     return;
-//   }
-
-//   let mut set = JoinSet::new();
-//   test_paths.iter().for_each(|v| {
-//     set.spawn(async move { GoatRodeoCluster::cluster_files_in_dir(v.into(), false).await });
-//   });
-
-//   let mut test_clusters = vec![];
-//   while let Some(res) = set.join_next().await {}
-
-//   info!("Got test clusters");
-
-//   for should_thread in vec![true, false] {
-//     let cluster_copy = test_clusters.clone();
-
-//     merge_fresh(test_clusters.clone(), 10_000, &target_path)
-//       .await
-//       .expect("Should merge correctly");
-
-//     // a block so the file gets closed
-//     async {
-//       use std::io::BufReader;
-
-//       let mut purl_path = PathBuf::from(target_path);
-//       purl_path.push("purls.txt");
-//       let mut purl_file = BufReader::new(File::open(purl_path).expect("Should have purls"));
-//       let mut read = String::new();
-//       purl_file.read_line(&mut read).expect("Must read a line");
-//       assert!(read.len() > 4, "Expected to read a pURL");
-//     }
-//     .await;
-
-//     let dest_cluster = GoatRodeoCluster::cluster_files_in_dir(target_path.into(), false)
-//       .await
-//       .expect("Got a valid cluster in test directory")
-//       .pop()
-//       .expect("And it should have at least 1 element");
-
-//     let mut loop_cnt = 0usize;
-//     let start = Instant::now();
-//     for test_cluster in cluster_copy {
-//       let index = test_cluster.get_index().unwrap();
-//       for item in index.iter() {
-//         if rng.gen_range(0..1000) == 42 {
-//           let old = test_cluster.item_for_hash(item.hash).unwrap();
-//           let new = dest_cluster.item_for_hash(item.hash).unwrap();
-//           assert_eq!(
-//             old.identifier, new.identifier,
-//             "Expecting the same identifiers"
-//           );
-
-//           for i in old.connections.iter() {
-//             assert!(
-//               new.connections.contains(i),
-//               "Expecting {} to contain {:?}",
-//               new.identifier,
-//               i
-//             );
-//           }
-
-//           match (&new.identifier, &old.identifier) {
-//             (None, Some(omd)) => assert!(
-//               false,
-//               "for {} new did not contain metadata, old did {:?}",
-//               new.identifier, omd
-//             ),
-//             (Some(nmd), Some(omd)) => {
-//               for file_name in omd.file_names.iter() {
-//                 assert!(
-//                   nmd.file_names.contains(file_name),
-//                   "Expected new to contain filenames id {} old filenames {:?} new filenames {:?}",
-//                   new.identifier,
-//                   omd.file_names,
-//                   nmd.file_names
-//                 );
-//               }
-//             }
-//             _ => {}
-//           }
-//         }
-
-//         loop_cnt += 1;
-//         if loop_cnt % 500_000 == 0 {
-//           info!(
-//             "MTesting Loop {} at {:?} cluster {:?} threaded {}",
-//             loop_cnt,
-//             Instant::now().duration_since(start),
-//             test_cluster.cluster_path,
-//             should_thread
-//           );
-//         }
-//       }
-//     }
-//   }
-// }
 
 struct ClusterPos {
     pub cluster: Arc<HerdMember>,
