@@ -4,8 +4,9 @@ This guide will help you build, run, and start developing with BigTent.
 
 ## Prerequisites
 
-- **Rust**: Version 1.86.0 or later
+- **Rust**: Version 1.86.0 or later (only needed when building from source)
 - **Git**: For cloning the repository
+- **Docker**: Alternative to building from source (see [Docker Deployment](#docker-deployment))
 - **System Requirements**:
   - Linux, macOS, or Windows with WSL2
   - At least 4 GB RAM (more for large clusters)
@@ -45,7 +46,9 @@ cargo build
 cargo build --release
 ```
 
-The binary will be at `target/release/bigtent`.
+The binary will be at `target/release/bigtent`. This is a statically linked,
+optimized binary suitable for production deployment. There is no separate
+"install" step -- copy the binary to your server and run it directly.
 
 ### Run Tests
 
@@ -53,9 +56,148 @@ The binary will be at `target/release/bigtent`.
 cargo test
 ```
 
+## Docker Deployment
+
+BigTent publishes multi-architecture Docker images (linux/amd64, linux/arm64)
+to Docker Hub as `spicelabs/bigtent`.
+
+### Using a Pre-built Image
+
+```bash
+# Pull the latest release
+docker pull spicelabs/bigtent:latest
+
+# Or pull a specific version
+docker pull spicelabs/bigtent:0.13.0
+
+# Run the server, mounting your cluster data
+docker run -p 3000:3000 \
+    -v /path/to/your/clusters:/data \
+    spicelabs/bigtent --rodeo /data --host 0.0.0.0 --port 3000
+
+# Run a batch lookup
+docker run \
+    -v /path/to/your/clusters:/data \
+    -v /path/to/identifiers.json:/identifiers.json \
+    spicelabs/bigtent --rodeo /data --lookup /identifiers.json
+
+# Merge clusters
+docker run \
+    -v /path/to/cluster1:/cluster1 \
+    -v /path/to/cluster2:/cluster2 \
+    -v /path/to/output:/output \
+    spicelabs/bigtent --fresh-merge /cluster1 /cluster2 --dest /output
+```
+
+### Building the Docker Image Locally
+
+```bash
+docker build -t bigtent .
+docker run -p 3000:3000 -v /path/to/clusters:/data \
+    bigtent --rodeo /data --host 0.0.0.0 --port 3000
+```
+
+The Dockerfile uses a multi-stage Alpine build: the first stage compiles
+the release binary, and the second stage copies only the binary into a
+minimal Alpine image.
+
+## Understanding Identifiers
+
+BigTent uses two types of identifiers as primary keys for Items:
+
+### GitOIDs (Git Object Identifiers)
+
+A [GitOID](https://www.iana.org/assignments/uri-schemes/prov/gitoid) is a
+content-addressable identifier based on hashing a software artifact the same
+way Git hashes objects. The format is:
+
+```
+gitoid:<object_type>:<hash_algorithm>:<hex_digest>
+```
+
+For example:
+```
+gitoid:blob:sha256:fee53a18d32820613c0527aa79be5cb30173c823a9b448fa4817767cc84c6f03
+```
+
+Where:
+- `gitoid` -- the URI scheme
+- `blob` -- the Git object type (almost always `blob` for file content)
+- `sha256` -- the hash algorithm
+- `fee53a...` -- the full SHA-256 hex digest (64 characters)
+
+GitOIDs are the foundation of the [OmniBOR](https://omnibor.io/) specification
+for tracking software artifact identity.
+
+### Package URLs (PURLs)
+
+BigTent also supports [Package URLs](https://github.com/package-url/purl-spec)
+as identifiers for well-known software packages. The format is:
+
+```
+pkg:<type>/<namespace>/<name>@<version>
+```
+
+For example:
+```
+pkg:npm/lodash@4.17.21
+pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0
+pkg:docker/red-kibble-1@1.0.0
+```
+
+PURLs typically appear as aliases that resolve to their underlying GitOID.
+Use the `/aa` (anti-alias) endpoint to resolve a PURL to its canonical Item.
+
+## Cluster Directory Structure
+
+BigTent reads data from **cluster directories** -- directories containing a
+set of related `.grc`, `.gri`, and `.grd` files that together form an
+OmniBOR Corpus.
+
+### What a Valid Cluster Directory Looks Like
+
+```
+my_cluster/
+├── 2025_04_19_17_10_26_012a73d9c40dc9c0.grc   # Cluster file (entry point)
+├── 674f1be2154b27d1.gri                         # Index file
+├── 432e473a3c3e5630.grd                         # Data file
+├── purls.txt                                     # Package URLs (optional)
+└── history.jsonl                                 # Cluster history (optional)
+```
+
+**Required files:**
+- **`.grc` (Cluster file)** -- the entry point that references all index and
+  data files. Named with a timestamp prefix
+  (`YYYY_MM_DD_HH_MM_SS_<hash>.grc`) so the most recent cluster is easy to
+  identify. A directory may contain multiple `.grc` files; BigTent loads
+  the most recent.
+- **`.gri` (Index files)** -- sorted indexes that map MD5 hashes of
+  identifiers to data file locations. Named `<hash>.gri`.
+- **`.grd` (Data files)** -- CBOR-encoded Items stored at specific offsets.
+  Named `<hash>.grd`.
+
+**Optional files:**
+- **`purls.txt`** -- a plain text file listing all Package URLs in the
+  cluster, one per line. Served by the `GET /purls` endpoint.
+- **`history.jsonl`** -- JSON Lines file tracking the merge/creation
+  history of the cluster.
+
+A cluster can contain multiple index and data files. Large datasets are
+automatically split across multiple files during creation and merging.
+
+### Creating Clusters
+
+Clusters are created by [Goat Rodeo](https://github.com/spice-labs-inc/goatrodeo),
+which scans software artifacts and produces the `.grc`/`.gri`/`.grd` files.
+BigTent itself creates new clusters only during merge operations
+(`--fresh-merge`).
+
+For detailed file format specifications, see
+[info/files_and_formats.md](info/files_and_formats.md).
+
 ## Running BigTent
 
-BigTent has two primary modes of operation:
+BigTent has three modes of operation:
 
 ### 1. Server Mode (Rodeo)
 
@@ -86,6 +228,28 @@ Merge multiple clusters into a new one:
     --fresh-merge /path/to/cluster1/ /path/to/cluster2/ \
     --dest /path/to/output/ \
     --buffer-limit 5000
+```
+
+### 3. Lookup Mode
+
+Look up a batch of identifiers against loaded clusters without starting a server:
+
+```bash
+# Create a JSON file with identifiers to look up
+echo '["gitoid:blob:sha256:abc123...", "unknown_id"]' > identifiers.json
+
+# Look up identifiers, output to stdout
+./target/release/bigtent --rodeo /path/to/cluster/ --lookup identifiers.json
+
+# Look up identifiers, output to file
+./target/release/bigtent --rodeo /path/to/cluster/ \
+    --lookup identifiers.json \
+    --output results.json
+
+# With pre-cached index for faster lookups
+./target/release/bigtent --rodeo /path/to/cluster/ \
+    --lookup identifiers.json \
+    --cache-index true
 ```
 
 ## Your First API Query
@@ -244,10 +408,70 @@ ulimit -n 4096
 - Ensure data is on SSD
 - Check if binary search is hitting disk (memory pressure)
 
+## Authentication and Security
+
+BigTent does **not** include built-in authentication or authorization.
+All HTTP endpoints are open and accessible to any client that can reach the
+server.
+
+For production deployments, secure BigTent at the infrastructure level:
+
+- **Reverse proxy**: Place BigTent behind nginx, Caddy, or a cloud load
+  balancer that handles TLS termination and authentication.
+- **Network isolation**: Bind to `localhost` (the default) or a private
+  network interface, and use firewall rules to restrict access.
+- **Container networking**: When running in Docker/Kubernetes, use network
+  policies to control which services can reach BigTent.
+
 ## Environment Variables
 
-- `RUST_LOG` - Log level (e.g., `RUST_LOG=info`, `RUST_LOG=debug`)
-- `RUST_BACKTRACE` - Enable backtraces on errors (`RUST_BACKTRACE=1`)
+BigTent is configured entirely via CLI arguments. No `config.toml` or other
+configuration files are needed. Only two environment variables are recognized
+at runtime:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `RUST_LOG` | Controls log verbosity via `tracing-subscriber` | `RUST_LOG=info` |
+| `RUST_BACKTRACE` | Enables stack traces on errors | `RUST_BACKTRACE=1` |
+
+`RUST_LOG` filter examples:
+
+```bash
+# Show info-level messages from all crates
+RUST_LOG=info ./target/release/bigtent --rodeo /data/clusters/
+
+# Show debug messages only from bigtent code
+RUST_LOG=bigtent=debug ./target/release/bigtent --rodeo /data/clusters/
+
+# Show warnings and above (quietest useful level)
+RUST_LOG=warn ./target/release/bigtent --rodeo /data/clusters/
+```
+
+> **Note**: The `config.toml` file format referenced in older documentation
+> is deprecated and no longer used. All configuration is via CLI arguments.
+
+## Logging
+
+BigTent outputs structured JSON logs to stderr via `tracing-subscriber`.
+Each log line is a JSON object suitable for ingestion by log aggregation
+tools (ELK, Datadog, CloudWatch, etc.).
+
+Example log output:
+
+```json
+{"timestamp":"2025-04-19T17:10:26Z","level":"INFO","message":"Starting big tent git sha abc1234"}
+{"timestamp":"2025-04-19T17:10:27Z","level":"INFO","message":"Loaded cluster my_cluster"}
+{"timestamp":"2025-04-19T17:10:28Z","level":"INFO","message":"Served /item/gitoid:blob:sha256:... response 200 OK time 1.234ms"}
+```
+
+Every HTTP request is logged with its URI, response status code, and elapsed
+time. There is no built-in metrics endpoint (e.g., Prometheus). To collect
+metrics, parse the structured JSON logs or use an external observability
+sidecar.
+
+The `GET /node_count` endpoint can serve as a basic health check -- it
+returns the total number of items loaded and confirms the server is
+responsive.
 
 ## Next Steps
 

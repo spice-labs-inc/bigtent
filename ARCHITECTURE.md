@@ -12,11 +12,12 @@ content-addressable hashes that uniquely identify each artifact.
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        BigTent Server                           │
-├─────────────────────────────────────────────────────────────────┤
-│                     REST API (Axum)                             │
-│   /item  /aa  /north  /flatten  /bulk  /purls  /openapi.json   │
-├─────────────────────────────────────────────────────────────────┤
-│                   ClusterHolder<GRT>                            │
+├──────────────────────────────┬──────────────────────────────────┤
+│      REST API (Axum)         │      Lookup CLI                  │
+│   /item /aa /north /flatten  │   --lookup identifiers.json      │
+│   /bulk /purls /openapi.json │   --output results.json          │
+├──────────────────────────────┴──────────────────────────────────┤
+│                   ClusterHolder<GRT> / GoatHerd                 │
 │              (Hot-reload via ArcSwap)                           │
 ├─────────────────────────────────────────────────────────────────┤
 │                   GoatRodeoTrait                                │
@@ -213,6 +214,28 @@ Built on Axum with streaming support for large responses.
 6. Finalize .grc (cluster) with all references
 ```
 
+### Lookup Path (Batch CLI)
+
+```
+1. CLI: bigtent --rodeo /path --lookup ids.json
+                          │
+2. Parse Input            ▼
+   Read JSON file → Vec<String> of identifiers
+                          │
+3. Load Clusters          ▼
+   GoatRodeoCluster::cluster_files_in_dir() → GoatHerd
+                          │
+4. Batch Lookup           ▼
+   For each identifier:
+     GoatHerd.item_for_identifier(id) → Option<Item>
+                          │
+5. Serialize              ▼
+   Build JSON map: {id: item.to_json() | null}
+                          │
+6. Output                 ▼
+   Write to stdout or --output file
+```
+
 ## Threading Model
 
 ### Server Mode
@@ -265,6 +288,48 @@ The `--buffer-limit` parameter controls backpressure during merges:
 - Limits items queued for writing
 - Prevents memory exhaustion on large merges
 - Default: 10,000 items
+
+## Logging and Observability
+
+### Logging Infrastructure
+
+BigTent uses `tracing-subscriber` configured for JSON output. All logs go
+to stderr as structured JSON, one object per line:
+
+```
+┌──────────────┐     ┌──────────────────────┐     ┌──────────┐
+│  Application │────►│ tracing-subscriber   │────►│  stderr  │
+│  log macros  │     │ (JSON formatter)     │     │  (JSON)  │
+│  info!()     │     │                      │     │          │
+│  error!()    │     │ Controlled by        │     │          │
+│              │     │ RUST_LOG env var     │     │          │
+└──────────────┘     └──────────────────────┘     └──────────┘
+```
+
+### Request Logging
+
+The HTTP server includes a middleware (`request_log_middleware` in
+`src/server.rs`) that logs every request:
+- Request URI
+- Response HTTP status code
+- Elapsed time from request receipt to response
+
+### Observability Gaps
+
+BigTent does **not** currently provide:
+- Prometheus `/metrics` endpoint
+- OpenTelemetry tracing spans
+- Built-in health check endpoint (though `GET /node_count` can serve this purpose)
+
+For production monitoring, parse the structured JSON logs with a log
+aggregation tool.
+
+### Authentication
+
+BigTent does not implement authentication or authorization at the
+application level. All endpoints are publicly accessible. Access control
+must be handled at the infrastructure layer (reverse proxy, firewall,
+network policy).
 
 ## Error Handling
 

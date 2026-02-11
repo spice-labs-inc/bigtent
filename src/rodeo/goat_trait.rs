@@ -214,11 +214,11 @@ pub fn impl_antialias_for<GRT: GoatRodeoTrait + 'static>(
                 // Follow the alias to the target
                 ret = match the_self.item_for_identifier(&v.1) {
                     Some(v) => v,
-                    _ => return None,  // Broken alias chain
+                    _ => return None, // Broken alias chain
                 };
             }
             None => {
-                return None;  // Inconsistent: is_alias() true but no alias:to edge
+                return None; // Inconsistent: is_alias() true but no alias:to edge
             }
         }
     }
@@ -263,9 +263,9 @@ pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
 
     // Spawn async task to populate the channel
     tokio::spawn(async move {
-        let mut found = HashSet::new();       // Items we've already visited
-        let mut to_find = HashSet::new();     // Items we need to visit
-        let mut found_purls = HashSet::<String>::new();  // Dedupe PURLs
+        let mut found = HashSet::new(); // Items we've already visited
+        let mut to_find = HashSet::new(); // Items we need to visit
+        let mut found_purls = HashSet::<String>::new(); // Dedupe PURLs
         to_find.extend(gitoids);
 
         let cnt = AtomicU32::new(0);
@@ -290,11 +290,11 @@ pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
             let to_search = less(&to_find, &found);
 
             if to_search.len() == 0 {
-                break;  // All reachable items visited
+                break; // All reachable items visited
             }
 
             for this_oid in to_search {
-                found.insert(this_oid.clone());  // Mark as visited
+                found.insert(this_oid.clone()); // Mark as visited
 
                 match the_self.item_for_identifier(&this_oid) {
                     Some(item) => {
@@ -317,7 +317,7 @@ pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
                         // Add containers to next iteration's work
                         to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
                     }
-                    _ => {}  // Item not found, skip
+                    _ => {} // Item not found, skip
                 }
                 cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }

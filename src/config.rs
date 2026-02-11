@@ -18,6 +18,12 @@
 //! - `--dest <path>` - Output directory for merged cluster
 //! - `--buffer-limit <n>` - Max items in merge queue (default: 10,000)
 //!
+//! ### Lookup Mode (`--rodeo` + `--lookup`)
+//! - `--rodeo <paths>` - Path(s) to `.grc` cluster files or directories
+//! - `--lookup <path>` - JSON file containing array of identifiers to look up
+//! - `--output <path>` - Output file for results (default: stdout)
+//! - `--cache-index` - Pre-load index into memory (uses more RAM but faster queries)
+//!
 //! ## Performance Tuning
 //!
 //! - **Memory vs Speed**: Use `--cache-index` for faster queries at the cost of
@@ -77,6 +83,35 @@ pub struct Args {
     /// queue.  Adjust this according to your system's memory limits.
     #[arg(long, short, default_value_t = 10_000)]
     pub buffer_limit: usize,
+
+    /// Path to a JSON file containing an array of identifier strings to look up
+    /// in the loaded cluster(s).
+    ///
+    /// Requires `--rodeo` to specify which cluster(s) to load. When provided,
+    /// Big Tent performs a batch lookup instead of starting the web server.
+    ///
+    /// The JSON file must contain an array of strings, e.g.:
+    /// ```json
+    /// ["gitoid:blob:sha256:abc123...", "pkg:npm/lodash@4.17.21"]
+    /// ```
+    ///
+    /// Results are written as a JSON object mapping each identifier to its
+    /// [`Item`](crate::item::Item) (as JSON) or `null` if not found:
+    /// ```json
+    /// {"gitoid:blob:sha256:abc123...": {...}, "pkg:npm/lodash@4.17.21": null}
+    /// ```
+    ///
+    /// Output goes to stdout by default, or to a file specified by `--output`.
+    #[arg(long, short)]
+    pub lookup: Option<PathBuf>,
+
+    /// Output file path for `--lookup` results.
+    ///
+    /// When specified, the lookup results JSON is written to this file
+    /// instead of stdout. The file is created if it doesn't exist,
+    /// or overwritten if it does.
+    #[arg(long, short)]
+    pub output: Option<PathBuf>,
 }
 
 impl Args {
