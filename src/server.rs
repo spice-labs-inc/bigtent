@@ -804,21 +804,34 @@ mod openapi_tests {
         assert!(json.is_ok(), "OpenAPI spec should serialize to JSON");
 
         let json_str = json.unwrap();
-        assert!(json_str.contains("\"openapi\""), "JSON should contain openapi version");
-        assert!(json_str.contains("BigTent API"), "JSON should contain API title");
+        assert!(
+            json_str.contains("\"openapi\""),
+            "JSON should contain openapi version"
+        );
+        assert!(
+            json_str.contains("BigTent API"),
+            "JSON should contain API title"
+        );
 
         // Print a sample when running with --nocapture for verification
         #[cfg(test)]
         {
             let lines: Vec<&str> = json_str.lines().take(50).collect();
-            eprintln!("\n=== OpenAPI Spec Sample (first 50 lines) ===\n{}", lines.join("\n"));
+            eprintln!(
+                "\n=== OpenAPI Spec Sample (first 50 lines) ===\n{}",
+                lines.join("\n")
+            );
         }
     }
 
     #[test]
     fn test_openapi_contains_item_schema() {
         let spec = ApiDoc::openapi();
-        let schemas = &spec.components.as_ref().expect("Should have components").schemas;
+        let schemas = &spec
+            .components
+            .as_ref()
+            .expect("Should have components")
+            .schemas;
 
         assert!(schemas.contains_key("Item"), "Should contain Item schema");
     }
@@ -859,7 +872,11 @@ mod openapi_tests {
     #[test]
     fn test_openapi_bulk_endpoint_is_post() {
         let spec = ApiDoc::openapi();
-        let bulk_path = spec.paths.paths.get("/bulk").expect("Should have /bulk path");
+        let bulk_path = spec
+            .paths
+            .paths
+            .get("/bulk")
+            .expect("Should have /bulk path");
 
         assert!(bulk_path.post.is_some(), "/bulk should have POST method");
         assert!(bulk_path.get.is_none(), "/bulk should not have GET method");
@@ -868,10 +885,20 @@ mod openapi_tests {
     #[test]
     fn test_openapi_item_endpoint_is_get() {
         let spec = ApiDoc::openapi();
-        let item_path = spec.paths.paths.get("/item/{gitoid}").expect("Should have /item/{{gitoid}} path");
+        let item_path = spec
+            .paths
+            .paths
+            .get("/item/{gitoid}")
+            .expect("Should have /item/{{gitoid}} path");
 
-        assert!(item_path.get.is_some(), "/item/{{gitoid}} should have GET method");
-        assert!(item_path.post.is_none(), "/item/{{gitoid}} should not have POST method");
+        assert!(
+            item_path.get.is_some(),
+            "/item/{{gitoid}} should have GET method"
+        );
+        assert!(
+            item_path.post.is_none(),
+            "/item/{{gitoid}} should not have POST method"
+        );
     }
 
     #[test]
@@ -882,25 +909,47 @@ mod openapi_tests {
         let tag_names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
 
         assert!(tag_names.contains(&"items"), "Should have 'items' tag");
-        assert!(tag_names.contains(&"anti-alias"), "Should have 'anti-alias' tag");
-        assert!(tag_names.contains(&"traversal"), "Should have 'traversal' tag");
-        assert!(tag_names.contains(&"metadata"), "Should have 'metadata' tag");
+        assert!(
+            tag_names.contains(&"anti-alias"),
+            "Should have 'anti-alias' tag"
+        );
+        assert!(
+            tag_names.contains(&"traversal"),
+            "Should have 'traversal' tag"
+        );
+        assert!(
+            tag_names.contains(&"metadata"),
+            "Should have 'metadata' tag"
+        );
     }
 
     #[test]
     fn test_openapi_item_schema_has_required_fields() {
         let spec = ApiDoc::openapi();
-        let schemas = &spec.components.as_ref().expect("Should have components").schemas;
+        let schemas = &spec
+            .components
+            .as_ref()
+            .expect("Should have components")
+            .schemas;
         let item_schema = schemas.get("Item").expect("Should have Item schema");
 
         // Serialize to check structure
         let json = serde_json::to_value(item_schema).expect("Should serialize");
 
         // Check that it's an object with properties
-        assert!(json.get("properties").is_some(), "Item schema should have properties");
+        assert!(
+            json.get("properties").is_some(),
+            "Item schema should have properties"
+        );
 
         let props = json.get("properties").unwrap();
-        assert!(props.get("identifier").is_some(), "Item should have identifier property");
-        assert!(props.get("connections").is_some(), "Item should have connections property");
+        assert!(
+            props.get("identifier").is_some(),
+            "Item should have identifier property"
+        );
+        assert!(
+            props.get("connections").is_some(),
+            "Item should have connections property"
+        );
     }
 }

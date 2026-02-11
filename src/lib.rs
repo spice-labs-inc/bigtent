@@ -27,10 +27,12 @@
 //!
 //! ## Usage Modes
 //!
-//! BigTent operates in two primary modes:
+//! BigTent operates in three modes:
 //!
-//! 1. **Rodeo Mode** (`--rodeo`): Load and serve existing cluster files
+//! 1. **Rodeo Mode** (`--rodeo`): Load and serve existing cluster files via HTTP
 //! 2. **Fresh Merge Mode** (`--fresh-merge`): Merge multiple clusters into one
+//! 3. **Lookup Mode** (`--rodeo` + `--lookup`): Batch identifier lookup from a JSON file,
+//!    outputting results to stdout or a file without starting a server
 //!
 //! ## Example
 //!

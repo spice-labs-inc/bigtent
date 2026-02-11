@@ -4,7 +4,7 @@
 //!
 //! ## Execution Modes
 //!
-//! The binary supports two mutually exclusive modes:
+//! The binary supports three mutually exclusive modes:
 //!
 //! ### Rodeo Mode (`--rodeo <paths>`)
 //! Loads cluster files from the specified paths and starts an HTTP server
@@ -23,6 +23,15 @@
 //! bigtent --fresh-merge /path/to/cluster1 /path/to/cluster2 --dest /output
 //! ```
 //!
+//! ### Lookup Mode (`--rodeo <paths>` + `--lookup <file>`)
+//! Loads cluster files and performs a batch identifier lookup without starting
+//! a server. Results are written to stdout or to a file specified by `--output`.
+//!
+//! ```bash
+//! bigtent --rodeo /path/to/clusters --lookup identifiers.json
+//! bigtent --rodeo /path/to/clusters --lookup identifiers.json --output results.json
+//! ```
+//!
 //! ## Threading
 //!
 //! The binary runs on a Tokio multi-threaded runtime with 100 worker threads
@@ -36,6 +45,7 @@ use bigtent::{
     rodeo::{
         goat::GoatRodeoCluster,
         goat_herd::GoatHerd,
+        goat_trait::GoatRodeoTrait,
         holder::ClusterHolder,
         member::{HerdMember, member_core},
         robo_goat::ClusterRoboMember,
@@ -48,7 +58,7 @@ use log::info; // Use log crate when building application
 
 #[cfg(test)]
 use std::println as info;
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{io::Write, path::PathBuf, sync::Arc, time::Instant};
 
 async fn run_rodeo(path_vec: &Vec<PathBuf>, args: &Args) -> Result<()> {
     let mut clusters: Vec<Arc<HerdMember>> = vec![];
@@ -117,6 +127,117 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
     ret
 }
 
+/// Perform a batch identifier lookup against loaded cluster(s).
+///
+/// This function implements the "lookup mode" of Big Tent. It:
+///
+/// 1. Reads and parses a JSON file containing an array of identifier strings
+/// 2. Loads cluster(s) from the paths specified by `--rodeo`
+/// 3. Looks up each identifier using [`GoatRodeoTrait::item_for_identifier`]
+/// 4. Outputs a JSON object mapping each identifier to its
+///    [`Item`](bigtent::item::Item) (serialized via [`Item::to_json`]) or `null`
+///    if the identifier was not found
+///
+/// Output is written to stdout by default, or to a file if `--output` is specified.
+///
+/// # Arguments
+///
+/// * `path_vec` - Cluster directory paths from the `--rodeo` CLI argument
+/// * `args` - Parsed CLI arguments (must include `lookup`; optionally `output`)
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The lookup file does not exist or is not a file
+/// - The lookup file cannot be parsed as a JSON array of strings
+/// - A cluster path does not exist
+/// - The output file cannot be written
+///
+/// # Example CLI Usage
+///
+/// ```bash
+/// bigtent -r /path/to/clusters --lookup identifiers.json
+/// bigtent -r /path/to/clusters --lookup identifiers.json --output results.json
+/// ```
+async fn run_lookup(path_vec: &Vec<PathBuf>, args: &Args) -> Result<()> {
+    // Extract and validate the lookup file path
+    let lookup_path = match &args.lookup {
+        Some(p) => p.clone(),
+        None => bail!("A `--lookup` path must be supplied"),
+    };
+
+    if !lookup_path.exists() || !lookup_path.is_file() {
+        bail!(
+            "Lookup file does not exist or is not a file: {:?}",
+            lookup_path
+        );
+    }
+
+    // Read the JSON file and parse it as an array of identifier strings
+    let lookup_content = std::fs::read_to_string(&lookup_path)?;
+    let identifiers: Vec<String> = serde_json::from_str(&lookup_content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse lookup file as JSON array of strings: {}",
+            e
+        )
+    })?;
+
+    info!("Lookup: {} identifiers to resolve", identifiers.len());
+
+    // Load clusters using the same pattern as run_rodeo
+    let mut clusters: Vec<Arc<HerdMember>> = vec![];
+    for path in path_vec.iter() {
+        if path.exists() {
+            for b in
+                GoatRodeoCluster::cluster_files_in_dir(path.clone(), args.pre_cache_index(), vec![])
+                    .await?
+            {
+                info!("Loaded cluster {}", b.name());
+                clusters.push(member_core(b));
+            }
+        } else {
+            bail!("Path to `.grc` does not point to a file: {:?}", path)
+        }
+    }
+    let herd = GoatHerd::new(clusters);
+
+    // Look up each identifier and build the result map.
+    // Uses serde_json::Map to preserve insertion order (matches input order).
+    let mut result_map = serde_json::Map::new();
+    for identifier in &identifiers {
+        let value = match herd.item_for_identifier(identifier) {
+            Some(item) => item.to_json(),    // Serialize the found Item to JSON
+            None => serde_json::Value::Null, // Not found → null
+        };
+        result_map.insert(identifier.clone(), value);
+    }
+    let result_json = serde_json::Value::Object(result_map);
+
+    // Write the result JSON to the output destination
+    let output_string = serde_json::to_string_pretty(&result_json)?;
+    match &args.output {
+        Some(output_path) => {
+            // Write to the specified output file
+            std::fs::write(output_path, &output_string)?;
+            info!("Lookup results written to {:?}", output_path);
+        }
+        None => {
+            // Write to stdout
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            handle.write_all(output_string.as_bytes())?;
+            handle.write_all(b"\n")?;
+            handle.flush()?;
+        }
+    }
+
+    info!(
+        "Lookup complete: {} identifiers processed",
+        identifiers.len()
+    );
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 100)]
 async fn main() -> Result<()> {
     // use tracing_subscriber in JSON mode
@@ -126,14 +247,13 @@ async fn main() -> Result<()> {
     info!("Starting big tent git sha {}", env!("VERGEN_GIT_SHA"));
     let args = Args::parse();
 
-    match (&args.rodeo, &args.fresh_merge) {
-        (Some(rodeo), v) if v.len() == 0 => run_rodeo(rodeo, &args).await?,
-        // (None, Some(_conf), v) if v.len() == 0 => run_full_server(args).await?,
-
-        // normally there'd be a generic here, but because this function is `main`, it's necessary
-        // to specify the concrete type (in this case `ItemMetaData`) rather than the generic
-        // type
-        (None, v) if v.len() > 0 => run_merge(v.clone(), args).await?,
+    match (&args.rodeo, &args.fresh_merge, &args.lookup) {
+        // Lookup mode: --rodeo + --lookup (batch identifier lookup, no server)
+        (Some(rodeo), v, Some(_)) if v.len() == 0 => run_lookup(rodeo, &args).await?,
+        // Server mode: --rodeo only (start HTTP server)
+        (Some(rodeo), v, None) if v.len() == 0 => run_rodeo(rodeo, &args).await?,
+        // Merge mode: --fresh-merge (merge clusters into a new one)
+        (None, v, None) if v.len() > 0 => run_merge(v.clone(), args).await?,
         _ => {
             Args::command().print_help()?;
         }
