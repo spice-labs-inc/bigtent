@@ -1,0 +1,63 @@
+# BigTent Production Deployment with Caddy Reverse Proxy
+#
+# Usage:
+#   docker compose up -d
+#
+# This configuration provides:
+#   - BigTent server with cluster data mounted from a volume
+#   - Caddy reverse proxy with automatic HTTPS via Let's Encrypt
+#
+# Before starting:
+#   1. Edit examples/Caddyfile and replace bigtent.example.com with your domain
+#   2. Place your cluster data in the bigtent-data volume (or bind mount a host path)
+#
+# To use a bind mount instead of a named volume, replace the volume with:
+#   volumes:
+#     - /path/to/your/clusters:/data:ro
+
+services:
+  bigtent:
+    image: spicelabs/bigtent:latest
+    command: ["--rodeo", "/data", "--host", "0.0.0.0"]
+    volumes:
+      - bigtent-data:/data:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    networks:
+      - bigtent-internal
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./examples/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+    depends_on:
+      bigtent:
+        condition: service_healthy
+    networks:
+      - bigtent-internal
+
+volumes:
+  bigtent-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  bigtent-internal:
+    driver: bridge

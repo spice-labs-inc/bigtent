@@ -1,0 +1,66 @@
+# BigTent systemd Service Unit
+#
+# Installation:
+#   1. Copy this file to /etc/systemd/system/bigtent.service
+#   2. Create the bigtent user: sudo useradd --system --no-create-home bigtent
+#   3. Place the binary at /usr/local/bin/bigtent
+#   4. Create the data directory and set ownership:
+#        sudo mkdir -p /var/lib/bigtent/clusters
+#        sudo chown bigtent:bigtent /var/lib/bigtent/clusters
+#   5. Enable and start:
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable bigtent
+#        sudo systemctl start bigtent
+#
+# Reload clusters without restart:
+#   sudo systemctl reload bigtent
+#
+# View logs:
+#   journalctl -u bigtent -f
+
+[Unit]
+Description=BigTent Graph Database Server
+Documentation=https://bigtent.cc
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bigtent
+Group=bigtent
+WorkingDirectory=/var/lib/bigtent
+
+# Adjust --rodeo path to your cluster data location
+ExecStart=/usr/local/bin/bigtent \
+    --rodeo /var/lib/bigtent/clusters \
+    --host 127.0.0.1 \
+    --port 3000 \
+    --pid-file /run/bigtent/bigtent.pid
+
+# SIGHUP triggers cluster reload
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart on failure with exponential backoff
+Restart=on-failure
+RestartSec=5s
+
+# File descriptor limits (needed for large clusters with many .grd/.gri files)
+LimitNOFILE=65536
+
+# Environment
+Environment=RUST_LOG=info
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/bigtent
+ReadOnlyPaths=/var/lib/bigtent/clusters
+PrivateTmp=true
+
+# PID file directory
+RuntimeDirectory=bigtent
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

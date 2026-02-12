@@ -9,11 +9,13 @@
 //! ┌────────────────────────────────────┐
 //! │ Magic Number (4 bytes): 0xba4a4a   │  "Banana" - identifies file type
 //! ├────────────────────────────────────┤
-//! │ Length (4 bytes)                   │  Size of CBOR payload
+//! │ Length (2 bytes, u16 big-endian)   │  Size of CBOR payload
 //! ├────────────────────────────────────┤
 //! │ CBOR Payload (ClusterFileEnvelope) │  Serialized metadata
 //! └────────────────────────────────────┘
 //! ```
+//!
+//! The u16 length prefix imposes an implicit 64 KiB safety bound on the CBOR payload.
 //!
 //! ## ClusterFileEnvelope Fields
 //!

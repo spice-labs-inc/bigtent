@@ -52,8 +52,10 @@
 //! - `.gri` - Index files (GitOID → data offset mapping)
 //! - `.grd` - Data files (CBOR-encoded Items)
 
+pub mod cluster_list;
 pub mod config;
 pub mod fresh_merge;
+pub mod pid_file;
 pub mod server;
 pub mod rodeo {
     pub mod cluster;

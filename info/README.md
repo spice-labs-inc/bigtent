@@ -6,6 +6,7 @@ This directory contains technical documentation for Big Tent.
 
 * [Files and Formats](files_and_formats.md) - Detailed file format specifications (.grc, .gri, .grd)
 * [Configuration Reference](config.md) - CLI arguments, environment variables, and tuning
+* [Operations Guide](operations.md) - Production deployment, TLS, monitoring, upgrades, and runbook
 
 ## Top-Level Documentation
 

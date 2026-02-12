@@ -412,16 +412,23 @@ ulimit -n 4096
 
 BigTent does **not** include built-in authentication or authorization.
 All HTTP endpoints are open and accessible to any client that can reach the
-server.
+server. (All endpoints are read-only — even the POST endpoints only perform lookups.)
 
 For production deployments, secure BigTent at the infrastructure level:
 
-- **Reverse proxy**: Place BigTent behind nginx, Caddy, or a cloud load
-  balancer that handles TLS termination and authentication.
+- **Reverse proxy**: Place BigTent behind nginx or Caddy for TLS termination
+  and authentication. Ready-to-use configs are provided in
+  [`examples/nginx.conf`](examples/nginx.conf) and
+  [`examples/Caddyfile`](examples/Caddyfile).
 - **Network isolation**: Bind to `localhost` (the default) or a private
   network interface, and use firewall rules to restrict access.
 - **Container networking**: When running in Docker/Kubernetes, use network
   policies to control which services can reach BigTent.
+- **Docker Compose**: The included [`docker-compose.yml`](docker-compose.yml)
+  bundles BigTent with Caddy for automatic HTTPS.
+
+For detailed TLS configuration, mTLS guidance, and authentication examples,
+see the [Operations Guide](info/operations.md#tls-and-authentication).
 
 ## Environment Variables
 
@@ -464,14 +471,23 @@ Example log output:
 {"timestamp":"2025-04-19T17:10:28Z","level":"INFO","message":"Served /item/gitoid:blob:sha256:... response 200 OK time 1.234ms"}
 ```
 
-Every HTTP request is logged with its URI, response status code, and elapsed
-time. There is no built-in metrics endpoint (e.g., Prometheus). To collect
-metrics, parse the structured JSON logs or use an external observability
-sidecar.
+Every HTTP request is logged with its URI, response status code, and elapsed time.
 
-The `GET /node_count` endpoint can serve as a basic health check -- it
-returns the total number of items loaded and confirms the server is
-responsive.
+### Metrics and Health
+
+BigTent exposes a `GET /metrics` endpoint in Prometheus text exposition format,
+providing request counts, latency histograms, node/cluster gauges, and process
+metrics (RSS, CPU, open FDs).
+
+Health endpoints for load balancers and orchestrators:
+
+- `GET /healthz` — Liveness probe (always 200 if the process is running)
+- `GET /readyz` — Readiness probe (200 if clusters are loaded, 503 otherwise)
+- `GET /health` — Detailed JSON with version, git SHA, node count, uptime, and status
+
+For log volume estimates, Docker log driver configuration, logrotate setup,
+monitoring/alerting rules, and a complete operational runbook, see the
+[Operations Guide](info/operations.md).
 
 ## Next Steps
 
