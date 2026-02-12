@@ -4,7 +4,7 @@
 //!
 //! ## Execution Modes
 //!
-//! The binary supports three mutually exclusive modes:
+//! The binary supports four mutually exclusive modes:
 //!
 //! ### Rodeo Mode (`--rodeo <paths>`)
 //! Loads cluster files from the specified paths and starts an HTTP server
@@ -12,6 +12,14 @@
 //!
 //! ```bash
 //! bigtent --rodeo /path/to/clusters --port 3000
+//! ```
+//!
+//! ### Cluster List Mode (`--cluster-list <file>`)
+//! Reads a JSON file containing directory paths and starts an HTTP server.
+//! On SIGHUP, the file is re-read to pick up directory changes.
+//!
+//! ```bash
+//! bigtent --cluster-list /path/to/dirs.json --pid-file /tmp/bt.pid
 //! ```
 //!
 //! ### Fresh Merge Mode (`--fresh-merge <paths>... --dest <output>`)
@@ -40,8 +48,10 @@
 use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
 use bigtent::{
-    config::Args,
+    cluster_list::{load_cluster_list, load_clusters_from_dirs},
+    config::{Args, ClusterSource},
     fresh_merge::merge_fresh,
+    pid_file::PidFile,
     rodeo::{
         goat::GoatRodeoCluster,
         goat_herd::GoatHerd,
@@ -58,32 +68,113 @@ use log::info; // Use log crate when building application
 
 #[cfg(test)]
 use std::println as info;
-use std::{io::Write, path::PathBuf, sync::Arc, time::Instant};
+use std::{io::Write, path::PathBuf, sync::Arc, time::{Duration, Instant}};
+use tokio::signal::unix::{SignalKind, signal};
 
-async fn run_rodeo(path_vec: &Vec<PathBuf>, args: &Args) -> Result<()> {
-    let mut clusters: Vec<Arc<HerdMember>> = vec![];
-    for path in path_vec.iter() {
-        if path.exists() {
-            for b in
-                GoatRodeoCluster::cluster_files_in_dir(path.clone(), args.pre_cache_index(), vec![])
-                    .await?
-            {
-                info!("Loaded cluster {}", b.name());
-                clusters.push(member_core(b));
+async fn run_server(cluster_source: ClusterSource, args: &Args) -> Result<()> {
+    // Load initial clusters
+    let dirs = match &cluster_source {
+        ClusterSource::Rodeo(paths) => {
+            // Validate that all paths exist before loading
+            for path in paths {
+                if !path.exists() {
+                    bail!("Path to `.grc` does not point to a file: {:?}", path);
+                }
             }
-        } else {
-            bail!("Path to `.grc` does not point to a file: {:?}", path)
+            paths.clone()
         }
-    }
+        ClusterSource::ClusterList(path) => load_cluster_list(path)?,
+    };
+
+    let clusters = load_clusters_from_dirs(&dirs, args.pre_cache_index()).await?;
 
     let herd = GoatHerd::new(clusters);
+    let initial_cluster_count = herd.get_herd().len() as u64;
+
     let cluster_holder =
         ClusterHolder::new_from_cluster(ArcSwap::new(Arc::new(herd)), Some(Arc::new(args.clone())))
             .await?;
+    cluster_holder.record_reload(initial_cluster_count);
 
-    info!("Build cluster... about to run it",);
+    info!("Built cluster... about to run it");
 
-    run_web_server(cluster_holder).await?;
+    // Acquire PID file if requested
+    let _pid_file = match &args.pid_file {
+        Some(path) => Some(PidFile::create(path)?),
+        None => None,
+    };
+
+    // Spawn the web server as a background task
+    let holder_for_server = cluster_holder.clone();
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = run_web_server(holder_for_server).await {
+            tracing::error!("Web server error: {}", e);
+        }
+    });
+
+    // SIGHUP reload loop
+    let mut sighup = signal(SignalKind::hangup())?;
+    let mut last_reload = Instant::now();
+    let cooldown = Duration::from_secs(5);
+
+    loop {
+        tokio::select! {
+            _ = sighup.recv() => {
+                if last_reload.elapsed() < cooldown {
+                    tracing::warn!("SIGHUP suppressed (cooldown)");
+                    continue;
+                }
+                // Determine dirs from source
+                let reload_dirs = match &cluster_source {
+                    ClusterSource::Rodeo(paths) => paths.clone(),
+                    ClusterSource::ClusterList(path) => {
+                        match load_cluster_list(path) {
+                            Ok(dirs) => dirs,
+                            Err(e) => {
+                                tracing::error!("Failed to read cluster list: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                };
+                // Load new clusters
+                let old_count = cluster_holder.get_cluster().node_count();
+                let old_cluster_count = cluster_holder.get_cluster().get_herd().len();
+                let start = Instant::now();
+                match load_clusters_from_dirs(&reload_dirs, args.pre_cache_index()).await {
+                    Ok(members) if members.is_empty() => {
+                        tracing::error!("Reload produced zero clusters, retaining existing data");
+                    }
+                    Ok(members) => {
+                        let new_herd = GoatHerd::new(members);
+                        let new_count = new_herd.node_count();
+                        let new_cluster_count = new_herd.get_herd().len();
+                        cluster_holder.update_cluster(Arc::new(new_herd));
+                        cluster_holder.record_reload(new_cluster_count as u64);
+                        tracing::info!(
+                            event = "reload",
+                            status = "success",
+                            duration_ms = start.elapsed().as_millis() as u64,
+                            old_cluster_count,
+                            new_cluster_count,
+                            old_node_count = old_count,
+                            new_node_count = new_count,
+                        );
+                        last_reload = Instant::now();
+                    }
+                    Err(e) => {
+                        tracing::error!("Reload failed: {}, retaining existing data", e);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received SIGINT, shutting down");
+                break;
+            }
+        }
+    }
+
+    server_handle.abort();
     Ok(())
 }
 
@@ -184,7 +275,7 @@ async fn run_lookup(path_vec: &Vec<PathBuf>, args: &Args) -> Result<()> {
 
     info!("Lookup: {} identifiers to resolve", identifiers.len());
 
-    // Load clusters using the same pattern as run_rodeo
+    // Load clusters using the same pattern as run_server
     let mut clusters: Vec<Arc<HerdMember>> = vec![];
     for path in path_vec.iter() {
         if path.exists() {
@@ -247,13 +338,25 @@ async fn main() -> Result<()> {
     info!("Starting big tent git sha {}", env!("VERGEN_GIT_SHA"));
     let args = Args::parse();
 
-    match (&args.rodeo, &args.fresh_merge, &args.lookup) {
+    // Warn if --pid-file is used with non-server modes
+    if args.pid_file.is_some() && args.rodeo.is_none() && args.cluster_list.is_none() {
+        tracing::warn!("--pid-file is only meaningful in server mode (--rodeo or --cluster-list)");
+    }
+
+    // Check for cluster-list mode first (it's mutually exclusive with rodeo via cluster_source)
+    let cluster_source = args.cluster_source().map_err(|e| anyhow::anyhow!(e))?;
+
+    match (&cluster_source, &args.fresh_merge, &args.lookup) {
         // Lookup mode: --rodeo + --lookup (batch identifier lookup, no server)
-        (Some(rodeo), v, Some(_)) if v.len() == 0 => run_lookup(rodeo, &args).await?,
-        // Server mode: --rodeo only (start HTTP server)
-        (Some(rodeo), v, None) if v.len() == 0 => run_rodeo(rodeo, &args).await?,
+        (Some(ClusterSource::Rodeo(rodeo)), v, Some(_)) if v.is_empty() => {
+            run_lookup(rodeo, &args).await?
+        }
+        // Server mode: --rodeo or --cluster-list (start HTTP server with SIGHUP support)
+        (Some(source), v, None) if v.is_empty() => {
+            run_server(source.clone(), &args).await?
+        }
         // Merge mode: --fresh-merge (merge clusters into a new one)
-        (None, v, None) if v.len() > 0 => run_merge(v.clone(), args).await?,
+        (None, v, None) if !v.is_empty() => run_merge(v.clone(), args).await?,
         _ => {
             Args::command().print_help()?;
         }

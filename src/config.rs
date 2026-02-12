@@ -112,6 +112,26 @@ pub struct Args {
     /// or overwritten if it does.
     #[arg(long, short)]
     pub output: Option<PathBuf>,
+
+    /// Path to a JSON file containing a list of directories to search for .grc
+    /// cluster files. Mutually exclusive with --rodeo. On SIGHUP, the file is
+    /// re-read to pick up directory changes.
+    #[arg(long)]
+    pub cluster_list: Option<PathBuf>,
+
+    /// Path to write a PID file when running in server mode.
+    /// The PID file is flocked for the lifetime of the process and deleted on
+    /// clean shutdown.
+    #[arg(long)]
+    pub pid_file: Option<PathBuf>,
+}
+
+/// Represents the source of cluster directories — enforces mutual exclusivity
+/// between --rodeo and --cluster-list at the type level.
+#[derive(Debug, Clone)]
+pub enum ClusterSource {
+    Rodeo(Vec<PathBuf>),
+    ClusterList(PathBuf),
 }
 
 impl Args {
@@ -141,5 +161,64 @@ impl Args {
 
     pub fn pre_cache_index(&self) -> bool {
         self.cache_index.unwrap_or(false)
+    }
+
+    /// Derive the cluster source from CLI arguments.
+    ///
+    /// Returns `Some(Rodeo(..))` if `--rodeo` is set, `Some(ClusterList(..))` if
+    /// `--cluster-list` is set, `None` if neither. Returns an error if both are set.
+    pub fn cluster_source(&self) -> Result<Option<ClusterSource>, String> {
+        match (&self.rodeo, &self.cluster_list) {
+            (Some(_), Some(_)) => {
+                Err("--rodeo and --cluster-list are mutually exclusive".to_string())
+            }
+            (Some(paths), None) => Ok(Some(ClusterSource::Rodeo(paths.clone()))),
+            (None, Some(path)) => Ok(Some(ClusterSource::ClusterList(path.clone()))),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cluster_source_rodeo() {
+        let args = Args {
+            rodeo: Some(vec![PathBuf::from("/tmp/cluster_a")]),
+            ..Default::default()
+        };
+        let source = args.cluster_source().unwrap();
+        assert!(matches!(source, Some(ClusterSource::Rodeo(_))));
+    }
+
+    #[test]
+    fn test_cluster_source_cluster_list() {
+        let args = Args {
+            cluster_list: Some(PathBuf::from("/tmp/dirs.json")),
+            ..Default::default()
+        };
+        let source = args.cluster_source().unwrap();
+        assert!(matches!(source, Some(ClusterSource::ClusterList(_))));
+    }
+
+    #[test]
+    fn test_cluster_source_both_rejected() {
+        let args = Args {
+            rodeo: Some(vec![PathBuf::from("/tmp/cluster_a")]),
+            cluster_list: Some(PathBuf::from("/tmp/dirs.json")),
+            ..Default::default()
+        };
+        let result = args.cluster_source();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn test_cluster_source_neither() {
+        let args = Args::default();
+        let source = args.cluster_source().unwrap();
+        assert!(source.is_none());
     }
 }

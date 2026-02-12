@@ -57,6 +57,8 @@ use tokio_util::either::Either;
 use tower_http::services::fs::ServeFileSystemResponseBody;
 use utoipa::OpenApi;
 
+use serde::Serialize;
+
 use crate::{
     item::Item,
     rodeo::{goat_trait::GoatRodeoTrait, holder::ClusterHolder},
@@ -173,7 +175,12 @@ async fn serve_bulk<GRT: GoatRodeoTrait + 'static>(
     })
 }
 
-/// Get the total number of items (nodes) in the cluster.
+/// Returns the total item count as a bare decimal integer.
+/// Response body is exactly a JSON number with no wrapper object.
+/// Example response: `42`
+///
+/// Consumers (e.g. mace) parse this with `.trim().parse::<u64>()`.
+/// Do not change this format without coordinating with mace.
 #[utoipa::path(
     get,
     path = "/node_count",
@@ -186,6 +193,27 @@ async fn node_count<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
 ) -> Result<Json<u64>, Json<serde_json::Value>> {
     Ok(Json(rodeo.get_cluster().node_count()))
+}
+
+/// Health check endpoint returning cluster status information.
+#[derive(Serialize)]
+struct HealthResponse {
+    node_count: u64,
+    cluster_count: u64,
+    last_reload_at: Option<String>,
+    uptime_seconds: u64,
+}
+
+async fn health<GRT: GoatRodeoTrait + 'static>(
+    State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+) -> Json<HealthResponse> {
+    let info = rodeo.health_info();
+    Json(HealthResponse {
+        node_count: info.node_count,
+        cluster_count: info.cluster_count,
+        last_reload_at: info.last_reload_at,
+        uptime_seconds: info.uptime_seconds,
+    })
 }
 
 async fn do_serve_gitoid<GRT: GoatRodeoTrait + 'static>(
@@ -741,6 +769,7 @@ pub fn build_route<GRT: GoatRodeoTrait + 'static>(state: Arc<ClusterHolder<GRT>>
         .route("/flatten", post(serve_flatten_bulk))
         .route("/purls", get(gimme_purls))
         .route("/node_count", get(node_count))
+        .route("/health", get(health))
         .route("/", get(serve_gitoid_query))
         .route("/{*gitoid}", get(serve_gitoid))
         .with_state(state.clone());

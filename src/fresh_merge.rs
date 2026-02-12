@@ -119,6 +119,11 @@ use thousands::Separable;
 /// - `data_<hash>.grd` - Data file(s)
 /// - `purls.txt` - All Package URLs found
 /// - `cluster_info.jsonl` - Merge metadata in JSON Lines format
+///
+/// ## Errors
+///
+/// Returns an error if `clusters` contains fewer than 2 members.
+/// Callers must ensure at least 2 members are provided.
 pub async fn merge_fresh<PB: Into<PathBuf>>(
     clusters: Vec<Arc<HerdMember>>,
     merge_buffer_limit: usize,
