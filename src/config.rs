@@ -124,6 +124,11 @@ pub struct Args {
     /// clean shutdown.
     #[arg(long)]
     pub pid_file: Option<PathBuf>,
+
+    /// Validate cluster files and exit. Returns 0 if valid, 1 if errors found.
+    /// Requires --rodeo or --cluster-list to specify which clusters to validate.
+    #[arg(long)]
+    pub check: bool,
 }
 
 /// Represents the source of cluster directories — enforces mutual exclusivity

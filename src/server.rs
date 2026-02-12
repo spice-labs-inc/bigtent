@@ -25,6 +25,12 @@
 //! - `GET /purls` - Download purls.txt file
 //! - `GET /openapi.json` - OpenAPI specification
 //!
+//! ### Operations
+//! - `GET /health` - Detailed health check with version, status, and cluster info
+//! - `GET /healthz` - Liveness probe (always returns 200 if server is running)
+//! - `GET /readyz` - Readiness probe (returns 200 if clusters are loaded, 503 otherwise)
+//! - `GET /metrics` - Prometheus metrics endpoint
+//!
 //! ## Route Mirroring
 //!
 //! All routes are available at both `/` and `/omnibor/` prefixes for compatibility.
@@ -96,13 +102,18 @@ use std::println as info;
         serve_flatten_source_bulk,
         gimme_purls,
         node_count,
+        health,
+        livez,
+        readyz,
+        serve_metrics,
     ),
-    components(schemas(Item)),
+    components(schemas(Item, HealthResponse, LivezResponse, ReadyzResponse)),
     tags(
         (name = "items", description = "Item retrieval endpoints"),
         (name = "anti-alias", description = "Alias resolution endpoints"),
         (name = "traversal", description = "Graph traversal endpoints"),
-        (name = "metadata", description = "Cluster metadata endpoints")
+        (name = "metadata", description = "Cluster metadata endpoints"),
+        (name = "operations", description = "Health, readiness, and metrics endpoints")
     )
 )]
 pub struct ApiDoc;
@@ -195,15 +206,30 @@ async fn node_count<GRT: GoatRodeoTrait + 'static>(
     Ok(Json(rodeo.get_cluster().node_count()))
 }
 
-/// Health check endpoint returning cluster status information.
-#[derive(Serialize)]
+/// Health check response with cluster status, version, and uptime information.
+#[derive(Serialize, utoipa::ToSchema)]
 struct HealthResponse {
     node_count: u64,
     cluster_count: u64,
     last_reload_at: Option<String>,
     uptime_seconds: u64,
+    version: String,
+    git_sha: String,
+    status: String,
 }
 
+/// Health check endpoint returning cluster status information.
+///
+/// Returns detailed health information including node count, cluster count,
+/// version, git SHA, and overall status ("ok" or "degraded").
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "operations",
+    responses(
+        (status = 200, description = "Health check response", body = HealthResponse)
+    )
+)]
 async fn health<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
 ) -> Json<HealthResponse> {
@@ -213,7 +239,94 @@ async fn health<GRT: GoatRodeoTrait + 'static>(
         cluster_count: info.cluster_count,
         last_reload_at: info.last_reload_at,
         uptime_seconds: info.uptime_seconds,
+        version: info.version,
+        git_sha: info.git_sha,
+        status: info.status,
     })
+}
+
+/// Liveness probe response.
+#[derive(Serialize, utoipa::ToSchema)]
+struct LivezResponse {
+    status: String,
+}
+
+/// Liveness probe endpoint.
+///
+/// Returns 200 OK if the HTTP server is running. No cluster access needed --
+/// if this endpoint responds, the process is alive.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "operations",
+    responses(
+        (status = 200, description = "Server is alive", body = LivezResponse)
+    )
+)]
+async fn livez() -> Json<LivezResponse> {
+    Json(LivezResponse {
+        status: "ok".to_string(),
+    })
+}
+
+/// Readiness probe response.
+#[derive(Serialize, utoipa::ToSchema)]
+struct ReadyzResponse {
+    ready: bool,
+}
+
+/// Readiness probe endpoint.
+///
+/// Returns 200 if clusters are loaded (node_count > 0), or 503 Service Unavailable
+/// if no data is available yet.
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "operations",
+    responses(
+        (status = 200, description = "Server is ready", body = ReadyzResponse),
+        (status = 503, description = "Server is not ready", body = ReadyzResponse)
+    )
+)]
+async fn readyz<GRT: GoatRodeoTrait + 'static>(
+    State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+) -> (StatusCode, Json<ReadyzResponse>) {
+    let ready = rodeo.get_cluster().node_count() > 0;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(ReadyzResponse { ready }))
+}
+
+/// Prometheus metrics endpoint.
+///
+/// Returns all registered metrics in Prometheus text exposition format,
+/// including process_* metrics and bigtent_* application metrics.
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "operations",
+    responses(
+        (status = 200, description = "Prometheus metrics", content_type = "text/plain"),
+        (status = 500, description = "Failed to encode metrics")
+    )
+)]
+async fn serve_metrics<GRT: GoatRodeoTrait + 'static>(
+    State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+) -> Result<Response, StatusCode> {
+    // Update dynamic gauges before scraping
+    let info = rodeo.health_info();
+    let _ = info; // health_info() already updates the gauges
+
+    match rodeo.metrics().encode() {
+        Ok(body) => Ok(Response::builder()
+            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            .body(body.into())
+            .unwrap()),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn do_serve_gitoid<GRT: GoatRodeoTrait + 'static>(
@@ -745,6 +858,31 @@ async fn serve_openapi() -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
 }
 
+/// Normalize a request path for metrics labeling.
+/// Replaces dynamic path segments with placeholders to avoid high cardinality.
+fn normalize_path(path: &str) -> &str {
+    // Strip /omnibor prefix if present
+    let p = path.strip_prefix("/omnibor").unwrap_or(path);
+
+    if p.starts_with("/item/") {
+        "/item/{gitoid}"
+    } else if p.starts_with("/aa/") {
+        "/aa/{gitoid}"
+    } else if p.starts_with("/north_purls/") {
+        "/north_purls/{gitoid}"
+    } else if p.starts_with("/north/") {
+        "/north/{gitoid}"
+    } else if p.starts_with("/flatten_source/") {
+        "/flatten_source/{gitoid}"
+    } else if p.starts_with("/flatten/") {
+        "/flatten/{gitoid}"
+    } else if p == "/" {
+        "/item"
+    } else {
+        p
+    }
+}
+
 /// Build up the routes for the default Big Tent features
 pub fn build_route<GRT: GoatRodeoTrait + 'static>(state: Arc<ClusterHolder<GRT>>) -> Router {
     let app: Router<()> = Router::new()
@@ -770,6 +908,9 @@ pub fn build_route<GRT: GoatRodeoTrait + 'static>(state: Arc<ClusterHolder<GRT>>
         .route("/purls", get(gimme_purls))
         .route("/node_count", get(node_count))
         .route("/health", get(health))
+        .route("/healthz", get(livez))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(serve_metrics))
         .route("/", get(serve_gitoid_query))
         .route("/{*gitoid}", get(serve_gitoid))
         .with_state(state.clone());
@@ -777,18 +918,71 @@ pub fn build_route<GRT: GoatRodeoTrait + 'static>(state: Arc<ClusterHolder<GRT>>
     app
 }
 
-/// middleware for request logging
+/// middleware for request logging and metrics recording
 pub async fn request_log_middleware(request: ExtractRequest, next: Next) -> Response {
     let start = Instant::now();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
     let request_uri_string = format!("{}", request.uri());
     let response = next.run(request).await;
+    let status = response.status().as_u16().to_string();
+    let duration = start.elapsed();
 
     info!(
         "Served {} response {} time {:?}",
         request_uri_string,
         response.status(),
-        Instant::now().duration_since(start)
+        duration
     );
+
+    // Record metrics via the Extension if available
+    if let Some(metrics) = response.extensions().get::<crate::rodeo::holder::MetricsHandles>() {
+        let normalized = normalize_path(&path);
+        metrics
+            .http_requests_total
+            .with_label_values(&[method.as_str(), normalized, status.as_str()])
+            .inc();
+        metrics
+            .http_request_duration_seconds
+            .with_label_values(&[method.as_str(), normalized])
+            .observe(duration.as_secs_f64());
+    }
+
+    response
+}
+
+/// Middleware that records request metrics using the ClusterHolder's metrics handles.
+pub async fn metrics_middleware<GRT: GoatRodeoTrait + 'static>(
+    State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+    request: ExtractRequest,
+    next: Next,
+) -> Response {
+    let start = Instant::now();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let request_uri_string = format!("{}", request.uri());
+
+    let response = next.run(request).await;
+    let status = response.status().as_u16().to_string();
+    let duration = start.elapsed();
+
+    info!(
+        "Served {} response {} time {:?}",
+        request_uri_string,
+        response.status(),
+        duration
+    );
+
+    let normalized = normalize_path(&path);
+    let metrics = rodeo.metrics();
+    metrics
+        .http_requests_total
+        .with_label_values(&[method.as_str(), normalized, status.as_str()])
+        .inc();
+    metrics
+        .http_request_duration_seconds
+        .with_label_values(&[method.as_str(), normalized])
+        .observe(duration.as_secs_f64());
 
     response
 }
@@ -800,7 +994,8 @@ pub async fn run_web_server<GRT: GoatRodeoTrait + 'static>(
     let addrs = index.the_args().to_socket_addrs();
     info!("Listen on {:?}", addrs);
 
-    let app = build_route(state).layer(middleware::from_fn(request_log_middleware));
+    let app = build_route(state.clone())
+        .layer(middleware::from_fn_with_state(state, metrics_middleware));
 
     let nested = Router::new().nest("/omnibor", app.clone());
 
@@ -887,6 +1082,10 @@ mod openapi_tests {
             "/flatten_source",
             "/purls",
             "/node_count",
+            "/health",
+            "/healthz",
+            "/readyz",
+            "/metrics",
         ];
 
         for path in &expected_paths {
@@ -949,6 +1148,10 @@ mod openapi_tests {
         assert!(
             tag_names.contains(&"metadata"),
             "Should have 'metadata' tag"
+        );
+        assert!(
+            tag_names.contains(&"operations"),
+            "Should have 'operations' tag"
         );
     }
 

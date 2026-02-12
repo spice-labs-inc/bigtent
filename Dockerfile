@@ -16,5 +16,8 @@ FROM alpine:3.21
 
 COPY --from=builder /src/bigtent/target/release/bigtent /bigtent
 
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD wget -qO- http://localhost:3000/healthz || exit 1
+
 ENTRYPOINT ["/bigtent"]
 

@@ -70,6 +70,7 @@ tracing-subscriber = {version = "0.3", features = ["json", "env-filter", "fmt", 
 
 utoipa = { version = "5", features = ["axum_extras"] }
 memmap2 = { version = "0.9" }
+prometheus = { version = "0.14", features = ["process"] }
 [dev-dependencies]
 rand = "0.9.1"
 tempfile = "3"

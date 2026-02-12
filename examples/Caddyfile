@@ -1,0 +1,53 @@
+# BigTent Caddy Reverse Proxy Configuration
+#
+# Caddy automatically obtains and renews TLS certificates via Let's Encrypt.
+# Replace bigtent.example.com with your actual domain name.
+#
+# For local/development use without TLS:
+#   :8080 {
+#       reverse_proxy bigtent:3000
+#   }
+
+bigtent.example.com {
+    # Reverse proxy to BigTent
+    reverse_proxy bigtent:3000
+
+    # Security headers
+    header {
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -Server
+    }
+
+    # Basic authentication (uncomment and adjust to enable)
+    # To generate a password hash: caddy hash-password
+    #
+    # basicauth /bulk {
+    #     admin $2a$14$HASH_FROM_caddy_hash-password
+    # }
+    # basicauth /aa {
+    #     admin $2a$14$HASH_FROM_caddy_hash-password
+    # }
+
+    # Rate limiting via headers (Caddy community plugin required)
+    # See: https://github.com/mholt/caddy-ratelimit
+    #
+    # rate_limit {
+    #     zone static_zone {
+    #         key    {remote_host}
+    #         events 100
+    #         window 1m
+    #     }
+    # }
+
+    # Access logging
+    log {
+        output file /var/log/caddy/bigtent-access.log {
+            roll_size 100mb
+            roll_keep 5
+        }
+    }
+}

@@ -329,6 +329,95 @@ async fn run_lookup(path_vec: &Vec<PathBuf>, args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Validate cluster files and exit.
+///
+/// Loads clusters from the given source and reports any errors.
+/// Returns `true` if all clusters are valid, `false` if errors were found.
+async fn run_check(cluster_source: &ClusterSource, args: &Args) -> bool {
+    let dirs = match cluster_source {
+        ClusterSource::Rodeo(paths) => {
+            let mut errors = false;
+            for path in paths {
+                if !path.exists() {
+                    eprintln!("ERROR: Path does not exist: {:?}", path);
+                    errors = true;
+                }
+            }
+            if errors {
+                return false;
+            }
+            paths.clone()
+        }
+        ClusterSource::ClusterList(path) => {
+            if !path.exists() {
+                eprintln!("ERROR: Cluster list file does not exist: {:?}", path);
+                return false;
+            }
+            match load_cluster_list(path) {
+                Ok(dirs) => dirs,
+                Err(e) => {
+                    eprintln!("ERROR: Failed to read cluster list {:?}: {}", path, e);
+                    return false;
+                }
+            }
+        }
+    };
+
+    if dirs.is_empty() {
+        eprintln!("ERROR: No cluster directories specified");
+        return false;
+    }
+
+    let mut total_clusters = 0u64;
+    let mut total_nodes = 0u64;
+    let mut errors = false;
+
+    for dir in &dirs {
+        if !dir.exists() {
+            eprintln!("ERROR: Directory does not exist: {:?}", dir);
+            errors = true;
+            continue;
+        }
+
+        match load_clusters_from_dirs(&[dir.clone()], args.pre_cache_index()).await {
+            Ok(members) => {
+                if members.is_empty() {
+                    eprintln!("WARNING: No cluster files found in {:?}", dir);
+                } else {
+                    for member in &members {
+                        total_clusters += 1;
+                        let node_count = member.node_count();
+                        total_nodes += node_count;
+                        println!(
+                            "  OK: cluster in {:?} — {} nodes",
+                            dir, node_count
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("ERROR: Failed to load cluster from {:?}: {}", dir, e);
+                errors = true;
+            }
+        }
+    }
+
+    println!();
+    if errors {
+        eprintln!(
+            "FAILED: Found errors. {} clusters loaded, {} total nodes.",
+            total_clusters, total_nodes
+        );
+        false
+    } else {
+        println!(
+            "OK: All clusters valid. {} clusters, {} total nodes.",
+            total_clusters, total_nodes
+        );
+        true
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 100)]
 async fn main() -> Result<()> {
     // use tracing_subscriber in JSON mode
@@ -346,17 +435,23 @@ async fn main() -> Result<()> {
     // Check for cluster-list mode first (it's mutually exclusive with rodeo via cluster_source)
     let cluster_source = args.cluster_source().map_err(|e| anyhow::anyhow!(e))?;
 
-    match (&cluster_source, &args.fresh_merge, &args.lookup) {
+    match (&cluster_source, &args.fresh_merge, &args.lookup, args.check) {
+        // Check mode: --rodeo/--cluster-list + --check (validate and exit)
+        (Some(source), v, None, true) if v.is_empty() => {
+            if !run_check(source, &args).await {
+                std::process::exit(1);
+            }
+        }
         // Lookup mode: --rodeo + --lookup (batch identifier lookup, no server)
-        (Some(ClusterSource::Rodeo(rodeo)), v, Some(_)) if v.is_empty() => {
+        (Some(ClusterSource::Rodeo(rodeo)), v, Some(_), false) if v.is_empty() => {
             run_lookup(rodeo, &args).await?
         }
         // Server mode: --rodeo or --cluster-list (start HTTP server with SIGHUP support)
-        (Some(source), v, None) if v.is_empty() => {
+        (Some(source), v, None, false) if v.is_empty() => {
             run_server(source.clone(), &args).await?
         }
         // Merge mode: --fresh-merge (merge clusters into a new one)
-        (None, v, None) if !v.is_empty() => run_merge(v.clone(), args).await?,
+        (None, v, None, false) if !v.is_empty() => run_merge(v.clone(), args).await?,
         _ => {
             Args::command().print_help()?;
         }
