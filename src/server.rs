@@ -936,7 +936,10 @@ pub async fn request_log_middleware(request: ExtractRequest, next: Next) -> Resp
     );
 
     // Record metrics via the Extension if available
-    if let Some(metrics) = response.extensions().get::<crate::rodeo::holder::MetricsHandles>() {
+    if let Some(metrics) = response
+        .extensions()
+        .get::<crate::rodeo::holder::MetricsHandles>()
+    {
         let normalized = normalize_path(&path);
         metrics
             .http_requests_total
@@ -994,8 +997,8 @@ pub async fn run_web_server<GRT: GoatRodeoTrait + 'static>(
     let addrs = index.the_args().to_socket_addrs();
     info!("Listen on {:?}", addrs);
 
-    let app = build_route(state.clone())
-        .layer(middleware::from_fn_with_state(state, metrics_middleware));
+    let app =
+        build_route(state.clone()).layer(middleware::from_fn_with_state(state, metrics_middleware));
 
     let nested = Router::new().nest("/omnibor", app.clone());
 
