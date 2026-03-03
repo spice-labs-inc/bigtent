@@ -35,13 +35,13 @@
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use prometheus::{
-    Counter, CounterVec, Encoder, Gauge, HistogramVec, Opts, Registry,
-    TextEncoder,
-};
+use prometheus::{Counter, CounterVec, Encoder, Gauge, HistogramVec, Opts, Registry, TextEncoder};
 use std::{
     path::PathBuf,
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -83,7 +83,10 @@ impl MetricsHandles {
         registry.register(Box::new(process_collector))?;
 
         let http_requests_total = CounterVec::new(
-            Opts::new("bigtent_http_requests_total", "Total number of HTTP requests"),
+            Opts::new(
+                "bigtent_http_requests_total",
+                "Total number of HTTP requests",
+            ),
             &["method", "path", "status"],
         )?;
         registry.register(Box::new(http_requests_total.clone()))?;
@@ -93,7 +96,9 @@ impl MetricsHandles {
                 "bigtent_http_request_duration_seconds",
                 "HTTP request duration in seconds",
             )
-            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
             &["method", "path"],
         )?;
         registry.register(Box::new(http_request_duration_seconds.clone()))?;
@@ -107,7 +112,8 @@ impl MetricsHandles {
         let uptime_seconds = Gauge::new("bigtent_uptime_seconds", "Server uptime in seconds")?;
         registry.register(Box::new(uptime_seconds.clone()))?;
 
-        let reload_total = Counter::new("bigtent_reload_total", "Total number of successful reloads")?;
+        let reload_total =
+            Counter::new("bigtent_reload_total", "Total number of successful reloads")?;
         registry.register(Box::new(reload_total.clone()))?;
 
         let reload_last_success_timestamp = Gauge::new(
@@ -193,9 +199,13 @@ impl<GRT: GoatRodeoTrait> ClusterHolder<GRT> {
 
         // Update Prometheus metrics
         self.metrics.reload_total.inc();
-        self.metrics.reload_last_success_timestamp.set((epoch_ms / 1000) as f64);
+        self.metrics
+            .reload_last_success_timestamp
+            .set((epoch_ms / 1000) as f64);
         self.metrics.cluster_count.set(cluster_count as f64);
-        self.metrics.node_count.set(self.cluster.load().node_count() as f64);
+        self.metrics
+            .node_count
+            .set(self.cluster.load().node_count() as f64);
     }
 
     /// Return a snapshot of health information.
@@ -209,8 +219,7 @@ impl<GRT: GoatRodeoTrait> ClusterHolder<GRT> {
             // Convert epoch millis to RFC 3339
             let secs = (epoch_ms / 1000) as i64;
             let nanos = ((epoch_ms % 1000) * 1_000_000) as u32;
-            chrono::DateTime::from_timestamp(secs, nanos)
-                .map(|dt| dt.to_rfc3339())
+            chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.to_rfc3339())
         };
         let uptime_seconds = self.start_time.elapsed().as_secs();
         let status = if node_count > 0 { "ok" } else { "degraded" }.to_string();
@@ -226,7 +235,9 @@ impl<GRT: GoatRodeoTrait> ClusterHolder<GRT> {
             last_reload_at,
             uptime_seconds,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            git_sha: option_env!("VERGEN_GIT_SHA").unwrap_or("unknown").to_string(),
+            git_sha: option_env!("VERGEN_GIT_SHA")
+                .unwrap_or("unknown")
+                .to_string(),
             status,
         }
     }

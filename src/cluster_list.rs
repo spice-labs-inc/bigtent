@@ -11,11 +11,11 @@ use std::sync::Arc;
 use log::{error, info, warn};
 
 #[cfg(test)]
-use std::println as info;
-#[cfg(test)]
 use std::eprintln as warn;
 #[cfg(test)]
 use std::eprintln as error;
+#[cfg(test)]
+use std::println as info;
 
 use crate::rodeo::{
     goat::GoatRodeoCluster,

@@ -12,3 +12,12 @@ baddy.txt
 froggy.idx
 frogs/
 .idea
+
+# Benchmark test data (generated, not committed)
+benches/test_data/
+
+# Baseline HTML reports (generated, not committed)
+benches/baselines/reports/
+
+# Criterion temporary files
+benches/target/
