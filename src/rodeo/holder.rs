@@ -78,9 +78,11 @@ impl MetricsHandles {
     fn new() -> Result<Self> {
         let registry = Registry::new_custom(None, None)?;
 
-        // Register process metrics
-        let process_collector = prometheus::process_collector::ProcessCollector::for_self();
-        registry.register(Box::new(process_collector))?;
+        // Register process metrics (Linux only)
+        #[cfg(target_os = "linux")] {
+            let process_collector = prometheus::process_collector::ProcessCollector::for_self();
+            registry.register(Box::new(process_collector))?;
+        }
 
         let http_requests_total = CounterVec::new(
             Opts::new("bigtent_http_requests_total", "Total number of HTTP requests"),
