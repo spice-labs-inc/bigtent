@@ -68,7 +68,12 @@ use log::info; // Use log crate when building application
 
 #[cfg(test)]
 use std::println as info;
-use std::{io::Write, path::PathBuf, sync::Arc, time::{Duration, Instant}};
+use std::{
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::signal::unix::{SignalKind, signal};
 
 async fn run_server(cluster_source: ClusterSource, args: &Args) -> Result<()> {
@@ -388,10 +393,7 @@ async fn run_check(cluster_source: &ClusterSource, args: &Args) -> bool {
                         total_clusters += 1;
                         let node_count = member.node_count();
                         total_nodes += node_count;
-                        println!(
-                            "  OK: cluster in {:?} — {} nodes",
-                            dir, node_count
-                        );
+                        println!("  OK: cluster in {:?} — {} nodes", dir, node_count);
                     }
                 }
             }
@@ -447,9 +449,7 @@ async fn main() -> Result<()> {
             run_lookup(rodeo, &args).await?
         }
         // Server mode: --rodeo or --cluster-list (start HTTP server with SIGHUP support)
-        (Some(source), v, None, false) if v.is_empty() => {
-            run_server(source.clone(), &args).await?
-        }
+        (Some(source), v, None, false) if v.is_empty() => run_server(source.clone(), &args).await?,
         // Merge mode: --fresh-merge (merge clusters into a new one)
         (None, v, None, false) if !v.is_empty() => run_merge(v.clone(), args).await?,
         _ => {

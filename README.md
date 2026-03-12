@@ -35,6 +35,7 @@ For detailed setup instructions, see [GETTING_STARTED.md](GETTING_STARTED.md).
 |----------|-------------|
 | [GETTING_STARTED.md](GETTING_STARTED.md) | Installation, building, and first steps |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design, components, and data flow |
+| [BENCHMARKING.md](BENCHMARKING.md) | Merge benchmarking suite and performance tracking |
 | [PERFORMANCE.md](PERFORMANCE.md) | Performance tuning and optimization |
 | [info/config.md](info/config.md) | Configuration reference |
 | [info/files_and_formats.md](info/files_and_formats.md) | File format specifications |

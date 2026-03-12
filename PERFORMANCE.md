@@ -116,6 +116,8 @@ Communication via bounded channels prevents memory exhaustion.
 
 ## Benchmarking
 
+For comprehensive merge operation benchmarking, see [BENCHMARKING.md](BENCHMARKING.md).
+
 ### Quick Performance Check
 
 ```bash

@@ -116,12 +116,7 @@ mod tests {
 
         let result = PidFile::create(&link_path);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("symlink")
-        );
+        assert!(result.unwrap_err().to_string().contains("symlink"));
     }
 
     #[test]
