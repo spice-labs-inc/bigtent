@@ -73,7 +73,7 @@ use crate::{
     },
     util::{MD5Hash, NiceDurationDisplay, iso8601_now},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use thousands::Separable;
 
 /// Merge multiple clusters into a single new cluster.
@@ -133,7 +133,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     let dest: PathBuf = dest_directory.into();
 
     // === PHASE 1: Initialization ===
-    fs::create_dir_all(dest.clone())?;
+    fs::create_dir_all(dest.clone()).with_context(|| format!("Failed reading {:?}", dest))?;
     let mut seen_purls = BTreeSet::new();
 
     info!(
@@ -174,7 +174,9 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         Instant::now().duration_since(start)
     );
 
-    let mut cluster_writer = ClusterWriter::new(&dest).await?;
+    let mut cluster_writer = ClusterWriter::new(&dest)
+        .await
+        .with_context(|| format!("Failed creating ClusterWriter for {:?}", dest))?;
     let merge_start = Instant::now();
 
     // === PHASE 2: Set up threading infrastructure ===
@@ -319,7 +321,10 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                         loop_cnt += 1;
 
                         // Decrement atomic gate for every item removed
-                        cluster_writer.write_item(item, cbor_bytes).await?;
+                        cluster_writer
+                            .write_item(item, cbor_bytes)
+                            .await
+                            .with_context(|| format!("Failed writing {:?}", dest))?;
 
                         // Log, but only occasionally
                         if loop_cnt % 2_500_000 == 0 {
@@ -362,28 +367,42 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         );
     }
 
-    info!("Writing pURLs");
-    tokio::task::spawn_blocking(move || {
-        fn do_thing(dest: PathBuf, seen_purls: BTreeSet<String>) -> Result<()> {
-            let mut purl_file = BufWriter::new(File::create({
-                let mut dest = dest.clone();
+    {
+        info!("Writing pURLs");
+        let dest = dest.clone();
+        tokio::task::spawn_blocking(move || {
+            fn do_thing(dest: PathBuf, seen_purls: BTreeSet<String>) -> Result<()> {
+                let mut purl_file = BufWriter::new(
+                    File::create({
+                        let mut dest = dest.clone();
 
-                dest.push("purls.txt");
-                dest
-            })?);
-            for purl in &seen_purls {
-                purl_file.write_fmt(format_args!("{}\n", purl))?;
+                        dest.push("purls.txt");
+                        dest
+                    })
+                    .with_context(|| format!("Failed creating {:?}", dest))?,
+                );
+                for purl in &seen_purls {
+                    purl_file
+                        .write_fmt(format_args!("{}\n", purl))
+                        .with_context(|| format!("Failed writing {:?}", dest))?;
+                }
+                purl_file
+                    .flush()
+                    .with_context(|| format!("Failed flushing to {:?}", dest))?;
+                Ok(())
             }
-            purl_file.flush()?;
-            Ok(())
-        }
 
-        do_thing(dest, seen_purls)
-    })
-    .await??;
-    info!("Wrote pURLs");
+            do_thing(dest, seen_purls)
+        })
+        .await
+        .context("Writing pURLs")??;
+        info!("Wrote pURLs");
+    }
 
-    let cluster_file = cluster_writer.finalize_cluster().await?;
+    let cluster_file = cluster_writer
+        .finalize_cluster()
+        .await
+        .with_context(|| format!("Failed finalizing cluster in {:?}", dest))?;
 
     let mut cluster_names = vec![];
     let mut history = vec![];
@@ -393,13 +412,10 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         history.append(&mut cluster_history);
     }
     let iso_time = iso8601_now();
-    let cluster_name = format!(
-        "{}",
-        cluster_file
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("unknown")
-    );
+    let cluster_name = cluster_file
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("unknown");
     let last_json = json!({"date": iso_time,
 			   "big_tent_commit": env!("VERGEN_GIT_SHA"),
 			   "cluster_name": cluster_name,  "operation": "merge_clusters",
@@ -408,12 +424,14 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     history.push(last_json);
 
     let history_file = cluster_file
-        .canonicalize()?
+        .canonicalize()
+        .with_context(|| format!("Could not canonicalize {:?}", cluster_file))?
         .parent()
-        .expect("Should have cluster parent dir")
+        .with_context(|| format!("Cluster {:?} should have cluster parent dir", cluster_file))?
         .join("history.jsonl");
 
-    write_json_lines(&history_file, &history)?;
+    write_json_lines(&history_file, &history)
+        .with_context(|| format!("Failed writing json to {:?}", history_file))?;
 
     info!(
         "Finished {} loops at {:?}",
@@ -447,10 +465,10 @@ impl ClusterPos {
             None
         } else {
             match &self.cache {
-                Some(v) => Some(v.clone()),
+                Some(v) => Some(*v),
                 None => match self.cluster.offset_from_pos(self.pos) {
                     Some(v) => {
-                        self.cache = Some(v.clone());
+                        self.cache = Some(v);
                         Some(v)
                     }
                     _ => None,
