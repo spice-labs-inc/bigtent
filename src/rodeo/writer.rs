@@ -181,8 +181,6 @@ impl ClusterWriter {
 
         self.items_written += 1;
 
-        if self.items_written % 250_000 == 0 {}
-
         Ok(())
     }
 
