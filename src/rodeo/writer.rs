@@ -164,7 +164,7 @@ impl ClusterWriter {
 
         write_int(&mut self.dest_data, item_bytes.len() as u32).await?;
 
-        (&mut self.dest_data).write_all(&item_bytes).await?;
+        self.dest_data.write_all(&item_bytes).await?;
         self.index_info.push(IndexInfo {
             hash: the_hash,
             offset: cur_pos,
@@ -206,14 +206,8 @@ impl ClusterWriter {
                 version: CLUSTER_VERSION,
                 magic: ClusterFileMagicNumber,
                 info: BTreeMap::new(),
-                data_files: self
-                    .seen_data_files
-                    .lock()
-                    .await
-                    .iter()
-                    .map(|v| *v)
-                    .collect(),
-                index_files: self.index_files.lock().await.iter().map(|v| *v).collect(),
+                data_files: self.seen_data_files.lock().await.iter().copied().collect(),
+                index_files: self.index_files.lock().await.iter().copied().collect(),
             };
             write_envelope(cluster_writer, &cluster_env).await?;
         }
