@@ -214,14 +214,20 @@ impl ClusterWriter {
 
         // compute sha256 of index
         let cluster_reader: &[u8] = &cluster_file;
-        let grc_sha = byte_slice_to_u63(&sha256_for_slice(cluster_reader))?;
+        let grc_sha = byte_slice_to_u63(&sha256_for_slice(cluster_reader))
+            .context(format!("Reading {:?}", cluster_file))?;
 
         // write the .grc file
-
         let grc_file_path = path_plus_timed(&self.dir, &format!("{:016x}.grc", grc_sha));
-        let mut grc_file = File::create(&grc_file_path).await?;
-        grc_file.write_all(&cluster_file).await?;
-        grc_file.flush().await?;
+        let context = format!("Failed writing {:?}", grc_file_path);
+        let mut grc_file = File::create(&grc_file_path)
+            .await
+            .context(context.clone())?;
+        grc_file
+            .write_all(&cluster_file)
+            .await
+            .context(context.clone())?;
+        grc_file.flush().await.context(context.clone())?;
 
         Ok(grc_file_path)
     }
