@@ -164,7 +164,7 @@ impl ClusterWriter {
 
         write_int(&mut self.dest_data, item_bytes.len() as u32).await?;
 
-        (&mut self.dest_data).write_all(&item_bytes).await?;
+        self.dest_data.write_all(&item_bytes).await?;
         self.index_info.push(IndexInfo {
             hash: the_hash,
             offset: cur_pos,
@@ -206,28 +206,28 @@ impl ClusterWriter {
                 version: CLUSTER_VERSION,
                 magic: ClusterFileMagicNumber,
                 info: BTreeMap::new(),
-                data_files: self
-                    .seen_data_files
-                    .lock()
-                    .await
-                    .iter()
-                    .map(|v| *v)
-                    .collect(),
-                index_files: self.index_files.lock().await.iter().map(|v| *v).collect(),
+                data_files: self.seen_data_files.lock().await.iter().copied().collect(),
+                index_files: self.index_files.lock().await.iter().copied().collect(),
             };
             write_envelope(cluster_writer, &cluster_env).await?;
         }
 
         // compute sha256 of index
         let cluster_reader: &[u8] = &cluster_file;
-        let grc_sha = byte_slice_to_u63(&sha256_for_slice(cluster_reader))?;
+        let grc_sha = byte_slice_to_u63(&sha256_for_slice(cluster_reader))
+            .context(format!("Reading {:?}", cluster_file))?;
 
         // write the .grc file
-
         let grc_file_path = path_plus_timed(&self.dir, &format!("{:016x}.grc", grc_sha));
-        let mut grc_file = File::create(&grc_file_path).await?;
-        grc_file.write_all(&cluster_file).await?;
-        grc_file.flush().await?;
+        let context = format!("Failed writing {:?}", grc_file_path);
+        let mut grc_file = File::create(&grc_file_path)
+            .await
+            .context(context.clone())?;
+        grc_file
+            .write_all(&cluster_file)
+            .await
+            .context(context.clone())?;
+        grc_file.flush().await.context(context.clone())?;
 
         Ok(grc_file_path)
     }
