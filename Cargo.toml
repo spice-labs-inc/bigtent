@@ -87,10 +87,8 @@ tempfile = "3"
 criterion = "0.5"
 
 [features]
-
-longtest = [] # feature has no explicit dependencies
-
-
+longtest = []
+extra_progress = []
 
 [build-dependencies]
 # All features enabled

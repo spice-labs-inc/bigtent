@@ -114,7 +114,7 @@ fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
     fn fix_uno(s: &Value) -> Vec<String> {
         match s {
             Value::Text(s) => vec![s.clone()],
-            Value::Array(value_vec) => value_vec.iter().flat_map(|v| fix_uno(v)).collect(),
+            Value::Array(value_vec) => value_vec.iter().flat_map(fix_uno).collect(),
             _ => vec![],
         }
     }
@@ -154,13 +154,11 @@ fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
                         let clean_merge: BTreeSet<Value> =
                             match (merged_file_names.len(), names.len(), v2_names.len()) {
                                 // if there's only one filename, then it's a clean merge
-                                (1, _, _) => {
-                                    merged_file_names.into_iter().map(|v| v.clone()).collect()
-                                }
+                                (1, _, _) => merged_file_names.into_iter().cloned().collect(),
 
                                 // if both have already done the filename to gitoid mapping, then it's safe to merge
                                 (_, tsize, osize) if tsize > 1 && osize > 1 => {
-                                    merged_file_names.into_iter().map(|v| v.clone()).collect()
+                                    merged_file_names.into_iter().cloned().collect()
                                 }
 
                                 // create the mapping
@@ -231,7 +229,7 @@ fn test_merge() {
     let merged_key = match merge1 {
         Value::Map(map) => {
             let m2 = map.clone();
-            m2.get(&foo).map(|v| v.clone())
+            m2.get(&foo).cloned()
         }
         _ => None,
     };
@@ -471,12 +469,9 @@ impl Item {
 
     pub fn to_json(&self) -> serde_json::Value {
         let mut ret = serde_json::to_value(self).expect("Should be able to serialize Item");
-        match ret {
-            serde_json::Value::Object(mut m) => {
-                m.remove_entry("reference");
-                ret = serde_json::Value::Object(m)
-            }
-            _ => {}
+        if let serde_json::Value::Object(mut m) = ret {
+            m.remove_entry("reference");
+            ret = serde_json::Value::Object(m)
         }
         ret
     }
@@ -504,7 +499,7 @@ impl Item {
 
     // merge to `Item`s
     pub fn merge(&self, other: Item) -> Item {
-        let (body, mime_type) = match (
+        let (body, body_mime_type) = match (
             &self.body,
             other.body.clone(),
             self.body_mime_type == other.body_mime_type,
@@ -513,12 +508,12 @@ impl Item {
             (None, Some(a), _) => (Some(a), other.body_mime_type.clone()),
             (Some(a), None, _) => (Some(a.clone()), self.body_mime_type.clone()),
             (Some(a), Some(b), true)
-                if self.body_mime_type.iter().map(|mt| mt as &str).last()
+                if self.body_mime_type.iter().map(|mt| mt as &str).next_back()
                     == Some(ITEM_METADATA_MIME_TYPE) =>
             {
                 match (from_value(a.clone()), from_value(b.clone())) {
                     (Ok::<ItemMetaData, _>(ai), Ok::<ItemMetaData, _>(bi)) => {
-                        let merged = ai.merge(bi, &self, &other);
+                        let merged = ai.merge(bi, self, &other);
                         (to_value(merged).ok(), self.body_mime_type.clone())
                     }
 
@@ -565,8 +560,8 @@ impl Item {
                 it.extend(other.connections);
                 it
             },
-            body_mime_type: mime_type,
-            body: body,
+            body_mime_type,
+            body,
         }
     }
 }
