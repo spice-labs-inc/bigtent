@@ -132,35 +132,32 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
         while !to_find.is_empty() {
             let mut new_to_find = HashSet::new();
             for identifier in to_find.clone() {
-                match the_self.item_for_identifier(&identifier) {
-                    Some(item) => {
-                        // deal with anti-aliasing
-                        item.connections
-                            .iter()
-                            .filter(|a| a.0.is_alias_to())
-                            .for_each(|s| {
-                                if !to_find.contains(&s.1) && !processed.contains(&s.1) {
-                                    new_to_find.insert(s.1.clone());
-                                }
-                            });
-
-                        // process
-                        for s in item
-                            .connections
-                            .iter()
-                            .filter(|a| a.0.is_contains_down() || (source && a.0.is_built_from()))
-                        {
+                if let Some(item) = the_self.item_for_identifier(&identifier) {
+                    // deal with anti-aliasing
+                    item.connections
+                        .iter()
+                        .filter(|a| a.0.is_alias_to())
+                        .for_each(|s| {
                             if !to_find.contains(&s.1) && !processed.contains(&s.1) {
                                 new_to_find.insert(s.1.clone());
+                            }
+                        });
 
-                                // if we are looking at source only, only include build sources
-                                if !source || s.0.is_built_from() {
-                                    let _ = tx.send(Either::Right(s.1.clone())).await;
-                                }
+                    // process
+                    for s in item
+                        .connections
+                        .iter()
+                        .filter(|a| a.0.is_contains_down() || (source && a.0.is_built_from()))
+                    {
+                        if !to_find.contains(&s.1) && !processed.contains(&s.1) {
+                            new_to_find.insert(s.1.clone());
+
+                            // if we are looking at source only, only include build sources
+                            if !source || s.0.is_built_from() {
+                                let _ = tx.send(Either::Right(s.1.clone())).await;
                             }
                         }
                     }
-                    _ => {}
                 }
                 processed.insert(identifier);
             }
@@ -289,35 +286,32 @@ pub async fn impl_north_send<GRT: GoatRodeoTrait + 'static>(
             // Get items we haven't visited yet
             let to_search = less(&to_find, &found);
 
-            if to_search.len() == 0 {
+            if to_search.is_empty() {
                 break; // All reachable items visited
             }
 
             for this_oid in to_search {
                 found.insert(this_oid.clone()); // Mark as visited
 
-                match the_self.item_for_identifier(&this_oid) {
-                    Some(item) => {
-                        // Find containers/builders of this item (upward edges)
-                        let and_then = item.contained_by();
+                if let Some(item) = the_self.item_for_identifier(&this_oid) {
+                    // Find containers/builders of this item (upward edges)
+                    let and_then = item.contained_by();
 
-                        if purls_only {
-                            // Only stream unique PURLs
-                            for purl in item.find_purls() {
-                                if !found_purls.contains(&purl) {
-                                    let _ = tx.send(Either::Right(purl.clone())).await;
-                                    found_purls.insert(purl);
-                                }
+                    if purls_only {
+                        // Only stream unique PURLs
+                        for purl in item.find_purls() {
+                            if !found_purls.contains(&purl) {
+                                let _ = tx.send(Either::Right(purl.clone())).await;
+                                found_purls.insert(purl);
                             }
-                        } else {
-                            // Stream the full item
-                            let _ = tx.send(Either::Left(item)).await;
                         }
-
-                        // Add containers to next iteration's work
-                        to_find = to_find.union(&and_then).map(|s| s.clone()).collect();
+                    } else {
+                        // Stream the full item
+                        let _ = tx.send(Either::Left(item)).await;
                     }
-                    _ => {} // Item not found, skip
+
+                    // Add containers to next iteration's work
+                    to_find = to_find.union(&and_then).cloned().collect();
                 }
                 cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
