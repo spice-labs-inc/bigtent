@@ -12,6 +12,7 @@ use std::time::Instant;
 use thousands::Separable;
 
 use bigtent::bench_util::{OverlapStrategy, SyntheticItemGenerator, generate_synthetic_cluster};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 const DEFAULT_SIZE: usize = 100_000;
 const DEFAULT_CLUSTERS: usize = 3;
@@ -19,6 +20,11 @@ const DEFAULT_OVERLAP: f64 = 50.0;
 const DEFAULT_SEED: u64 = 42;
 
 fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(fmt::layer().pretty())
+        .with(EnvFilter::from_default_env())
+        .init();
+
     let args = parse_args()?;
 
     println!("Generating test data:");

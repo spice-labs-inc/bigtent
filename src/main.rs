@@ -64,7 +64,14 @@ use bigtent::{
 };
 use clap::{CommandFactory, Parser};
 #[cfg(not(test))]
-use log::info; // Use log crate when building application
+use {
+    opentelemetry::trace::TracerProvider,
+    opentelemetry_sdk::trace::SdkTracerProvider,
+    tracing::info,
+    tracing_subscriber::layer::SubscriberExt,
+    tracing_subscriber::util::SubscriberInitExt,
+    tracing_subscriber::{EnvFilter, fmt},
+};
 
 #[cfg(test)]
 use std::println as info;
@@ -420,11 +427,38 @@ async fn run_check(cluster_source: &ClusterSource, args: &Args) -> bool {
     }
 }
 
+/// Initialize OpenTelemetry tracing with OTLP exporter
+fn init_telemetry() -> SdkTracerProvider {
+    let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
+        .expect("Failed to create OTLP exporter");
+
+    SdkTracerProvider::builder()
+        .with_batch_exporter(otlp_exporter)
+        .build()
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 100)]
 async fn main() -> Result<()> {
-    // use tracing_subscriber in JSON mode
-    // rather than the previous env logger
-    tracing_subscriber::fmt().json().init();
+    // Initialize OpenTelemetry
+    let tracer_provider = init_telemetry();
+    let telemetry_layer =
+        tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("bigtent"));
+
+    if std::env::var("LOG_FORMAT").unwrap_or("json".to_owned()) == "json" {
+        tracing_subscriber::registry()
+            .with(telemetry_layer)
+            .with(fmt::layer().json())
+            .with(EnvFilter::from_default_env())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(telemetry_layer)
+            .with(fmt::layer().pretty())
+            .with(EnvFilter::from_default_env())
+            .init();
+    }
 
     info!("Starting big tent git sha {}", env!("VERGEN_GIT_SHA"));
     let args = Args::parse();

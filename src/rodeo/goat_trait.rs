@@ -33,11 +33,11 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use log::info;
 use scopeguard::defer;
 use thousands::Separable;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::either::Either;
+use tracing::info;
 
 use crate::{
     item::{EdgeType, Item},

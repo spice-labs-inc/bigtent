@@ -55,7 +55,7 @@ use axum_streams::*;
 
 use futures::StreamExt;
 #[cfg(not(test))]
-use log::info;
+use tracing::info;
 
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::Stream;
