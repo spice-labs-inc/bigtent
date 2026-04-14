@@ -195,10 +195,7 @@ impl GoatRodeoTrait for GoatRodeoCluster {
     }
 
     fn get_purl(&self) -> Result<PathBuf> {
-        Ok(self
-            .cluster_path
-            .canonicalize()?
-            .with_file_name("purls.txt"))
+        Ok(self.cluster_path.with_file_name("purls.txt"))
     }
 
     /// get the number of items this cluster is managing

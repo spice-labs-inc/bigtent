@@ -7,7 +7,7 @@ use crate::item::{CONTAINED_BY, CONTAINS, Item};
 use crate::rodeo::goat_trait::GoatRodeoTrait;
 use crate::rodeo::robo_goat::{ClusterRoboMember, RoboticGoat};
 use crate::rodeo::writer::ClusterWriter;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -181,9 +181,8 @@ pub async fn write_cluster_to_disk(
 
     // Write history
     let history_file = cluster_file
-        .canonicalize()?
         .parent()
-        .expect("Should have cluster parent dir")
+        .with_context(|| "Expected cluster_file {cluster_file:?} to have a parent directory")?
         .join("history.jsonl");
 
     let history = cluster.read_history()?;

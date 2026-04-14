@@ -427,12 +427,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 
     history.push(last_json);
 
-    let history_file = cluster_file
-        .canonicalize()
-        .with_context(|| format!("Could not canonicalize {:?}", cluster_file))?
-        .parent()
-        .with_context(|| format!("Cluster {:?} should have cluster parent dir", cluster_file))?
-        .join("history.jsonl");
+    let history_file = cluster_file.with_file_name("history.jsonl");
 
     write_json_lines(&history_file, &history)
         .with_context(|| format!("Failed writing json to {:?}", history_file))?;
