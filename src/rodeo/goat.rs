@@ -856,22 +856,17 @@ async fn test_antialias() {
         return;
     }
 
-    let mut files = match GoatRodeoCluster::cluster_files_in_dir(
+    let mut files = GoatRodeoCluster::cluster_files_in_dir(
         "../goatrodeo/res_for_big_tent/".into(),
         true,
         vec![],
     )
     .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            assert!(false, "Failure to read files {:?}", e);
-            return;
-        }
-    };
+    .expect("To read file");
+
     println!("Read cluster at {:?}", start.elapsed());
 
-    assert!(files.len() > 0, "Need a cluster");
+    assert!(!files.is_empty(), "Need a cluster");
     let cluster = files.pop().expect("Expect a cluster");
     let index = cluster
         .get_md5_to_item_offset_index_if_load_index_true()
@@ -931,20 +926,15 @@ async fn test_generated_cluster() {
         }
 
         let start = Instant::now();
-        let files =
-            match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), true, vec![]).await {
-                Ok(v) => v,
-                Err(e) => {
-                    assert!(false, "Failure to read files {:?}", e);
-                    return;
-                }
-            };
+        let files = GoatRodeoCluster::cluster_files_in_dir(test_path.into(), true, vec![])
+            .await
+            .expect("Failure to read files");
 
         info!(
             "Finding files took {:?}",
             Instant::now().duration_since(start)
         );
-        assert!(files.len() > 0, "We should find some files");
+        assert!(!files.is_empty(), "We should find some files");
         let mut pass_num = 0;
         for cluster in files {
             pass_num += 1;
@@ -999,11 +989,11 @@ async fn test_files_in_dir() {
         }
     };
 
-    assert!(files.len() > 0, "We should find some files");
+    assert!(!files.is_empty(), "We should find some files");
     let mut total_index_size = 0;
     for cluster in &files {
-        assert!(cluster.data_files.len() > 0);
-        assert!(cluster.index_files.len() > 0);
+        assert!(!cluster.data_files.is_empty());
+        assert!(!cluster.index_files.is_empty());
 
         let start = Instant::now();
         let complete_index = cluster
@@ -1118,7 +1108,7 @@ async fn test_generated_cluster_no_index() {
             "Finding files took {:?}",
             Instant::now().duration_since(start)
         );
-        assert!(files.len() > 0, "We should find some files");
+        assert!(!files.is_empty(), "We should find some files");
         let mut pass_num = 0;
         for cluster in files {
             pass_num += 1;
