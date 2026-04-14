@@ -79,7 +79,8 @@ impl MetricsHandles {
         let registry = Registry::new_custom(None, None)?;
 
         // Register process metrics (Linux only)
-        #[cfg(target_os = "linux")] {
+        #[cfg(target_os = "linux")]
+        {
             let process_collector = prometheus::process_collector::ProcessCollector::for_self();
             registry.register(Box::new(process_collector))?;
         }
