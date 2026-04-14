@@ -38,10 +38,10 @@ use crate::{
     util::{MD5Hash, iso8601_now, md5hash_str, sha256_for_slice},
 };
 use anyhow::Result;
-use log::error;
 use serde_json::{Map, json};
 use tokio::sync::mpsc::Receiver;
 use tokio_util::either::Either;
+use tracing::error;
 use uuid::Uuid;
 
 pub trait ClusterRoboMember {

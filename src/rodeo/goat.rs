@@ -37,7 +37,6 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
-use log::error;
 use memmap2::Mmap;
 use serde_jsonlines::json_lines;
 use std::{
@@ -51,6 +50,7 @@ use std::{
 };
 use thousands::Separable;
 use tokio_util::either::Either;
+use tracing::error;
 
 use tokio::{
     fs::{File as TokioFile, read_dir},
@@ -66,7 +66,7 @@ use crate::{
     },
 };
 #[cfg(not(test))]
-use log::info;
+use tracing::info;
 
 #[cfg(test)]
 use std::println as info;

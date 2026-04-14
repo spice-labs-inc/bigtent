@@ -34,10 +34,10 @@
 //!
 //! File names include SHA256 hashes for content-addressable storage.
 
-use log::error;
-#[cfg(not(test))]
-use log::info;
 use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
+use tracing::error;
+#[cfg(not(test))]
+use tracing::info;
 
 #[cfg(test)]
 use std::println as info;

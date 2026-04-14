@@ -59,28 +59,29 @@ tokio = { version = "1.44", features = [
     "net",
     "signal",
 ] }
-tokio-util = { version = "0.7", features = ["io"] }
-tokio-stream = { version = "0.1" }
-signal-hook = "0.3.17"
+
 arc-swap = "1.7.1"
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
-thousands = "0.2.0"
-uuid = { version = "1.16", features = ["v4"] }
 flume = { version = "0.11", features = ["spin", "async"] }
-scopeguard = "1.2.0"
 libc = "0.2"
-
-# Logging
-log = "0.4"
-# env_logger = "0.11"
-tracing = "0.1"
-tracing-subscriber = {version = "0.3", features = ["json", "env-filter", "fmt", ]}
-
-utoipa = { version = "5", features = ["axum_extras"] }
 memmap2 = { version = "0.9" }
+opentelemetry = "0.29"
+opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.29", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.30"
 prometheus = { version = "0.14", features = ["process"] }
 rand = "0.9.1"
+scopeguard = "1.2.0"
+signal-hook = "0.3.17"
 sysinfo = "0.32"
+thousands = "0.2.0"
+tokio-stream = { version = "0.1" }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = {version = "0.3", features = ["json", "env-filter", "fmt"]}
+utoipa = { version = "5", features = ["axum_extras"] }
+uuid = { version = "1.16", features = ["v4"] }
+
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.5"

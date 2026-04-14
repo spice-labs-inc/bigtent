@@ -28,8 +28,6 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-#[cfg(not(test))]
-use log::info;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_cbor::Value;
 use std::{
@@ -40,6 +38,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(test))]
+use tracing::info;
 
 #[cfg(test)]
 use std::println as info;

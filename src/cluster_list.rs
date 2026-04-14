@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(not(test))]
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 
 #[cfg(test)]
 use std::eprintln as warn;

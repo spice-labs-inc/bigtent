@@ -42,8 +42,6 @@
 //! - `purls.txt` - Package URL listing
 //! - `cluster_info.jsonl` - Cluster metadata in JSON Lines format
 
-#[cfg(not(test))]
-use log::info;
 use serde_json::json;
 use serde_jsonlines::write_json_lines;
 use std::{
@@ -57,7 +55,9 @@ use std::{
     },
     thread::{self},
     time::{Duration, Instant},
-}; // Use log crate when building application
+};
+#[cfg(not(test))]
+use tracing::info; // Use log crate when building application
 
 #[cfg(test)]
 use std::println as info;
