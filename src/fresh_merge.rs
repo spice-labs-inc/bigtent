@@ -207,10 +207,12 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                 // Returns None when all clusters are exhausted
                 match next_hash_of_item_to_merge(&mut index_holder) {
                     Some(items_to_merge) => {
-                        // Send work to worker threads
-                        offset_tx
-                            .send((pos, items_to_merge))
-                            .expect("Should be able to send the message");
+                        // If the receiver is gone (workers have all exited, or the
+                        // caller's async task was cancelled), stop cleanly instead
+                        // of panicking.
+                        if offset_tx.send((pos, items_to_merge)).is_err() {
+                            break;
+                        }
                         pos += 1;
                     }
                     // All clusters exhausted - we're done!
@@ -267,14 +269,21 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                 let cbor_bytes =
                     serde_cbor::to_vec(&top).expect("Should be able to encode an item");
 
-                tx.send(ItemOrPurl::Item {
-                    pos: position,
-                    item: top,
-                    cbor_bytes,
-                    merged: items_to_merge.len() - 1,
-                    purls,
-                })
-                .expect("Should send message");
+                // If the main thread's receiver is gone (e.g. the caller's async
+                // task was cancelled during shutdown), stop cleanly instead of
+                // panicking.
+                if tx
+                    .send(ItemOrPurl::Item {
+                        pos: position,
+                        item: top,
+                        cbor_bytes,
+                        merged: items_to_merge.len() - 1,
+                        purls,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
                 #[cfg(feature = "extra_progress")]
                 {
                     cnt += 1;
