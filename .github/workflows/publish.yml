@@ -94,5 +94,5 @@ jobs:
         uses: spice-labs-inc/action-spice-labs-surveyor@v5
         with:
           spice_pass: "${{ secrets.SPICE_PASS }}"
-          input: "${{ env.GITHUB_WORKSPACE }}"
+          input: "."
           subject: "${{ github.event.repository.name }}"
