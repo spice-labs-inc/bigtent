@@ -76,7 +76,7 @@ use std::println as info;
 use std::{
     io::Write,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 use tokio::signal::unix::{SignalKind, signal};
@@ -220,7 +220,13 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
         );
     }
 
-    let ret = merge_fresh(clusters, args.buffer_limit, dest).await;
+    let ret = merge_fresh(
+        clusters,
+        args.buffer_limit,
+        dest,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await;
     info!(
         "Finished merging at {:?}",
         Instant::now().duration_since(start)

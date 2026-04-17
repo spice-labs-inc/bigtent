@@ -855,7 +855,7 @@ async fn test_antialias() {
     let mut aliases = vec![];
     for v in index.iter() {
         let item = cluster
-            .item_for_hash(*crate::rodeo::index::HasHash::hash(v))
+            .item_for_hash(v.hash)
             .expect("And it should be a Some");
         if item.is_alias() {
             aliases.push(item);

@@ -235,8 +235,10 @@ async fn test_purls_and_merge() {
     let herd2 = herd.clone();
 
     crate::fresh_merge::merge_fresh(
-        herd.herd, 10_000, /* a nice round limit for the merge buffer */
+        herd.herd,
+        10_000, /* a nice round limit for the merge buffer */
         &dest_dir,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     )
     .await
     .expect("Should do a merge");
