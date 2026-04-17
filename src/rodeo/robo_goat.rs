@@ -128,7 +128,7 @@ impl RoboticGoat {
 
             let body: serde_cbor::Value = serde_cbor::from_reader(&ser[..])?;
 
-            let identifier = format!("tag:sha256:{}", hex::encode(&sha256_for_slice(&ser)));
+            let identifier = format!("tag:sha256:{}", hex::encode(sha256_for_slice(&ser)));
 
             let i = Item {
                 identifier: identifier.clone(),
@@ -291,8 +291,7 @@ impl GoatRodeoTrait for RoboticGoat {
             Ok(v) => v,
             Err(_) => return None,
         };
-        let res = self.item_from_item_offset(&self.offsets[found]);
-        res
+        self.item_from_item_offset(&self.offsets[found])
     }
 
     fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item> {

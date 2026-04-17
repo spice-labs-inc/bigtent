@@ -175,7 +175,7 @@ impl GoatRodeoTrait for GoatHerd {
     async fn roots(self: Arc<GoatHerd>) -> Receiver<Item> {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
 
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             for goat in &self.herd {
                 let mut real_rx: Receiver<Item> = call_root(goat).await;
                 while let Some(v) = real_rx.recv().await {

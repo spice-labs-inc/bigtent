@@ -232,12 +232,12 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     // 20 threads fetch items from clusters and merge them
     // Channel for workers -> main thread: sends merged items
     let (merged_tx, merged_rx) = flume::bounded(200_000);
-    for thread_num in 0..20 {
+    for _thread_num in 0..20 {
         let rx = offset_rx.clone();
         let tx = merged_tx.clone();
 
         let processor_handle = thread::spawn(move || {
-            let mut cnt = 0usize;
+            // let mut cnt = 0usize;
             while let Ok((position, items_to_merge)) = rx.recv() {
                 let mut to_merge = vec![];
                 let mut purls = vec![];
@@ -274,14 +274,14 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                     purls,
                 })
                 .expect("Should send message");
-                cnt += 1;
-                if false && cnt % 500_000 == 0 {
-                    info!(
-                        "Thread {} at cnt {}",
-                        thread_num,
-                        cnt.separate_with_commas()
-                    );
-                }
+                // cnt += 1;
+                // if false && cnt % 500_000 == 0 {
+                //     info!(
+                //         "Thread {} at cnt {}",
+                //         thread_num,
+                //         cnt.separate_with_commas()
+                //     );
+                // }
             }
         });
         threads.push(processor_handle);

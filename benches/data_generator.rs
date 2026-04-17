@@ -128,7 +128,7 @@ fn parse_args() -> Result<Args> {
                     anyhow::bail!("--overlap requires a value");
                 }
                 overlap = args[i + 1].parse()?;
-                if overlap < 0.0 || overlap > 100.0 {
+                if !(0.0..=100.0).contains(&overlap) {
                     anyhow::bail!("--overlap must be between 0 and 100");
                 }
                 i += 2;
