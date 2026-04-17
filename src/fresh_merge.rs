@@ -51,11 +51,12 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self},
     time::{Duration, Instant},
 };
+use tracing::error;
 #[cfg(not(test))]
 use tracing::info; // Use log crate when building application
 
@@ -128,9 +129,14 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     clusters: Vec<Arc<HerdMember>>,
     merge_buffer_limit: usize,
     dest_directory: PB,
+    is_live: Arc<AtomicBool>,
 ) -> Result<()> {
     let start = Instant::now();
     let dest: PathBuf = dest_directory.into();
+
+    if !is_live.load(Ordering::Relaxed) {
+        bail!("Stopped running merge based on is_live");
+    }
 
     // === PHASE 1: Initialization ===
     fs::create_dir_all(dest.clone()).with_context(|| format!("Failed reading {:?}", dest))?;
@@ -198,33 +204,51 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     // === COORDINATOR THREAD ===
     // Finds items to merge by iterating through sorted indices
     let hpg = Arc::clone(&holding_pen_gate);
-    let coorindator_handle = thread::spawn(move || {
-        let mut pos = 0usize; // Global position counter for ordering
-        loop {
-            // Only send more work if we're under the buffer limit
-            if check_limit(&hpg, merge_buffer_limit) {
-                // Find all clusters that have the item with the lowest hash
-                // Returns None when all clusters are exhausted
-                match next_hash_of_item_to_merge(&mut index_holder) {
-                    Some(items_to_merge) => {
-                        // Send work to worker threads
-                        offset_tx
-                            .send((pos, items_to_merge))
-                            .expect("Should be able to send the message");
-                        pos += 1;
+    let coorindator_handle = {
+        let is_live = is_live.clone();
+        thread::spawn(move || {
+            let mut pos = 0usize; // Global position counter for ordering
+            loop {
+                // stop processing when not live
+                if !is_live.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Only send more work if we're under the buffer limit
+                if check_limit(&hpg, merge_buffer_limit) {
+                    // Find all clusters that have the item with the lowest hash
+                    // Returns None when all clusters are exhausted
+                    match next_hash_of_item_to_merge(&mut index_holder) {
+                        Some(items_to_merge) => {
+                            // Send work to worker threads
+                            if is_live.load(Ordering::Relaxed) {
+                                match offset_tx.send((pos, items_to_merge)) {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to send message in coorindator thread {e:?}"
+                                        );
+                                        break;
+                                    }
+                                };
+                                pos += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        // All clusters exhausted - we're done!
+                        None => break,
                     }
-                    // All clusters exhausted - we're done!
-                    None => break,
+                }
+                // Backpressure: wait for workers to catch up
+                else {
+                    while !check_limit(&hpg, merge_buffer_limit) {
+                        thread::sleep(Duration::from_millis(20));
+                    }
                 }
             }
-            // Backpressure: wait for workers to catch up
-            else {
-                while !check_limit(&hpg, merge_buffer_limit) {
-                    thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-    });
+        })
+    };
 
     threads.push(coorindator_handle);
 
@@ -235,16 +259,24 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     for thread_num in 0..20 {
         let rx = offset_rx.clone();
         let tx = merged_tx.clone();
+        let is_live = is_live.clone();
 
         let processor_handle = thread::spawn(move || {
-            let mut cnt = 0usize;
+            // let mut cnt = 0usize;
             while let Ok((position, items_to_merge)) = rx.recv() {
+                if !is_live.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 let mut to_merge = vec![];
                 let mut purls = vec![];
                 for (offset, cluster) in &items_to_merge {
-                    let merge_final = cluster
-                        .item_from_item_offset(offset)
-                        .expect("Should get the item");
+                    let merge_final = match cluster.item_from_item_offset(offset) {
+                        Some(v) => v,
+                        None => {
+                            break;
+                        }
+                    };
                     merge_final
                         .connections
                         .iter()
@@ -263,25 +295,31 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                     top = top.merge(i);
                 }
 
-                let cbor_bytes =
-                    serde_cbor::to_vec(&top).expect("Should be able to encode an item");
-
-                tx.send(ItemOrPurl::Item {
-                    pos: position,
-                    item: top,
-                    cbor_bytes,
-                    merged: items_to_merge.len() - 1,
-                    purls,
-                })
-                .expect("Should send message");
-                cnt += 1;
-                if false && cnt % 500_000 == 0 {
-                    info!(
-                        "Thread {} at cnt {}",
-                        thread_num,
-                        cnt.separate_with_commas()
-                    );
-                }
+                let cbor_bytes = match serde_cbor::to_vec(&top) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("Failed to CBOR serialize Item {top:?} error {e:?}");
+                        continue;
+                    }
+                };
+                // only send if things are still alive
+                if is_live.load(Ordering::Relaxed) {
+                    match tx.send(ItemOrPurl::Item {
+                        pos: position,
+                        item: top,
+                        cbor_bytes,
+                        merged: items_to_merge.len() - 1,
+                        purls,
+                    }) {
+                        Ok(_) => {} // keep going
+                        Err(e) => {
+                            error!("Failed to send message in merge worker {thread_num} {e:?}");
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                };
             }
         });
         threads.push(processor_handle);
@@ -297,6 +335,10 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     let mut holding_pen = HashMap::new();
 
     while let Ok(item_or_purl) = merged_rx.recv_async().await {
+        // stop processing when not live
+        if !is_live.load(Ordering::Relaxed) {
+            bail!("Merge Loop ending because no longer live");
+        }
         match item_or_purl {
             ItemOrPurl::Item {
                 pos: position,

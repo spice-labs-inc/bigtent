@@ -70,12 +70,13 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use core::slice;
 #[cfg(test)]
 use std::println as info;
 use std::{
     io::Write,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 use tokio::signal::unix::{SignalKind, signal};
@@ -219,7 +220,13 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
         );
     }
 
-    let ret = merge_fresh(clusters, args.buffer_limit, dest).await;
+    let ret = merge_fresh(
+        clusters,
+        args.buffer_limit,
+        dest,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await;
     info!(
         "Finished merging at {:?}",
         Instant::now().duration_since(start)
@@ -259,7 +266,7 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
 /// bigtent -r /path/to/clusters --lookup identifiers.json
 /// bigtent -r /path/to/clusters --lookup identifiers.json --output results.json
 /// ```
-async fn run_lookup(path_vec: &Vec<PathBuf>, args: &Args) -> Result<()> {
+async fn run_lookup(path_vec: &[PathBuf], args: &Args) -> Result<()> {
     // Extract and validate the lookup file path
     let lookup_path = match &args.lookup {
         Some(p) => p.clone(),
@@ -388,7 +395,7 @@ async fn run_check(cluster_source: &ClusterSource, args: &Args) -> bool {
             continue;
         }
 
-        match load_clusters_from_dirs(&[dir.clone()], args.pre_cache_index()).await {
+        match load_clusters_from_dirs(slice::from_ref(dir), args.pre_cache_index()).await {
             Ok(members) => {
                 if members.is_empty() {
                     eprintln!("WARNING: No cluster files found in {:?}", dir);

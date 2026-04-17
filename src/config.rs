@@ -156,8 +156,7 @@ impl Args {
             .iter()
             .flat_map(|host_name| {
                 let ma = format!("{}:{}", host_name, the_port);
-                let addr = ma.to_socket_addrs().ok();
-                addr
+                ma.to_socket_addrs().ok()
             })
             .flatten()
             .collect();

@@ -34,7 +34,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     ffi::OsStr,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -113,9 +113,8 @@ pub fn byte_slice_to_u63(it: &[u8]) -> Result<u64> {
         );
     }
 
-    for x in 0..8 {
-        buff[x] = it[x];
-    }
+    buff.copy_from_slice(&it[..8]);
+
     // Mask off high bit to get 63-bit value
     Ok(u64::from_be_bytes(buff) & 0x7fffffffffffffff)
 }
@@ -233,7 +232,7 @@ pub fn current_date_string() -> String {
     format!("{:?}", chrono::offset::Utc::now())
 }
 
-pub fn is_child_dir(root: &PathBuf, potential_child: &PathBuf) -> Result<bool> {
+pub fn is_child_dir(root: &Path, potential_child: &PathBuf) -> Result<bool> {
     let full_root = root.canonicalize()?;
 
     let full_kid = potential_child
@@ -296,7 +295,7 @@ pub fn find_common_root_dir(from: Vec<PathBuf>) -> Result<PathBuf> {
 
     let mut root = with_parents[0].1.clone();
     for j in &with_parents {
-        root = root.intersection(&j.1).map(|v| v.clone()).collect();
+        root = root.intersection(&j.1).cloned().collect();
     }
 
     if root.len() <= 1 {
@@ -343,8 +342,8 @@ pub fn os_str_to_string(oss: &OsStr) -> Result<String> {
     }
 }
 
-pub fn path_plus_timed(root: &PathBuf, suffix: &str) -> PathBuf {
-    let mut ret = root.clone();
+pub fn path_plus_timed(root: &Path, suffix: &str) -> PathBuf {
+    let mut ret = root.to_path_buf();
     ret.push(timed_filename(suffix));
     ret
 }
@@ -372,7 +371,7 @@ pub async fn read_all<R: AsyncReadExt + Unpin>(r: &mut R, max: usize) -> Result<
     let mut read: usize = 0;
     loop {
         let to_read = BYTE_BUFFER_SIZE.min(max - read);
-        if to_read <= 0 {
+        if to_read == 0 {
             break;
         }
         match r.read(&mut buf[0..to_read]).await {
@@ -430,10 +429,8 @@ pub async fn read_len_and_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
     file: &mut R,
 ) -> Result<T> {
     let len = read_u16(file).await? as usize;
-    let mut buffer = Vec::with_capacity(len);
-    for _ in 0..len {
-        buffer.push(0u8);
-    }
+    let mut buffer = vec![0u8; len];
+
     file.read_exact(&mut buffer).await?;
 
     serde_cbor::from_reader(&*buffer).map_err(|e| e.into())
@@ -441,10 +438,8 @@ pub async fn read_len_and_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
 
 pub fn read_len_and_cbor_sync<T: DeserializeOwned, R: Read>(file: &mut R) -> Result<T> {
     let len = read_u16_sync(file)? as usize;
-    let mut buffer = Vec::with_capacity(len);
-    for _ in 0..len {
-        buffer.push(0u8);
-    }
+    let mut buffer = vec![0u8; len];
+
     file.read_exact(&mut buffer)?;
 
     serde_cbor::from_reader(&*buffer).map_err(|e| e.into())
@@ -454,16 +449,14 @@ pub async fn read_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
     file: &mut R,
     len: usize,
 ) -> Result<T> {
-    let mut buffer = Vec::with_capacity(len);
-    for _ in 0..len {
-        buffer.push(0u8);
-    }
+    let mut buffer = vec![0u8; len];
+
     file.read_exact(&mut buffer).await?;
 
-    match serde_cbor::from_slice(&*buffer) {
+    match serde_cbor::from_slice(&buffer) {
         Ok(v) => Ok(v),
         Err(e) => {
-            match serde_cbor::from_slice::<Value>(&*&buffer) {
+            match serde_cbor::from_slice::<Value>(&buffer) {
                 Ok(v) => {
                     info!("Deserialized value {:?} but got error {}", v, e);
                 }
@@ -482,16 +475,14 @@ pub async fn read_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
 }
 
 pub fn read_cbor_sync<T: DeserializeOwned, R: Read + Unpin>(file: &mut R, len: usize) -> Result<T> {
-    let mut buffer = Vec::with_capacity(len);
-    for _ in 0..len {
-        buffer.push(0u8);
-    }
+    let mut buffer = vec![0u8; len];
+
     file.read_exact(&mut buffer)?;
 
-    match serde_cbor::from_slice(&*buffer) {
+    match serde_cbor::from_slice(&buffer) {
         Ok(v) => Ok(v),
         Err(e) => {
-            match serde_cbor::from_slice::<Value>(&*&buffer) {
+            match serde_cbor::from_slice::<Value>(&buffer) {
                 Ok(v) => {
                     info!("Deserialized value {:?} but got error {}", v, e);
                 }
@@ -572,21 +563,21 @@ pub fn traverse_value(v: &Value, path: Vec<&str>) -> Option<Value> {
     Some(first.clone())
 }
 
-pub fn as_obj<'a>(v: &'a Value) -> Option<&'a BTreeMap<Value, Value>> {
+pub fn as_obj(v: &Value) -> Option<&BTreeMap<Value, Value>> {
     match v {
         Value::Map(m) => Some(m),
         _ => None,
     }
 }
 
-pub fn as_array<'a>(v: &'a Value) -> Option<&'a Vec<Value>> {
+pub fn as_array(v: &Value) -> Option<&Vec<Value>> {
     match v {
         Value::Array(m) => Some(m),
         _ => None,
     }
 }
 
-pub fn as_str<'a>(v: &'a Value) -> Option<&'a String> {
+pub fn as_str(v: &Value) -> Option<&String> {
     match v {
         Value::Text(s) => Some(s),
         _ => None,
