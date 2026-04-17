@@ -63,15 +63,12 @@ use bigtent::{
     server::run_web_server,
 };
 use clap::{CommandFactory, Parser};
+use opentelemetry::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 #[cfg(not(test))]
-use {
-    opentelemetry::trace::TracerProvider,
-    opentelemetry_sdk::trace::SdkTracerProvider,
-    tracing::info,
-    tracing_subscriber::layer::SubscriberExt,
-    tracing_subscriber::util::SubscriberInitExt,
-    tracing_subscriber::{EnvFilter, fmt},
-};
+use tracing::info;
+use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg(test)]
 use std::println as info;
