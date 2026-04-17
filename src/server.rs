@@ -126,10 +126,13 @@ async fn stream_items<GRT: GoatRodeoTrait + 'static>(
 
     tokio::spawn(async move {
         for item_id in items {
-            if let Some(i) = rodeo.get_cluster().item_for_identifier(&item_id) {
-                if !mtx.is_closed() {
-                    let _ = mtx.send(i).await;
+            match rodeo.get_cluster().item_for_identifier(&item_id) {
+                Some(i) => {
+                    if !mtx.is_closed() {
+                        let _ = mtx.send(i).await;
+                    }
                 }
+                _ => {}
             }
         }
     });
@@ -331,7 +334,7 @@ async fn do_serve_gitoid<GRT: GoatRodeoTrait + 'static>(
     maybe_gitoid: Option<&String>,
 ) -> Result<Json<Item>, (StatusCode, Json<String>)> {
     if let Some(gitoid) = maybe_gitoid {
-        let ret = rodeo.get_cluster().item_for_identifier(gitoid);
+        let ret = rodeo.get_cluster().item_for_identifier(&gitoid);
 
         match ret {
             Some(item) => Ok(Json(item)),
@@ -343,7 +346,7 @@ async fn do_serve_gitoid<GRT: GoatRodeoTrait + 'static>(
     } else {
         Err((
             StatusCode::NOT_FOUND,
-            Json("No 'identifier' supplied".to_string()),
+            Json(format!("No 'identifier' supplied")),
         ))
     }
 }
@@ -407,8 +410,11 @@ async fn anti_alias_bulk<GRT: GoatRodeoTrait + 'static>(
     let mut ret = HashMap::new();
     let cluster = rodeo.get_cluster();
     for key in payload {
-        if let Some(item) = cluster.clone().antialias_for(&key) {
-            ret.insert(key, item);
+        match cluster.clone().antialias_for(&key) {
+            Some(item) => {
+                ret.insert(key, item);
+            }
+            None => {}
         }
     }
 
@@ -419,7 +425,7 @@ async fn do_serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
     gitoid: Option<&String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<String>)> {
     if let Some(to_find) = gitoid {
-        let ret = rodeo.get_cluster().antialias_for(to_find);
+        let ret = rodeo.get_cluster().antialias_for(&to_find);
 
         match ret {
             Some(item) => Ok(Json(item.to_json())),
@@ -431,7 +437,7 @@ async fn do_serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
     } else {
         Err((
             StatusCode::NOT_FOUND,
-            Json("No 'identifier' supplied".to_string()),
+            Json(format!("No 'identifier' supplied")),
         ))
     }
 }

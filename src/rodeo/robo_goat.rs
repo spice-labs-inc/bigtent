@@ -128,7 +128,7 @@ impl RoboticGoat {
 
             let body: serde_cbor::Value = serde_cbor::from_reader(&ser[..])?;
 
-            let identifier = format!("tag:sha256:{}", hex::encode(sha256_for_slice(&ser)));
+            let identifier = format!("tag:sha256:{}", hex::encode(&sha256_for_slice(&ser)));
 
             let i = Item {
                 identifier: identifier.clone(),
@@ -215,13 +215,13 @@ async fn test_synthetic() {
     assert_eq!(tagged.len(), 1, "Expecting 1 tag, got {:?}", tagged);
 
     for t in &tagged {
-        let the_tag = herd.item_for_identifier(t).expect("Get tag");
+        let the_tag = herd.item_for_identifier(&t).expect("Get tag");
         let the_tag_id = &the_tag.identifier;
         for (t, v) in &the_tag.connections {
             if t.is_tag_to() {
                 let tagged_item = herd
                     .item_for_identifier(v)
-                    .unwrap_or_else(|| panic!("Should load {}", v));
+                    .expect(&format!("Should load {}", v));
                 assert_eq!(
                     1,
                     tagged_item
@@ -291,7 +291,8 @@ impl GoatRodeoTrait for RoboticGoat {
             Ok(v) => v,
             Err(_) => return None,
         };
-        self.item_from_item_offset(&self.offsets[found])
+        let res = self.item_from_item_offset(&self.offsets[found]);
+        res
     }
 
     fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item> {

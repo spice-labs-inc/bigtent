@@ -97,7 +97,7 @@ impl IndexFile {
         // ensure we close `file` after computing the hash
         if check_hash {
             let mut file = GoatRodeoCluster::find_data_or_index_file_from_sha256(
-                dir,
+                &dir,
                 hash,
                 GOAT_RODEO_INDEX_FILE_SUFFIX,
             )
@@ -114,7 +114,7 @@ impl IndexFile {
         }
 
         let file = GoatRodeoCluster::find_data_or_index_file_from_sha256(
-            dir,
+            &dir,
             hash,
             GOAT_RODEO_INDEX_FILE_SUFFIX,
         )
@@ -178,7 +178,7 @@ impl IndexFile {
 
     pub fn read_index_at_byte_offset(&self, pos: usize) -> Result<ItemOffset> {
         let mut info: &[u8] = &self.file[(self.data_offset + pos)..];
-        ItemOffset::read(&mut info)
+        Ok(ItemOffset::read(&mut info)?)
     }
 }
 
@@ -209,17 +209,17 @@ pub struct ItemOffset {
 }
 
 pub trait HasHash {
-    fn hash(&self) -> &MD5Hash;
+    fn hash<'a>(&'a self) -> &'a MD5Hash;
 }
 
 impl HasHash for ItemOffset {
-    fn hash(&self) -> &MD5Hash {
+    fn hash<'a>(&'a self) -> &'a MD5Hash {
         &self.hash
     }
 }
 
 pub(crate) fn find_item_offset(to_find: [u8; 16], offsets: &[ItemOffset]) -> Option<ItemOffset> {
-    if !offsets.is_empty() {
+    if offsets.len() == 0 {
         return None;
     }
 
