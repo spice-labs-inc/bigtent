@@ -237,21 +237,27 @@ impl GoatRodeoTrait for GoatRodeoCluster {
     }
 
     fn read_history(&self) -> Result<Vec<serde_json::Value>> {
-        let history_path = self
-            .cluster_path
-            .canonicalize()
-            .with_context(|| format!("Could not canonicalize {:?}", self.cluster_path))?
-            .with_file_name("history.jsonl");
+        let history_path = self.cluster_path.with_file_name("history.jsonl");
 
         if !history_path.exists() || !history_path.is_file() {
             return Ok(vec![]);
         }
 
-        let lines = json_lines::<serde_json::Value, _>(&history_path)
-            .with_context(|| format!("Could not read JSON {:?}", history_path))?;
+        let lines = match json_lines::<serde_json::Value, _>(&history_path) {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Could not open history file {:?}: {}", history_path, e);
+                return Ok(vec![]);
+            }
+        };
         let mut ret = vec![];
         for line in lines {
-            ret.push(line?);
+            match line {
+                Ok(v) => ret.push(v),
+                Err(e) => {
+                    error!("Skipping malformed line in {:?}: {}", history_path, e);
+                }
+            }
         }
 
         Ok(ret)
