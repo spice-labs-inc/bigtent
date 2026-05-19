@@ -467,8 +467,18 @@ impl GoatRodeoCluster {
         }
 
         let mut data_files = HashMap::new();
-        for data_file in &env.data_files {
-            let the_file = Arc::new(DataFile::new(&parent, *data_file).await?);
+        for (i, data_file) in env.data_files.iter().enumerate() {
+            // Saturate the ordinal at u8::MAX, matching goatrodeo's
+            // WriteContext behaviour for clusters with more than 128
+            // DataFiles. Beyond that bigtent will see all cross-file
+            // edges as `External` instead of `CrossFile`, which still
+            // round-trips correctly (just with a larger encoding).
+            let ordinal: u8 = if i > u8::MAX as usize {
+                u8::MAX
+            } else {
+                i as u8
+            };
+            let the_file = Arc::new(DataFile::new(&parent, *data_file, ordinal).await?);
             data_files.insert(*data_file, the_file);
         }
 
@@ -813,9 +823,21 @@ impl GoatRodeoCluster {
         let data_file = data_files.get(&file_hash);
         match data_file {
             Some(df) => {
-                let item = df.read_item_at(offset)?;
-
-                Some(item)
+                if df.envelope.version < 2 {
+                    return df.read_item_at(offset);
+                }
+                // v >= 2 path: WireItem -> resolve back-references -> Item.
+                let wi = df.read_wire_item_at(offset)?;
+                let connections = self.resolve_wire_edges(
+                    wi.connections,
+                    df.file_ordinal,
+                );
+                Some(Item {
+                    identifier: wi.identifier,
+                    connections,
+                    body_mime_type: wi.body_mime_type,
+                    body: wi.body,
+                })
             }
             None => {
                 panic!(
@@ -824,6 +846,75 @@ impl GoatRodeoCluster {
                 );
             }
         }
+    }
+
+    /// Resolve a vector of [`crate::item::WireEdge`]s into the concrete
+    /// `(edgeType, targetIdentifier)` edges that the rest of bigtent
+    /// expects in [`Item::connections`].
+    ///
+    /// For `SameFile(off)` we look up the identifier at `(ord, off)`
+    /// in the current data file. For `CrossFile(fo, off)` we resolve
+    /// against the DataFile with that ordinal in
+    /// `self.envelope.data_files`. Unknown byte IDs in `External`
+    /// edges fall back to logging and being dropped — they shouldn't
+    /// appear under any released version of the wire format.
+    fn resolve_wire_edges(
+        &self,
+        wire_edges: Vec<crate::item::WireEdge>,
+        current_ordinal: u8,
+    ) -> std::collections::BTreeSet<crate::item::Edge> {
+        use crate::item::{WireEdge, edge_type_id};
+        let mut out = std::collections::BTreeSet::new();
+        for we in wire_edges {
+            match we {
+                WireEdge::SameFile { edge_type, offset } => {
+                    let et = match edge_type_id::to_str(edge_type) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if let Some(target) =
+                        self.identifier_at(current_ordinal, offset)
+                    {
+                        out.insert((et.to_string(), target));
+                    }
+                }
+                WireEdge::CrossFile {
+                    edge_type,
+                    file_ordinal,
+                    offset,
+                } => {
+                    let et = match edge_type_id::to_str(edge_type) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if let Some(target) = self.identifier_at(file_ordinal, offset)
+                    {
+                        out.insert((et.to_string(), target));
+                    }
+                }
+                WireEdge::External { edge_type, target } => {
+                    if let Some(et) = edge_type_id::to_str(edge_type) {
+                        out.insert((et.to_string(), target));
+                    }
+                }
+                WireEdge::UnknownType { edge_type, target } => {
+                    out.insert((edge_type, target));
+                }
+            }
+        }
+        out
+    }
+
+    /// Read the identifier of the item stored at `(file_ordinal, offset)`
+    /// in this cluster. Returns `None` if no DataFile with that ordinal
+    /// exists or the bytes at the offset can't be decoded.
+    fn identifier_at(&self, file_ordinal: u8, offset: u64) -> Option<String> {
+        let file_hash = *self
+            .envelope
+            .data_files
+            .get(file_ordinal as usize)?;
+        let df = self.data_files.get(&file_hash)?;
+        df.read_identifier_at(offset as usize)
     }
 
     pub fn item_from_index_loc(&self, index_loc: &ItemLoc) -> Option<Item> {

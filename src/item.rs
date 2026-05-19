@@ -312,6 +312,174 @@ pub const BUILT_FROM: &str = "build:down";
 pub const TAG_FROM: &str = "tag:from";
 pub const TAG_TO: &str = "tag:to";
 
+// ─────────────────────────────────────────────────────────────────────────
+//  EdgeTypeId — compact byte identifiers for the eight known edge types.
+//  Mirrors goatrodeo's `io.spicelabs.goatrodeo.util.EdgeTypeId`. The table
+//  is append-only — values are part of the v3 wire format.
+// ─────────────────────────────────────────────────────────────────────────
+
+pub mod edge_type_id {
+    use super::*;
+
+    pub const CONTAINED_BY_ID: u8 = 0;
+    pub const CONTAINS_ID:     u8 = 1;
+    pub const ALIAS_FROM_ID:   u8 = 2;
+    pub const ALIAS_TO_ID:     u8 = 3;
+    pub const BUILDS_TO_ID:    u8 = 4;
+    pub const BUILT_FROM_ID:   u8 = 5;
+    pub const TAG_FROM_ID:     u8 = 6;
+    pub const TAG_TO_ID:       u8 = 7;
+
+    /// Map a byte ID back to its canonical edge-type string. Returns
+    /// `None` when the ID is not in the well-known table; callers should
+    /// fall back to the [`WireEdge::UnknownType`] variant.
+    pub fn to_str(id: u8) -> Option<&'static str> {
+        match id {
+            CONTAINED_BY_ID => Some(CONTAINED_BY),
+            CONTAINS_ID     => Some(CONTAINS),
+            ALIAS_FROM_ID   => Some(ALIAS_FROM),
+            ALIAS_TO_ID     => Some(ALIAS_TO),
+            BUILDS_TO_ID    => Some(BUILDS_TO),
+            BUILT_FROM_ID   => Some(BUILT_FROM),
+            TAG_FROM_ID     => Some(TAG_FROM),
+            TAG_TO_ID       => Some(TAG_TO),
+            _ => None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  WireEdge — compact on-disk edge encoding (DataFileEnvelope v >= 2)
+//  CBOR (sized arrays, first element is the discriminator tag):
+//      SameFile     : [0, edgeTypeId, offset]
+//      CrossFile    : [1, edgeTypeId, fileOrdinal, offset]
+//      External     : [2, edgeTypeId, gitoidStr]
+//      UnknownType  : [3, edgeTypeStr, gitoidStr]
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An edge as it appears on disk in v3 DataFiles. See goatrodeo's
+/// `io.spicelabs.goatrodeo.omnibor.WireEdge` for the authoritative
+/// description of each variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum WireEdge {
+    SameFile { edge_type: u8, offset: u64 },
+    CrossFile { edge_type: u8, file_ordinal: u8, offset: u64 },
+    External { edge_type: u8, target: String },
+    UnknownType { edge_type: String, target: String },
+}
+
+impl<'de> Deserialize<'de> for WireEdge {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct WireEdgeVisitor;
+        impl<'de> serde::de::Visitor<'de> for WireEdgeVisitor {
+            type Value = WireEdge;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a WireEdge array")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<WireEdge, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let tag: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::missing_field("tag"))?;
+                let result = match tag {
+                    0 => {
+                        let et: u32 = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::missing_field("edge_type"))?;
+                        let offset: u64 = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::missing_field("offset"))?;
+                        WireEdge::SameFile {
+                            edge_type: et as u8,
+                            offset,
+                        }
+                    }
+                    1 => {
+                        let et: u32 = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::missing_field("edge_type"))?;
+                        let fo: u32 = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::missing_field("file_ordinal"))?;
+                        let offset: u64 = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::missing_field("offset"))?;
+                        WireEdge::CrossFile {
+                            edge_type: et as u8,
+                            file_ordinal: fo as u8,
+                            offset,
+                        }
+                    }
+                    2 => {
+                        let et: u32 = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::missing_field("edge_type"))?;
+                        let target: String = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::missing_field("target"))?;
+                        WireEdge::External {
+                            edge_type: et as u8,
+                            target,
+                        }
+                    }
+                    3 => {
+                        let et: String = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::missing_field("edge_type"))?;
+                        let target: String = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::missing_field("target"))?;
+                        WireEdge::UnknownType {
+                            edge_type: et,
+                            target,
+                        }
+                    }
+                    other => {
+                        return Err(serde::de::Error::custom(format!(
+                            "Unknown WireEdge tag: {}",
+                            other
+                        )));
+                    }
+                };
+                // Drain to None. Goatrodeo's WireEdge encoder uses Borer's
+                // indefinite-length CBOR array form (`writeArrayOpen(n) …
+                // writeArrayClose()`), which emits a `0xFF` break marker
+                // after the elements. serde_cbor's SeqAccess expects
+                // `next_element` to be called until it returns `None` so
+                // that the break is consumed; returning from `visit_seq`
+                // early leaves the byte cursor pointing at the break,
+                // misaligning the outer Vec<WireEdge>'s SeqAccess. For
+                // hypothetical sized-array encoders this loop is a no-op
+                // (the first iteration returns `None` immediately).
+                while seq
+                    .next_element::<serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(result)
+            }
+        }
+        deserializer.deserialize_seq(WireEdgeVisitor)
+    }
+}
+
+/// The on-disk shape of an Item under DataFileEnvelope v >= 2 — a thin
+/// mirror of [`Item`] but with `connections` carrying [`WireEdge`]
+/// values that still need to be resolved against the cluster's
+/// `(file_ordinal, offset) -> identifier` map.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WireItem {
+    pub identifier: String,
+    pub connections: Vec<WireEdge>,
+    pub body_mime_type: Option<String>,
+    pub body: Option<Value>,
+}
+
 impl EdgeType for String {
     fn is_alias_from(&self) -> bool {
         self == ALIAS_FROM

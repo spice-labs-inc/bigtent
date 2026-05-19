@@ -34,7 +34,7 @@
 //! loading the entire file into memory.
 
 use crate::{
-    item::Item,
+    item::{Item, WireItem},
     util::{read_cbor_sync, read_len_and_cbor_sync, read_u32_sync},
 };
 use anyhow::{Result, bail};
@@ -54,7 +54,8 @@ use super::goat::GoatRodeoCluster;
 /// Metadata envelope stored at the beginning of .grd data files.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct DataFileEnvelope {
-    /// File format version
+    /// File format version. v1 stored connections as `(String, String)`
+    /// tuples directly; v2 switched to the streamed `WireEdge` encoding.
     pub version: u32,
 
     /// Magic number for validation (should be `DataFileMagicNumber`)
@@ -82,6 +83,12 @@ pub struct DataFile {
     pub envelope: DataFileEnvelope,
     pub file: Arc<Mmap>,
     pub data_offset: usize,
+    /// Position of this DataFile in the cluster envelope's `data_files`
+    /// vector. Used to resolve v3 [`crate::item::WireEdge`] back-references.
+    /// Saturates at [`u8::MAX`] for clusters with more than 128
+    /// DataFiles — past that, cross-file edges are written as
+    /// [`crate::item::WireEdge::External`] by goatrodeo.
+    pub file_ordinal: u8,
 }
 
 pub const GOAT_RODEO_DATA_FILE_SUFFIX: &str = "grd";
@@ -89,7 +96,7 @@ pub const GOAT_RODEO_INDEX_FILE_SUFFIX: &str = "gri";
 pub const GOAT_RODEO_CLUSTER_FILE_SUFFIX: &str = "grc";
 
 impl DataFile {
-    pub async fn new(dir: &PathBuf, hash: u64) -> Result<DataFile> {
+    pub async fn new(dir: &PathBuf, hash: u64, file_ordinal: u8) -> Result<DataFile> {
         let mut data_file = GoatRodeoCluster::find_data_or_index_file_from_sha256(
             dir,
             hash,
@@ -120,14 +127,35 @@ impl DataFile {
             envelope: env,
             file: Arc::new(mmap),
             data_offset: cur_pos as usize,
+            file_ordinal,
         })
     }
 
-    /// read the item. This is a mixture of synchronous and async code. Why?
+    /// Read an Item at the given byte offset in this data file.
+    ///
+    /// For envelopes at version 1 the legacy CBOR `Item` codec is used.
+    /// For version >= 2 the on-disk form is the streamed [`WireItem`]
+    /// shape — callers (in `goat.rs`) handle WireEdge resolution and
+    /// alias:from synthesis against the cluster state and assemble the
+    /// final [`Item`].
+    ///
+    /// This is a mixture of synchronous and async code. Why?
     /// Turns out the async BufReader is freakin' slow, so we're doing synchronous
     /// BufReader. Ideally, we'd put this on a blocking Tokio thread, but, sigh
     /// async closures are not in mainline Rust right now, so "no thread-friendly soup for you!"
     pub fn read_item_at(&self, pos: usize) -> Option<Item> {
+        if self.envelope.version >= 2 {
+            // v3 callers should be using `read_wire_item_at` and
+            // resolving against the cluster-level back-reference map.
+            // We don't have access to that map here, so we surface an
+            // error via the existing `None`-on-failure contract.
+            error!(
+                "DataFile::read_item_at called on v{} file at offset {} without a cluster resolver — \
+                 use GoatRodeoCluster::item_for_file_and_offset for v >= 2 data",
+                self.envelope.version, pos
+            );
+            return None;
+        }
         let mut my_reader: &[u8] = &self.file[pos..];
 
         let item_len = match read_u32_sync(&mut my_reader) {
@@ -145,6 +173,37 @@ impl DataFile {
             }
         };
         Some(item)
+    }
+
+    /// Read a [`WireItem`] from this v >= 2 data file. Returns `None`
+    /// for v1 files (callers should use [`read_item_at`] for those).
+    pub fn read_wire_item_at(&self, pos: usize) -> Option<WireItem> {
+        if self.envelope.version < 2 {
+            return None;
+        }
+        let mut my_reader: &[u8] = &self.file[pos..];
+        let item_len = match read_u32_sync(&mut my_reader) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to read length at offset {} err {:?}", pos, e);
+                return None;
+            }
+        };
+        let wi = match read_cbor_sync::<WireItem, _>(&mut my_reader, item_len as usize) {
+            Ok(i) => i,
+            Err(e) => {
+                error!("Failed to read WireItem at offset {} error {:?}", pos, e);
+                return None;
+            }
+        };
+        Some(wi)
+    }
+
+    /// Read just the `identifier` of the v >= 2 item at this offset,
+    /// without paying the cost of resolving its connections. Used for
+    /// lazily populating the cluster's back-reference cache.
+    pub fn read_identifier_at(&self, pos: usize) -> Option<String> {
+        self.read_wire_item_at(pos).map(|wi| wi.identifier)
     }
 }
 
