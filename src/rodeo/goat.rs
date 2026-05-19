@@ -45,7 +45,7 @@ use std::{
     fs::File,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 use thousands::Separable;
@@ -178,7 +178,28 @@ pub struct GoatRodeoCluster {
 
     /// Whether to pre-load index into memory
     load_index: bool,
+
+    /// Lazy per-cluster inverse-edge index, populated by streaming
+    /// every v >= 2 DataFile on first request. Maps
+    /// `(forward_edge_type, target_identifier) -> { source_identifier }`
+    /// for the forward content edges (`contained:up`, `build:down`).
+    ///
+    /// Goatrodeo v3 writers drop the inverse halves of these edges
+    /// (`contained:down`, `build:up`) from items on disk; this index
+    /// lets bigtent transparently synthesise them on read so traversal
+    /// callers don't need to change.
+    ///
+    /// `OnceLock` gives us blocking lazy initialisation that is safe to
+    /// call from synchronous hot paths.
+    inverse_edge_index: Arc<OnceLock<InverseEdgeIndex>>,
 }
+
+/// `(forward_edge_type, target_identifier) -> { source_identifier }`.
+///
+/// Built by walking every v >= 2 DataFile sequentially and recording
+/// each item's outgoing `contained:up` and `build:down` edges keyed
+/// against the target identifier.
+type InverseEdgeIndex = HashMap<(String, String), HashSet<String>>;
 
 impl GoatRodeoTrait for GoatRodeoCluster {
     /// create a stream for the flattened items. If any of the `gitoids` cannot
@@ -524,6 +545,7 @@ impl GoatRodeoCluster {
             load_index,
             directory: parent,
             index_offset: IndexOffset::from_index_files(&index_vec),
+            inverse_edge_index: Arc::new(OnceLock::new()),
         });
 
         ret.clone().kick_off_index_build_if_load_true().await;
@@ -824,14 +846,20 @@ impl GoatRodeoCluster {
         match data_file {
             Some(df) => {
                 if df.envelope.version < 2 {
+                    // v1 items already carry their inverse edges
+                    // verbatim — no augmentation needed.
                     return df.read_item_at(offset);
                 }
-                // v >= 2 path: WireItem -> resolve back-references -> Item.
+                // v >= 2 path: WireItem -> resolve back-references -> Item,
+                // augmenting with the inverse halves of forward content
+                // edges via the cluster's lazy inverse-edge index.
                 let wi = df.read_wire_item_at(offset)?;
                 let connections = self.resolve_wire_edges(
                     wi.connections,
                     df.file_ordinal,
                 );
+                let connections =
+                    self.synthesise_inverse_content_edges(connections, &wi.identifier);
                 Some(Item {
                     identifier: wi.identifier,
                     connections,
@@ -846,6 +874,96 @@ impl GoatRodeoCluster {
                 );
             }
         }
+    }
+
+    /// Get the per-cluster inverse-edge index, building it on demand.
+    ///
+    /// The build walks every v >= 2 DataFile sequentially (using the
+    /// length-prefixed frame format) and records each item's outgoing
+    /// `contained:up` and `build:down` edges keyed against the target
+    /// identifier. For v1 DataFiles nothing is recorded — v1 items
+    /// already carry their inverse edges on disk so callers don't need
+    /// to consult this index.
+    fn get_or_build_inverse_index(&self) -> &InverseEdgeIndex {
+        self.inverse_edge_index
+            .get_or_init(|| self.build_inverse_index())
+    }
+
+    fn build_inverse_index(&self) -> InverseEdgeIndex {
+        use crate::item::{BUILT_FROM, CONTAINED_BY};
+        let mut idx: InverseEdgeIndex = HashMap::new();
+
+        for df in self.data_files.values() {
+            if df.envelope.version < 2 {
+                continue;
+            }
+            let mut pos = df.data_offset;
+            let file_len = df.file.len();
+            loop {
+                if pos + 4 > file_len {
+                    break;
+                }
+                let len_bytes: [u8; 4] = match df.file[pos..pos + 4].try_into() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                let item_len = u32::from_be_bytes(len_bytes);
+                if item_len == 0xFFFF_FFFF {
+                    // EOF sentinel (-1 as u32, big-endian).
+                    break;
+                }
+                let item_len = item_len as usize;
+                if pos + 4 + item_len > file_len {
+                    break;
+                }
+                let frame_start = pos;
+                let wi = match df.read_wire_item_at(frame_start) {
+                    Some(wi) => wi,
+                    None => break,
+                };
+                // Resolve WireEdges back to (et, target) edges so we
+                // see the actual target identifiers (not raw offsets).
+                let connections =
+                    self.resolve_wire_edges(wi.connections, df.file_ordinal);
+                for (et, target) in connections {
+                    if et == CONTAINED_BY || et == BUILT_FROM {
+                        idx.entry((et, target))
+                            .or_insert_with(HashSet::new)
+                            .insert(wi.identifier.clone());
+                    }
+                }
+                pos = frame_start + 4 + item_len;
+            }
+        }
+        idx
+    }
+
+    /// Augment a v >= 2 Item's connections with the inverse halves of
+    /// forward content edges (`contained:down`, `build:up`) by
+    /// consulting the cluster's lazy inverse-edge index. Idempotent for
+    /// v1-style data where the inverse edges may already be present.
+    fn synthesise_inverse_content_edges(
+        &self,
+        mut connections: std::collections::BTreeSet<crate::item::Edge>,
+        identifier: &str,
+    ) -> std::collections::BTreeSet<crate::item::Edge> {
+        use crate::item::{BUILDS_TO, BUILT_FROM, CONTAINED_BY, CONTAINS};
+        let idx = self.get_or_build_inverse_index();
+        if let Some(sources) =
+            idx.get(&(CONTAINED_BY.to_string(), identifier.to_string()))
+        {
+            for src in sources {
+                connections.insert((CONTAINS.to_string(), src.clone()));
+            }
+        }
+        if let Some(sources) =
+            idx.get(&(BUILT_FROM.to_string(), identifier.to_string()))
+        {
+            for src in sources {
+                connections.insert((BUILDS_TO.to_string(), src.clone()));
+            }
+        }
+        connections
     }
 
     /// Resolve a vector of [`crate::item::WireEdge`]s into the concrete
