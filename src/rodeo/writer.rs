@@ -208,6 +208,11 @@ impl ClusterWriter {
                 info: BTreeMap::new(),
                 data_files: self.seen_data_files.lock().await.iter().copied().collect(),
                 index_files: self.index_files.lock().await.iter().copied().collect(),
+                // Bigtent's writer doesn't produce an alias map sidecar
+                // (it ships clusters built by goatrodeo); leave the
+                // reference unset so the cluster encodes as if it had
+                // no aliases.
+                alias_map_file: None,
             };
             write_envelope(cluster_writer, &cluster_env).await?;
         }

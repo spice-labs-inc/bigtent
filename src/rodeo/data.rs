@@ -54,8 +54,16 @@ use super::goat::GoatRodeoCluster;
 /// Metadata envelope stored at the beginning of .grd data files.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct DataFileEnvelope {
-    /// File format version. v1 stored connections as `(String, String)`
-    /// tuples directly; v2 switched to the streamed `WireEdge` encoding.
+    /// File format version.
+    ///
+    /// - v1 stored connections as `(String, String)` tuples directly.
+    /// - v2 switched to the streamed `WireEdge` encoding.
+    /// - v3 added an `alias_map` field — withdrawn: the 16-bit
+    ///   envelope-length prefix overflows once the embedded alias map
+    ///   exceeds 64 KiB.
+    /// - v4 has no `alias_map` field; the alias map lives in a
+    ///   cluster-wide `.gra` sidecar referenced from the cluster
+    ///   envelope's `alias_map_file`.
     pub version: u32,
 
     /// Magic number for validation (should be `DataFileMagicNumber`)

@@ -192,6 +192,17 @@ pub struct GoatRodeoCluster {
     /// `OnceLock` gives us blocking lazy initialisation that is safe to
     /// call from synchronous hot paths.
     inverse_edge_index: Arc<OnceLock<InverseEdgeIndex>>,
+
+    /// Cluster-wide alias map, loaded from the `<hash>.gra` sidecar
+    /// file referenced by `ClusterFileEnvelope.alias_map_file` when
+    /// the cluster is opened. Empty for v3 clusters and for v4
+    /// clusters with `alias_map_file: None`.
+    ///
+    /// Maps `canonical_identifier -> set of alternate identifiers`.
+    /// Consulted on the v3/v4 item-read path to synthesise the
+    /// `alias:from` edges that goatrodeo's v4 writer strips from the
+    /// on-disk Item bytes.
+    alias_map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 /// `(forward_edge_type, target_identifier) -> { source_identifier }`.
@@ -524,6 +535,14 @@ impl GoatRodeoCluster {
             });
         }
 
+        // Load the cluster-wide alias map sidecar if the envelope
+        // references one. v3 clusters don't set this field; v4 clusters
+        // set it to Some(hash) when the cluster has any aliases.
+        let alias_map = match env.alias_map_file {
+            Some(hash) => Self::load_alias_map_file(&parent, hash).await?,
+            None => std::collections::BTreeMap::new(),
+        };
+
         info!("New cluster load time {:?}", start.elapsed());
 
         let ret = Arc::new(GoatRodeoCluster {
@@ -546,6 +565,7 @@ impl GoatRodeoCluster {
             directory: parent,
             index_offset: IndexOffset::from_index_files(&index_vec),
             inverse_edge_index: Arc::new(OnceLock::new()),
+            alias_map,
         });
 
         ret.clone().kick_off_index_build_if_load_true().await;
@@ -851,13 +871,16 @@ impl GoatRodeoCluster {
                     return df.read_item_at(offset);
                 }
                 // v >= 2 path: WireItem -> resolve back-references -> Item,
-                // augmenting with the inverse halves of forward content
-                // edges via the cluster's lazy inverse-edge index.
+                // synthesising alias:from edges from the cluster's
+                // alias map, then augmenting with the inverse halves of
+                // forward content edges via the lazy inverse-edge index.
                 let wi = df.read_wire_item_at(offset)?;
                 let connections = self.resolve_wire_edges(
                     wi.connections,
                     df.file_ordinal,
                 );
+                let connections =
+                    self.synthesise_alias_from(connections, &wi.identifier);
                 let connections =
                     self.synthesise_inverse_content_edges(connections, &wi.identifier);
                 Some(Item {
@@ -1033,6 +1056,55 @@ impl GoatRodeoCluster {
             .get(file_ordinal as usize)?;
         let df = self.data_files.get(&file_hash)?;
         df.read_identifier_at(offset as usize)
+    }
+
+    /// If this canonical's identifier appears as a key in the cluster's
+    /// `alias_map`, synthesise an `alias:from` edge for each alternate.
+    /// This restores byte-for-byte parity with the pre-collapse
+    /// in-memory shape that v1 readers saw, hiding the alias-table
+    /// optimisation from callers.
+    fn synthesise_alias_from(
+        &self,
+        mut connections: std::collections::BTreeSet<crate::item::Edge>,
+        identifier: &str,
+    ) -> std::collections::BTreeSet<crate::item::Edge> {
+        use crate::item::ALIAS_FROM;
+        if let Some(alts) = self.alias_map.get(identifier) {
+            for alt in alts {
+                connections.insert((ALIAS_FROM.to_string(), alt.clone()));
+            }
+        }
+        connections
+    }
+
+    /// Read and decode a `<hash>.gra` alias-map sidecar file produced
+    /// by goatrodeo's v4 writer. Layout: a 4-byte magic
+    /// ([`AliasMapFileMagicNumber`]) followed by a single CBOR map (no
+    /// length prefix — the map is self-delimiting and consumes the
+    /// remainder of the file).
+    async fn load_alias_map_file(
+        dir: &PathBuf,
+        hash: u64,
+    ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>> {
+        use crate::rodeo::cluster::AliasMapFileMagicNumber;
+        use std::io::Read;
+
+        let mut file =
+            GoatRodeoCluster::find_data_or_index_file_from_sha256(dir, hash, "gra").await?;
+        let magic = crate::util::read_u32_sync(&mut file)?;
+        if magic != AliasMapFileMagicNumber {
+            bail!(
+                "Unexpected magic number {:x}, expecting {:x} for alias-map file {:016x}.gra",
+                magic,
+                AliasMapFileMagicNumber,
+                hash
+            );
+        }
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        let map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            serde_cbor::from_slice(&buf)?;
+        Ok(map)
     }
 
     pub fn item_from_index_loc(&self, index_loc: &ItemLoc) -> Option<Item> {

@@ -42,7 +42,8 @@ use std::collections::BTreeMap;
 /// cluster file (after the magic number and length prefix).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClusterFileEnvelope {
-    /// File format version (currently 3)
+    /// File format version (3 = legacy with per-DataFile aliasMap, 4 =
+    /// cluster-wide alias-map sidecar referenced by [`Self::alias_map_file`])
     pub version: u32,
 
     /// Magic number for file type validation (should be `ClusterFileMagicNumber`)
@@ -56,6 +57,14 @@ pub struct ClusterFileEnvelope {
 
     /// Arbitrary metadata (creation time, source info, build details, etc.)
     pub info: BTreeMap<String, String>,
+
+    /// SHA256-derived hash (truncated to u64) of the cluster-wide
+    /// alias-map sidecar file (`<hash>.gra`), if one was written. v3
+    /// envelopes omit the field; v4 envelopes set it to `Some(_)` when
+    /// the cluster has any aliases and `None` (encoded as CBOR null)
+    /// when it has none.
+    #[serde(default, rename = "alias_map_file")]
+    pub alias_map_file: Option<u64>,
 }
 
 /// Magic number identifying cluster (.grc) files: 0xba4a4a ("Banana")
@@ -65,14 +74,26 @@ pub struct ClusterFileEnvelope {
 #[allow(non_upper_case_globals)]
 pub const ClusterFileMagicNumber: u32 = 0xba4a4a; // Banana
 
-/// Minimum supported cluster file format version.
+/// Magic number identifying alias-map sidecar (.gra) files: 0x0a11a5ed ("Aliased").
 ///
-/// Files with versions below this cannot be read by this version of BigTent.
+/// Written by goatrodeo's v4 writer when the cluster's alias map is
+/// non-empty. The file's CBOR payload is a `BTreeMap<String,
+/// BTreeSet<String>>` mapping canonical identifiers to their alternates.
+#[allow(non_upper_case_globals)]
+pub const AliasMapFileMagicNumber: u32 = 0x0a11a5ed; // Aliased
+
+/// Lowest supported cluster file format version. v3 is accepted for
+/// backward compatibility (alias map in DataFile envelope, broken at
+/// scale); v4 is preferred (alias map in sidecar).
 #[allow(non_upper_case_globals)]
 pub const MinClusterVersion: u32 = 3;
 
+/// Highest supported cluster file format version.
+#[allow(non_upper_case_globals)]
+pub const MaxClusterVersion: u32 = 4;
+
 /// Current cluster file format version used when writing new clusters.
-pub const CLUSTER_VERSION: u32 = MinClusterVersion;
+pub const CLUSTER_VERSION: u32 = MaxClusterVersion;
 
 impl ClusterFileEnvelope {
     pub fn validate(&self) -> Result<()> {
@@ -80,11 +101,12 @@ impl ClusterFileEnvelope {
             bail!("Loaded a cluster with an invalid magic number: {:?}", self);
         }
 
-        if self.version != MinClusterVersion {
+        if self.version < MinClusterVersion || self.version > MaxClusterVersion {
             bail!(
-                "Loaded a Cluster with version {} but this code only supports version {} Clusters",
+                "Loaded a Cluster with version {} but this code only supports versions {}..={} Clusters",
                 self.version,
-                MinClusterVersion
+                MinClusterVersion,
+                MaxClusterVersion
             );
         }
 
