@@ -138,14 +138,154 @@ pub fn millis_now() -> i64 {
         .as_millis() as i64
 }
 
-/// Compute MD5 hash of a string.
+/// Compute MD5 hash of a string for use as a primary `.gri` index key.
 ///
-/// Used for index key generation. Note: MD5 is used for lookup efficiency,
-/// not security. Data integrity uses SHA256.
+/// Goatrodeo's v4 writer (and BigTent, going forward) keys index entries
+/// by MD5 of the *binary* `Identifier` form (header byte + raw hash
+/// bytes for gitoid/raw-hash, header byte + UTF-8 bytes for
+/// PackageUrl/sentinel). See [`identifier_bytes`] for the layout.
+///
+/// MD5 is used for lookup efficiency, not security; data integrity
+/// uses SHA256.
 pub fn md5hash_str(st: &str) -> MD5Hash {
-    let res = md5::compute(st);
-
+    let bytes = identifier_bytes(st);
+    let res = md5::compute(&bytes);
     res.into()
+}
+
+/// Legacy MD5 hash form — MD5 of the canonical UTF-8 string.
+///
+/// Pre-v4 goatrodeo (and earlier BigTent writers) keyed `.gri` entries
+/// by this. Kept for backward-compatible lookups against existing v1
+/// clusters, used as a fallback when the primary [`md5hash_str`] lookup
+/// misses.
+pub fn md5hash_str_canonical(st: &str) -> MD5Hash {
+    let res = md5::compute(st);
+    res.into()
+}
+
+/// Encode a canonical-form identifier string into the binary representation
+/// that goatrodeo's `Identifier` opaque type stores on disk.
+///
+/// Layout — byte 0 packs the kind into the high nibble and a kind-specific
+/// sub-encoding into the low nibble:
+///
+/// ```text
+///   high nibble (bits 7..4)        low nibble (bits 3..0)
+///   0 = Gitoid                     (ObjectType.ordinal << 2) | HashAlgorithm.ordinal
+///   1 = RawHash                    RawHashAlgorithm.ordinal
+///   2 = PackageUrl                 0
+///   3 = Sentinel                   0
+/// ```
+///
+/// Bytes 1.. are the raw hash bytes (for Gitoid / RawHash) or the UTF-8
+/// bytes of the canonical text form (for PackageUrl / Sentinel).
+///
+/// Object-type ordinals: Blob=0, Tree=1, Commit=2, Tag=3.
+/// HashAlgorithm ordinals (Gitoid): Sha1=0, Sha256=1.
+/// RawHashAlgorithm ordinals: Md5=0, Sha1=1, Sha256=2, Sha512=3.
+///
+/// Falls back to the sentinel encoding for malformed gitoid / raw-hash
+/// strings, matching goatrodeo's tolerance for short test fixtures.
+pub fn identifier_bytes(canonical: &str) -> Vec<u8> {
+    const KIND_GITOID: u8 = 0;
+    const KIND_RAW_HASH: u8 = 1;
+    const KIND_PACKAGE_URL: u8 = 2;
+    const KIND_SENTINEL: u8 = 3;
+
+    fn header(kind: u8, sub: u8) -> u8 {
+        ((kind & 0xf) << 4) | (sub & 0xf)
+    }
+
+    fn sentinel(s: &str) -> Vec<u8> {
+        let utf8 = s.as_bytes();
+        let mut out = Vec::with_capacity(1 + utf8.len());
+        out.push(header(KIND_SENTINEL, 0));
+        out.extend_from_slice(utf8);
+        out
+    }
+
+    fn hex_to_bytes(hex: &str, out: &mut Vec<u8>) -> bool {
+        if !hex.len().is_multiple_of(2) {
+            return false;
+        }
+        for chunk in hex.as_bytes().chunks(2) {
+            let hi = match (chunk[0] as char).to_digit(16) {
+                Some(v) => v as u8,
+                None => return false,
+            };
+            let lo = match (chunk[1] as char).to_digit(16) {
+                Some(v) => v as u8,
+                None => return false,
+            };
+            out.push((hi << 4) | lo);
+        }
+        true
+    }
+
+    // gitoid:<objectType>:<algo>:<hex>
+    if let Some(rest) = canonical.strip_prefix("gitoid:") {
+        let parts: Vec<&str> = rest.splitn(3, ':').collect();
+        if parts.len() == 3 {
+            let object_ordinal: Option<u8> = match parts[0] {
+                "blob" => Some(0),
+                "tree" => Some(1),
+                "commit" => Some(2),
+                "tag" => Some(3),
+                _ => None,
+            };
+            let algo: Option<(u8, usize)> = match parts[1] {
+                "sha1" => Some((0, 20)),
+                "sha256" => Some((1, 32)),
+                _ => None,
+            };
+            if let (Some(obj), Some((algo_ord, byte_len))) = (object_ordinal, algo) {
+                if parts[2].len() == byte_len * 2 {
+                    let mut out = Vec::with_capacity(1 + byte_len);
+                    out.push(header(KIND_GITOID, ((obj & 0x3) << 2) | (algo_ord & 0x3)));
+                    if hex_to_bytes(parts[2], &mut out) {
+                        return out;
+                    }
+                }
+            }
+        }
+        return sentinel(canonical);
+    }
+
+    // pkg:...
+    if let Some(_rest) = canonical.strip_prefix("pkg:") {
+        let utf8 = canonical.as_bytes();
+        let mut out = Vec::with_capacity(1 + utf8.len());
+        out.push(header(KIND_PACKAGE_URL, 0));
+        out.extend_from_slice(utf8);
+        return out;
+    }
+
+    // <algo>:<hex>
+    let raw_algo: Option<(&str, u8, usize)> = if canonical.starts_with("md5:") {
+        Some(("md5:", 0, 16))
+    } else if canonical.starts_with("sha1:") {
+        Some(("sha1:", 1, 20))
+    } else if canonical.starts_with("sha256:") {
+        Some(("sha256:", 2, 32))
+    } else if canonical.starts_with("sha512:") {
+        Some(("sha512:", 3, 64))
+    } else {
+        None
+    };
+    if let Some((prefix, algo_ord, byte_len)) = raw_algo {
+        let hex = &canonical[prefix.len()..];
+        if hex.len() == byte_len * 2 {
+            let mut out = Vec::with_capacity(1 + byte_len);
+            out.push(header(KIND_RAW_HASH, algo_ord));
+            if hex_to_bytes(hex, &mut out) {
+                return out;
+            }
+        }
+        return sentinel(canonical);
+    }
+
+    sentinel(canonical)
 }
 
 /// Compute SHA256 hash of a byte slice.
@@ -158,6 +298,33 @@ pub fn sha256_for_slice(r: &[u8]) -> [u8; 32] {
     hasher.update(r);
 
     hasher.finalize().into()
+}
+
+#[test]
+fn test_md5hash_str_matches_goatrodeo_identifier_form() {
+    // Pinned against the index files goatrodeo's v4 writer produces.
+    // The MD5 keys cover the binary Identifier layout, not the canonical
+    // text form — see identifier_bytes for the layout.
+    let cases: &[(&str, &str)] = &[
+        (
+            "gitoid:blob:sha256:bac938b7bc5d3af6ffc1e83d3ae26219d10660315f6f5481d97251bbfc8560a6",
+            "d58fa99dbbb64eac9ed11ff56440cec2",
+        ),
+        (
+            "gitoid:blob:sha256:4ffa7795396697e3de38d20cae12be8d81b6da1cebb61c214a332747e726ba86",
+            "b68691f79d534a3086626d83e0675c97",
+        ),
+        ("tags", "7d71edd9af3c27c8fae771e8811d524e"),
+    ];
+    for (id, expected) in cases {
+        let bytes = md5hash_str(id);
+        let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(
+            hex, *expected,
+            "md5hash_str({}) produced {} but expected {}",
+            id, hex, expected
+        );
+    }
 }
 
 #[test]

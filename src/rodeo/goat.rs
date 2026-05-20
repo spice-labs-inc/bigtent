@@ -245,8 +245,19 @@ impl GoatRodeoTrait for GoatRodeoCluster {
     }
 
     fn item_for_identifier(&self, data: &str) -> Option<Item> {
-        let md5_hash = md5hash_str(data);
-        self.item_for_hash(md5_hash)
+        // Try the primary (binary Identifier form) hash first; fall back
+        // to the legacy canonical-string form for compatibility with v1
+        // clusters whose `.gri` keys predate the Identifier opaque type.
+        let primary = md5hash_str(data);
+        if let Some(item) = self.item_for_hash(primary) {
+            return Some(item);
+        }
+        let legacy = crate::util::md5hash_str_canonical(data);
+        if legacy != primary {
+            self.item_for_hash(legacy)
+        } else {
+            None
+        }
     }
 
     fn item_for_hash(&self, hash: MD5Hash) -> Option<Item> {
@@ -826,8 +837,16 @@ impl GoatRodeoCluster {
     /// index. This is a fast operation as it's just a binary search of the index which is
     /// in memory
     pub fn identifier_to_item_offset(&self, identifier: &str) -> Option<ItemOffset> {
-        let hash = md5hash_str(identifier);
-        self.hash_to_item_offset(hash)
+        let primary = md5hash_str(identifier);
+        if let Some(eo) = self.hash_to_item_offset(primary) {
+            return Some(eo);
+        }
+        let legacy = crate::util::md5hash_str_canonical(identifier);
+        if legacy != primary {
+            self.hash_to_item_offset(legacy)
+        } else {
+            None
+        }
     }
 
     /// from a hash, find the ItemOffset
