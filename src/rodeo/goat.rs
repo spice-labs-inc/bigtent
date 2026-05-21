@@ -203,6 +203,18 @@ pub struct GoatRodeoCluster {
     /// `alias:from` edges that goatrodeo's v4 writer strips from the
     /// on-disk Item bytes.
     alias_map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+
+    /// Lazy inverse of [`Self::alias_map`] — maps each alternate
+    /// identifier to its canonical. Populated on first use by
+    /// `alias_inverse_map()`.
+    ///
+    /// Used by `item_for_identifier` (and friends) to restore the v1
+    /// "look up by alias" behaviour against v4 clusters: in v1 each
+    /// alternate had its own pointer Item in the `.gri` with a single
+    /// `alias:to` edge; in v4 those Items don't exist on disk, only as
+    /// entries in this map. On lookup miss we synthesise the same
+    /// pointer Item from the inverse map.
+    alias_inverse_map: Arc<OnceLock<HashMap<String, String>>>,
 }
 
 /// `(forward_edge_type, target_identifier) -> { source_identifier }`.
@@ -254,10 +266,30 @@ impl GoatRodeoTrait for GoatRodeoCluster {
         }
         let legacy = crate::util::md5hash_str_canonical(data);
         if legacy != primary {
-            self.item_for_hash(legacy)
-        } else {
-            None
+            if let Some(item) = self.item_for_hash(legacy) {
+                return Some(item);
+            }
         }
+        // v4 clusters strip alternate-form identifiers from the .grd
+        // (they survive only as entries in the cluster's .gra sidecar).
+        // For v1 compatibility, when the index miss happens but the
+        // identifier is a known alternate, synthesise the pointer Item
+        // that v1 would have stored on disk: identifier-as-given,
+        // `connections: [(alias:to, canonical)]`, no body. Downstream
+        // helpers (`antialias_for`, `impl_stream_flattened_items`,
+        // `impl_north_send`) already know how to chase `alias:to`.
+        if let Some(canonical) = self.alias_inverse_map().get(data) {
+            use crate::item::ALIAS_TO;
+            let mut connections = std::collections::BTreeSet::new();
+            connections.insert((ALIAS_TO.to_string(), canonical.clone()));
+            return Some(Item {
+                identifier: data.to_string(),
+                connections,
+                body_mime_type: None,
+                body: None,
+            });
+        }
+        None
     }
 
     fn item_for_hash(&self, hash: MD5Hash) -> Option<Item> {
@@ -273,6 +305,7 @@ impl GoatRodeoTrait for GoatRodeoCluster {
 
     fn has_identifier(&self, identifier: &str) -> bool {
         self.identifier_to_item_offset(identifier).is_some()
+            || self.alias_inverse_map().contains_key(identifier)
     }
 
     fn is_empty(&self) -> bool {
@@ -577,6 +610,7 @@ impl GoatRodeoCluster {
             index_offset: IndexOffset::from_index_files(&index_vec),
             inverse_edge_index: Arc::new(OnceLock::new()),
             alias_map,
+            alias_inverse_map: Arc::new(OnceLock::new()),
         });
 
         ret.clone().kick_off_index_build_if_load_true().await;
@@ -1096,6 +1130,26 @@ impl GoatRodeoCluster {
         connections
     }
 
+    /// Inverse of [`Self::alias_map`] — `alternate → canonical`.
+    /// Built lazily on first request from the sidecar map.
+    ///
+    /// Used by the v1-compat path in `item_for_identifier`: when an
+    /// alternate-form identifier misses the `.gri` index, we synthesise
+    /// the pointer Item that v1 would have returned (a single
+    /// `alias:to → canonical` edge, no body). Empty for v1 clusters,
+    /// so the new code path is dead for them.
+    fn alias_inverse_map(&self) -> &HashMap<String, String> {
+        self.alias_inverse_map.get_or_init(|| {
+            let mut out = HashMap::new();
+            for (canon, alts) in &self.alias_map {
+                for alt in alts {
+                    out.insert(alt.clone(), canon.clone());
+                }
+            }
+            out
+        })
+    }
+
     /// Read and decode a `<hash>.gra` alias-map sidecar file produced
     /// by goatrodeo's v4 writer. Layout: a 4-byte magic
     /// ([`AliasMapFileMagicNumber`]) followed by a single CBOR map (no
@@ -1129,6 +1183,103 @@ impl GoatRodeoCluster {
     pub fn item_from_index_loc(&self, index_loc: &ItemLoc) -> Option<Item> {
         self.item_for_file_and_offset(index_loc.get_file_hash(), index_loc.get_offset())
     }
+}
+
+/// On v4 clusters, alternate-form identifiers are not items in the
+/// `.gri`; they live only as entries in the `.gra` sidecar. Verify
+/// that bigtent restores v1's "look up by alias" behaviour by
+/// synthesising the pointer Item from the sidecar.
+///
+/// The test punts unless `../goatrodeo/res_for_big_tent/` is populated.
+/// It picks any canonical that has at least one alternate in the
+/// alias map, then for each alternate confirms:
+///   1. `item_for_identifier(alternate)` returns a synthesised stub
+///      with `connections = [(alias:to, canonical)]`, no body.
+///   2. `has_identifier(alternate)` returns true.
+///   3. `antialias_for(alternate)` returns the canonical's full Item
+///      (with body and full connection set).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_alias_lookup_through_sidecar() {
+    use crate::item::{ALIAS_TO, ALIAS_FROM};
+    use std::path::PathBuf;
+    use crate::rodeo::goat_trait::GoatRodeoTrait;
+    let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
+    if !goat_rodeo_test_data.is_dir() {
+        return;
+    }
+    let mut files = GoatRodeoCluster::cluster_files_in_dir(
+        "../goatrodeo/res_for_big_tent/".into(),
+        false,
+        vec![],
+    )
+    .await
+    .expect("Should read cluster files");
+    let Some(cluster) = files.pop() else {
+        return;
+    };
+    // Only v4 clusters have a non-empty alias map.
+    let Some((canonical, alts)) = cluster
+        .alias_map
+        .iter()
+        .find(|(_, alts)| !alts.is_empty())
+    else {
+        eprintln!("No aliases in cluster — skipping (cluster is likely v1)");
+        return;
+    };
+    let canonical = canonical.clone();
+    let alt = alts.iter().next().unwrap().clone();
+
+    // 1. /item/<alt> synthesises the stub.
+    let stub = cluster
+        .item_for_identifier(&alt)
+        .expect("alternate must resolve via the sidecar fallback");
+    assert_eq!(stub.identifier, alt);
+    assert!(stub.body.is_none(), "stub item should have no body");
+    assert!(
+        stub.body_mime_type.is_none(),
+        "stub item should have no body_mime_type"
+    );
+    assert_eq!(
+        stub.connections.len(),
+        1,
+        "stub should have exactly one alias:to edge, got {:?}",
+        stub.connections
+    );
+    let (et, target) = stub.connections.iter().next().unwrap();
+    assert_eq!(et, ALIAS_TO);
+    assert_eq!(target, &canonical);
+
+    // 2. /has/<alt>
+    assert!(
+        cluster.has_identifier(&alt),
+        "has_identifier should return true for an alternate in the alias map"
+    );
+
+    // 3. /aa/<alt> resolves through alias:to to the canonical's full Item.
+    let canon_via_alt = cluster
+        .clone()
+        .antialias_for(&alt)
+        .expect("antialias_for must follow alias:to to the canonical");
+    let canon_direct = cluster
+        .item_for_identifier(&canonical)
+        .expect("canonical must be directly resolvable");
+    assert_eq!(
+        canon_via_alt.identifier, canon_direct.identifier,
+        "antialiased identifier should be the canonical"
+    );
+    assert_eq!(
+        canon_via_alt.body, canon_direct.body,
+        "antialiased body should match canonical's"
+    );
+    // The canonical's connections include the synthesised alias:from edges,
+    // one per alternate.
+    assert!(
+        canon_direct
+            .connections
+            .iter()
+            .any(|(et, target)| et == ALIAS_FROM && target == &alt),
+        "canonical must expose an alias:from edge back to the alternate"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
