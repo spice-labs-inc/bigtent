@@ -60,6 +60,7 @@ pub mod pid_file;
 pub mod server;
 
 pub mod rodeo {
+    pub mod alias_sidecar;
     pub mod cluster;
     pub mod data;
     pub mod goat;

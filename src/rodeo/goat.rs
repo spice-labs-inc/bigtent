@@ -193,28 +193,27 @@ pub struct GoatRodeoCluster {
     /// call from synchronous hot paths.
     inverse_edge_index: Arc<OnceLock<InverseEdgeIndex>>,
 
-    /// Cluster-wide alias map, loaded from the `<hash>.gra` sidecar
-    /// file referenced by `ClusterFileEnvelope.alias_map_file` when
-    /// the cluster is opened. Empty for v3 clusters and for v4
-    /// clusters with `alias_map_file: None`.
+    /// Mmap'd `<hash>.gra` v2 alias sidecar referenced by
+    /// `ClusterFileEnvelope.alias_map_file`. `None` for v3 clusters and
+    /// for v4 clusters without aliases.
     ///
-    /// Maps `canonical_identifier -> set of alternate identifiers`.
-    /// Consulted on the v3/v4 item-read path to synthesise the
-    /// `alias:from` edges that goatrodeo's v4 writer strips from the
-    /// on-disk Item bytes.
-    alias_map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-
-    /// Lazy inverse of [`Self::alias_map`] — maps each alternate
-    /// identifier to its canonical. Populated on first use by
-    /// `alias_inverse_map()`.
+    /// Replaces the earlier eagerly-deserialised
+    /// `BTreeMap<String, BTreeSet<String>>` representation: lookups go
+    /// through a binary search over the mmap'd file rather than an
+    /// in-memory map. Cluster open drops from ~100 ms / ~180 MB
+    /// resident-set on the ADG corpus to a few microseconds and no
+    /// extra heap; per-lookup cost is one or two page faults cold-
+    /// cache, sub-microsecond warm.
     ///
-    /// Used by `item_for_identifier` (and friends) to restore the v1
-    /// "look up by alias" behaviour against v4 clusters: in v1 each
-    /// alternate had its own pointer Item in the `.gri` with a single
-    /// `alias:to` edge; in v4 those Items don't exist on disk, only as
-    /// entries in this map. On lookup miss we synthesise the same
-    /// pointer Item from the inverse map.
-    alias_inverse_map: Arc<OnceLock<HashMap<String, String>>>,
+    /// Two views are supported:
+    ///   - `lookup_canonical(alternate)` — fallback path for
+    ///     `item_for_identifier` when the `.gri` index doesn't contain
+    ///     the input (it's an alternate-form identifier collapsed into
+    ///     a canonical at write time).
+    ///   - `alternates_of(canonical)` — used by `synthesise_alias_from`
+    ///     when reading a canonical's Item, to re-emit the `alias:from`
+    ///     edges goatrodeo strips at write time.
+    alias_sidecar: Option<crate::rodeo::alias_sidecar::AliasSidecar>,
 }
 
 /// `(forward_edge_type, target_identifier) -> { source_identifier }`.
@@ -278,16 +277,18 @@ impl GoatRodeoTrait for GoatRodeoCluster {
         // `connections: [(alias:to, canonical)]`, no body. Downstream
         // helpers (`antialias_for`, `impl_stream_flattened_items`,
         // `impl_north_send`) already know how to chase `alias:to`.
-        if let Some(canonical) = self.alias_inverse_map().get(data) {
-            use crate::item::ALIAS_TO;
-            let mut connections = std::collections::BTreeSet::new();
-            connections.insert((ALIAS_TO.to_string(), canonical.clone()));
-            return Some(Item {
-                identifier: data.to_string(),
-                connections,
-                body_mime_type: None,
-                body: None,
-            });
+        if let Some(sidecar) = &self.alias_sidecar {
+            if let Some(canonical) = sidecar.lookup_canonical(data) {
+                use crate::item::ALIAS_TO;
+                let mut connections = std::collections::BTreeSet::new();
+                connections.insert((ALIAS_TO.to_string(), canonical));
+                return Some(Item {
+                    identifier: data.to_string(),
+                    connections,
+                    body_mime_type: None,
+                    body: None,
+                });
+            }
         }
         None
     }
@@ -304,8 +305,13 @@ impl GoatRodeoTrait for GoatRodeoCluster {
     }
 
     fn has_identifier(&self, identifier: &str) -> bool {
-        self.identifier_to_item_offset(identifier).is_some()
-            || self.alias_inverse_map().contains_key(identifier)
+        if self.identifier_to_item_offset(identifier).is_some() {
+            return true;
+        }
+        if let Some(sidecar) = &self.alias_sidecar {
+            return sidecar.lookup_canonical(identifier).is_some();
+        }
+        false
     }
 
     fn is_empty(&self) -> bool {
@@ -579,12 +585,15 @@ impl GoatRodeoCluster {
             });
         }
 
-        // Load the cluster-wide alias map sidecar if the envelope
-        // references one. v3 clusters don't set this field; v4 clusters
-        // set it to Some(hash) when the cluster has any aliases.
-        let alias_map = match env.alias_map_file {
-            Some(hash) => Self::load_alias_map_file(&parent, hash).await?,
-            None => std::collections::BTreeMap::new(),
+        // Map the cluster-wide alias sidecar if the envelope references
+        // one. v3 clusters don't set this field; v4 clusters set it to
+        // Some(hash) when the cluster has any aliases. We mmap the
+        // sidecar lazily (open, validate the header, return) — no
+        // deserialisation, so cluster open stays in the microseconds
+        // even for sidecars hundreds of MB long.
+        let alias_sidecar = match env.alias_map_file {
+            Some(hash) => Some(Self::open_alias_sidecar(&parent, hash).await?),
+            None => None,
         };
 
         info!("New cluster load time {:?}", start.elapsed());
@@ -609,8 +618,7 @@ impl GoatRodeoCluster {
             directory: parent,
             index_offset: IndexOffset::from_index_files(&index_vec),
             inverse_edge_index: Arc::new(OnceLock::new()),
-            alias_map,
-            alias_inverse_map: Arc::new(OnceLock::new()),
+            alias_sidecar,
         });
 
         ret.clone().kick_off_index_build_if_load_true().await;
@@ -1111,73 +1119,36 @@ impl GoatRodeoCluster {
         df.read_identifier_at(offset as usize)
     }
 
-    /// If this canonical's identifier appears as a key in the cluster's
-    /// `alias_map`, synthesise an `alias:from` edge for each alternate.
-    /// This restores byte-for-byte parity with the pre-collapse
-    /// in-memory shape that v1 readers saw, hiding the alias-table
-    /// optimisation from callers.
+    /// If this canonical's identifier appears in the cluster's alias
+    /// sidecar, synthesise an `alias:from` edge for each alternate.
+    /// Binary-searches the `.gra`'s canon_index in place — no heap
+    /// allocation beyond the alternates themselves, which we have to
+    /// materialise as strings anyway to put them into `connections`.
     fn synthesise_alias_from(
         &self,
         mut connections: std::collections::BTreeSet<crate::item::Edge>,
         identifier: &str,
     ) -> std::collections::BTreeSet<crate::item::Edge> {
         use crate::item::ALIAS_FROM;
-        if let Some(alts) = self.alias_map.get(identifier) {
-            for alt in alts {
-                connections.insert((ALIAS_FROM.to_string(), alt.clone()));
+        if let Some(sidecar) = &self.alias_sidecar {
+            for alt in sidecar.alternates_of(identifier) {
+                connections.insert((ALIAS_FROM.to_string(), alt));
             }
         }
         connections
     }
 
-    /// Inverse of [`Self::alias_map`] — `alternate → canonical`.
-    /// Built lazily on first request from the sidecar map.
-    ///
-    /// Used by the v1-compat path in `item_for_identifier`: when an
-    /// alternate-form identifier misses the `.gri` index, we synthesise
-    /// the pointer Item that v1 would have returned (a single
-    /// `alias:to → canonical` edge, no body). Empty for v1 clusters,
-    /// so the new code path is dead for them.
-    fn alias_inverse_map(&self) -> &HashMap<String, String> {
-        self.alias_inverse_map.get_or_init(|| {
-            let mut out = HashMap::new();
-            for (canon, alts) in &self.alias_map {
-                for alt in alts {
-                    out.insert(alt.clone(), canon.clone());
-                }
-            }
-            out
-        })
-    }
-
-    /// Read and decode a `<hash>.gra` alias-map sidecar file produced
-    /// by goatrodeo's v4 writer. Layout: a 4-byte magic
-    /// ([`AliasMapFileMagicNumber`]) followed by a single CBOR map (no
-    /// length prefix — the map is self-delimiting and consumes the
-    /// remainder of the file).
-    async fn load_alias_map_file(
+    /// Open the `<hash>.gra` v2 sidecar via mmap (no deserialisation).
+    /// See [`crate::rodeo::alias_sidecar::AliasSidecar`] for the
+    /// on-disk layout.
+    async fn open_alias_sidecar(
         dir: &PathBuf,
         hash: u64,
-    ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>> {
-        use crate::rodeo::cluster::AliasMapFileMagicNumber;
-        use std::io::Read;
-
-        let mut file =
+    ) -> Result<crate::rodeo::alias_sidecar::AliasSidecar> {
+        let file =
             GoatRodeoCluster::find_data_or_index_file_from_sha256(dir, hash, "gra").await?;
-        let magic = crate::util::read_u32_sync(&mut file)?;
-        if magic != AliasMapFileMagicNumber {
-            bail!(
-                "Unexpected magic number {:x}, expecting {:x} for alias-map file {:016x}.gra",
-                magic,
-                AliasMapFileMagicNumber,
-                hash
-            );
-        }
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-        let map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-            serde_cbor::from_slice(&buf)?;
-        Ok(map)
+        let mmap = unsafe { Mmap::map(&file)? };
+        crate::rodeo::alias_sidecar::AliasSidecar::from_mmap(Arc::new(mmap))
     }
 
     pub fn item_from_index_loc(&self, index_loc: &ItemLoc) -> Option<Item> {
@@ -1217,17 +1188,17 @@ async fn test_alias_lookup_through_sidecar() {
     let Some(cluster) = files.pop() else {
         return;
     };
-    // Only v4 clusters have a non-empty alias map.
-    let Some((canonical, alts)) = cluster
-        .alias_map
-        .iter()
-        .find(|(_, alts)| !alts.is_empty())
-    else {
-        eprintln!("No aliases in cluster — skipping (cluster is likely v1)");
+    // Only v4 clusters have a sidecar; v1 clusters skip the rest.
+    let Some(sidecar) = cluster.alias_sidecar.as_ref() else {
+        eprintln!("No alias sidecar — skipping (cluster is likely v1)");
         return;
     };
-    let canonical = canonical.clone();
-    let alt = alts.iter().next().unwrap().clone();
+    // Pick any canonical entry that has at least one alternate.
+    let (canonical, alts) = (0..sidecar.canon_count())
+        .filter_map(|i| sidecar.canonical_entry(i))
+        .find(|(_, alts)| !alts.is_empty())
+        .expect("v4 sidecar should have at least one canonical with alternates");
+    let alt = alts.into_iter().next().unwrap();
 
     // 1. /item/<alt> synthesises the stub.
     let stub = cluster
