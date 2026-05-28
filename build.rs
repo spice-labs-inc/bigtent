@@ -1,7 +1,6 @@
 // build.rs
-extern crate vergen;
-use vergen::*;
-use vergen_git2::Git2Builder;
+use vergen_git2::*;
+
 fn main() {
     let build = BuildBuilder::all_build().expect("Should be able to generate build time info");
     let cargo = CargoBuilder::all_cargo().expect("Should be able to generate build time info");
