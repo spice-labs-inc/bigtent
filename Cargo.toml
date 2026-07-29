@@ -66,6 +66,7 @@ flume = { version = "0.11", features = ["spin", "async"] }
 libc = "0.2"
 memmap2 = { version = "0.9" }
 opentelemetry = "0.32"
+rustc-hash = "1.1"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.33"
@@ -85,6 +86,7 @@ uuid = { version = "1.16", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.5"
+proptest = "1.5"
 
 [features]
 

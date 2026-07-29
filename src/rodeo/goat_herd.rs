@@ -239,6 +239,7 @@ async fn test_purls_and_merge() {
         10_000, /* a nice round limit for the merge buffer */
         &dest_dir,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        15, /* default merge buffer size in GB */
     )
     .await
     .expect("Should do a merge");

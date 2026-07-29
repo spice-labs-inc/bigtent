@@ -84,6 +84,12 @@ pub struct Args {
     #[arg(long, short, default_value_t = 10_000)]
     pub buffer_limit: usize,
 
+    /// Applies to `fresh_merge` jobs: set the maximum size of each in-memory `.grd` data buffer in
+    /// gigabytes. Lower values reduce peak memory usage at the cost of smaller data files.
+    /// Default is 15 GB.
+    #[arg(long, default_value_t = 15)]
+    pub merge_buffer_size: usize,
+
     /// Path to a JSON file containing an array of identifier strings to look up
     /// in the loaded cluster(s).
     ///
@@ -224,5 +230,25 @@ mod tests {
         let args = Args::default();
         let source = args.cluster_source().unwrap();
         assert!(source.is_none());
+    }
+
+    #[test]
+    fn test_merge_buffer_size_default() {
+        let args = Args::parse_from(["bigtent", "--fresh-merge", "/tmp/a", "--dest", "/tmp/out"]);
+        assert_eq!(args.merge_buffer_size, 15);
+    }
+
+    #[test]
+    fn test_merge_buffer_size_parses() {
+        let args = Args::parse_from([
+            "bigtent",
+            "--fresh-merge",
+            "/tmp/a",
+            "--dest",
+            "/tmp/out",
+            "--merge-buffer-size",
+            "8",
+        ]);
+        assert_eq!(args.merge_buffer_size, 8);
     }
 }
