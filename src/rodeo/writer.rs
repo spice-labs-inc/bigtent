@@ -206,16 +206,18 @@ impl ClusterWriter {
     pub async fn finalize_cluster(&mut self) -> Result<PathBuf> {
         if self.previous_position != 0 {
             self.write_data_and_index().await?;
-            info!("Waiting for data and index file write to complete");
-            while self
-                .current_write_cnt
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0
-            {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            info!("Data and index file write complete");
         }
+        // Wait for any in-flight data/index file writes (they update the file sets the
+        // .grc file will reference) before building the cluster file.
+        info!("Waiting for data and index file write to complete");
+        while self
+            .current_write_cnt
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        info!("Data and index file write complete");
 
         let mut cluster_file = vec![];
         {
