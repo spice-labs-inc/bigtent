@@ -225,6 +225,7 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
         args.buffer_limit,
         dest,
         Arc::new(AtomicBool::new(true)),
+        args.merge_buffer_size,
     )
     .await;
     info!(

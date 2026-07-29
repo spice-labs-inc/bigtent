@@ -84,6 +84,7 @@ pub struct ClusterWriter {
     index_files: Arc<Mutex<BTreeSet<u64>>>,
     items_written: usize,
     current_write_cnt: Arc<AtomicUsize>,
+    max_data_file_size: usize,
 }
 
 impl ClusterWriter {
@@ -118,6 +119,13 @@ impl ClusterWriter {
     }
 
     pub async fn new<I: Into<PathBuf>>(dir: I) -> Result<ClusterWriter> {
+        Self::new_with_max_size(dir, Self::MAX_DATA_FILE_SIZE).await
+    }
+
+    pub async fn new_with_max_size<I: Into<PathBuf>>(
+        dir: I,
+        max_data_file_size: usize,
+    ) -> Result<ClusterWriter> {
         let dir_path: PathBuf = dir.into();
         if !dir_path.exists() {
             tokio::fs::create_dir_all(&dir_path).await?;
@@ -139,6 +147,7 @@ impl ClusterWriter {
             index_files: Arc::new(Mutex::new(BTreeSet::new())),
             items_written: 0,
             current_write_cnt: Arc::new(AtomicUsize::new(0)),
+            max_data_file_size,
         };
 
         my_writer.write_data_envelope_start().await?;
@@ -158,6 +167,16 @@ impl ClusterWriter {
     /// `Item`s should be written in order by MD5 hash of the `item.identifier`
     pub async fn write_item(&mut self, item: Item, cbor_bytes: Vec<u8>) -> Result<()> {
         let the_hash = md5hash_str(&item.identifier);
+        self.write_item_with_hash(cbor_bytes, the_hash).await
+    }
+
+    /// add CBOR-encoded item bytes using a precomputed MD5 hash.
+    /// This avoids recomputing the hash in the writer hot path.
+    pub async fn write_item_with_hash(
+        &mut self,
+        cbor_bytes: Vec<u8>,
+        the_hash: MD5Hash,
+    ) -> Result<()> {
         let cur_pos = self.dest_data.len();
 
         let item_bytes = cbor_bytes; //serde_cbor::to_vec(&item)?;
@@ -174,7 +193,7 @@ impl ClusterWriter {
         self.previous_position = cur_pos;
 
         if self.index_info.len() > ClusterWriter::MAX_INDEX_CNT
-            || self.dest_data.len() > ClusterWriter::MAX_DATA_FILE_SIZE
+            || self.dest_data.len() > self.max_data_file_size
         {
             self.write_data_and_index().await?;
         }
@@ -187,16 +206,18 @@ impl ClusterWriter {
     pub async fn finalize_cluster(&mut self) -> Result<PathBuf> {
         if self.previous_position != 0 {
             self.write_data_and_index().await?;
-            info!("Waiting for data and index file write to complete");
-            while self
-                .current_write_cnt
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0
-            {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            info!("Data and index file write complete");
         }
+        // Wait for any in-flight data/index file writes (they update the file sets the
+        // .grc file will reference) before building the cluster file.
+        info!("Waiting for data and index file write to complete");
+        while self
+            .current_write_cnt
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        info!("Data and index file write complete");
 
         let mut cluster_file = vec![];
         {
@@ -436,3 +457,69 @@ impl ClusterWriter {
 }
 
 pub const DATA_FILE_ENVELOPE_VERSION: u32 = 1u32;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn tiny_item() -> Item {
+        Item {
+            identifier: "gitoid:test".to_string(),
+            connections: BTreeSet::new(),
+            body_mime_type: None,
+            body: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_new_with_max_size_respects_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut writer = ClusterWriter::new_with_max_size(dir.path(), 1)
+            .await
+            .expect("Should create writer");
+        let cbor = serde_cbor::to_vec(&tiny_item()).unwrap();
+        writer
+            .write_item_with_hash(cbor, [0u8; 16])
+            .await
+            .expect("Should write item");
+        writer
+            .finalize_cluster()
+            .await
+            .expect("Should finalize cluster");
+
+        let grd_files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "grd")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !grd_files.is_empty(),
+            "Should produce at least one .grd file with a tiny max size"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_item_with_hash_uses_provided_hash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut writer = ClusterWriter::new(dir.path())
+            .await
+            .expect("Should create writer");
+        let cbor = serde_cbor::to_vec(&tiny_item()).unwrap();
+        let hash = [42u8; 16];
+        writer
+            .write_item_with_hash(cbor, hash)
+            .await
+            .expect("Should write item with precomputed hash");
+        assert_eq!(writer.items_written, 1);
+        writer
+            .finalize_cluster()
+            .await
+            .expect("Should finalize cluster");
+    }
+}
