@@ -43,10 +43,11 @@
 //! - `cluster_info.jsonl` - Cluster metadata in JSON Lines format
 
 use rustc_hash::FxHashMap;
+use serde_cbor::value::{from_value, to_value};
 use serde_json::json;
 use serde_jsonlines::write_json_lines;
 use std::{
-    collections::{BTreeSet, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet},
     fs::{self, File},
     io::{BufWriter, Write},
     path::PathBuf,
@@ -65,6 +66,7 @@ use tracing::info; // Use log crate when building application
 use std::println as info;
 
 use crate::{
+    item::{EdgeType, ITEM_METADATA_MIME_TYPE, Item, ItemMetaData},
     rodeo::{
         goat_trait::GoatRodeoTrait,
         index::{HasHash, ItemOffset},
@@ -177,11 +179,12 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 
         max_merge_len += index_len;
     }
-
+    let cluster_pos_len = cluster_positions.len();
     let mut index_holder = IndexHolder::new(cluster_positions);
 
     info!(
-        "Read indicies at {:?}",
+        "Read {} indicies at {:?}",
+        cluster_pos_len,
         Instant::now().duration_since(start)
     );
 
@@ -201,8 +204,8 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     // === PHASE 2: Set up threading infrastructure ===
     //
     // Channel for coordinator -> workers: sends (position, items_to_merge)
-    // Bounded to 200,000 to prevent unbounded memory growth
-    let (offset_tx, offset_rx) = flume::bounded(200_000);
+    // Bounded to 20,000 to prevent unbounded memory growth
+    let (offset_tx, offset_rx) = flume::bounded(1_000);
 
     // Atomic counter for backpressure control
     // Tracks how many items are currently being processed
@@ -266,10 +269,10 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     threads.push(coorindator_handle);
 
     // === WORKER THREADS ===
-    // 20 threads fetch items from clusters and merge them
+    // 50 threads fetch items from clusters and merge them
     // Channel for workers -> main thread: sends merged items
-    let (merged_tx, merged_rx) = flume::bounded(200_000);
-    for thread_num in 0..20 {
+    let (merged_tx, merged_rx) = flume::bounded(1_000);
+    for thread_num in 0..50 {
         let rx = offset_rx.clone();
         let tx = merged_tx.clone();
         let is_live = is_live.clone();
@@ -280,9 +283,11 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                 if !is_live.load(Ordering::Relaxed) {
                     break;
                 }
-
+                let start_merge = Instant::now();
                 let mut to_merge = vec![];
-                let mut purls = vec![];
+                let mut purls = HashSet::new();
+                let mut id: String = "".to_string();
+
                 for (offset, cluster) in &items_to_merge {
                     let merge_final = match cluster.item_from_item_offset(offset) {
                         Some(v) => v,
@@ -290,23 +295,116 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                             break;
                         }
                     };
+
                     merge_final
                         .connections
                         .iter()
                         .filter(|v| v.1.starts_with("pkg:"))
-                        .for_each(|v| purls.push(v.1.to_string()));
-
+                        .for_each(|v| {
+                            purls.insert(v.1.to_string());
+                        });
+                    if id.len() == 0 {
+                        id = merge_final.identifier.clone();
+                    }
                     to_merge.push(merge_final);
                 }
 
-                let mut top = match to_merge.pop() {
-                    Some(v) => v,
-                    None => continue,
-                };
+                let top = {
+                    let cmp = Some(ITEM_METADATA_MIME_TYPE.to_string());
+                    let all_same = to_merge
+                        .iter()
+                        .all(|item| item.body_mime_type == cmp && item.body.is_some());
 
-                for i in to_merge {
-                    top = top.merge(i);
-                }
+                    // if there's only 1 item, do no merging
+                    if to_merge.len() == 1 {
+                        to_merge.pop().unwrap()
+                    } else if all_same {
+                        let mut file_size = 0;
+                        let mut connections = BTreeSet::new();
+                        let mut bodies = Vec::with_capacity(to_merge.len());
+                        for mut item in to_merge {
+                            let conns: HashSet<String> = item
+                                .connections
+                                .iter()
+                                .filter(|v| {
+                                    v.0.is_contained_by_up() && v.1.starts_with("gitoid:blob:")
+                                })
+                                .map(|v| v.1.to_string())
+                                .collect();
+                            connections.append(&mut item.connections);
+
+                            let body: ItemMetaData = from_value(item.body.unwrap()).unwrap();
+                            file_size = body.file_size;
+                            bodies.push((body, conns));
+                        }
+
+                        let mut extra = BTreeMap::new();
+                        let mut file_names = BTreeSet::new();
+                        let mut mime_type = BTreeSet::new();
+
+                        fn update_filenames(
+                            filenames: BTreeSet<String>,
+                            conns: HashSet<String>,
+                        ) -> BTreeSet<String> {
+                            let mut ret = BTreeSet::new();
+
+                            for name in filenames {
+                                if name.starts_with("gitoid:blob:") {
+                                    ret.insert(name);
+                                } else {
+                                    for c in &conns {
+                                        ret.insert(format!("{c}:{name}"));
+                                    }
+                                }
+                            }
+
+                            ret
+                        }
+
+                        for (mut body, conns) in bodies {
+                            mime_type.append(&mut body.mime_type);
+                            for (k, mut v) in body.extra {
+                                match extra.get_mut(&k) {
+                                    None => {
+                                        extra.insert(k, v);
+                                    }
+                                    Some(vv) => {
+                                        vv.append(&mut v);
+                                    }
+                                };
+                            }
+
+                            if file_names.is_empty() {
+                                file_names = update_filenames(body.file_names, conns);
+                            } else if file_names != body.file_names {
+                                file_names.append(&mut update_filenames(body.file_names, conns));
+                            } // the filenames match... and are set... do nothing
+                        }
+
+                        Item {
+                            identifier: id,
+                            connections,
+                            body_mime_type: cmp.clone(),
+                            body: Some(
+                                to_value(ItemMetaData {
+                                    extra,
+                                    file_names,
+                                    file_size,
+                                    mime_type,
+                                })
+                                .unwrap(),
+                            ),
+                        }
+                    } else {
+                        let mut top = to_merge.pop().unwrap();
+
+                        for i in to_merge {
+                            top = top.merge(i);
+                        }
+
+                        top
+                    }
+                };
 
                 let hash = md5hash_str(&top.identifier);
                 let cbor_bytes = match serde_cbor::to_vec(&top) {
@@ -316,6 +414,17 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                         continue;
                     }
                 };
+
+                let delta = Instant::now().duration_since(start_merge);
+                if delta > Duration::from_secs(5) {
+                    info!(
+                        "Merge of {} with {} connections took {:?}",
+                        top.identifier,
+                        top.connections.len(),
+                        delta
+                    );
+                }
+
                 // only send if things are still alive
                 if is_live.load(Ordering::Relaxed) {
                     match tx.send(ItemOrPurl::Item {
@@ -383,7 +492,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                             .await
                             .with_context(|| format!("Failed writing {:?}", dest))?;
 
-                        // Log, but only once per 2.5M output items
+                        // Log, but only once per 2M output items
                         if should_log_progress(loop_cnt, last_log_loop_cnt) {
                             last_log_loop_cnt = loop_cnt;
                             let diff = merge_start.elapsed();
@@ -505,7 +614,7 @@ enum ItemOrPurl {
         pos: usize,
         cbor_bytes: Vec<u8>,
         merged: usize,
-        purls: Vec<String>,
+        purls: HashSet<String>,
         hash: MD5Hash,
     },
 }
@@ -646,7 +755,7 @@ fn compute_merge_eta(
 
 /// Determine whether a progress log should be emitted at this loop count.
 fn should_log_progress(loop_cnt: usize, last_log_loop_cnt: usize) -> bool {
-    loop_cnt > 0 && loop_cnt.saturating_sub(last_log_loop_cnt) >= 2_500_000
+    loop_cnt > 0 && loop_cnt.saturating_sub(last_log_loop_cnt) >= 2_000_000
 }
 
 #[cfg(test)]
@@ -818,19 +927,6 @@ mod tests {
         assert_eq!(ratio, 0.0);
     }
 
-    #[test]
-    fn test_progress_log_once_per_2_5m_boundary() {
-        let mut last = 0usize;
-        assert!(!should_log_progress(1, last));
-        assert!(should_log_progress(2_500_000, last));
-        last = 2_500_000;
-        assert!(!should_log_progress(2_500_001, last));
-        assert!(!should_log_progress(4_999_999, last));
-        assert!(should_log_progress(5_000_000, last));
-        last = 5_000_000;
-        assert!(should_log_progress(7_500_000, last));
-    }
-
     use proptest::prelude::*;
 
     proptest! {
@@ -855,7 +951,7 @@ mod tests {
         ) {
             let loop_cnt = last + delta;
             let should_log = should_log_progress(loop_cnt, last);
-            prop_assert_eq!(should_log, delta >= 2_500_000 && loop_cnt > 0);
+            prop_assert_eq!(should_log, delta >= 2_000_000 && loop_cnt > 0);
         }
 
         #[test]
