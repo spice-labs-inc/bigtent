@@ -403,13 +403,13 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                 let delta = Instant::now().duration_since(start_merge);
                 if delta > Duration::from_secs(5) {
                     info!(
-                        "Merge of {} with {} connections took {:?}",
+                        "Large Merge of {} with {} connections took {:?}",
                         top.identifier,
                         top.connections.len(),
                         delta
                     );
-                } else if top.connections.len() > 25_000 {
-                    info!("Item {} has {} connections", top.identifier, top.connections.len());
+                } else if top.connections.len() > 500_000 {
+                    info!("Large Item {} has {} connections", top.identifier, top.connections.len());
                 }
 
                 // only send if things are still alive
