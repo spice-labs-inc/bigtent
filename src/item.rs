@@ -87,29 +87,8 @@ use utoipa::ToSchema;
 ///
 /// - `v1`, `v2`: The values to merge
 /// - `depth`: Current recursion depth (0 = top level)
-/// - `v1_contains`, `v2_contains`: Closures returning container GitOIDs for filename disambiguation
-fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
-    v1: &Value,
-    v2: &Value,
-    depth: usize,
-    v1_contains: &F,
-    v2_contains: &F2,
-) -> Value {
-    // Expand a filename Value into prefixed versions with container GitOIDs
-    // e.g., "foo.rs" -> ["foo.rs", "gitoid123!foo.rs", "gitoid456!foo.rs"]
-    fn fix(filename: &Value, gitoids: Vec<String>) -> Vec<String> {
-        let expanded_filename = fix_uno(filename);
-        let mut ret = vec![];
-        for the_filename in expanded_filename {
-            ret.push(the_filename.clone());
-            for gitoid in &gitoids {
-                ret.push(format!("{}!{}", gitoid, the_filename));
-            }
-        }
 
-        ret
-    }
-
+fn merge_values(v1: &Value, v2: &Value, depth: usize) -> Value {
     // Extract string(s) from a Value (handles both single strings and arrays)
     fn fix_uno(s: &Value) -> Vec<String> {
         match s {
@@ -162,17 +141,9 @@ fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
                                 }
 
                                 // create the mapping
-                                (_, tsize, osize) => {
-                                    let mut v1_with_mapping = if tsize > 1 {
-                                        fix_uno(&names[0])
-                                    } else {
-                                        fix(&names[0], v1_contains())
-                                    };
-                                    let mut v2_with_mapping = if osize > 1 {
-                                        fix_uno(&v2_names[0])
-                                    } else {
-                                        fix(&v2_names[0], v2_contains())
-                                    };
+                                (_, _, _) => {
+                                    let mut v1_with_mapping = fix_uno(&names[0]);
+                                    let mut v2_with_mapping = fix_uno(&v2_names[0]);
                                     v1_with_mapping.append(&mut v2_with_mapping);
                                     let mut the_final = BTreeSet::new();
                                     for s in v1_with_mapping {
@@ -185,7 +156,7 @@ fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
                     }
 
                     (v, Some(ov)) => {
-                        let to_insert = merge_values(v, ov, depth + 1, v1_contains, v2_contains);
+                        let to_insert = merge_values(v, ov, depth + 1);
                         // remaining.remove(k);
                         ret.insert(k.clone(), to_insert);
                     }
@@ -204,13 +175,6 @@ fn merge_values<F: Fn() -> Vec<String>, F2: Fn() -> Vec<String>>(
 
 #[test]
 fn test_merge() {
-    fn gimme_vec() -> Vec<String> {
-        vec!["foo".into(), "bar".into()]
-    }
-    fn gimme_vec2() -> Vec<String> {
-        vec!["baz".into(), "cat".into()]
-    }
-
     let foo = Value::Text("foo".to_string());
     let v1 = Value::Array(vec![foo.clone()]);
     let bar = Value::Text("bar".to_string());
@@ -218,14 +182,11 @@ fn test_merge() {
     let v1_2 = Value::Array(vec![bar.clone(), foo.clone()]);
     let m1 = Value::Map(BTreeMap::from([(foo.clone(), v1.clone())]));
     let m2 = Value::Map(BTreeMap::from([(foo.clone(), v2.clone())]));
-    assert_eq!(foo, merge_values(&foo, &foo, 0, &gimme_vec, &gimme_vec2));
-    assert_eq!(v1, merge_values(&v1, &foo, 0, &gimme_vec, &gimme_vec2));
-    assert_eq!(v1, merge_values(&v1, &v1, 0, &gimme_vec, &gimme_vec2));
-    assert_eq!(
-        v1_2.clone(),
-        merge_values(&v1, &v2, 0, &gimme_vec, &gimme_vec2)
-    );
-    let merge1 = merge_values(&m1, &m2, 0, &gimme_vec, &gimme_vec2);
+    assert_eq!(foo, merge_values(&foo, &foo, 0));
+    assert_eq!(v1, merge_values(&v1, &foo, 0));
+    assert_eq!(v1, merge_values(&v1, &v1, 0));
+    assert_eq!(v1_2.clone(), merge_values(&v1, &v2, 0));
+    let merge1 = merge_values(&m1, &m2, 0);
     let merged_key = match merge1 {
         Value::Map(map) => {
             let m2 = map.clone();
@@ -245,11 +206,11 @@ fn test_merge() {
         Value::Array(vec![Value::Text("bar".to_string())]),
     )]));
 
-    let merged_aa = merge_values(&a, &a, 0, &gimme_vec, &gimme_vec2);
+    let merged_aa = merge_values(&a, &a, 0);
 
     assert_eq!(a, merged_aa, "merging with self should be same");
 
-    let merged_ab = merge_values(&a, &b, 0, &gimme_vec, &gimme_vec2);
+    let merged_ab = merge_values(&a, &b, 0);
     assert_ne!(a, merged_ab, "They should differ");
     let size = match merged_ab {
         Value::Map(m) => {
@@ -266,8 +227,8 @@ fn test_merge() {
         }
     };
     assert!(
-        size == 6,
-        "there should be 6 different filenames, but got {}",
+        size == 2,
+        "there should be 2 different filenames, but got {}",
         size
     )
 }
@@ -405,13 +366,13 @@ impl From<&Item> for serde_json::Value {
 
 impl Item {
     /// Make a list of all the gitoids that this Item contains
-    pub fn list_contains(&self) -> Vec<String> {
-        self.connections
-            .iter()
-            .filter(|v| v.0.is_contained_by_up())
-            .map(|v| v.1.clone())
-            .collect()
-    }
+    // pub fn list_contains(&self) -> Vec<String> {
+    //     self.connections
+    //         .iter()
+    //         .filter(|v| v.0.is_contained_by_up())
+    //         .map(|v| v.1.clone())
+    //         .collect()
+    // }
     /// is the item a "root" item... no "up" or "tag:from"
     pub fn is_root_item(&self) -> bool {
         if self.body_mime_type != Some("application/vnd.cc.goatrodeo".to_string()) {
@@ -513,42 +474,15 @@ impl Item {
             {
                 match (from_value(a.clone()), from_value(b.clone())) {
                     (Ok::<ItemMetaData, _>(ai), Ok::<ItemMetaData, _>(bi)) => {
-                        let merged = ai.merge(bi, self, &other);
+                        let merged = ai.merge(bi);
                         (to_value(merged).ok(), self.body_mime_type.clone())
                     }
 
                     // if we can't deserialize, then try merging the CBOR
-                    _ => (
-                        Some(merge_values(a, &b, 0, &|| self.list_contains(), &|| {
-                            other.list_contains()
-                        })),
-                        self.body_mime_type.clone(),
-                    ),
+                    _ => (Some(merge_values(a, &b, 0)), self.body_mime_type.clone()),
                 }
             }
-            (Some(a), Some(b), true) => (
-                Some(merge_values(
-                    a,
-                    &b,
-                    0,
-                    &|| {
-                        self.connections
-                            .iter()
-                            .filter(|v| v.0.is_contained_by_up())
-                            .map(|v| v.1.to_string())
-                            .collect()
-                    },
-                    &|| {
-                        other
-                            .connections
-                            .iter()
-                            .filter(|v| v.0.is_contained_by_up())
-                            .map(|v| v.1.to_string())
-                            .collect()
-                    },
-                )),
-                self.body_mime_type.clone(),
-            ),
+            (Some(a), Some(b), true) => (Some(merge_values(a, &b, 0)), self.body_mime_type.clone()),
             _ => (self.body.clone(), self.body_mime_type.clone()),
         };
 
@@ -643,61 +577,12 @@ pub struct ItemMetaData {
 }
 
 impl ItemMetaData {
-    pub fn merge(&self, other: ItemMetaData, self_item: &Item, other_item: &Item) -> ItemMetaData {
-        fn fix(filename: String, gitoids: Vec<String>) -> BTreeSet<String> {
-            let mut ret: BTreeSet<String> = gitoids
-                .iter()
-                .map(|go| format!("{go}!${filename}"))
-                .collect();
-
-            ret.insert(filename);
-
-            ret
-        }
-
+    pub fn merge(&self, other: ItemMetaData) -> ItemMetaData {
         let mut merged_filenames = self.file_names.clone();
         merged_filenames.append(&mut other.file_names.clone());
 
-        let resolved_filenames = match (
-            merged_filenames.len(),
-            self.file_names.len(),
-            other.file_names.len(),
-        ) {
-            // if there's only one filename, then it's a clean merge
-            (1, _, _) => merged_filenames,
-
-            // if both have already done the filename to gitoid mapping, then it's safe to merge
-            (_, tsize, osize) if tsize > 1 && osize > 1 => merged_filenames,
-
-            // create the mapping
-            (_, tsize, osize) => {
-                let mut this_with_mapping: BTreeSet<String> = if tsize > 1 {
-                    self.file_names.clone()
-                } else if tsize == 0 {
-                    BTreeSet::new()
-                } else {
-                    fix(
-                        self.file_names.first().expect("Just tested").clone(),
-                        self_item.list_contains(),
-                    )
-                };
-                let mut other_with_mapping = if osize > 1 {
-                    other.file_names.clone()
-                } else if osize == 0 {
-                    BTreeSet::new()
-                } else {
-                    fix(
-                        other.file_names.first().expect("Just tested").clone(),
-                        other_item.list_contains(),
-                    )
-                };
-                this_with_mapping.append(&mut other_with_mapping);
-                this_with_mapping
-            }
-        };
-
         ItemMetaData {
-            file_names: resolved_filenames,
+            file_names: merged_filenames,
             mime_type: {
                 let mut it = self.mime_type.clone();
                 it.extend(other.mime_type.clone());

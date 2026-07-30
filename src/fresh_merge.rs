@@ -17,7 +17,7 @@
 //! ```text
 //! ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
 //! │ Coordinator │────>│ Worker Pool  │────>│ Main Thread │
-//! │   Thread    │     │ (20 threads) │     │  (Writer)   │
+//! │   Thread    │     │ (   threads) │     │  (Writer)   │
 //! └─────────────┘     └──────────────┘     └─────────────┘
 //!       │                    │                    │
 //!       │ finds items        │ fetches &          │ writes to
@@ -66,7 +66,7 @@ use tracing::info; // Use log crate when building application
 use std::println as info;
 
 use crate::{
-    item::{EdgeType, ITEM_METADATA_MIME_TYPE, Item, ItemMetaData},
+    item::{ITEM_METADATA_MIME_TYPE, Item, ItemMetaData},
     rodeo::{
         goat_trait::GoatRodeoTrait,
         index::{HasHash, ItemOffset},
@@ -97,7 +97,7 @@ use thousands::Separable;
 ///    - Sends work to worker threads via channel
 ///    - Implements backpressure via `merge_buffer_limit`
 ///
-/// 3. **Worker Threads (20 threads)**
+/// 3. **Worker Threads (threads)**
 ///    - Receive item offsets from coordinator
 ///    - Fetch actual Items from source clusters
 ///    - Merge items with same identifier
@@ -114,6 +114,7 @@ use thousands::Separable;
 /// - `clusters`: Source clusters to merge
 /// - `merge_buffer_limit`: Max items in processing queue (backpressure control)
 /// - `dest_directory`: Output directory for the merged cluster
+/// - `block_list`: Identifiers that should be excluded from the merged output
 /// - `is_live`: Atomic flag to signal early termination
 /// - `merge_buffer_size_gb`: Max size of each in-memory `.grd` data buffer in GB
 ///
@@ -133,6 +134,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     clusters: Vec<Arc<HerdMember>>,
     merge_buffer_limit: usize,
     dest_directory: PB,
+    block_list: Arc<HashSet<String>>,
     is_live: Arc<AtomicBool>,
     merge_buffer_size_gb: usize,
 ) -> Result<()> {
@@ -204,7 +206,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     // === PHASE 2: Set up threading infrastructure ===
     //
     // Channel for coordinator -> workers: sends (position, items_to_merge)
-    // Bounded to 20,000 to prevent unbounded memory growth
+    // Bounded to prevent unbounded memory growth
     let (offset_tx, offset_rx) = flume::bounded(1_000);
 
     // Atomic counter for backpressure control
@@ -276,6 +278,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         let rx = offset_rx.clone();
         let tx = merged_tx.clone();
         let is_live = is_live.clone();
+        let block_list = Arc::clone(&block_list);
 
         let processor_handle = thread::spawn(move || {
             // let mut cnt = 0usize;
@@ -296,6 +299,10 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                         }
                     };
 
+                    if block_list.contains(&merge_final.identifier) {
+                        continue;
+                    }
+
                     merge_final
                         .connections
                         .iter()
@@ -309,7 +316,13 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                     to_merge.push(merge_final);
                 }
 
-                let top = {
+                if to_merge.is_empty() {
+                    continue;
+                }
+
+                let merged_count = to_merge.len().saturating_sub(1);
+
+                let mut top = {
                     let cmp = Some(ITEM_METADATA_MIME_TYPE.to_string());
                     let all_same = to_merge
                         .iter()
@@ -323,45 +336,18 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                         let mut connections = BTreeSet::new();
                         let mut bodies = Vec::with_capacity(to_merge.len());
                         for mut item in to_merge {
-                            let conns: HashSet<String> = item
-                                .connections
-                                .iter()
-                                .filter(|v| {
-                                    v.0.is_contained_by_up() && v.1.starts_with("gitoid:blob:")
-                                })
-                                .map(|v| v.1.to_string())
-                                .collect();
                             connections.append(&mut item.connections);
 
                             let body: ItemMetaData = from_value(item.body.unwrap()).unwrap();
                             file_size = body.file_size;
-                            bodies.push((body, conns));
+                            bodies.push(body);
                         }
 
                         let mut extra = BTreeMap::new();
                         let mut file_names = BTreeSet::new();
                         let mut mime_type = BTreeSet::new();
 
-                        fn update_filenames(
-                            filenames: BTreeSet<String>,
-                            conns: HashSet<String>,
-                        ) -> BTreeSet<String> {
-                            let mut ret = BTreeSet::new();
-
-                            for name in filenames {
-                                if name.starts_with("gitoid:blob:") {
-                                    ret.insert(name);
-                                } else {
-                                    for c in &conns {
-                                        ret.insert(format!("{c}:{name}"));
-                                    }
-                                }
-                            }
-
-                            ret
-                        }
-
-                        for (mut body, conns) in bodies {
+                        for mut body in bodies {
                             mime_type.append(&mut body.mime_type);
                             for (k, mut v) in body.extra {
                                 match extra.get_mut(&k) {
@@ -374,11 +360,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                                 };
                             }
 
-                            if file_names.is_empty() {
-                                file_names = update_filenames(body.file_names, conns);
-                            } else if file_names != body.file_names {
-                                file_names.append(&mut update_filenames(body.file_names, conns));
-                            } // the filenames match... and are set... do nothing
+                            file_names.append(&mut body.file_names);
                         }
 
                         Item {
@@ -406,6 +388,9 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                     }
                 };
 
+                top.connections
+                    .retain(|(_, target)| !block_list.contains(target));
+
                 let hash = md5hash_str(&top.identifier);
                 let cbor_bytes = match serde_cbor::to_vec(&top) {
                     Ok(v) => v,
@@ -430,7 +415,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                     match tx.send(ItemOrPurl::Item {
                         pos: position,
                         cbor_bytes,
-                        merged: items_to_merge.len() - 1,
+                        merged: merged_count,
                         purls,
                         hash,
                     }) {
@@ -801,7 +786,7 @@ fn linear_scan_next_hash(
 mod tests {
     use super::*;
     use crate::{
-        item::Item,
+        item::{CONTAINS, Item},
         rodeo::{
             goat::GoatRodeoCluster,
             member::{member_core, member_synth},
@@ -925,6 +910,91 @@ mod tests {
         assert_eq!(estimated, 0);
         assert_eq!(remaining, 0.0);
         assert_eq!(ratio, 0.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_block_list_filters_items_and_edges() {
+        use tempfile::tempdir;
+
+        let blocked =
+            "gitoid:blob:sha256:0000000000000000000000000000000000000000000000000000000000000001";
+        let keep_a =
+            "gitoid:blob:sha256:0000000000000000000000000000000000000000000000000000000000000002";
+        let keep_b =
+            "gitoid:blob:sha256:0000000000000000000000000000000000000000000000000000000000000003";
+
+        fn make_connected_item(identifier: &str, targets: &[&str]) -> Item {
+            Item {
+                identifier: identifier.to_string(),
+                connections: targets
+                    .iter()
+                    .map(|t| (CONTAINS.to_string(), t.to_string()))
+                    .collect(),
+                body_mime_type: None,
+                body: None,
+            }
+        }
+
+        let cluster_a = member_synth(RoboticGoat::new(
+            "a",
+            vec![
+                make_connected_item(blocked, &[]),
+                make_connected_item(keep_a, &[blocked]),
+            ],
+            serde_json::Value::Null,
+        ));
+        let cluster_b = member_synth(RoboticGoat::new(
+            "b",
+            vec![
+                make_connected_item(blocked, &[]),
+                make_connected_item(keep_b, &[]),
+            ],
+            serde_json::Value::Null,
+        ));
+
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path().to_path_buf();
+        let block_list = {
+            let mut s = HashSet::new();
+            s.insert(blocked.to_string());
+            Arc::new(s)
+        };
+
+        merge_fresh(
+            vec![cluster_a, cluster_b],
+            1_000,
+            &dest,
+            block_list,
+            Arc::new(AtomicBool::new(true)),
+            1,
+        )
+        .await
+        .expect("merge should succeed");
+
+        let mut clusters = GoatRodeoCluster::cluster_files_in_dir(dest, false, vec![])
+            .await
+            .expect("should read output cluster");
+        let cluster = clusters.pop().expect("output cluster should exist");
+
+        assert!(
+            cluster.item_for_identifier(blocked).is_none(),
+            "blocked item should not appear in output"
+        );
+        assert!(
+            cluster.item_for_identifier(keep_b).is_some(),
+            "keep_b should appear in output"
+        );
+
+        let kept_a = cluster
+            .item_for_identifier(keep_a)
+            .expect("keep_a should appear in output");
+        assert!(
+            !kept_a
+                .connections
+                .iter()
+                .any(|(_, target)| target == blocked),
+            "edges pointing to blocked items should be removed"
+        );
     }
 
     use proptest::prelude::*;

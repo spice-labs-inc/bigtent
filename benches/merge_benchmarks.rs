@@ -6,6 +6,7 @@ use bigtent::fresh_merge::merge_fresh;
 use bigtent::rodeo::goat::GoatRodeoCluster;
 use bigtent::rodeo::member::member_core;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -42,6 +43,9 @@ fn run_merge(clusters: Vec<Arc<bigtent::rodeo::member::HerdMember>>, buffer_limi
                 black_box(clusters),
                 black_box(buffer_limit),
                 black_box(dest),
+                black_box(Arc::new(HashSet::new())),
+                black_box(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+                black_box(15),
             )
             .await
             .unwrap(),

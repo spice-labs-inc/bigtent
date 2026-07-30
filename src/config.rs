@@ -90,6 +90,12 @@ pub struct Args {
     #[arg(long, default_value_t = 15)]
     pub merge_buffer_size: usize,
 
+    /// Path to a plain-text file containing identifiers to exclude from a `fresh_merge`.
+    /// One identifier per line; empty lines and lines starting with `#` are ignored.
+    /// Requires `--fresh-merge`.
+    #[arg(long)]
+    pub block_list: Option<PathBuf>,
+
     /// Path to a JSON file containing an array of identifier strings to look up
     /// in the loaded cluster(s).
     ///
@@ -250,5 +256,19 @@ mod tests {
             "8",
         ]);
         assert_eq!(args.merge_buffer_size, 8);
+    }
+
+    #[test]
+    fn test_block_list_arg_parses() {
+        let args = Args::parse_from([
+            "bigtent",
+            "--fresh-merge",
+            "/tmp/a",
+            "--dest",
+            "/tmp/out",
+            "--block-list",
+            "/tmp/blocks.txt",
+        ]);
+        assert_eq!(args.block_list, Some(PathBuf::from("/tmp/blocks.txt")));
     }
 }
