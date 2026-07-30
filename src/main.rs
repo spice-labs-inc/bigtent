@@ -45,7 +45,7 @@
 //! The binary runs on a Tokio multi-threaded runtime with 100 worker threads
 //! to handle concurrent requests and I/O operations efficiently.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use bigtent::{
     cluster_list::{load_cluster_list, load_clusters_from_dirs},
@@ -74,6 +74,7 @@ use core::slice;
 #[cfg(test)]
 use std::println as info;
 use std::{
+    collections::HashSet,
     io::Write,
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
@@ -188,6 +189,24 @@ async fn run_server(cluster_source: ClusterSource, args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Read a block-list file and return the set of identifiers to ignore.
+///
+/// The file format is one identifier per line. Empty lines and lines that start
+/// with `#` (after optional whitespace) are skipped.
+fn load_block_list(path: &PathBuf) -> Result<HashSet<String>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed reading block list {:?}", path))?;
+    let mut set = HashSet::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        set.insert(trimmed.to_string());
+    }
+    Ok(set)
+}
+
 async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
     for p in &paths {
         if !p.exists() || !p.is_dir() {
@@ -198,6 +217,12 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
         Some(d) => d.clone(),
         None => bail!("A `--dest` must be supplied"),
     };
+
+    let block_list: Arc<HashSet<String>> = match &args.block_list {
+        Some(path) => Arc::new(load_block_list(path)?),
+        None => Arc::new(HashSet::new()),
+    };
+    info!("Block list contains {} identifiers", block_list.len());
 
     let start = Instant::now();
 
@@ -224,6 +249,7 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
         clusters,
         args.buffer_limit,
         dest,
+        block_list,
         Arc::new(AtomicBool::new(true)),
         args.merge_buffer_size,
     )
@@ -471,6 +497,11 @@ async fn main() -> Result<()> {
     // Warn if --pid-file is used with non-server modes
     if args.pid_file.is_some() && args.rodeo.is_none() && args.cluster_list.is_none() {
         tracing::warn!("--pid-file is only meaningful in server mode (--rodeo or --cluster-list)");
+    }
+
+    // Warn if --block-list is used without --fresh-merge
+    if args.block_list.is_some() && args.fresh_merge.is_empty() {
+        tracing::warn!("--block-list is only meaningful with --fresh-merge");
     }
 
     // Check for cluster-list mode first (it's mutually exclusive with rodeo via cluster_source)
