@@ -317,6 +317,17 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                 }
 
                 if to_merge.is_empty() {
+                    if is_live.load(Ordering::Relaxed) {
+                        match tx.send(ItemOrPurl::Skipped { pos: position }) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                error!(
+                                    "Failed to send skipped marker in merge worker {thread_num} {e:?}"
+                                );
+                                break;
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -409,7 +420,11 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                         delta
                     );
                 } else if top.connections.len() > 500_000 {
-                    info!("Large Item {} has {} connections", top.identifier, top.connections.len());
+                    info!(
+                        "Large Item {} has {} connections",
+                        top.identifier,
+                        top.connections.len()
+                    );
                 }
 
                 // only send if things are still alive
@@ -443,7 +458,8 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 
     let mut next_expected = 0usize;
     let mut last_log_loop_cnt = 0usize;
-    let mut holding_pen = FxHashMap::default();
+    // None marks a position that was skipped because all items were blocked.
+    let mut holding_pen: FxHashMap<usize, Option<(Vec<u8>, MD5Hash)>> = FxHashMap::default();
 
     while let Ok(item_or_purl) = merged_rx.recv_async().await {
         // stop processing when not live
@@ -465,58 +481,53 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                     }
                 }
                 merge_cnt += merged;
-
-                if position == next_expected {
-                    // Insert new position into holding pen and increment atomic gate
-                    holding_pen.insert(position, (cbor_bytes, hash));
-
-                    while let Some((cbor_bytes, hash)) = holding_pen.remove(&next_expected) {
-                        loop_cnt += 1;
-
-                        // Decrement atomic gate for every item removed
-                        cluster_writer
-                            .write_item_with_hash(cbor_bytes, hash)
-                            .await
-                            .with_context(|| format!("Failed writing {:?}", dest))?;
-
-                        // Log, but only once per 2M output items
-                        if should_log_progress(loop_cnt, last_log_loop_cnt) {
-                            last_log_loop_cnt = loop_cnt;
-                            let diff = merge_start.elapsed();
-                            let items_per_second = (loop_cnt as f64) / diff.as_secs_f64();
-                            let (estimated_total_out, remaining_seconds, ratio) = compute_merge_eta(
-                                loop_cnt,
-                                merge_cnt,
-                                max_merge_len,
-                                items_per_second,
-                            );
-
-                            let nd: NiceDurationDisplay = remaining_seconds.into();
-                            let td: NiceDurationDisplay = merge_start.elapsed().into();
-                            info!(
-                                "Merge cnt {}m of {}m merge cnt {}m ratio {:.2}:1 at {} estimated end {} written pURLs {} holding pen cnt {}",
-                                (loop_cnt / 1_000_000).separate_with_commas(),
-                                (estimated_total_out / 1_000_000).separate_with_commas(),
-                                (merge_cnt / 1_000_000).separate_with_commas(),
-                                ratio,
-                                td,
-                                nd,
-                                seen_purls.len().separate_with_commas(),
-                                holding_pen.len()
-                            );
-                        }
-
-                        next_expected += 1;
-                    }
-                } else {
-                    // Insert an unexpected position into the holding pen
-                    holding_pen.insert(position, (cbor_bytes, hash));
-                }
-
-                // Store the current length of the holding pen
-                holding_pen_gate.store(holding_pen.len(), Ordering::Release);
+                holding_pen.insert(position, Some((cbor_bytes, hash)));
+            }
+            ItemOrPurl::Skipped { pos: position } => {
+                holding_pen.insert(position, None);
             }
         }
+
+        // Process positions in order. A `None` entry means the position was
+        // skipped because every item with that hash was blocked.
+        while let Some(entry) = holding_pen.remove(&next_expected) {
+            if let Some((cbor_bytes, hash)) = entry {
+                loop_cnt += 1;
+
+                cluster_writer
+                    .write_item_with_hash(cbor_bytes, hash)
+                    .await
+                    .with_context(|| format!("Failed writing {:?}", dest))?;
+
+                // Log, but only once per 2M output items
+                if should_log_progress(loop_cnt, last_log_loop_cnt) {
+                    last_log_loop_cnt = loop_cnt;
+                    let diff = merge_start.elapsed();
+                    let items_per_second = (loop_cnt as f64) / diff.as_secs_f64();
+                    let (estimated_total_out, remaining_seconds, ratio) =
+                        compute_merge_eta(loop_cnt, merge_cnt, max_merge_len, items_per_second);
+
+                    let nd: NiceDurationDisplay = remaining_seconds.into();
+                    let td: NiceDurationDisplay = merge_start.elapsed().into();
+                    info!(
+                        "Merge cnt {}m of {}m merge cnt {}m ratio {:.2}:1 at {} estimated end {} written pURLs {} holding pen cnt {}",
+                        (loop_cnt / 1_000_000).separate_with_commas(),
+                        (estimated_total_out / 1_000_000).separate_with_commas(),
+                        (merge_cnt / 1_000_000).separate_with_commas(),
+                        ratio,
+                        td,
+                        nd,
+                        seen_purls.len().separate_with_commas(),
+                        holding_pen.len()
+                    );
+                }
+            }
+
+            next_expected += 1;
+        }
+
+        // Store the current length of the holding pen
+        holding_pen_gate.store(holding_pen.len(), Ordering::Release);
     }
 
     if !holding_pen.is_empty() {
@@ -604,6 +615,8 @@ enum ItemOrPurl {
         purls: HashSet<String>,
         hash: MD5Hash,
     },
+    /// A position whose items were all blocked and should produce no output.
+    Skipped { pos: usize },
 }
 
 struct ClusterPos {
