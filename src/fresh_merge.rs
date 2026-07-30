@@ -408,6 +408,8 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                         top.connections.len(),
                         delta
                     );
+                } else if top.connections.len() > 25_000 {
+                    info!("Item {} has {} connections", top.identifier, top.connections.len());
                 }
 
                 // only send if things are still alive
