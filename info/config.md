@@ -35,6 +35,7 @@ bigtent --rodeo /data/clusters/ --cache-index true
 | `--fresh-merge <paths>...` | Path(s) | - | Directories containing clusters to merge |
 | `--dest <path>` | Path | Required | Output directory for merged cluster |
 | `--buffer-limit <n>` | usize | `10000` | Max items in merge queue |
+| `--merge-worker-count <n>` | usize | 75% of cores | Number of parallel merge worker threads |
 
 #### Examples
 
@@ -46,6 +47,11 @@ bigtent --fresh-merge /data/cluster1/ /data/cluster2/ --dest /data/merged/
 bigtent --fresh-merge /data/cluster1/ /data/cluster2/ \
     --dest /data/merged/ \
     --buffer-limit 5000
+
+# Constrain CPU usage during merge
+bigtent --fresh-merge /data/cluster1/ /data/cluster2/ \
+    --dest /data/merged/ \
+    --merge-worker-count 4
 ```
 
 ### Lookup Mode Arguments
@@ -208,6 +214,24 @@ Controls backpressure during merge operations:
 - Default (10,000) works well for most systems
 - Reduce to 1,000-5,000 for systems with < 8GB RAM
 - Increase to 50,000+ for high-memory systems doing large merges
+
+### `--merge-worker-count`
+
+Controls how many threads `fresh_merge` uses to fetch and merge items in
+parallel. The default is 75% of available CPU cores as reported by
+`std::thread::available_parallelism()`, which is cgroup-quota aware, with a
+minimum of 1.
+
+- **Higher values**: Faster merges on CPU-bound systems, but may starve other
+  work (e.g. HTTP health endpoints)
+- **Lower values**: Leaves headroom for other tasks, potentially slower merges
+
+**Recommendation**:
+- Use the default for dedicated batch merges
+- Reduce when running inside a container alongside query serving or health
+  endpoints
+- Set explicitly when running under Kubernetes CPU limits to avoid being OOM
+  killed or liveness-probe failures
 
 ## Legacy Configuration File
 

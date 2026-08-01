@@ -240,7 +240,8 @@ async fn test_purls_and_merge() {
         &dest_dir,
         Arc::new(std::collections::HashSet::new()),
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        15, /* default merge buffer size in GB */
+        15,  /* default merge buffer size in GB */
+        2,   /* a small, deterministic worker count for tests */
     )
     .await
     .expect("Should do a merge");
