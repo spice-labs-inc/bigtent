@@ -50,7 +50,7 @@ use arc_swap::ArcSwap;
 use bigtent::{
     cluster_list::{load_cluster_list, load_clusters_from_dirs},
     config::{Args, ClusterSource},
-    fresh_merge::merge_fresh,
+    fresh_merge::{default_merge_worker_count, merge_fresh},
     pid_file::PidFile,
     rodeo::{
         goat::GoatRodeoCluster,
@@ -245,6 +245,9 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
         );
     }
 
+    let merge_worker_count = args.merge_worker_count.unwrap_or_else(default_merge_worker_count);
+    info!("Using {} merge worker threads", merge_worker_count);
+
     let ret = merge_fresh(
         clusters,
         args.buffer_limit,
@@ -252,6 +255,7 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
         block_list,
         Arc::new(AtomicBool::new(true)),
         args.merge_buffer_size,
+        merge_worker_count,
     )
     .await;
     info!(

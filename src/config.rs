@@ -90,6 +90,11 @@ pub struct Args {
     #[arg(long, default_value_t = 15)]
     pub merge_buffer_size: usize,
 
+    /// Applies to `fresh_merge` jobs: number of worker threads used to fetch and merge items in
+    /// parallel. Defaults to 75% of available CPU cores (cgroup-aware), with a minimum of 1.
+    #[arg(long)]
+    pub merge_worker_count: Option<usize>,
+
     /// Path to a plain-text file containing identifiers to exclude from a `fresh_merge`.
     /// One identifier per line; empty lines and lines starting with `#` are ignored.
     /// Requires `--fresh-merge`.
@@ -270,5 +275,25 @@ mod tests {
             "/tmp/blocks.txt",
         ]);
         assert_eq!(args.block_list, Some(PathBuf::from("/tmp/blocks.txt")));
+    }
+
+    #[test]
+    fn test_merge_worker_count_default_is_none() {
+        let args = Args::parse_from(["bigtent", "--fresh-merge", "/tmp/a", "--dest", "/tmp/out"]);
+        assert_eq!(args.merge_worker_count, None);
+    }
+
+    #[test]
+    fn test_merge_worker_count_parses() {
+        let args = Args::parse_from([
+            "bigtent",
+            "--fresh-merge",
+            "/tmp/a",
+            "--dest",
+            "/tmp/out",
+            "--merge-worker-count",
+            "6",
+        ]);
+        assert_eq!(args.merge_worker_count, Some(6));
     }
 }

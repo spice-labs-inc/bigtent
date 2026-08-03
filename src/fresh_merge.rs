@@ -9,7 +9,7 @@
 //!
 //! 1. **Initialization**: Load all source clusters and create position trackers
 //! 2. **Coordinator Thread**: Finds items with matching hashes across clusters
-//! 3. **Worker Threads**: Fetch and merge items in parallel (20 workers)
+//! 3. **Worker Threads**: Fetch and merge items in parallel (configurable, default 75% of cores)
 //! 4. **Main Thread**: Writes merged items to the output cluster
 //!
 //! ## Threading Model
@@ -17,7 +17,7 @@
 //! ```text
 //! ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
 //! │ Coordinator │────>│ Worker Pool  │────>│ Main Thread │
-//! │   Thread    │     │ (   threads) │     │  (Writer)   │
+//! │   Thread    │     │ (N threads)  │     │  (Writer)   │
 //! └─────────────┘     └──────────────┘     └─────────────┘
 //!       │                    │                    │
 //!       │ finds items        │ fetches &          │ writes to
@@ -79,6 +79,17 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use thousands::Separable;
 
+/// Compute the default number of fresh-merge worker threads.
+///
+/// Uses `std::thread::available_parallelism()`, which is cgroup-quota aware,
+/// and returns 75% of that value with a minimum of 1.
+pub fn default_merge_worker_count() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    std::cmp::max(1, cores * 3 / 4)
+}
+
 /// Merge multiple clusters into a single new cluster.
 ///
 /// This is the main entry point for the "fresh merge" operation, which combines
@@ -97,7 +108,7 @@ use thousands::Separable;
 ///    - Sends work to worker threads via channel
 ///    - Implements backpressure via `merge_buffer_limit`
 ///
-/// 3. **Worker Threads (threads)**
+/// 3. **Worker Threads (`merge_worker_count` threads)**
 ///    - Receive item offsets from coordinator
 ///    - Fetch actual Items from source clusters
 ///    - Merge items with same identifier
@@ -117,6 +128,7 @@ use thousands::Separable;
 /// - `block_list`: Identifiers that should be excluded from the merged output
 /// - `is_live`: Atomic flag to signal early termination
 /// - `merge_buffer_size_gb`: Max size of each in-memory `.grd` data buffer in GB
+/// - `merge_worker_count`: Number of worker threads to spawn for merging
 ///
 /// ## Output Files
 ///
@@ -137,6 +149,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     block_list: Arc<HashSet<String>>,
     is_live: Arc<AtomicBool>,
     merge_buffer_size_gb: usize,
+    merge_worker_count: usize,
 ) -> Result<()> {
     let start = Instant::now();
     let dest: PathBuf = dest_directory.into();
@@ -271,10 +284,10 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     threads.push(coorindator_handle);
 
     // === WORKER THREADS ===
-    // 50 threads fetch items from clusters and merge them
+    // `merge_worker_count` threads fetch items from clusters and merge them
     // Channel for workers -> main thread: sends merged items
     let (merged_tx, merged_rx) = flume::bounded(1_000);
-    for thread_num in 0..50 {
+    for thread_num in 0..merge_worker_count {
         let rx = offset_rx.clone();
         let tx = merged_tx.clone();
         let is_live = is_live.clone();
@@ -903,6 +916,21 @@ mod tests {
     }
 
     #[test]
+    fn test_default_merge_worker_count_is_at_least_one() {
+        let count = default_merge_worker_count();
+        assert!(count >= 1, "worker count should be at least 1, got {}", count);
+    }
+
+    #[test]
+    fn test_default_merge_worker_count_is_75_percent_of_cores() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let expected = std::cmp::max(1, cores * 3 / 4);
+        assert_eq!(default_merge_worker_count(), expected);
+    }
+
+    #[test]
     fn test_merge_eta_uses_observed_ratio() {
         // 100 inputs processed, 25 outputs -> 4:1 ratio, estimated total 400 * 0.25 = 100
         let (estimated, remaining, ratio) = compute_merge_eta(25, 75, 400, 10.0);
@@ -982,6 +1010,7 @@ mod tests {
             block_list,
             Arc::new(AtomicBool::new(true)),
             1,
+            2,
         )
         .await
         .expect("merge should succeed");

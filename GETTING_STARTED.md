@@ -228,6 +228,12 @@ Merge multiple clusters into a new one:
     --fresh-merge /path/to/cluster1/ /path/to/cluster2/ \
     --dest /path/to/output/ \
     --buffer-limit 5000
+
+# Limit worker threads to leave CPU headroom for other services
+./target/release/bigtent \
+    --fresh-merge /path/to/cluster1/ /path/to/cluster2/ \
+    --dest /path/to/output/ \
+    --merge-worker-count 4
 ```
 
 ### 3. Lookup Mode

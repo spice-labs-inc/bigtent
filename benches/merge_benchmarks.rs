@@ -46,6 +46,7 @@ fn run_merge(clusters: Vec<Arc<bigtent::rodeo::member::HerdMember>>, buffer_limi
                 black_box(Arc::new(HashSet::new())),
                 black_box(Arc::new(std::sync::atomic::AtomicBool::new(true))),
                 black_box(15),
+                black_box(bigtent::fresh_merge::default_merge_worker_count()),
             )
             .await
             .unwrap(),
