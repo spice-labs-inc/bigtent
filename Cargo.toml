@@ -29,6 +29,7 @@ name = "merge_benchmarks"
 harness = false
 
 [dependencies]
+sansho = { path = "engine/sansho" }
 anyhow = "1.0"
 regex = "1.11"
 md5 = "0.7.0"
@@ -98,4 +99,7 @@ longtest = [] # feature has no explicit dependencies
 # All features enabled
 vergen = { version = "9", features = ["build", "cargo", "rustc", "si"] }
 vergen-git2 = {version = "9", features = ["build", "cargo", "rustc", "si"]}
+
+[workspace]
+members = ["engine/sansho"]
 
