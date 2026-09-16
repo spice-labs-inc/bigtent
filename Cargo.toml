@@ -99,3 +99,6 @@ longtest = [] # feature has no explicit dependencies
 vergen = { version = "9", features = ["build", "cargo", "rustc", "si"] }
 vergen-git2 = {version = "9", features = ["build", "cargo", "rustc", "si"]}
 
+[workspace]
+members = ["engine/sansho"]
+
