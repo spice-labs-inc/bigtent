@@ -34,11 +34,13 @@
 //! [`evaluate`] byte-slice entry point — arrives with the cursor phase.
 
 pub mod ast;
-pub mod corpus;
+pub mod cache;
 pub mod cbor;
+pub mod corpus;
 pub mod cursor;
 pub mod error;
 pub mod eval;
+pub mod limits;
 pub mod materialized;
 pub mod parser;
 pub mod program;
@@ -48,15 +50,18 @@ pub mod view;
 mod ast_tests;
 
 pub use ast::canonical;
+pub use cache::ProgramCache;
 pub use corpus::{Driver, DriverOutcome, Unimplemented};
 pub use error::SanshoError;
 pub use eval::Stop;
 pub use eval::{
-    evaluate_cbor, evaluate_cbor_stopped, evaluate_cbor_with_stats, evaluate_json, RealEngine,
+    RealEngine, evaluate_cbor, evaluate_cbor_stopped, evaluate_cbor_with_limits,
+    evaluate_cbor_with_stats, evaluate_json, evaluate_json_with_limits,
 };
+pub use limits::Limits;
 pub use materialized::MaterializedNode;
-pub use parser::parse;
-pub use program::{compile, Program};
+pub use parser::{parse, parse_with_limits};
+pub use program::{Program, compile};
 pub use view::{Kind, Node};
 
 /// Evaluate a [Program] against one CBOR document.

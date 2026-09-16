@@ -25,8 +25,9 @@
 use crate::ast::CmpOp;
 use crate::corpus::{Driver, DriverOutcome};
 use crate::error::SanshoError;
+use crate::limits::EvalContext;
 use crate::materialized::MaterializedNode;
-use crate::program::{compile as to_program, Edge, FnArgP, Program, Spine};
+use crate::program::{Edge, FnArgP, Program, Spine, compile as to_program};
 use crate::view::Node;
 use serde_json::Value as J;
 
@@ -58,14 +59,16 @@ pub(crate) enum Flow<N> {
 }
 
 impl<'d, N: Node<'d>> Flow<N> {
-    pub(crate) fn as_value(&self) -> Result<J, SanshoError> {
+    /// Materialize the flow, accounting its nodes and bytes against the
+    /// limits (the output/aggregation caps check here).
+    pub(crate) fn as_value(&self, context: &EvalContext) -> Result<J, SanshoError> {
         match self {
             Flow::One(node) => node.materialize(),
             Flow::Value(value) => Ok(value.clone()),
             Flow::Proj(items) => {
                 let mut array = Vec::with_capacity(items.len());
                 for item in items {
-                    array.push(item.as_value()?);
+                    array.push(item.as_value(context)?);
                 }
                 Ok(J::Array(array))
             }
@@ -97,19 +100,37 @@ impl Driver for RealEngine {
 
 /// Evaluate a program against an in-memory JSON document.
 pub fn evaluate_json(program: &Program, document: &J) -> Result<J, SanshoError> {
-    eval_program(program, document).map_err(|stop| match stop {
-        Stop::Error(e) => e,
-        Stop::NotImplemented => SanshoError::Compile {
-            message: "expression uses constructs not yet implemented".to_string(),
+    evaluate_json_with_limits(program, document, &crate::limits::Limits::default())
+}
+
+/// The limit-configurable form of the in-memory entry (the limits are
+/// SPEC-0001 §5.5's configurable bounds).
+pub fn evaluate_json_with_limits(
+    program: &Program,
+    document: &J,
+    limits: &crate::limits::Limits,
+) -> Result<J, SanshoError> {
+    let context = EvalContext::new(limits.clone());
+    let root = MaterializedNode::root(document);
+    match eval(program, &root, &context) {
+        Ok(flow) => match flow.as_value(&context) {
+            Ok(value) => {
+                context.account_output(&value)?;
+                Ok(value)
+            }
+            Err(e) => Err(Stop::from(e)),
         },
-    })
+        Err(stop) => Err(stop),
+    }
+    .map_err(|stop| stop.into_error())
 }
 
 /// Evaluate a program against one CBOR document (the byte-slice input of
 /// SPEC-0001 §2): the cursor backend, with every position decoded at
 /// most once per evaluation.
 pub fn evaluate_cbor(program: &Program, document: &[u8]) -> Result<J, SanshoError> {
-    evaluate_cbor_with_stats(program, document).0
+    evaluate_cbor_with_limits(program, document, &crate::limits::Limits::default())
+        .map_err(|stop| stop.into_error())
 }
 
 /// The instrumented form: the result plus the number of DISTINCT
@@ -118,15 +139,36 @@ pub fn evaluate_cbor_with_stats(
     program: &Program,
     document: &[u8],
 ) -> (Result<J, SanshoError>, usize) {
+    let context = EvalContext::new(crate::limits::Limits::default());
     let root = crate::cursor::CursorNode::root(document);
-    let result = match eval(program, &root) {
-        Ok(flow) => flow.as_value(),
-        Err(Stop::Error(e)) => Err(e),
-        Err(Stop::NotImplemented) => Err(SanshoError::Compile {
-            message: "expression uses constructs not yet implemented".to_string(),
-        }),
+    let result = match eval(program, &root, &context) {
+        Ok(flow) => flow
+            .as_value(&context)
+            .map_err(Stop::from)
+            .map_err(|stop| stop.into_error()),
+        Err(stop) => Err(stop.into_error()),
     };
     (result, root.decode_count())
+}
+
+/// The limit-configurable form of the byte-slice entry.
+pub fn evaluate_cbor_with_limits(
+    program: &Program,
+    document: &[u8],
+    limits: &crate::limits::Limits,
+) -> Result<J, Stop> {
+    let context = EvalContext::new(limits.clone());
+    let root = crate::cursor::CursorNode::root(document);
+    match eval(program, &root, &context) {
+        Ok(flow) => match flow.as_value(&context) {
+            Ok(value) => {
+                context.account_output(&value).map_err(Stop::from)?;
+                Ok(value)
+            }
+            Err(e) => Err(Stop::from(e)),
+        },
+        Err(stop) => Err(stop),
+    }
 }
 
 /// The phase-visible form of the CBOR entry: the not-implemented
@@ -134,30 +176,51 @@ pub fn evaluate_cbor_with_stats(
 /// scores those as not-built-yet, never as failures). Interim during the
 /// phased construction.
 pub fn evaluate_cbor_stopped(program: &Program, document: &[u8]) -> Result<J, Stop> {
-    let root = crate::cursor::CursorNode::root(document);
-    eval(program, &root).and_then(|flow| flow.as_value().map_err(Stop::from))
+    evaluate_cbor_with_limits(program, document, &crate::limits::Limits::default())
+}
+
+/// The TESTS' entry: the flow (the phase-distinction + the node-tree)
+/// visible; used by the cursor's internal probes.
+#[cfg(test)]
+pub(crate) fn eval_program_for_tests<'d, N: Node<'d>>(
+    program: &Program,
+    node: &N,
+) -> Result<Flow<N>, Stop> {
+    let context = EvalContext::new(crate::limits::Limits::default());
+    eval(program, node, &context)
 }
 
 /// The corpus harness's materialized entry: the outcome-visible form.
 pub(crate) fn eval_program(program: &Program, document: &J) -> Result<J, Stop> {
+    let context = EvalContext::new(crate::limits::Limits::default());
     let root = MaterializedNode::root(document);
-    match eval(program, &root) {
-        Ok(flow) => flow.as_value().map_err(Stop::from),
+    match eval(program, &root, &context) {
+        Ok(flow) => flow.as_value(&context).map_err(Stop::from),
         Err(stop) => Err(stop),
     }
 }
 
-fn eval<'d, N: Node<'d>>(program: &Program, node: &N) -> Result<Flow<N>, Stop> {
+fn eval<'d, N: Node<'d>>(
+    program: &Program,
+    node: &N,
+    context: &EvalContext,
+) -> Result<Flow<N>, Stop> {
+    context.step().map_err(Stop::from)?;
     match program {
-        Program::Literal(value) => Ok(Flow::Value(value.clone())),
-        Program::Spine(spine) => eval_spine(Flow::One(node.clone()), spine),
+        Program::Literal(value) => {
+            context.account_aggregation(value).map_err(Stop::from)?;
+            Ok(Flow::Value(value.clone()))
+        }
+        Program::Spine(spine) => eval_spine(Flow::One(node.clone()), spine, context),
         Program::MultiList(slots) => {
             if node.is_null() {
                 return Ok(Flow::Value(J::Null));
             }
             let mut items = Vec::with_capacity(slots.len());
             for slot in slots {
-                items.push(eval(slot, node)?.as_value()?);
+                let value = eval(slot, node, context)?.as_value(context)?;
+                context.account_aggregation(&value).map_err(Stop::from)?;
+                items.push(value);
             }
             Ok(Flow::Value(J::Array(items)))
         }
@@ -170,7 +233,8 @@ fn eval<'d, N: Node<'d>>(program: &Program, node: &N) -> Result<Flow<N>, Stop> {
             // corpus and deterministic run to run.
             let mut object = serde_json::Map::new();
             for (key, slot) in entries {
-                let value = eval(slot, node)?.as_value()?;
+                let value = eval(slot, node, context)?.as_value(context)?;
+                context.account_aggregation(&value).map_err(Stop::from)?;
                 object.insert(key.clone(), value);
             }
             Ok(Flow::Value(J::Object(object)))
@@ -180,37 +244,56 @@ fn eval<'d, N: Node<'d>>(program: &Program, node: &N) -> Result<Flow<N>, Stop> {
             // evaluates against that value through the materialized
             // backend (a computed value has no backend position); the
             // result is a computed value
-            let left_value = eval(left, node)?.as_value()?;
-            let right_flow = eval_value_flow(right, &left_value)?;
-            let value = right_flow.as_value().map_err(Stop::from)?;
+            let left_value = eval(left, node, context)?.as_value(context)?;
+            if N::counts_toward_aggregation() {
+                context
+                    .account_aggregation(&left_value)
+                    .map_err(Stop::from)?;
+            }
+            let right_flow = eval_value_flow_ctx(right, &left_value, context)?;
+            let value = right_flow.as_value(context).map_err(Stop::from)?;
             Ok(Flow::Value(value))
         }
         Program::Or(left, right) => {
-            let left_value = eval(left, node)?.as_value()?;
+            let left_value = eval(left, node, context)?.as_value(context)?;
             if truthy(&left_value) {
                 Ok(Flow::Value(left_value))
             } else {
-                eval(right, node)
+                eval(right, node, context)
             }
         }
         Program::And(left, right) => {
-            let left_value = eval(left, node)?.as_value()?;
+            let left_value = eval(left, node, context)?.as_value(context)?;
             if truthy(&left_value) {
-                eval(right, node)
+                eval(right, node, context)
             } else {
                 Ok(Flow::Value(left_value))
             }
         }
         Program::Not(inner) => {
-            let value = eval(inner, node)?.as_value()?;
+            let value = eval(inner, node, context)?.as_value(context)?;
             Ok(Flow::Value(J::Bool(!truthy(&value))))
         }
         Program::Compare(op, left, right) => {
-            let left_value = eval(left, node)?.as_value()?;
-            let right_value = eval(right, node)?.as_value()?;
+            let left_value = eval(left, node, context)?.as_value(context)?;
+            let right_value = eval(right, node, context)?.as_value(context)?;
             compare(*op, &left_value, &right_value).map(Flow::Value)
         }
-        Program::Function(name, args) => eval_function(name, args, node),
+        Program::Function(name, args) => eval_function(name, args, node, context),
+    }
+}
+
+impl Stop {
+    /// The Stop's error form: the not-implemented state maps to its
+    /// structured compile-error surrogate (for the public entries that
+    /// do not expose the phase distinction).
+    pub(crate) fn into_error(self) -> SanshoError {
+        match self {
+            Stop::Error(e) => e,
+            Stop::NotImplemented => SanshoError::Compile {
+                message: "expression uses constructs not yet implemented".to_string(),
+            },
+        }
     }
 }
 
@@ -221,33 +304,57 @@ fn eval_value_flow<'a>(
     program: &Program,
     document: &'a J,
 ) -> Result<Flow<MaterializedNode<'a>>, Stop> {
+    let context = EvalContext::new(crate::limits::Limits::default());
     let root = MaterializedNode::root(document);
-    eval(program, &root)
+    eval(program, &root, &context)
 }
 
-fn eval_spine<'d, N: Node<'d>>(input: Flow<N>, spine: &Spine) -> Result<Flow<N>, Stop> {
+/// The context-carrying materialized instantiation (the pipe's right
+/// side; the ref-programs' per-element evaluation): the sub-evaluation
+/// shares the CALLER's accounting, so the caps hold across the whole
+/// evaluation.
+fn eval_value_flow_ctx<'a>(
+    program: &Program,
+    document: &'a J,
+    context: &EvalContext,
+) -> Result<Flow<MaterializedNode<'a>>, Stop> {
+    let root = MaterializedNode::root(document);
+    eval(program, &root, context)
+}
+
+fn eval_spine<'d, N: Node<'d>>(
+    input: Flow<N>,
+    spine: &Spine,
+    context: &EvalContext,
+) -> Result<Flow<N>, Stop> {
     let mut flow = input;
     for edge in &spine.edges {
-        flow = eval_edge(flow, edge)?;
+        context.step().map_err(Stop::from)?;
+        flow = eval_edge(flow, edge, context)?;
     }
     Ok(flow)
 }
 
-fn eval_edge<'d, N: Node<'d>>(input: Flow<N>, edge: &Edge) -> Result<Flow<N>, Stop> {
+fn eval_edge<'d, N: Node<'d>>(
+    input: Flow<N>,
+    edge: &Edge,
+    context: &EvalContext,
+) -> Result<Flow<N>, Stop> {
     // the flatten operator consumes the whole flow (it is the great
     // flattener); every other edge after a projection applies per
     // element — the mapping recurses into nested projections preserving
     // shape, and null element-results drop
     if let Edge::Flatten = edge {
-        return flatten_flow(input);
+        return flatten_flow(input, context);
     }
     match input {
-        Flow::One(node) => eval_edge_on_node(node, edge),
-        Flow::Value(value) => eval_edge_on_json(value, edge),
+        Flow::One(node) => eval_edge_on_node(node, edge, context),
+        Flow::Value(value) => eval_edge_on_json(value, edge, context),
         Flow::Proj(items) => {
             let mut flows = Vec::new();
             for item in items {
-                match eval_edge(item, edge)? {
+                context.step().map_err(Stop::from)?;
+                match eval_edge(item, edge, context)? {
                     // null element-results drop (materialization is
                     // memoized, so the drop-decision is not wasted work)
                     Flow::One(node) => match node.materialize() {
@@ -264,16 +371,18 @@ fn eval_edge<'d, N: Node<'d>>(input: Flow<N>, edge: &Edge) -> Result<Flow<N>, St
     }
 }
 
-fn eval_edge_on_json<'d, N: Node<'d>>(value: J, edge: &Edge) -> Result<Flow<N>, Stop> {
+fn eval_edge_on_json<'d, N: Node<'d>>(
+    value: J,
+    edge: &Edge,
+    context: &EvalContext,
+) -> Result<Flow<N>, Stop> {
     match edge {
         Edge::Compute(program) => {
-            let flow = eval_value_flow(program, &value)?;
-            let computed = flow.as_value().map_err(Stop::from)?;
+            let flow = eval_value_flow_ctx(program, &value, context)?;
+            let computed = flow.as_value(context).map_err(Stop::from)?;
             Ok(Flow::Value(computed))
         }
-        Edge::Key(name) => Ok(Flow::Value(
-            value.get(name).cloned().unwrap_or(J::Null),
-        )),
+        Edge::Key(name) => Ok(Flow::Value(value.get(name).cloned().unwrap_or(J::Null))),
         Edge::Index(index) => {
             let resolved = match &value {
                 J::Array(items) => {
@@ -312,15 +421,11 @@ fn eval_edge_on_json<'d, N: Node<'d>>(value: J, edge: &Edge) -> Result<Flow<N>, 
             _ => Ok(Flow::Value(J::Null)),
         },
         Edge::WildcardDot => match &value {
-            J::Object(map) => Ok(Flow::Proj(
-                map.values().cloned().map(Flow::Value).collect(),
-            )),
+            J::Object(map) => Ok(Flow::Proj(map.values().cloned().map(Flow::Value).collect())),
             _ => Ok(Flow::Value(J::Null)),
         },
         Edge::WildcardBracket => match &value {
-            J::Array(items) => {
-                Ok(Flow::Proj(items.iter().cloned().map(Flow::Value).collect()))
-            }
+            J::Array(items) => Ok(Flow::Proj(items.iter().cloned().map(Flow::Value).collect())),
             _ => Ok(Flow::Value(J::Null)),
         },
         Edge::Filter(predicate) => match &value {
@@ -328,7 +433,7 @@ fn eval_edge_on_json<'d, N: Node<'d>>(value: J, edge: &Edge) -> Result<Flow<N>, 
                 let mut flows = Vec::new();
                 for item in items {
                     let keep = match eval_value_flow(predicate, item) {
-                        Ok(flow) => truthy(&flow.as_value().map_err(Stop::from)?),
+                        Ok(flow) => truthy(&flow.as_value(context).map_err(Stop::from)?),
                         Err(Stop::Error(e)) => return Err(Stop::Error(e)),
                         Err(Stop::NotImplemented) => return Err(Stop::NotImplemented),
                     };
@@ -344,11 +449,15 @@ fn eval_edge_on_json<'d, N: Node<'d>>(value: J, edge: &Edge) -> Result<Flow<N>, 
     }
 }
 
-fn eval_edge_on_node<'d, N: Node<'d>>(node: N, edge: &Edge) -> Result<Flow<N>, Stop> {
+fn eval_edge_on_node<'d, N: Node<'d>>(
+    node: N,
+    edge: &Edge,
+    context: &EvalContext,
+) -> Result<Flow<N>, Stop> {
     match edge {
         // a value-construct spliced into the chain: the multi-selects,
         // function calls, and literal heads
-        Edge::Compute(program) => eval(program, &node),
+        Edge::Compute(program) => eval(program, &node, context),
         Edge::Key(name) => match node.get_key(name) {
             Some(child) => Ok(Flow::One(child)),
             None => Ok(Flow::Value(J::Null)),
@@ -374,14 +483,22 @@ fn eval_edge_on_node<'d, N: Node<'d>>(node: N, edge: &Edge) -> Result<Flow<N>, S
         // the dot form reads object values only
         Edge::WildcardDot => match node.kind() {
             crate::view::Kind::Object => {
-                Ok(Flow::Proj(node.entries().into_iter().map(|(_, v)| Flow::One(v)).collect()))
+                let flows: Vec<_> = node
+                    .entries()
+                    .into_iter()
+                    .map(|(_, v)| Flow::One(v))
+                    .collect();
+                account_projection(&flows, context)?;
+                Ok(Flow::Proj(flows))
             }
             _ => Ok(Flow::Value(J::Null)),
         },
         // the bracket form reads array elements only
         Edge::WildcardBracket => match node.kind() {
             crate::view::Kind::Array => {
-                Ok(Flow::Proj(node.elements().into_iter().map(Flow::One).collect()))
+                let flows: Vec<_> = node.elements().into_iter().map(Flow::One).collect();
+                account_projection(&flows, context)?;
+                Ok(Flow::Proj(flows))
             }
             _ => Ok(Flow::Value(J::Null)),
         },
@@ -389,11 +506,17 @@ fn eval_edge_on_node<'d, N: Node<'d>>(node: N, edge: &Edge) -> Result<Flow<N>, S
             crate::view::Kind::Array => {
                 let mut flows = Vec::new();
                 for element in node.elements() {
-                    let keep = truthy(&eval(predicate, &element)?.as_value()?);
+                    context.step().map_err(Stop::from)?;
+                    let keep = truthy(
+                        &eval(predicate, &element, context)?
+                            .as_value(context)
+                            .map_err(Stop::from)?,
+                    );
                     if keep {
                         flows.push(Flow::One(element));
                     }
                 }
+                account_projection(&flows, context)?;
                 Ok(Flow::Proj(flows))
             }
             _ => Ok(Flow::Value(J::Null)),
@@ -406,17 +529,16 @@ fn eval_edge_on_node<'d, N: Node<'d>>(node: N, edge: &Edge) -> Result<Flow<N>, S
                 let selected = slice_indices(len, spec)?;
                 let mut flows = Vec::with_capacity(selected.len());
                 for index in selected {
+                    context.step().map_err(Stop::from)?;
                     if let Some(element) = node.get_index(index as usize) {
                         flows.push(Flow::One(element));
                     }
                 }
+                account_projection(&flows, context)?;
                 Ok(Flow::Proj(flows))
             }
             crate::view::Kind::String => {
-                let text = node
-                    .as_str()
-                    .map(|s| s.into_owned())
-                    .unwrap_or_default();
+                let text = node.as_str().map(|s| s.into_owned()).unwrap_or_default();
                 let chars: Vec<char> = text.chars().collect();
                 let selected = slice_indices(chars.len() as i64, spec)?;
                 let sliced: String = selected
@@ -434,17 +556,19 @@ fn eval_edge_on_node<'d, N: Node<'d>>(node: N, edge: &Edge) -> Result<Flow<N>, S
 /// The `[]` operator: dissolve array-valued results one level into the
 /// projection; scalars pass through within an existing projection; a
 /// plain non-array input flattens to null.
-fn flatten_flow<'d, N: Node<'d>>(input: Flow<N>) -> Result<Flow<N>, Stop> {
+fn flatten_flow<'d, N: Node<'d>>(input: Flow<N>, context: &EvalContext) -> Result<Flow<N>, Stop> {
     let mut flows = Vec::new();
     match input {
         Flow::Proj(items) => {
             for item in items {
-                flatten_into(item, &mut flows);
+                context.step().map_err(Stop::from)?;
+                flatten_into(item, &mut flows, context)?;
             }
         }
         Flow::One(node) => match node.kind() {
             crate::view::Kind::Array => {
                 for element in node.elements() {
+                    context.step().map_err(Stop::from)?;
                     match element.materialize() {
                         Ok(J::Null) => {}
                         Ok(J::Array(inner)) => {
@@ -469,10 +593,15 @@ fn flatten_flow<'d, N: Node<'d>>(input: Flow<N>) -> Result<Flow<N>, Stop> {
         }
         Flow::Value(_) => return Ok(Flow::Value(J::Null)),
     }
+    account_projection(&flows, context)?;
     Ok(Flow::Proj(flows))
 }
 
-fn flatten_into<'d, N: Node<'d>>(flow: Flow<N>, flows: &mut Vec<Flow<N>>) {
+fn flatten_into<'d, N: Node<'d>>(
+    flow: Flow<N>,
+    flows: &mut Vec<Flow<N>>,
+    context: &EvalContext,
+) -> Result<(), Stop> {
     match flow {
         Flow::Value(J::Null) => {}
         Flow::Value(J::Array(elements)) => {
@@ -491,22 +620,21 @@ fn flatten_into<'d, N: Node<'d>>(flow: Flow<N>, flows: &mut Vec<Flow<N>>) {
                 for element in elements {
                     match element {
                         J::Null => {}
-                        J::Array(inner) => {
-                            flows.extend(inner.into_iter().map(|v| Flow::Value(v)))
-                        }
+                        J::Array(inner) => flows.extend(inner.into_iter().map(|v| Flow::Value(v))),
                         plain => flows.push(Flow::Value(plain)),
                     }
                 }
             }
-            Ok(_) => flows.push(Flow::Value(node.materialize().unwrap_or(J::Null))),
-            Err(e) => flows.push(Flow::Value(J::Null)),
+            Ok(computed) => flows.push(Flow::Value(computed)),
+            Err(e) => return Err(Stop::Error(e)),
         },
         Flow::Proj(items) => {
             for item in items {
-                flatten_into(item, flows);
+                flatten_into(item, flows, context)?;
             }
         }
-    }
+    };
+    Ok(())
 }
 
 fn truthy(value: &J) -> bool {
@@ -571,6 +699,7 @@ fn eval_function<'d, N: Node<'d>>(
     name: &str,
     args: &[FnArgP],
     node: &N,
+    context: &EvalContext,
 ) -> Result<Flow<N>, Stop> {
     if !crate::program::function_implemented(name) {
         return Err(Stop::NotImplemented);
@@ -590,10 +719,10 @@ fn eval_function<'d, N: Node<'d>>(
                     message: format!(
                         "function {name} requires (expression-reference, array) or (array, expression-reference)"
                     ),
-                }))
+                }));
             }
         };
-        let array = eval(array_arg, node)?.as_value()?;
+        let array = eval(array_arg, node, context)?.as_value(context)?;
         let items = match array {
             J::Array(items) => items,
             other => return Err(type_error(name, kind_name(&other))),
@@ -603,7 +732,7 @@ fn eval_function<'d, N: Node<'d>>(
                 let mut mapped = Vec::with_capacity(items.len());
                 for item in &items {
                     let flow = eval_value_flow(ref_program, item)?;
-                    mapped.push(flow.as_value().map_err(Stop::from)?);
+                    mapped.push(flow.as_value(context).map_err(Stop::from)?);
                 }
                 Ok(Flow::Value(J::Array(mapped)))
             }
@@ -613,7 +742,7 @@ fn eval_function<'d, N: Node<'d>>(
                 let mut best_key: Option<J> = None;
                 for item in &items {
                     let flow = eval_value_flow(ref_program, item)?;
-                    let key = flow.as_value().map_err(Stop::from)?;
+                    let key = flow.as_value(context).map_err(Stop::from)?;
                     check_by_key(&key)?;
                     let take = match &best_key {
                         None => true,
@@ -637,7 +766,7 @@ fn eval_function<'d, N: Node<'d>>(
                 let mut keyed: Vec<(J, &J)> = Vec::with_capacity(items.len());
                 for item in &items {
                     let flow = eval_value_flow(ref_program, item)?;
-                    let key = flow.as_value().map_err(Stop::from)?;
+                    let key = flow.as_value(context).map_err(Stop::from)?;
                     check_by_key(&key)?;
                     keyed.push((key, item));
                 }
@@ -648,9 +777,7 @@ fn eval_function<'d, N: Node<'d>>(
                 if any_number && any_string {
                     return Err(type_error(name, "mixed-type keys"));
                 }
-                keyed.sort_by(|a, b| {
-                    order_values(&a.0, &b.0).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                keyed.sort_by(|a, b| order_values(&a.0, &b.0).unwrap_or(std::cmp::Ordering::Equal));
                 Ok(Flow::Value(J::Array(
                     keyed.into_iter().map(|(_, item)| item.clone()).collect(),
                 )))
@@ -665,12 +792,17 @@ fn eval_function<'d, N: Node<'d>>(
     for arg in args {
         match arg {
             FnArgP::Value(program) => {
-                values.push(eval(program, node).and_then(|flow| Ok(flow.as_value()?))?)
+                let value =
+                    eval(program, node, context).and_then(|flow| Ok(flow.as_value(context)?))?;
+                if N::counts_toward_aggregation() {
+                    context.account_aggregation(&value).map_err(Stop::from)?;
+                }
+                values.push(value)
             }
             FnArgP::Ref(_) => {
                 return Err(Stop::Error(SanshoError::Evaluation {
                     message: format!("function {name} does not accept expression references"),
-                }))
+                }));
             }
         }
     }
@@ -700,11 +832,11 @@ fn eval_function<'d, N: Node<'d>>(
             string_predicate("ends_with", subject, suffix, |s, p| s.ends_with(p))
         }
         ("contains", [subject, needle]) => match (subject, needle) {
-            (J::String(s), J::String(n)) => {
-                Ok(Flow::Value(J::Bool(s.contains(n.as_str()))))
-            }
+            (J::String(s), J::String(n)) => Ok(Flow::Value(J::Bool(s.contains(n.as_str())))),
             (J::Array(items), needle) => Ok(Flow::Value(J::Bool(
-                items.iter().any(|item| crate::corpus::json_equal(item, needle)),
+                items
+                    .iter()
+                    .any(|item| crate::corpus::json_equal(item, needle)),
             ))),
             (other, _) => Err(type_error("contains", kind_name(other))),
         },
@@ -778,9 +910,7 @@ fn eval_function<'d, N: Node<'d>>(
                     return Err(type_error("sort", "mixed-type array"));
                 }
                 let mut sorted = items.clone();
-                sorted.sort_by(|a, b| {
-                    order_values(a, b).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                sorted.sort_by(|a, b| order_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
                 Ok(Flow::Value(J::Array(sorted)))
             }
             other => Err(type_error("sort", kind_name(other))),
@@ -791,9 +921,7 @@ fn eval_function<'d, N: Node<'d>>(
                 reversed.reverse();
                 Ok(Flow::Value(J::Array(reversed)))
             }
-            J::String(text) => Ok(Flow::Value(J::String(
-                text.chars().rev().collect(),
-            ))),
+            J::String(text) => Ok(Flow::Value(J::String(text.chars().rev().collect()))),
             other => Err(type_error("reverse", kind_name(other))),
         },
         // string/number conversions
@@ -861,6 +989,27 @@ fn eval_function<'d, N: Node<'d>>(
     }
 }
 
+/// The projection-collection accounting: the in-flight items' node and
+/// byte counts accrue against the caps (a mega-projection cannot
+/// materialize silently).
+fn account_projection<'d, N: Node<'d>>(
+    flows: &[Flow<N>],
+    context: &EvalContext,
+) -> Result<(), Stop> {
+    if !N::counts_toward_aggregation() {
+        return Ok(());
+    }
+    for flow in flows {
+        match flow {
+            Flow::Value(value) => context.account_aggregation(value).map_err(Stop::from)?,
+            Flow::Proj(items) => account_projection(items, context)?,
+            // backend positions are accounted at their materialization
+            Flow::One(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// The `_by` functions' key contract: numbers or strings only; null
 /// (a missing by-value), booleans, and containers are invalid-type (the
 /// corpus's referee; mixed key types fail the ordering).
@@ -895,22 +1044,18 @@ fn number_of(value: &J, name: &str) -> Result<f64, Stop> {
 fn order_values(left: &J, right: &J) -> Result<std::cmp::Ordering, Stop> {
     match (left, right) {
         (J::Number(a), J::Number(b)) => match (a.as_f64(), b.as_f64()) {
-            (Some(a), Some(b)) => a
-                .partial_cmp(&b)
-                .ok_or_else(|| Stop::Error(SanshoError::Evaluation {
+            (Some(a), Some(b)) => a.partial_cmp(&b).ok_or_else(|| {
+                Stop::Error(SanshoError::Evaluation {
                     message: "cannot order NaN".to_string(),
-                })),
+                })
+            }),
             _ => Err(Stop::Error(SanshoError::Evaluation {
                 message: "cannot order numbers".to_string(),
             })),
         },
         (J::String(a), J::String(b)) => Ok(a.cmp(b)),
         _ => Err(Stop::Error(SanshoError::Evaluation {
-            message: format!(
-                "cannot order {} and {}",
-                kind_name(left),
-                kind_name(right)
-            ),
+            message: format!("cannot order {} and {}", kind_name(left), kind_name(right)),
         })),
     }
 }

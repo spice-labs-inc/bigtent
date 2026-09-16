@@ -63,10 +63,17 @@ fn minicbor_supports_the_cursor_surface() {
         buf
     };
     let mut indef_decoder = Decoder::new(&indefinite);
-    assert_eq!(indef_decoder.array().unwrap(), None, "indefinite array must be detectable");
+    assert_eq!(
+        indef_decoder.array().unwrap(),
+        None,
+        "indefinite array must be detectable"
+    );
 
     // datatype inspection without consuming
     let mut peek = Decoder::new(&bytes);
     let _ = peek.map().unwrap();
-    assert!(matches!(peek.datatype().unwrap(), minicbor::data::Type::String));
+    assert!(matches!(
+        peek.datatype().unwrap(),
+        minicbor::data::Type::String
+    ));
 }

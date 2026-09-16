@@ -58,7 +58,9 @@ pub enum FnArg {
 pub enum Postfix {
     Field(String),
     /// `.*` (dot form) or `[*]` (bracket form, arrays only).
-    Wildcard { bracket: bool },
+    Wildcard {
+        bracket: bool,
+    },
     Flatten,
     Index(i64),
     Slice(SliceSpec),

@@ -36,7 +36,14 @@ impl DecodeMemo {
             return Ok(value.clone());
         }
         self.decode_count.set(self.decode_count.get() + 1);
-        let value = decode_at_position(bytes, position)?;
+        // the ROOT position decodes as the WHOLE document: the
+        // exactly-one-document contract (trailing bytes are an input
+        // error) is enforced here, on the real evaluation path
+        let value = if position == 0 {
+            crate::cbor::decode_document(bytes)?
+        } else {
+            decode_at_position(bytes, position)?
+        };
         self.memo.borrow_mut().insert(position, value.clone());
         Ok(value)
     }
@@ -83,17 +90,17 @@ impl<'a> CursorNode<'a> {
                 message: format!("position {} past the end of the document", self.position),
             })?;
         Ok(match byte >> 5 {
-            0 | 1 => Kind::Number,          // unsigned / negative integer
-            2 => Kind::String,              // byte string: base64url in the view
-            3 => Kind::String,              // text string
+            0 | 1 => Kind::Number, // unsigned / negative integer
+            2 => Kind::String,     // byte string: base64url in the view
+            3 => Kind::String,     // text string
             4 => Kind::Array,
             5 => Kind::Object,
-            6 => Kind::Number,              // bignum tags render as numbers
+            6 => Kind::Number, // bignum tags render as numbers
             7 => match byte & 0x1F {
                 20 => Kind::Bool,
                 21 => Kind::Bool,
                 22 => Kind::Null,
-                24..=27 => Kind::Number,    // simple values / floats
+                24..=27 => Kind::Number, // simple values / floats
                 _ => Kind::Null,
             },
             _ => unreachable!("the major type is three bits"),
@@ -134,7 +141,10 @@ impl<'a> CursorNode<'a> {
         // one iteration per entry (the map's loop reads the key AND
         // the value) — len entries for both maps and arrays
         let count = len;
-        let mut positions = Vec::with_capacity(count as usize);
+        // NO capacity reservation from the hostile header: a huge count
+        // must not reserve huge memory — the walk fails on the missing
+        // bytes long before the vector grows meaningfully
+        let mut positions = Vec::new();
         for _ in 0..count {
             if is_map {
                 // the key: decoded (it names the member) and skipped past
@@ -177,16 +187,22 @@ impl<'a> CursorNode<'a> {
             .ok_or_else(|| SanshoError::Input {
                 message: format!("at byte {}: indefinite-length map", self.position),
             })?;
-        let mut keys = Vec::with_capacity(len as usize);
+        // no capacity reservation from the hostile header
+        let mut keys = Vec::new();
         for _ in 0..len {
             let key_type = decoder.datatype().map_err(|e| SanshoError::Input {
                 message: format!("at byte {}: map key: {e}", decoder.position()),
             })?;
             match key_type {
                 minicbor::data::Type::String => {
-                    keys.push(decoder.str().map_err(|e| SanshoError::Input {
-                        message: format!("at byte {}: map key: {e}", decoder.position()),
-                    })?.to_string());
+                    keys.push(
+                        decoder
+                            .str()
+                            .map_err(|e| SanshoError::Input {
+                                message: format!("at byte {}: map key: {e}", decoder.position()),
+                            })?
+                            .to_string(),
+                    );
                 }
                 _ => {
                     decoder.skip().map_err(|e| SanshoError::Input {
@@ -294,7 +310,63 @@ impl<'a> Node<'a> for CursorNode<'a> {
         }
     }
 
+    fn counts_toward_aggregation() -> bool {
+        true
+    }
+
     fn materialize(&self) -> Result<J, SanshoError> {
         self.memo.decode(self.bytes, self.position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The diagnostic probe: the body-map's key-lookup internals.
+    #[test]
+    fn probe_body_key_walk() {
+        let item = serde_json::json!({
+            "identifier": "x",
+            "body": {"extra": {}, "file_names": (0..4000).map(|i| format!("gitoid:blob:sha256:{:064x}!$org/apache/logging/log4j/core/lookup/JndiLookup.java", i)).collect::<Vec<String>>(), "file_size": 3050, "mime_type": ["t"]}
+        });
+        let bytes = serde_cbor::to_vec(&item).unwrap();
+        let root = CursorNode::root(&bytes);
+        println!(
+            "PROBE root kind={:?} root.get_key(body)={:?}",
+            root.kind(),
+            root.get_key("body").map(|n| n.position)
+        );
+        let body = root.get_key("body").expect("body exists");
+        println!("PROBE body kind={:?} pos={}", body.kind(), body.position);
+        let positions = body.container_positions();
+        println!("PROBE body positions={positions:?}");
+        let keys = body.map_keys();
+        println!("PROBE body keys={keys:?}");
+        println!(
+            "PROBE body.get_key(extra)={:?}",
+            body.get_key("extra").map(|n| n.position)
+        );
+        println!(
+            "PROBE body.get_key(file_size)={:?}",
+            body.get_key("file_size").map(|n| n.position)
+        );
+        // the eval-path probe: the same walk through the evaluator
+        let parsed = crate::parser::parse("body.file_size").unwrap();
+        let program = crate::program::compile(&parsed).unwrap();
+        let flow = crate::eval::eval_program_for_tests(&program, &root);
+        let value = match flow {
+            Ok(f) => f.as_value(&crate::limits::EvalContext::new(
+                crate::limits::Limits::default(),
+            )),
+            Err(stop) => Err(crate::SanshoError::Evaluation {
+                message: format!("{stop:?}"),
+            }),
+        };
+        println!("PROBE eval body.file_size={value:?}");
+        // and the direct materialization at the found position:
+        if let Some(node) = body.get_key("file_size") {
+            println!("PROBE materialize(file_size)={:?}", node.materialize());
+        }
     }
 }

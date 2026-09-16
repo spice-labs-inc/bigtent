@@ -4,7 +4,7 @@
 #[cfg(test)]
 mod tests {
     use crate::canonical;
-    use crate::corpus::{load_corpus, Driver};
+    use crate::corpus::{Driver, load_corpus};
     use crate::parser::parse;
     use std::path::Path;
 
@@ -200,85 +200,97 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod slice_tests {
-    use crate::canonical;
-    use crate::corpus::{load_corpus, run_corpus, Driver, DriverOutcome};
+
+    use crate::corpus::{Driver, DriverOutcome, load_corpus};
     use std::path::Path;
     // Requirement: SPEC-0001 §3, §6 — the first language slice turns the
-// corpus green on the materialized backend. What: per-feature roll-ups:
-// the slice's features fully green; later-phase features red-or-not-
-// implemented but never silently wrong (this test prints the full report
-// under --nocapture). Why: the corpus is the conformance referee (plan
-// `corpus_slice1_materialized`).
-//
-// LLM section: green set: basic, identifiers, indices, slice, multiselect,
-// literal, boolean, current, escape, unicode, pipe, syntax, filters,
-// wildcard. functions must have zero FAILURES (implemented functions
-// green, the rest not-implemented).
-#[test]
-fn corpus_slice1_materialized() {
-    let files = load_corpus(Path::new("tests/jmespath-corpus/compliance")).expect("loads");
-    let reports = crate::corpus::run_corpus(&crate::eval::RealEngine, &files);
-    for report in &reports {
-        println!(
-            "{:12} total {:4} passed {:4} failed {:4} not-implemented {:4}",
-            report.feature, report.total, report.passed, report.failed, report.not_implemented
-        );
-    }
-    // failing-case detail: the corpus is the referee, so every failure
-    // names the expression, the input, and what the engine produced
-    for file in &files {
-        for group in &file.groups {
-            for case in &group.cases {
-                let outcome = crate::eval::RealEngine.evaluate(&group.given, &case.expression);
-                let declared = case.error.clone().unwrap_or_else(|| "ok".to_string());
-                let matches = match (&outcome, &case.error) {
-                    (DriverOutcome::Result(value), None) => match &case.result {
-                        Some(expected) => crate::corpus::json_equal(value, expected),
-                        None => false,
-                    },
-                    (DriverOutcome::Error(error), Some(_)) => {
-                        crate::corpus::expected_category(&declared) == Some(error.category())
-                    }
-                    (DriverOutcome::NotImplemented, _) => true,
-                    _ => false,
-                };
-                if !matches {
-                    println!(
-                        "FAIL[{}] expr={:?}\n  given={}\n  declared={declared} expected={:?} outcome={outcome:?}",
-                        file.feature, case.expression, group.given, case.result, declared = declared,
-                    );
-                }
-                if let DriverOutcome::NotImplemented = outcome {
-                    if case.error.is_none() {
+    // corpus green on the materialized backend. What: per-feature roll-ups:
+    // the slice's features fully green; later-phase features red-or-not-
+    // implemented but never silently wrong (this test prints the full report
+    // under --nocapture). Why: the corpus is the conformance referee (plan
+    // `corpus_slice1_materialized`).
+    //
+    // LLM section: green set: basic, identifiers, indices, slice, multiselect,
+    // literal, boolean, current, escape, unicode, pipe, syntax, filters,
+    // wildcard. functions must have zero FAILURES (implemented functions
+    // green, the rest not-implemented).
+    #[test]
+    fn corpus_slice1_materialized() {
+        let files = load_corpus(Path::new("tests/jmespath-corpus/compliance")).expect("loads");
+        let reports = crate::corpus::run_corpus(&crate::eval::RealEngine, &files);
+        for report in &reports {
+            println!(
+                "{:12} total {:4} passed {:4} failed {:4} not-implemented {:4}",
+                report.feature, report.total, report.passed, report.failed, report.not_implemented
+            );
+        }
+        // failing-case detail: the corpus is the referee, so every failure
+        // names the expression, the input, and what the engine produced
+        for file in &files {
+            for group in &file.groups {
+                for case in &group.cases {
+                    let outcome = crate::eval::RealEngine.evaluate(&group.given, &case.expression);
+                    let declared = case.error.clone().unwrap_or_else(|| "ok".to_string());
+                    let matches = match (&outcome, &case.error) {
+                        (DriverOutcome::Result(value), None) => match &case.result {
+                            Some(expected) => crate::corpus::json_equal(value, expected),
+                            None => false,
+                        },
+                        (DriverOutcome::Error(error), Some(_)) => {
+                            crate::corpus::expected_category(&declared) == Some(error.category())
+                        }
+                        (DriverOutcome::NotImplemented, _) => true,
+                        _ => false,
+                    };
+                    if !matches {
                         println!(
-                            "NOTIMPL[{}] expr={:?}",
-                            file.feature, case.expression
+                            "FAIL[{}] expr={:?}\n  given={}\n  declared={declared} expected={:?} outcome={outcome:?}",
+                            file.feature,
+                            case.expression,
+                            group.given,
+                            case.result,
+                            declared = declared,
                         );
+                    }
+                    if let DriverOutcome::NotImplemented = outcome {
+                        if case.error.is_none() {
+                            println!("NOTIMPL[{}] expr={:?}", file.feature, case.expression);
+                        }
                     }
                 }
             }
         }
+        for feature in [
+            "basic",
+            "boolean",
+            "current",
+            "escape",
+            "identifiers",
+            "literal",
+            "pipe",
+            "slice",
+            "syntax",
+        ] {
+            let report = reports
+                .iter()
+                .find(|r| r.feature == feature)
+                .unwrap_or_else(|| panic!("{feature} report"));
+            assert!(report.is_green(), "{feature}: {report:?}");
+        }
+        // these features are fully implemented for their slice except where
+        // the flatten operator (a later phase) appears: zero failures, with
+        // the remainder honestly not-implemented
+        // the function library is complete (phase 4): functions is fully
+        // green, like the other implemented features
+        for feature in ["functions", "unicode"] {
+            let report = reports
+                .iter()
+                .find(|r| r.feature == feature)
+                .unwrap_or_else(|| panic!("{feature} report"));
+            assert_eq!(report.failed, 0, "{feature}: {report:?}");
+            assert!(report.is_green(), "{feature}: {report:?}");
+        }
     }
-    for feature in [
-        "basic", "boolean", "current", "escape", "identifiers", "literal", "pipe",
-        "slice", "syntax",
-    ] {
-        let report = reports.iter().find(|r| r.feature == feature).unwrap_or_else(|| panic!("{feature} report"));
-        assert!(report.is_green(), "{feature}: {report:?}");
-    }
-    // these features are fully implemented for their slice except where
-    // the flatten operator (a later phase) appears: zero failures, with
-    // the remainder honestly not-implemented
-    // the function library is complete (phase 4): functions is fully
-    // green, like the other implemented features
-    for feature in ["functions", "unicode"] {
-        let report = reports.iter().find(|r| r.feature == feature).unwrap_or_else(|| panic!("{feature} report"));
-        assert_eq!(report.failed, 0, "{feature}: {report:?}");
-        assert!(report.is_green(), "{feature}: {report:?}");
-    }
-}
-
 }

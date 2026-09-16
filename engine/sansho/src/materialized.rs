@@ -22,12 +22,6 @@ impl<'d> MaterializedNode<'d> {
     pub fn root(document: &'d serde_json::Value) -> Self {
         MaterializedNode { value: document }
     }
-
-    /// The in-memory value at this position (the materialized backend's
-    /// escape hatch for emitting node contents).
-    pub(crate) fn value(&self) -> &'d serde_json::Value {
-        self.value
-    }
 }
 
 impl<'d> Node<'d> for MaterializedNode<'d> {
@@ -92,6 +86,10 @@ impl<'d> Node<'d> for MaterializedNode<'d> {
             serde_json::Value::Array(items) => Some(items.len()),
             _ => None,
         }
+    }
+
+    fn counts_toward_aggregation() -> bool {
+        false
     }
 
     fn materialize(&self) -> Result<serde_json::Value, SanshoError> {

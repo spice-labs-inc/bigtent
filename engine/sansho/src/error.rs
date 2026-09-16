@@ -17,34 +17,23 @@ pub enum SanshoError {
     /// it holds zero or more than one CBOR document, uses an
     /// indefinite-length encoding, contains text that is not valid
     /// UTF-8, or cannot be decoded at all.
-    Input {
-        message: String,
-    },
+    Input { message: String },
     /// The expression text is not valid JMESPath. Carries the byte
     /// position in the expression text where parsing failed.
-    Parse {
-        message: String,
-        position: usize,
-    },
+    Parse { message: String, position: usize },
     /// The expression parses but the JMESPath specification declares it
     /// invalid (for example a wrong-arity function call pattern that the
     /// specification rejects statically).
-    Compile {
-        message: String,
-    },
+    Compile { message: String },
     /// The document's contents defeat evaluation: an unknown CBOR tag, a
     /// CBOR `undefined` value, or a type mismatch the JMESPath
     /// specification defines as an evaluation error.
-    Evaluation {
-        message: String,
-    },
+    Evaluation { message: String },
     /// A configured resource limit was exceeded: expression length,
     /// nesting depth, evaluation instruction count, output node count,
     /// or output byte size. Exceeding any limit aborts the whole
     /// evaluation; results are never partial.
-    Limit {
-        message: String,
-    },
+    Limit { message: String },
 }
 
 impl SanshoError {

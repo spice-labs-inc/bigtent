@@ -37,6 +37,7 @@ For detailed setup instructions, see [GETTING_STARTED.md](GETTING_STARTED.md).
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design, components, and data flow |
 | [BENCHMARKING.md](BENCHMARKING.md) | Merge benchmarking suite and performance tracking |
 | [PERFORMANCE.md](PERFORMANCE.md) | Performance tuning and optimization |
+| [docs/README.md](docs/README.md) | The documentation tree (Sansho engine, architecture, benchmarks, troubleshooting) |
 | [info/config.md](info/config.md) | Configuration reference |
 | [info/files_and_formats.md](info/files_and_formats.md) | File format specifications |
 

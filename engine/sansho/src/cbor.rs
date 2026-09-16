@@ -8,8 +8,8 @@
 //! duplicate map keys resolve last-wins.
 
 use crate::error::SanshoError;
-use minicbor::data::Type;
 use minicbor::Decoder;
+use minicbor::data::Type;
 use serde_json::Value as J;
 
 pub(crate) fn decode_document(bytes: &[u8]) -> Result<J, SanshoError> {
@@ -86,11 +86,11 @@ fn decode_item(decoder: &mut Decoder, bytes: &[u8]) -> Result<J, SanshoError> {
                 .map_err(|e| input_error(position, &format!("byte string: {e}")))?;
             Ok(J::String(base64url_encode(bytes)))
         }
-        Type::Bool => Ok(J::Bool(
-            decoder
-                .bool()
-                .map_err(|e| input_error(position, &format!("boolean: {e}")))?,
-        )),
+        Type::Bool => {
+            Ok(J::Bool(decoder.bool().map_err(|e| {
+                input_error(position, &format!("boolean: {e}"))
+            })?))
+        }
         Type::Null => {
             decoder
                 .null()
@@ -170,11 +170,15 @@ fn decode_map_key(decoder: &mut Decoder) -> Result<String, SanshoError> {
     // keys are text strings in this mapping (the document model is JSON)
     match decoder.datatype() {
         Ok(Type::String) => {
-            let key = decoder.str().map_err(|e| input_error(position, &format!("map key: {e}")))?;
+            let key = decoder
+                .str()
+                .map_err(|e| input_error(position, &format!("map key: {e}")))?;
             Ok(key.to_owned())
         }
         Ok(Type::U8 | Type::U16 | Type::U32 | Type::U64) => {
-            let key = decoder.u64().map_err(|e| input_error(position, &format!("map key: {e}")))?;
+            let key = decoder
+                .u64()
+                .map_err(|e| input_error(position, &format!("map key: {e}")))?;
             Ok(key.to_string())
         }
         Ok(other) => Err(input_error(
@@ -198,8 +202,7 @@ fn number_from_i64(value: i64) -> J {
 
 fn number_from_f64(value: f64) -> J {
     serde_json::Value::Number(
-        serde_json::Number::from_f64(value)
-            .unwrap_or_else(|| serde_json::Number::from(0u64)),
+        serde_json::Number::from_f64(value).unwrap_or_else(|| serde_json::Number::from(0u64)),
     )
 }
 

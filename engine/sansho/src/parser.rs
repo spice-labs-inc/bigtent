@@ -8,30 +8,41 @@
 
 use crate::ast::*;
 use crate::error::SanshoError;
+use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{take_while, take_while1};
 use nom::character::complete::char;
-use nom::combinator::{cut, eof, opt, recognize, success, value};
-use nom::multi::{separated_list0, separated_list1};
+use nom::combinator::{cut, eof, opt, recognize, value};
+use nom::multi::separated_list1;
 use nom::sequence::{delimited, preceded, terminated, tuple};
-use nom::IResult;
-
-/// The maximum expression nesting depth (parse-time limit,
-/// SPEC-0001 §5.5). Depth grows through filters and multi-selects;
-/// the bound is enforced during parsing so hostile nesting is rejected
-/// before recursion can run away.
-const MAX_DEPTH: usize = 64;
 
 /// Parse a complete JMESPath expression.
 pub fn parse(input: &str) -> Result<Expr, SanshoError> {
+    parse_with_limits(input, &crate::limits::Limits::default())
+}
+
+/// The limit-configurable parse: the expression-length and nesting-depth
+/// bounds come from the limits (SPEC-0001 §5.5).
+pub fn parse_with_limits(input: &str, limits: &crate::limits::Limits) -> Result<Expr, SanshoError> {
+    // the length bound first (the cheapest rejection)
+    if input.chars().count() > limits.max_expression_length {
+        return Err(SanshoError::Limit {
+            message: format!(
+                "expression length {} exceeds the maximum of {}",
+                input.chars().count(),
+                limits.max_expression_length
+            ),
+        });
+    }
     // Nesting is bounded BEFORE the recursive parser runs: an iterative
     // scan over the expression's structural characters (skipping string,
     // raw-string, and literal contexts) rejects hostile nesting without
     // recursing at all.
-    if let Some(position) = excessive_depth_at(input, MAX_DEPTH) {
+    if let Some(position) = excessive_depth_at(input, limits.max_depth) {
         return Err(SanshoError::Limit {
             message: format!(
-                "expression nesting exceeds the maximum depth of {MAX_DEPTH} at byte {position}"
+                "expression nesting exceeds the maximum depth of {} at byte {position}",
+                limits.max_depth
             ),
         });
     }
@@ -374,7 +385,10 @@ fn parse_bracket_start(input: &str) -> IResult<&str, Postfix, nom::error::Error<
     }
 }
 
-fn finish_slice(input: &str, start: Option<i64>) -> IResult<&str, Postfix, nom::error::Error<&str>> {
+fn finish_slice(
+    input: &str,
+    start: Option<i64>,
+) -> IResult<&str, Postfix, nom::error::Error<&str>> {
     let (rest, stop) = opt(preceded(wsp, parse_int))(input)?;
     let rest = ws(rest);
     let (rest, step) = if rest.starts_with(':') {
@@ -483,10 +497,7 @@ fn parse_function_or_field(input: &str) -> PrimaryResult<'_> {
     Ok((rest, Primary::Field(name)))
 }
 
-fn parse_function_args(
-    input: &str,
-    name: String,
-) -> PrimaryResult<'_> {
+fn parse_function_args(input: &str, name: String) -> PrimaryResult<'_> {
     let (rest, args) = parse_function_args_primary(input, name.clone())?;
     Ok((rest, Primary::Function(name, args)))
 }
@@ -542,7 +553,7 @@ fn parse_quoted_string(input: &str) -> IResult<&str, String, nom::error::Error<&
                 return Err(nom::Err::Failure(nom::error::Error::new(
                     rest,
                     nom::error::ErrorKind::Eof,
-                )))
+                )));
             }
         };
         if first != '\\' {
@@ -601,12 +612,9 @@ fn parse_quoted_string(input: &str) -> IResult<&str, String, nom::error::Error<&
                 } else if (LOW..=0xDFFF).contains(&code) {
                     match pending_high.take() {
                         Some(high) => {
-                            let combined = 0x10000
-                                + (((high - HIGH) as u32) << 10)
-                                + (code - LOW) as u32;
-                            out.push(
-                                char::from_u32(combined).unwrap_or('\u{FFFD}'),
-                            );
+                            let combined =
+                                0x10000 + (((high - HIGH) as u32) << 10) + (code - LOW) as u32;
+                            out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
                         }
                         None => out.push('\u{FFFD}'),
                     }
@@ -620,7 +628,7 @@ fn parse_quoted_string(input: &str) -> IResult<&str, String, nom::error::Error<&
                 return Err(nom::Err::Failure(nom::error::Error::new(
                     next,
                     nom::error::ErrorKind::Escaped,
-                )))
+                )));
             }
         };
     }
@@ -660,7 +668,7 @@ fn parse_literal(input: &str) -> PrimaryResult<'_> {
                 return Err(nom::Err::Error(nom::error::Error::new(
                     rest,
                     nom::error::ErrorKind::Eof,
-                )))
+                )));
             }
             Some('`') => {
                 rest = &rest[1..];
@@ -682,7 +690,7 @@ fn parse_literal(input: &str) -> PrimaryResult<'_> {
                         return Err(nom::Err::Failure(nom::error::Error::new(
                             rest,
                             nom::error::ErrorKind::Escaped,
-                        )))
+                        )));
                     }
                 }
             }
@@ -692,9 +700,8 @@ fn parse_literal(input: &str) -> PrimaryResult<'_> {
             }
         }
     }
-    let value = parse_literal_json(&raw).map_err(|_| {
-        nom::Err::Failure(nom::error::Error::new(rest, nom::error::ErrorKind::Tag))
-    })?;
+    let value = parse_literal_json(&raw)
+        .map_err(|_| nom::Err::Failure(nom::error::Error::new(rest, nom::error::ErrorKind::Tag)))?;
     Ok((rest, Primary::Literal(value)))
 }
 
@@ -721,7 +728,7 @@ fn parse_raw_string(input: &str) -> PrimaryResult<'_> {
     let mut content = String::new();
     let mut rest = rest;
     loop {
-        // the only escape inside a raw string is the quote: \' 
+        // the only escape inside a raw string is the quote: \'
         let (next, chunk) = take_while(|c: char| c != '\'' && c != '\\')(rest)?;
         content.push_str(chunk);
         rest = next;
@@ -748,7 +755,7 @@ fn parse_raw_string(input: &str) -> PrimaryResult<'_> {
                         return Err(nom::Err::Failure(nom::error::Error::new(
                             rest,
                             nom::error::ErrorKind::Eof,
-                        )))
+                        )));
                     }
                 }
             }
@@ -756,7 +763,7 @@ fn parse_raw_string(input: &str) -> PrimaryResult<'_> {
                 return Err(nom::Err::Failure(nom::error::Error::new(
                     rest,
                     nom::error::ErrorKind::Eof,
-                )))
+                )));
             }
         }
     }

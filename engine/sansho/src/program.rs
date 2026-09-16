@@ -88,8 +88,9 @@ pub enum Edge {
 pub fn function_arity(name: &str) -> Option<(usize, Option<usize>)> {
     match name {
         "abs" | "avg" | "ceil" | "floor" | "length" | "max" | "mean" | "min" | "reverse"
-        | "sort" | "sum" | "to_array" | "to_number" | "to_string" | "keys" | "values"
-        | "type" => Some((1, Some(1))),
+        | "sort" | "sum" | "to_array" | "to_number" | "to_string" | "keys" | "values" | "type" => {
+            Some((1, Some(1)))
+        }
         "contains" | "ends_with" | "join" | "map" | "max_by" | "min_by" | "sort_by"
         | "starts_with" => Some((2, Some(2))),
         "merge" | "not_null" => Some((1, None)),
@@ -103,10 +104,33 @@ pub fn function_arity(name: &str) -> Option<(usize, Option<usize>)> {
 pub fn function_implemented(name: &str) -> bool {
     matches!(
         name,
-        "length" | "starts_with" | "ends_with" | "contains" | "type" | "keys" | "values"
-            | "abs" | "avg" | "ceil" | "floor" | "join" | "map" | "max" | "max_by"
-            | "mean" | "min" | "min_by" | "merge" | "not_null" | "reverse" | "sort"
-            | "sort_by" | "sum" | "to_array" | "to_number" | "to_string"
+        "length"
+            | "starts_with"
+            | "ends_with"
+            | "contains"
+            | "type"
+            | "keys"
+            | "values"
+            | "abs"
+            | "avg"
+            | "ceil"
+            | "floor"
+            | "join"
+            | "map"
+            | "max"
+            | "max_by"
+            | "mean"
+            | "min"
+            | "min_by"
+            | "merge"
+            | "not_null"
+            | "reverse"
+            | "sort"
+            | "sort_by"
+            | "sum"
+            | "to_array"
+            | "to_number"
+            | "to_string"
     )
 }
 
@@ -183,9 +207,7 @@ pub fn compile(expr: &Expr) -> Result<Program, SanshoError> {
                         }
                     }
                     Postfix::Flatten => edges.push(Edge::Flatten),
-                    Postfix::Filter(pred) => {
-                        edges.push(Edge::Filter(Box::new(compile(pred)?)))
-                    }
+                    Postfix::Filter(pred) => edges.push(Edge::Filter(Box::new(compile(pred)?))),
                     Postfix::MultiList(items) => {
                         let slots = items
                             .iter()

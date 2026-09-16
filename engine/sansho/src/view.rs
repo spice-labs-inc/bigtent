@@ -104,6 +104,15 @@ pub trait Node<'d>: Clone {
     /// node; `None` for scalars.
     fn container_len(&self) -> Option<usize>;
 
+    /// Whether this backend's materializations count against the
+    /// evaluation's aggregation ledger. The cursor DECODES (each
+    /// materialization is memory the ENGINE creates — the aggregation
+    /// cap's subject); the materialized backend's clones are the
+    /// CALLER's pre-existing data (already fully materialized by
+    /// definition — counting it would attribute the caller's memory to
+    /// the engine).
+    fn counts_toward_aggregation() -> bool;
+
     /// The node's full value: the JSON view of everything this node
     /// spans. For the materialized backend this is a clone; for the
     /// cursor it is the memoized decode of the item at the node's

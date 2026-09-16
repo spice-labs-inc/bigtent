@@ -115,10 +115,9 @@ impl Driver for Unimplemented {
 /// same shape).
 pub fn load_corpus(dir: &Path) -> Result<Vec<CorpusFile>, SanshoError> {
     let mut files = Vec::new();
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| SanshoError::Input {
-            message: format!("cannot read corpus directory {}: {e}", dir.display()),
-        })?;
+    let entries = std::fs::read_dir(dir).map_err(|e| SanshoError::Input {
+        message: format!("cannot read corpus directory {}: {e}", dir.display()),
+    })?;
     let mut paths: Vec<_> = entries
         .filter_map(std::result::Result::ok)
         .map(|e| e.path())
@@ -139,19 +138,21 @@ pub fn load_corpus(dir: &Path) -> Result<Vec<CorpusFile>, SanshoError> {
         let raw = std::fs::read_to_string(&path).map_err(|e| SanshoError::Input {
             message: format!("cannot read corpus file {}: {e}", path.display()),
         })?;
-        let groups: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|e| {
-            SanshoError::Input {
+        let groups: Vec<serde_json::Value> =
+            serde_json::from_str(&raw).map_err(|e| SanshoError::Input {
                 message: format!("corpus file {} is not valid JSON: {e}", path.display()),
-            }
-        })?;
+            })?;
         let mut parsed = Vec::new();
         for group in groups {
             let given = match group.get("given") {
                 Some(g) => g.clone(),
                 None => {
                     return Err(SanshoError::Input {
-                        message: format!("corpus file {} has a group without `given`", path.display()),
-                    })
+                        message: format!(
+                            "corpus file {} has a group without `given`",
+                            path.display()
+                        ),
+                    });
                 }
             };
             let cases = match group.get("cases").and_then(|c| c.as_array()) {
@@ -166,7 +167,7 @@ pub fn load_corpus(dir: &Path) -> Result<Vec<CorpusFile>, SanshoError> {
                                         "corpus file {} has a case without an `expression` string",
                                         path.display()
                                     ),
-                                })
+                                });
                             }
                         };
                         out.push(CorpusCase {
@@ -183,8 +184,11 @@ pub fn load_corpus(dir: &Path) -> Result<Vec<CorpusFile>, SanshoError> {
                 }
                 None => {
                     return Err(SanshoError::Input {
-                        message: format!("corpus file {} has a group without `cases`", path.display()),
-                    })
+                        message: format!(
+                            "corpus file {} has a group without `cases`",
+                            path.display()
+                        ),
+                    });
                 }
             };
             parsed.push(CorpusGroup { given, cases });
@@ -317,13 +321,28 @@ mod tests {
     fn harness_runs_corpus_as_data_with_honest_red_baseline() {
         let dir = std::path::Path::new("tests/jmespath-corpus/compliance");
         let files = load_corpus(dir).expect("vendored corpus must load");
-        assert!(files.len() >= 15, "expected the full feature set, got {}", files.len());
+        assert!(
+            files.len() >= 15,
+            "expected the full feature set, got {}",
+            files.len()
+        );
         let reports = run_corpus(&Unimplemented, &files);
         let total: usize = reports.iter().map(|r| r.total).sum();
-        assert!(total > 300, "corpus should hold hundreds of cases, got {total}");
+        assert!(
+            total > 300,
+            "corpus should hold hundreds of cases, got {total}"
+        );
         for report in &reports {
-            assert_eq!(report.passed, 0, "red baseline must not pass anything: {}", report.feature);
-            assert_eq!(report.failed, 0, "a stub engine must not fail cases either: {}", report.feature);
+            assert_eq!(
+                report.passed, 0,
+                "red baseline must not pass anything: {}",
+                report.feature
+            );
+            assert_eq!(
+                report.failed, 0,
+                "a stub engine must not fail cases either: {}",
+                report.feature
+            );
             assert_eq!(report.not_implemented, report.total - report.bench);
             assert!(report.is_red());
             assert!(!report.is_green());
@@ -342,7 +361,13 @@ mod tests {
     // is a deliberate decision.
     #[test]
     fn every_corpus_error_string_maps_to_a_category() {
-        let declared = ["syntax", "invalid-type", "invalid-arity", "invalid-value", "unknown-function"];
+        let declared = [
+            "syntax",
+            "invalid-type",
+            "invalid-arity",
+            "invalid-value",
+            "unknown-function",
+        ];
         for d in declared {
             assert!(
                 expected_category(d).is_some(),
@@ -402,11 +427,7 @@ mod tests {
     fn harness_cannot_be_fooled_into_false_green() {
         struct AlwaysParseError;
         impl Driver for AlwaysParseError {
-            fn evaluate(
-                &self,
-                _given: &serde_json::Value,
-                _expression: &str,
-            ) -> DriverOutcome {
+            fn evaluate(&self, _given: &serde_json::Value, _expression: &str) -> DriverOutcome {
                 DriverOutcome::Error(SanshoError::Parse {
                     message: "always".into(),
                     position: 0,
@@ -419,7 +440,10 @@ mod tests {
         let total: usize = reports.iter().map(|r| r.total).sum();
         let passed: usize = reports.iter().map(|r| r.passed).sum();
         assert!(total > 300);
-        assert!(passed < total, "an always-error driver must not pass everything");
+        assert!(
+            passed < total,
+            "an always-error driver must not pass everything"
+        );
         // every result case failed; only some error cases (syntax) passed
         for report in &reports {
             if report.feature == "basic" {
@@ -442,11 +466,7 @@ mod tests {
     fn harness_cannot_be_fooled_by_always_result() {
         struct AlwaysResult;
         impl Driver for AlwaysResult {
-            fn evaluate(
-                &self,
-                given: &serde_json::Value,
-                _expression: &str,
-            ) -> DriverOutcome {
+            fn evaluate(&self, given: &serde_json::Value, _expression: &str) -> DriverOutcome {
                 DriverOutcome::Result(given.clone())
             }
         }

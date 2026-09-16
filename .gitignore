@@ -21,3 +21,6 @@ benches/baselines/reports/
 
 # Criterion temporary files
 benches/target/
+
+# Temporary workspace for spikes and exploration (not committed)
+/workspace/

@@ -5,7 +5,7 @@
 //! and the selective-materialization budget (SPEC-0001 §5.1–5.2).
 
 use proptest::prelude::*;
-use sansho::corpus::{load_corpus, run_corpus, Driver, DriverOutcome};
+use sansho::corpus::{Driver, DriverOutcome, load_corpus, run_corpus};
 use sansho::{compile, evaluate_cbor, parse};
 use std::path::Path;
 
@@ -17,9 +17,11 @@ impl Driver for CursorEngine {
     fn evaluate(&self, given: &serde_json::Value, expression: &str) -> DriverOutcome {
         let bytes = match serde_cbor::to_vec(given) {
             Ok(bytes) => bytes,
-            Err(e) => return DriverOutcome::Error(sansho::SanshoError::Input {
-                message: format!("fixture encoding: {e}"),
-            }),
+            Err(e) => {
+                return DriverOutcome::Error(sansho::SanshoError::Input {
+                    message: format!("fixture encoding: {e}"),
+                });
+            }
         };
         let parsed = match parse(expression) {
             Ok(parsed) => parsed,
@@ -57,8 +59,16 @@ fn corpus_cursor_matches_materialized() {
     let cursor = run_corpus(&CursorEngine, &files);
     for (reference, candidate) in materialized.iter().zip(cursor.iter()) {
         assert_eq!(
-            (reference.passed, reference.failed, reference.not_implemented),
-            (candidate.passed, candidate.failed, candidate.not_implemented),
+            (
+                reference.passed,
+                reference.failed,
+                reference.not_implemented
+            ),
+            (
+                candidate.passed,
+                candidate.failed,
+                candidate.not_implemented
+            ),
             "backend disagreement on {}: materialized {reference:?} cursor {candidate:?}",
             reference.feature
         );
@@ -243,9 +253,8 @@ fn probe_cursor_basic() {
 fn golden_layout_fixture_decodes_to_json_twin() {
     let bytes = std::fs::read(Path::new("tests/fixtures/item_a.cbor"))
         .expect("the committed fixture exists");
-    let expected_text =
-        std::fs::read_to_string(Path::new("tests/fixtures/item_a.json"))
-            .expect("the committed JSON twin exists");
+    let expected_text = std::fs::read_to_string(Path::new("tests/fixtures/item_a.json"))
+        .expect("the committed JSON twin exists");
     let expected: serde_json::Value = serde_json::from_str(&expected_text).unwrap();
 
     let parsed = parse("@").unwrap();
