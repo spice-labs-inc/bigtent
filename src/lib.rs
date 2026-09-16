@@ -57,6 +57,7 @@ pub mod cluster_list;
 pub mod config;
 pub mod fresh_merge;
 pub mod pid_file;
+pub mod sansho_seam;
 pub mod server;
 
 pub mod rodeo {

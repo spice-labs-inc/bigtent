@@ -88,7 +88,35 @@ pub const GOAT_RODEO_DATA_FILE_SUFFIX: &str = "grd";
 pub const GOAT_RODEO_INDEX_FILE_SUFFIX: &str = "gri";
 pub const GOAT_RODEO_CLUSTER_FILE_SUFFIX: &str = "grc";
 
+/// The raw byte span of a length-prefixed CBOR item at `pos` within a
+/// data-file byte slice: `[u32 LE length][CBOR item]`. Pure byte-level
+/// (no decode, no I/O) so it is testable without a mapped file.
+pub fn read_item_bytes_at(data: &[u8], pos: usize) -> Option<&[u8]> {
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let length = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+        as usize;
+    let start = pos + 4;
+    let end = start.checked_add(length)?;
+    if end > data.len() {
+        return None;
+    }
+    Some(&data[start..end])
+}
+
 impl DataFile {
+    /// The raw byte span of the length-prefixed item at `pos`, WITHOUT
+    /// decoding it: the Sansho integration seam's no-decode accessor —
+    /// the engine walks the bytes selectively, so the host must not
+    /// decode first (that would defeat selective materialization).
+    ///
+    /// Returns the CBOR bytes of the item itself (without the length
+    /// prefix), or `None` when the position/length is out of range.
+    pub fn read_item_bytes_at(&self, pos: usize) -> Option<&[u8]> {
+        read_item_bytes_at(self.file.as_ref(), pos)
+    }
+
     pub async fn new(dir: &PathBuf, hash: u64) -> Result<DataFile> {
         let mut data_file = GoatRodeoCluster::find_data_or_index_file_from_sha256(
             dir,
