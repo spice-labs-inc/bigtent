@@ -39,10 +39,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio_util::either::Either;
 use tracing::info;
 
-use crate::{
-    item::{EdgeType, Item},
-    util::MD5Hash,
-};
+use crate::item::{EdgeType, Item};
 
 /// Removing synthetic clusters, but still needed to aggregate
 /// multiple small clusters means having a trait that can
@@ -77,9 +74,6 @@ pub trait GoatRodeoTrait: Send + Sync {
     /// given an identifier, return the associated item
     fn item_for_identifier(&self, data: &str) -> Option<Item>;
 
-    /// given an MD5 hash, find the item for the hash
-    fn item_for_hash(&self, hash: MD5Hash) -> Option<Item>;
-
     /// given an identifier, traverse the graph to find the anti-aliased Item
     fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item>;
 
@@ -96,10 +90,6 @@ pub trait GoatRodeoTrait: Send + Sync {
 
     /// is the identifier known to the system
     fn has_identifier(&self, identifier: &str) -> bool;
-
-    /// is the collection empty. Always false for GoatRodeoCluster, true if GoatHerd has
-    /// no clusters
-    fn is_empty(&self) -> bool;
 }
 
 pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
@@ -135,26 +125,32 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
                 if let Some(item) = the_self.item_for_identifier(&identifier) {
                     // deal with anti-aliasing
                     item.connections
+                        .0
                         .iter()
-                        .filter(|a| a.0.is_alias_to())
-                        .for_each(|s| {
-                            if !to_find.contains(&s.1) && !processed.contains(&s.1) {
-                                new_to_find.insert(s.1.clone());
+                        .filter(|(edge_type, _)| edge_type.is_alias_to())
+                        .flat_map(|(_, targets)| targets.iter())
+                        .for_each(|target| {
+                            if !to_find.contains(target) && !processed.contains(target) {
+                                new_to_find.insert(target.clone());
                             }
                         });
 
                     // process
                     for s in item
                         .connections
+                        .0
                         .iter()
-                        .filter(|a| a.0.is_contains_down() || (source && a.0.is_built_from()))
+                        .filter(|(edge_type, _)| {
+                            edge_type.is_contains_down() || (source && edge_type.is_built_from())
+                        })
+                        .flat_map(|(_, targets)| targets.iter())
                     {
-                        if !to_find.contains(&s.1) && !processed.contains(&s.1) {
-                            new_to_find.insert(s.1.clone());
+                        if !to_find.contains(s) && !processed.contains(s) {
+                            new_to_find.insert(s.clone());
 
                             // if we are looking at source only, only include build sources
-                            if !source || s.0.is_built_from() {
-                                let _ = tx.send(Either::Right(s.1.clone())).await;
+                            if !source || item.connections.0.keys().any(|k| k.is_built_from()) {
+                                let _ = tx.send(Either::Right(s.clone())).await;
                             }
                         }
                     }
@@ -206,10 +202,16 @@ pub fn impl_antialias_for<GRT: GoatRodeoTrait + 'static>(
 
     // Follow alias:to edges until we find a non-alias item
     while ret.is_alias() {
-        match ret.connections.iter().find(|x| x.0.is_alias_to()) {
-            Some(v) => {
+        match ret
+            .connections
+            .0
+            .iter()
+            .find(|(edge_type, targets)| edge_type.is_alias_to() && !targets.is_empty())
+            .and_then(|(_, targets)| targets.iter().next())
+        {
+            Some(target) => {
                 // Follow the alias to the target
-                ret = match the_self.item_for_identifier(&v.1) {
+                ret = match the_self.item_for_identifier(target) {
                     Some(v) => v,
                     _ => return None, // Broken alias chain
                 };

@@ -42,12 +42,12 @@ use tracing::info;
 #[cfg(test)]
 use std::println as info;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet},
     mem::{self, swap},
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize},
+        atomic::AtomicUsize,
     },
     time::{Duration, Instant},
 };
@@ -58,7 +58,7 @@ use crate::{
     item::Item,
     rodeo::index::{IndexEnvelope, IndexFileMagicNumber},
     util::{
-        MD5Hash, byte_slice_to_u63, md5hash_str, path_plus_timed, sha256_for_slice, write_envelope,
+        KeyHash, byte_slice_to_u63, path_plus_timed, sha256_for_slice, write_envelope,
         write_int, write_long, write_short_signed, write_usize_sync,
     },
 };
@@ -69,7 +69,7 @@ use super::{
 };
 
 struct IndexInfo {
-    hash: MD5Hash,
+    hash: KeyHash,
     file_hash: u64,
     offset: usize,
 }
@@ -78,7 +78,12 @@ pub struct ClusterWriter {
     dir: PathBuf,
     dest_data: Vec<u8>, // ShaWriter,
     index_info: Vec<IndexInfo>,
-    previous_hash: Arc<AtomicU64>,
+    /// the key space this writer appends and declares (fresh writers:
+    /// BLAKE3; the merge: its sources' common key space)
+    key_alg: crate::util::KeyAlg,
+    /// the last appended index key; appends must never regress (output
+    /// clusters are key-ordered so the index is usable)
+    last_key: Option<KeyHash>,
     previous_position: usize,
     seen_data_files: Arc<Mutex<BTreeSet<u64>>>,
     index_files: Arc<Mutex<BTreeSet<u64>>>,
@@ -100,6 +105,17 @@ impl ClusterWriter {
     /// equals ~800 MB per index file. This limit ensures index files remain memory-mappable.
     const MAX_INDEX_CNT: usize = 25 * 1024 * 1024;
 
+    /// The data-file size split limit (shared with the conversion's chunk
+    /// budget: one set of limits).
+    pub(crate) const fn max_data_file_size() -> usize {
+        Self::MAX_DATA_FILE_SIZE
+    }
+
+    /// The index entry count split limit.
+    pub(crate) const fn max_index_entries() -> usize {
+        Self::MAX_INDEX_CNT
+    }
+
     #[inline]
     fn make_dest_buffer() -> Vec<u8> {
         // tests can run on small RAM machines, allocate a smaller buffer for tests
@@ -119,12 +135,68 @@ impl ClusterWriter {
     }
 
     pub async fn new<I: Into<PathBuf>>(dir: I) -> Result<ClusterWriter> {
-        Self::new_with_max_size(dir, Self::MAX_DATA_FILE_SIZE).await
+        Self::new_full(
+            dir,
+            Self::MAX_DATA_FILE_SIZE,
+            crate::util::KeyAlg::Blake3Truncated128,
+            None,
+        )
+        .await
     }
 
     pub async fn new_with_max_size<I: Into<PathBuf>>(
         dir: I,
         max_data_file_size: usize,
+    ) -> Result<ClusterWriter> {
+        Self::new_full(
+            dir,
+            max_data_file_size,
+            crate::util::KeyAlg::Blake3Truncated128,
+            None,
+        )
+        .await
+    }
+
+    /// Create a writer that declares and appends keys from `key_alg`'s key
+    /// space.
+    ///
+    /// Fresh writers use the version 4 default (BLAKE3). The merge passes
+    /// its sources' common key space: the coordinator pops items in that
+    /// order, so the output's declared algorithm and appended keys agree
+    /// (phase 3's conversion makes that space uniformly BLAKE3).
+    pub async fn new_with_key_alg<I: Into<PathBuf>>(
+        dir: I,
+        max_data_file_size: usize,
+        key_alg: crate::util::KeyAlg,
+    ) -> Result<ClusterWriter> {
+        Self::new_full(dir, max_data_file_size, key_alg, None).await
+    }
+
+    /// Create a writer with an explicit destination buffer capacity.
+    ///
+    /// The default writer reserves a large destination buffer up front;
+    /// the conversion path (phase 3) needs a bounded one instead. The
+    /// default behavior is unchanged when `dest_buffer_capacity` is None.
+    pub async fn new_bounded<I: Into<PathBuf>>(
+        dir: I,
+        max_data_file_size: usize,
+        key_alg: crate::util::KeyAlg,
+        dest_buffer_capacity: usize,
+    ) -> Result<ClusterWriter> {
+        Self::new_full(
+            dir,
+            max_data_file_size,
+            key_alg,
+            Some(dest_buffer_capacity),
+        )
+        .await
+    }
+
+    async fn new_full<I: Into<PathBuf>>(
+        dir: I,
+        max_data_file_size: usize,
+        key_alg: crate::util::KeyAlg,
+        dest_buffer_capacity: Option<usize>,
     ) -> Result<ClusterWriter> {
         let dir_path: PathBuf = dir.into();
         if !dir_path.exists() {
@@ -137,11 +209,17 @@ impl ClusterWriter {
             );
         }
 
+        let dest_data = match dest_buffer_capacity {
+            Some(capacity) => Vec::with_capacity(capacity),
+            None => ClusterWriter::make_dest_buffer(),
+        };
+
         let mut my_writer = ClusterWriter {
             dir: dir_path,
-            dest_data: ClusterWriter::make_dest_buffer(),
+            dest_data,
             index_info: ClusterWriter::make_index_buffer(),
-            previous_hash: Arc::new(AtomicU64::new(0)),
+            key_alg,
+            last_key: None,
             previous_position: 0,
             seen_data_files: Arc::new(Mutex::new(BTreeSet::new())),
             index_files: Arc::new(Mutex::new(BTreeSet::new())),
@@ -164,19 +242,40 @@ impl ClusterWriter {
     }
 
     /// add an `Item` to the cluster. for good performance
-    /// `Item`s should be written in order by MD5 hash of the `item.identifier`
+    /// `Item`s should be written in order by hash of the `item.identifier`
     pub async fn write_item(&mut self, item: Item, cbor_bytes: Vec<u8>) -> Result<()> {
-        let the_hash = md5hash_str(&item.identifier);
+        let the_hash = self.key_alg.hash_identifier(&item.identifier);
         self.write_item_with_hash(cbor_bytes, the_hash).await
     }
 
-    /// add CBOR-encoded item bytes using a precomputed MD5 hash.
+    /// add CBOR-encoded item bytes using a precomputed index key.
     /// This avoids recomputing the hash in the writer hot path.
+    ///
+    /// Version 4 output is key-ordered: appending a key **lower** than
+    /// the last appended key is rejected immediately, because it would
+    /// produce an index that cannot be searched. Equal keys are accepted
+    /// (duplicate identifiers merge downstream, and are not an error).
+    ///
+    /// The data-envelope chain fields are inert in version 4: every file
+    /// carries `previous: 0` and an empty `depends_on`, and BigTent
+    /// neither maintains nor consults the chain, which keeps multi-file
+    /// output byte-deterministic (H5).
     pub async fn write_item_with_hash(
         &mut self,
         cbor_bytes: Vec<u8>,
-        the_hash: MD5Hash,
+        the_hash: KeyHash,
     ) -> Result<()> {
+        if let Some(last) = &self.last_key {
+            if the_hash < *last {
+                bail!(
+                    "Out-of-order append: key {:02x?} is lower than the last appended key {:02x?}",
+                    the_hash,
+                    last
+                );
+            }
+        }
+        self.last_key = Some(the_hash);
+
         let cur_pos = self.dest_data.len();
 
         let item_bytes = cbor_bytes; //serde_cbor::to_vec(&item)?;
@@ -229,6 +328,7 @@ impl ClusterWriter {
                 info: BTreeMap::new(),
                 data_files: self.seen_data_files.lock().await.iter().copied().collect(),
                 index_files: self.index_files.lock().await.iter().copied().collect(),
+                encoding: Some(self.key_alg_encoding().to_string()),
             };
             write_envelope(cluster_writer, &cluster_env).await?;
         }
@@ -285,12 +385,12 @@ impl ClusterWriter {
 
             let self_dir = self.dir.clone();
             let self_start = Instant::now(); // self.start.clone();
-            let previous_hash = self.previous_hash.clone();
             let seen_data_files = self.seen_data_files.clone();
 
             let index_files = self.index_files.clone();
             let counter = self.current_write_cnt.clone();
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // increment the write count
+            let encoding = self.key_alg_encoding();
             tokio::task::spawn(async move {
                 info!(
                     "computing grd sha {:?}",
@@ -300,7 +400,7 @@ impl ClusterWriter {
                     data: Arc<Vec<u8>>,
                     self_dir: PathBuf,
                     self_start: Instant,
-                    previous_hash: Arc<AtomicU64>,
+                    encoding: &'static str,
                     new_index_info: Vec<IndexInfo>,
                     seen_data_files: Arc<Mutex<BTreeSet<u64>>>,
                     index_files: Arc<Mutex<BTreeSet<u64>>>,
@@ -320,9 +420,7 @@ impl ClusterWriter {
                         Instant::now().duration_since(self_start)
                     );
 
-                    previous_hash.store(grd_sha, std::sync::atomic::Ordering::Relaxed);
-
-                    let mut found_hashes = HashSet::new();
+                    let mut found_hashes = BTreeSet::new();
                     if grd_sha != 0 {
                         found_hashes.insert(grd_sha);
                     }
@@ -338,11 +436,14 @@ impl ClusterWriter {
                         let index_writer = &mut index_file;
                         write_int(index_writer, IndexFileMagicNumber).await?;
                         let index_env = IndexEnvelope {
+                            // the index envelope version is unchanged (the
+                            // v3 writer emitted 1); the encoding string is
+                            // what names the key algorithm (ADR 0002)
                             version: 1,
                             magic: IndexFileMagicNumber,
                             size: new_index_info.len() as u32,
                             data_files: found_hashes.clone(),
-                            encoding: "MD5/Long/Long".into(),
+                            encoding: encoding.into(),
                             info: BTreeMap::new(),
                         };
                         write_envelope(index_writer, &index_env).await?;
@@ -398,7 +499,7 @@ impl ClusterWriter {
                     data,
                     self_dir,
                     self_start,
-                    previous_hash,
+                    encoding,
                     new_index_info,
                     seen_data_files,
                     index_files,
@@ -421,30 +522,24 @@ impl ClusterWriter {
         Ok(())
     }
 
-    pub async fn add_index(&mut self, hash: MD5Hash, file_hash: u64, offset: usize) -> Result<()> {
-        self.index_info.push(IndexInfo {
-            hash,
-            offset,
-            file_hash,
-        });
-
-        if self.index_info.len() > ClusterWriter::MAX_INDEX_CNT {
-            self.write_data_and_index().await?;
-            self.write_data_envelope_start().await?;
+    /// The algorithm constant this writer declares (ADR 0002).
+    fn key_alg_encoding(&self) -> &'static str {
+        match self.key_alg {
+            crate::util::KeyAlg::Md5 => super::cluster::V3_CLUSTER_ENCODING,
+            crate::util::KeyAlg::Blake3Truncated128 => super::cluster::V4_CLUSTER_ENCODING,
         }
-        Ok(())
     }
 
     async fn write_data_envelope_start(&mut self) -> Result<()> {
         write_int(&mut self.dest_data, DataFileMagicNumber).await?;
 
+        // chain fields are inert in version 4 (H5): always `previous: 0`
+        // and an empty `depends_on`
         let data_envelope = DataFileEnvelope {
             version: DATA_FILE_ENVELOPE_VERSION,
             magic: DataFileMagicNumber,
-            previous: self
-                .previous_hash
-                .load(std::sync::atomic::Ordering::Relaxed),
-            depends_on: self.seen_data_files.lock().await.clone(),
+            previous: 0,
+            depends_on: BTreeSet::new(),
             built_from_merge: false,
             info: BTreeMap::new(),
         };
@@ -456,17 +551,18 @@ impl ClusterWriter {
     }
 }
 
-pub const DATA_FILE_ENVELOPE_VERSION: u32 = 1u32;
+/// Version 4 data file envelope version: the item shape changed (the
+/// connections map), so the data envelope version is bumped from 1.
+pub const DATA_FILE_ENVELOPE_VERSION: u32 = 2u32;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
 
     fn tiny_item() -> Item {
         Item {
             identifier: "gitoid:test".to_string(),
-            connections: BTreeSet::new(),
+            connections: crate::item::Connections::default(),
             body_mime_type: None,
             body: None,
         }

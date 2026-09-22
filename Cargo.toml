@@ -32,6 +32,7 @@ harness = false
 anyhow = "1.0"
 regex = "1.11"
 md5 = "0.7.0"
+blake3 = "1"
 sha2 = "0.10.8"
 hex = "0.4.3"
 bytes = "1.10"
@@ -82,11 +83,13 @@ tracing = "0.1"
 tracing-subscriber = {version = "0.3", features = ["json", "env-filter", "fmt"]}
 utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.16", features = ["v4"] }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 criterion = "0.5"
 proptest = "1.5"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [features]
 

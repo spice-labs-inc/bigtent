@@ -44,7 +44,7 @@ The fundamental unit of storage. Each Item represents a software artifact.
 ```rust
 pub struct Item {
     pub identifier: String,           // GitOID (e.g., "gitoid:blob:sha256:...")
-    pub connections: BTreeSet<Edge>,  // Typed edges to other items
+    pub connections: Connections,     // ordered map: edge type → target set
     pub body_mime_type: Option<String>,
     pub body: Option<Value>,          // CBOR-encoded metadata
 }
@@ -72,7 +72,7 @@ Edges connect Items and express relationships:
 ```
 cluster_20240101_120000.grc    # Cluster file (root)
 ├── index_a1b2c3d4.gri         # Index file(s)
-│   └── [MD5 hash → data location]
+│   └── [key hash → data location]  (algorithm declared in the files)
 └── data_e5f6g7h8.grd          # Data file(s)
     └── [CBOR-encoded Items]
 ```
@@ -85,7 +85,7 @@ The root file containing metadata and references to index/data files.
 ┌────────────────────────────────┐
 │ Magic: 0xba4a4a ("Banana")     │  4 bytes
 ├────────────────────────────────┤
-│ Envelope Length                │  4 bytes
+│ Envelope Length                │  2 bytes
 ├────────────────────────────────┤
 │ CBOR ClusterFileEnvelope       │  Variable
 │  - version: u32                │
@@ -105,13 +105,15 @@ Maps identifier hashes to data file locations for O(log n) lookups.
 ├────────────────────────────────┤
 │ CBOR IndexEnvelope             │  Variable
 ├────────────────────────────────┤
-│ Entry 1: [MD5][file][offset]   │  32 bytes each
-│ Entry 2: ...                   │  (sorted by MD5)
+│ Entry 1: [key][file][offset]   │  32 bytes each
+│ Entry 2: ...                   │  (sorted by key bytes)
 │ Entry N: ...                   │
 └────────────────────────────────┘
 ```
 
-Each entry: 16 bytes MD5 + 8 bytes file hash + 8 bytes offset = 32 bytes
+Each entry: 16 bytes key + 8 bytes file hash + 8 bytes offset = 32 bytes
+(version 4 keys are the first 16 bytes of BLAKE3; version 3 keys are MD5;
+the algorithm is declared in the `.grc` and `.gri` files)
 
 #### Data File (.grd)
 
@@ -314,15 +316,14 @@ The HTTP server includes a middleware (`request_log_middleware` in
 - Response HTTP status code
 - Elapsed time from request receipt to response
 
-### Observability Gaps
+### Observability
 
-BigTent does **not** currently provide:
-- Prometheus `/metrics` endpoint
-- OpenTelemetry tracing spans
-- Built-in health check endpoint (though `GET /node_count` can serve this purpose)
+BigTent provides:
+- Prometheus `/metrics` endpoint (text exposition; `test_metrics_endpoint_responds`)
+- Built-in health endpoints (`/health`, `/healthz`, `/readyz`)
+- Structured JSON logs for log aggregation
 
-For production monitoring, parse the structured JSON logs with a log
-aggregation tool.
+BigTent does **not** currently provide OpenTelemetry tracing spans.
 
 ### Authentication
 

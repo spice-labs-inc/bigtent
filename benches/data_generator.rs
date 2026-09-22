@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 use thousands::Separable;
 
-use bigtent::bench_util::{OverlapStrategy, SyntheticItemGenerator, generate_synthetic_cluster};
+use bigtent::bench_util::{
+    OverlapStrategy, SyntheticItemGenerator, generate_synthetic_cluster_with_max_size,
+};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 const DEFAULT_SIZE: usize = 100_000;
@@ -64,10 +66,11 @@ fn main() -> Result<()> {
         );
 
         let cluster_dir = args.output.join(format!("cluster_{}", i));
-        let cluster_file = tokio::runtime::Runtime::new()?.block_on(generate_synthetic_cluster(
+        let cluster_file = tokio::runtime::Runtime::new()?.block_on(generate_synthetic_cluster_with_max_size(
             &format!("cluster_{}", i),
             cluster_items,
             cluster_dir.clone(),
+            args.max_data_file_size,
         ))?;
 
         cluster_files.push(cluster_file);
@@ -92,6 +95,7 @@ struct Args {
     overlap: f64,
     seed: u64,
     output: PathBuf,
+    max_data_file_size: Option<usize>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -102,6 +106,7 @@ fn parse_args() -> Result<Args> {
     let mut overlap = DEFAULT_OVERLAP;
     let mut seed = DEFAULT_SEED;
     let mut output = PathBuf::from("./benches/test_data/test");
+    let mut max_data_file_size: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -140,6 +145,13 @@ fn parse_args() -> Result<Args> {
                 seed = args[i + 1].parse()?;
                 i += 2;
             }
+            "--max-data-file-size" => {
+                if i + 1 >= args.len() {
+                    anyhow::bail!("--max-data-file-size requires a value");
+                }
+                max_data_file_size = Some(parse_size(&args[i + 1])?);
+                i += 2;
+            }
             "--output" | "-d" => {
                 if i + 1 >= args.len() {
                     anyhow::bail!("--output requires a value");
@@ -163,6 +175,7 @@ fn parse_args() -> Result<Args> {
         overlap,
         seed,
         output,
+        max_data_file_size,
     })
 }
 
@@ -194,6 +207,7 @@ fn print_help() {
     println!("  -o, --overlap <PCT>      Percentage of items that overlap between clusters");
     println!("                           Default: {}%", DEFAULT_OVERLAP);
     println!("      --seed <N>           Random seed for reproducible data");
+    println!("      --max-data-file-size <N>  Cap each output .grd file size (e.g. 20k) so multi-file output is produced");
     println!("                           Default: {}", DEFAULT_SEED);
     println!("  -d, --output <PATH>      Output directory for generated clusters");
     println!("                           Default: ./benches/test_data/test");
