@@ -54,8 +54,10 @@
 
 pub mod bench_util;
 pub mod cluster_list;
+pub mod compare;
 pub mod config;
 pub mod fresh_merge;
+pub mod main_utils;
 pub mod pid_file;
 pub mod server;
 

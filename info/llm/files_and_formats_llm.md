@@ -109,3 +109,19 @@ version 4 output (`test_mixed_merge_output_is_version_4`, phase 3).
   `test_identifier_streams_unaffected_by_item_format`,
   `test_openapi_schema_contains_both_shapes`,
   `prop_default_and_v3_responses_are_semantically_equal`.
+
+## Conversion & comparison CLIs
+
+* `--convert-to-v4 <dirs...> --dest <dir>`: permanent V3→V4 re-keying
+  (byte-copy; items rust-equal; chunks at 15GB/25M split limits;
+  per-input `dest/<name>/`). Skips BLAKE3 sources. Tests:
+  `test_convert_output_items_equal_to_source`,
+  `test_convert_writes_blake3_keyed_clusters`.
+* `--compare <l> <r>`: full item-equality check (id, connections, body,
+  mime) across key algorithms (probe through the right side's
+  algorithm). Exit 0 equal / 1 not. ≥50M-item sides use the bounded
+  strategy (probe tuples only, ~28B/item; matched items re-materialized;
+  ~25 min for a 223M×2 compare). Mixed-algorithm sides refused. Tests:
+  `bounded_and_materializing_agree_on_fixture`,
+  `test_compare_rejects_mixed_algorithm_side`,
+  `test_compare_identity_holds`, `test_compare_detects_difference`.

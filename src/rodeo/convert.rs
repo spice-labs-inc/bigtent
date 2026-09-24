@@ -48,16 +48,17 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::item::Item;
 use crate::rodeo::cluster::ClusterFileEnvelope;
 use crate::rodeo::data::DataFile;
 use crate::rodeo::goat::GoatRodeoCluster;
 use crate::rodeo::goat_trait::GoatRodeoTrait;
-use crate::rodeo::index::ItemOffset;
 use crate::rodeo::member::{HerdMember, member_core};
 use crate::rodeo::writer::ClusterWriter;
+#[cfg(test)]
+use crate::item::Item;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::util::{KeyAlg, KeyHash, blake3hash_str, byte_slice_to_u63, sha256_for_slice};
 
 /// Options for a conversion run.
@@ -114,6 +115,7 @@ pub(crate) static TEST_MAX_CHUNK_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static TEST_FAIL_AFTER_CHUNKS: AtomicUsize = AtomicUsize::new(0);
 /// When true, the verification step is skipped (a test then exercises the
 /// verify helper directly against a tampered file).
+#[cfg(test)]
 #[cfg(test)]
 pub(crate) static TEST_FAIL_BEFORE_VERIFY: AtomicBool = AtomicBool::new(false);
 
@@ -381,6 +383,50 @@ pub async fn convert_cluster_for_merge(
     }
 
     let run_dir = create_run_dir(&options.temp_root)?;
+    let chunks = convert_chunks(cluster, run_dir.path()).await?;
+    let members = chunks
+        .into_iter()
+        .map(|(_, loaded)| member_core(loaded))
+        .collect();
+
+    Ok(Some(ConvertedClusters {
+        members,
+        guard: run_dir,
+    }))
+}
+
+/// Convert a version 3 source cluster into PERMANENT version 4-keyed
+/// clusters under `dest_dir` (the standalone `--convert-to-v4` path).
+///
+/// Each chunk cluster is written into `dest_dir` (created if absent) and
+/// returned by its `.grc` path. The clusters are ordinary clusters: the
+/// caller keeps them. The conversion is byte-copy re-keying: item bytes
+/// are copied verbatim, so the converted items are rust-equal to the
+/// source's.
+///
+/// Returns an empty vector when the cluster needs no conversion.
+pub async fn convert_cluster_to_dir(
+    cluster: &GoatRodeoCluster,
+    dest_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    if cluster.key_alg() != KeyAlg::Md5 {
+        return Ok(vec![]);
+    }
+    if !dest_dir.exists() {
+        std::fs::create_dir_all(dest_dir)
+            .with_context(|| format!("Creating conversion dest {:?}", dest_dir))?;
+    }
+    let chunks = convert_chunks(cluster, dest_dir).await?;
+    Ok(chunks.into_iter().map(|(grc, _)| grc).collect())
+}
+
+/// The core conversion: one re-keying pass over the source, writing
+/// chunks under `chunk_root` (one subdirectory per chunk) and returning
+/// each chunk's `.grc` path and loaded cluster.
+async fn convert_chunks(
+    cluster: &GoatRodeoCluster,
+    chunk_root: &Path,
+) -> Result<Vec<(PathBuf, Arc<GoatRodeoCluster>)>> {
 
     // every index entry, in source order (the full read is what a
     // conversion costs anyway; the source's own order does not matter
@@ -403,7 +449,7 @@ pub async fn convert_cluster_for_merge(
     }
 
     let (max_bytes, max_entries) = chunk_limits();
-    let mut members: Vec<Arc<HerdMember>> = vec![];
+    let mut chunks: Vec<(PathBuf, Arc<GoatRodeoCluster>)> = vec![];
     let mut chunk_idx: usize = 0usize;
     let mut iter = entries.into_iter().peekable();
     while iter.peek().is_some() {
@@ -425,7 +471,7 @@ pub async fn convert_cluster_for_merge(
         // deterministic order: (key, old grd file hash, old offset)
         chunk.sort();
 
-        let chunk_dir = run_dir.path().join(format!("chunk_{:06}", chunk_idx));
+        let chunk_dir = chunk_root.join(format!("chunk_{:06}", chunk_idx));
         tokio::fs::create_dir_all(&chunk_dir).await?;
         // the shared writer path: same code the normal merge writes with,
         // with a bounded destination buffer
@@ -466,21 +512,16 @@ pub async fn convert_cluster_for_merge(
         let loaded = GoatRodeoCluster::new(&grc_path, false, None, vec![])
             .await
             .with_context(|| format!("Loading converted chunk {}", chunk_idx))?;
-        let expected_count: usize = {
-            let start_idx = members.len();
-            let _ = start_idx;
-            chunk.len()
-        };
-        if loaded.number_of_items() != expected_count {
+        if loaded.number_of_items() != chunk.len() {
             bail!(
                 "Converted chunk {} holds {} items but its index declares {}",
                 chunk_idx,
-                expected_count,
+                chunk.len(),
                 loaded.number_of_items()
             );
         }
-        members.push(member_core(loaded));
         chunk_idx += 1;
+        chunks.push((grc_path, loaded));
 
         // deterministic failure hook (tests)
         if test_fail_after(chunk_idx) {
@@ -492,10 +533,7 @@ pub async fn convert_cluster_for_merge(
     }
     let _ = framed_total; // running total is available for metrics
 
-    Ok(Some(ConvertedClusters {
-        members,
-        guard: run_dir,
-    }))
+    Ok(chunks)
 }
 
 #[cfg(test)]
@@ -837,12 +875,25 @@ pub(crate) mod phase3_tests {
                     if p.is_dir() {
                         walk(&p, files);
                     } else {
-                        files.push((p.file_name().unwrap().to_string_lossy().to_string(), std::fs::read(p).unwrap()));
+                        let name = p.file_name().unwrap().to_string_lossy().to_string();
+                        // .grc names carry a wall-clock timestamp prefix;
+                        // two conversions in different seconds would then
+                        // differ in NAME alone. Determinism is about
+                        // content, so compare by the content-derived
+                        // suffix (the trailing 20 chars: _<16 hex>.grc,
+                        // <16 hex>.grd, <16 hex>.gri).
+                        let normalized = {
+                            let l = name.len();
+                            if l > 20 {
+                                name[l - 20..].to_string()
+                            } else {
+                                name
+                            }
+                        };
+                        files.push((normalized, std::fs::read(p).unwrap()));
                     }
                 }
             }
-            let guard_dir = base.path().join("unused");
-            let _ = guard_dir;
             // walk the conversion run dirs via the members' cluster paths
             for m in cc.members() {
                 if let HerdMember::Cluster(c) = m.as_ref() {

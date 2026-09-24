@@ -760,7 +760,7 @@ pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
     // histories, one conversion marker per converted version 3 input,
     // then the merge marker listing the original cluster names. Temporary
     // chunk clusters never appear here.
-    let mut cluster_names = original_names;
+    let cluster_names = original_names;
     let mut history = original_histories;
     {
         let iso_time = iso8601_now();
