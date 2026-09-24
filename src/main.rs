@@ -207,6 +207,93 @@ fn load_block_list(path: &PathBuf) -> Result<HashSet<String>> {
     Ok(set)
 }
 
+/// Convert version 3 clusters to version 4 (BLAKE3[0..16]) clusters.
+///
+/// Each input directory's clusters are converted into
+/// `dest/<input-dir-name>/` (one or more chunk clusters per input),
+/// using the same byte-copy re-keying the merge uses.
+async fn run_convert(inputs: Vec<PathBuf>, dest: PathBuf) -> Result<()> {
+    use bigtent::rodeo::convert::{ConversionOptions, convert_cluster_to_dir};
+
+    tokio::fs::create_dir_all(&dest).await?;
+    let start = std::time::Instant::now();
+    let mut total_clusters = 0usize;
+    let mut total_grcs = 0usize;
+
+    for input_dir in &inputs {
+        if !input_dir.is_dir() {
+            bail!("Input must be a directory of clusters: {:?}", input_dir);
+        }
+        let clusters =
+            GoatRodeoCluster::cluster_files_in_dir(input_dir.clone(), false, vec![]).await?;
+        let name = match input_dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => bail!("Input directory has no name: {:?}", input_dir),
+        };
+        let sub = dest.join(&name);
+        for cluster in &clusters {
+            let cluster_start = std::time::Instant::now();
+            let grcs = convert_cluster_to_dir(cluster, &sub).await?;
+            let _ = &ConversionOptions {
+                temp_root: dest.clone(),
+            };
+            info!(
+                "Converted {} ({} items) -> {} cluster(s) in {:?}",
+                cluster.name(),
+                cluster.number_of_items(),
+                grcs.len(),
+                cluster_start.elapsed()
+            );
+            total_clusters += 1;
+            total_grcs += grcs.len();
+        }
+    }
+    info!(
+        "Conversion complete: {} input cluster(s) -> {} output cluster(s) in {:?}; outputs under {:?}",
+        total_clusters,
+        total_grcs,
+        start.elapsed(),
+        dest
+    );
+    Ok(())
+}
+
+/// Compare two clusters (or directories of clusters) for item equality.
+///
+/// Exits 0 when every item on both sides is rust-equal; 1 otherwise.
+async fn run_compare(left: PathBuf, right: PathBuf) -> Result<()> {
+    use bigtent::compare::compare_clusters;
+
+    async fn load(p: &PathBuf) -> Result<Vec<std::sync::Arc<GoatRodeoCluster>>> {
+        if p.is_dir() {
+            GoatRodeoCluster::cluster_files_in_dir(p.clone(), false, vec![]).await
+        } else {
+            let cluster = GoatRodeoCluster::new(p, false, None, vec![]).await?;
+            Ok(vec![cluster])
+        }
+    }
+    let left_clusters = load(&left).await?;
+    let right_clusters = load(&right).await?;
+    if left_clusters.is_empty() || right_clusters.is_empty() {
+        bail!("Both sides must contain at least one cluster");
+    }
+    info!(
+        "Comparing {} cluster(s) vs {} cluster(s)",
+        left_clusters.len(),
+        right_clusters.len()
+    );
+    let outcome = compare_clusters(&left_clusters, &right_clusters)?;
+    println!("{}", outcome.summary());
+    for diff in &outcome.first_differences {
+        println!("  {}", diff);
+    }
+    if !outcome.equal() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Default number of fresh-merge worker threads.
 async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
     for p in &paths {
         if !p.exists() || !p.is_dir() {
@@ -245,7 +332,9 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
         );
     }
 
-    let merge_worker_count = args.merge_worker_count.unwrap_or_else(default_merge_worker_count);
+    let merge_worker_count = args
+        .merge_worker_count
+        .unwrap_or_else(default_merge_worker_count);
     info!("Using {} merge worker threads", merge_worker_count);
 
     let ret = merge_fresh_with_options(
@@ -512,6 +601,18 @@ async fn main() -> Result<()> {
 
     // Check for cluster-list mode first (it's mutually exclusive with rodeo via cluster_source)
     let cluster_source = args.cluster_source().map_err(|e| anyhow::anyhow!(e))?;
+
+    match bigtent::main_utils::mode_from_args(&args).map_err(|e| anyhow::anyhow!(e))? {
+        bigtent::main_utils::Mode::ConvertToV4 { inputs, dest } => {
+            run_convert(inputs, dest).await?;
+            return Ok(());
+        }
+        bigtent::main_utils::Mode::Compare { left, right } => {
+            run_compare(left, right).await?;
+            return Ok(());
+        }
+        _ => {}
+    }
 
     match (&cluster_source, &args.fresh_merge, &args.lookup, args.check) {
         // Check mode: --rodeo/--cluster-list + --check (validate and exit)

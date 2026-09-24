@@ -135,7 +135,10 @@ impl RoboticGoat {
             let i = Item {
                 identifier: identifier.clone(),
                 connections: crate::item::Connections(BTreeMap::from([
-                    (TAG_FROM.to_string(), [base_name.to_string()].into_iter().collect()),
+                    (
+                        TAG_FROM.to_string(),
+                        [base_name.to_string()].into_iter().collect(),
+                    ),
                     (TAG_TO.to_string(), [name.clone()].into_iter().collect()),
                 ])),
                 body_mime_type: Some("application/vnd.cc.goatrodeo.tag".to_string()),
@@ -225,14 +228,14 @@ async fn test_synthetic() {
     assert_eq!(tagged.len(), 1, "Expecting 1 tag, got {:?}", tagged);
 
     for t in &tagged {
-        let the_tag = herd.item_for_identifier(&t).expect("Get tag");
+        let the_tag = herd.item_for_identifier(t).expect("Get tag");
         let the_tag_id = &the_tag.identifier;
         for (t, targets) in &the_tag.connections.0 {
             if t.is_tag_to() {
                 for v in targets {
                     let tagged_item = herd
                         .item_for_identifier(v)
-                        .expect(&format!("Should load {}", v));
+                        .unwrap_or_else(|| panic!("Should load {}", v));
                     assert_eq!(
                         1,
                         tagged_item

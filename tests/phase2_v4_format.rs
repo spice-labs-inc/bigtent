@@ -11,13 +11,12 @@ mod common;
 
 use bigtent::item::Item;
 use bigtent::rodeo::cluster::{ClusterFileEnvelope, MinClusterVersion};
-use bigtent::rodeo::data::{DataFileMagicNumber, GOAT_RODEO_DATA_FILE_SUFFIX};
+use bigtent::rodeo::data::DataFileMagicNumber;
 use bigtent::rodeo::goat::GoatRodeoCluster;
 use bigtent::rodeo::goat_trait::GoatRodeoTrait;
 use bigtent::rodeo::writer::ClusterWriter;
-use bigtent::util::{KeyAlg, sha256_for_slice};
+use bigtent::util::KeyAlg;
 use common::{RawClusterSpec, V3_ENCODING, V4_ENCODING, assemble_raw_cluster};
-use std::collections::BTreeMap;
 
 fn v4_item(identifier: &str, target: &str) -> Item {
     let mut targets = std::collections::BTreeSet::new();
@@ -133,7 +132,10 @@ async fn test_v3_fixture_clusters_load_and_resolve() {
             let count = cluster.number_of_items();
             assert!(count > 0, "fixture has items");
             for pos in 0..count {
-                if let Some(offset) = bigtent::rodeo::robo_goat::ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos) {
+                if let Some(offset) = bigtent::rodeo::robo_goat::ClusterRoboMember::offset_from_pos(
+                    cluster.as_ref(),
+                    pos,
+                ) {
                     let item = bigtent::rodeo::robo_goat::ClusterRoboMember::item_from_item_offset(
                         cluster.as_ref(),
                         &offset,
@@ -178,7 +180,10 @@ async fn test_checked_in_v4_fixtures_load() {
             .unwrap_or(0)
     }
     let grc_count = count_grc(&path);
-    assert!(grc_count > 0, "test_data/v4 must contain checked-in clusters");
+    assert!(
+        grc_count > 0,
+        "test_data/v4 must contain checked-in clusters"
+    );
 
     let clusters = GoatRodeoCluster::cluster_files_in_dir(path, false, vec![])
         .await
@@ -436,14 +441,18 @@ async fn test_v4_cluster_lookup_traversal_and_roots() {
             .is_none()
     );
     // traversal: north from a file finds the container
-    use tokio_stream::StreamExt;
     let mut north = cluster
         .clone()
-        .north_send(vec!["gitoid:blob:sha256:file_1".to_string()], false, std::time::Instant::now())
+        .north_send(
+            vec!["gitoid:blob:sha256:file_1".to_string()],
+            false,
+            std::time::Instant::now(),
+        )
         .await
         .unwrap();
     let mut found = false;
     while let Some(e) = north.recv().await {
+        #[allow(clippy::collapsible_if)] // the Left guard + target check read clearly nested
         if let tokio_util::either::Either::Left(item) = e {
             if item.identifier == "pkg:npm:container@1" {
                 found = true;
@@ -471,18 +480,17 @@ async fn test_mixed_herd_lookup_resolves_both_versions() {
     let count = v3_cluster.number_of_items();
     let mut chosen: Option<String> = None;
     for pos in 0..count {
-        if let Some(offset) =
+        if let Some(item) =
             bigtent::rodeo::robo_goat::ClusterRoboMember::offset_from_pos(v3_cluster.as_ref(), pos)
+                .and_then(|offset| {
+                    bigtent::rodeo::robo_goat::ClusterRoboMember::item_from_item_offset(
+                        v3_cluster.as_ref(),
+                        &offset,
+                    )
+                })
         {
-            if let Some(item) =
-                bigtent::rodeo::robo_goat::ClusterRoboMember::item_from_item_offset(
-                    v3_cluster.as_ref(),
-                    &offset,
-                )
-            {
-                chosen = Some(item.identifier.clone());
-                break;
-            }
+            chosen = Some(item.identifier.clone());
+            break;
         }
     }
     let identifier = chosen.expect("v3 fixture must have at least one item");
@@ -494,9 +502,10 @@ async fn test_mixed_herd_lookup_resolves_both_versions() {
     let cbor = serde_cbor::to_vec(&twin).unwrap();
     writer.write_item(twin, cbor).await.unwrap();
     writer.finalize_cluster().await.unwrap();
-    let v4_clusters = GoatRodeoCluster::cluster_files_in_dir(dir.path().to_path_buf(), false, vec![])
-        .await
-        .unwrap();
+    let v4_clusters =
+        GoatRodeoCluster::cluster_files_in_dir(dir.path().to_path_buf(), false, vec![])
+            .await
+            .unwrap();
 
     // herd both
     let members: Vec<std::sync::Arc<HerdMember>> = v3_clusters
@@ -510,7 +519,8 @@ async fn test_mixed_herd_lookup_resolves_both_versions() {
         "the shared identifier resolves through the herd (v3 or v4 member)"
     );
     assert!(
-        herd.item_for_identifier("gitoid:blob:sha256:file_1").is_none(),
+        herd.item_for_identifier("gitoid:blob:sha256:file_1")
+            .is_none(),
         "an identifier in neither member is absent"
     );
 }
@@ -568,7 +578,12 @@ fn test_writer_output_is_deterministic_multi_file() {
                     Some("grd") | Some("gri")
                 )
             })
-            .map(|p| (p.file_name().unwrap().to_string_lossy().to_string(), std::fs::read(p).unwrap()))
+            .map(|p| {
+                (
+                    p.file_name().unwrap().to_string_lossy().to_string(),
+                    std::fs::read(p).unwrap(),
+                )
+            })
             .collect();
         files.sort();
         files
@@ -710,7 +725,11 @@ async fn test_empty_and_single_item_clusters() {
             .await
             .unwrap();
     assert_eq!(loaded.len(), 1);
-    assert!(loaded[0].item_for_identifier("gitoid:blob:sha256:solo").is_some());
+    assert!(
+        loaded[0]
+            .item_for_identifier("gitoid:blob:sha256:solo")
+            .is_some()
+    );
 }
 
 /// Test (min-version constant): the minimum supported version is 3 and

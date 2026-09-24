@@ -120,7 +120,6 @@ pub struct ApiDoc;
 
 use axum::extract::RawQuery;
 
-
 /// The requested item wire shape (D8).
 ///
 /// The map shape (version 4) is the default; `?item_format=v3` selects the
@@ -138,8 +137,7 @@ pub enum ItemFormat {
 
 impl ItemFormat {
     /// The static rejection message (no internal details).
-    pub const BAD_FORMAT_MESSAGE: &str =
-        "The 'item_format' parameter must be one of: v3, v4";
+    pub const BAD_FORMAT_MESSAGE: &str = "The 'item_format' parameter must be one of: v3, v4";
 
     /// Parse the `item_format` parameter out of the raw query string.
     ///
@@ -171,14 +169,6 @@ impl ItemFormat {
         }
         Ok(chosen.unwrap_or(ItemFormat::V4))
     }
-
-    /// Reject a bad format parameter with 400 and the static message.
-    fn bad_format<E>() -> Result<Self, E>
-    where
-        E: From<String>,
-    {
-        Err(E::from(ItemFormat::BAD_FORMAT_MESSAGE.to_string()))
-    }
 }
 
 /// Render an item in the requested wire shape (D8).
@@ -189,15 +179,13 @@ fn item_json(item: &Item, format: ItemFormat) -> serde_json::Value {
     }
 }
 
-/// Extract the item format from a raw query, mapping a rejection to 400
-/// with the static message (error hygiene: nothing internal leaks).
-fn parse_item_format(raw: &RawQuery) -> Result<ItemFormat, (axum::http::StatusCode, axum::Json<String>)> {
-    ItemFormat::from_raw_query(raw.0.as_deref()).map_err(|m| {
-        (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(m),
-        )
-    })
+/// Parse the item format from the raw query (duplicate detection reads
+/// the raw string, so conflicting duplicates are rejected).
+fn parse_item_format(
+    raw: &RawQuery,
+) -> Result<ItemFormat, (axum::http::StatusCode, axum::Json<String>)> {
+    ItemFormat::from_raw_query(raw.0.as_deref())
+        .map_err(|m| (axum::http::StatusCode::BAD_REQUEST, axum::Json(m)))
 }
 
 async fn stream_items<GRT: GoatRodeoTrait + 'static>(
@@ -208,10 +196,10 @@ async fn stream_items<GRT: GoatRodeoTrait + 'static>(
 
     tokio::spawn(async move {
         for item_id in items {
-            if let Some(i) = rodeo.get_cluster().item_for_identifier(&item_id) {
-                if !mtx.is_closed() {
-                    let _ = mtx.send(i).await;
-                }
+            if let Some(i) = rodeo.get_cluster().item_for_identifier(&item_id)
+                && !mtx.is_closed()
+            {
+                let _ = mtx.send(i).await;
             }
         }
     });
@@ -616,7 +604,7 @@ async fn serve_flatten_both<GRT: GoatRodeoTrait + 'static>(
             return Err((
                 StatusCode::NOT_FOUND,
                 axum::Json("One or more identifiers were not found".to_string()),
-            ))
+            ));
         }
     };
 
@@ -981,7 +969,7 @@ where
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json("An internal error occurred while traversing the graph".to_string()),
-            ))
+            ));
         }
     };
     Ok(StreamBodyAs::json_array(

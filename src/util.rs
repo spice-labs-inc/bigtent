@@ -661,15 +661,9 @@ fn test_blake3_known_answer_vectors() {
         // input_len 1: input [0x00]; digest 2d3adedf... first 16 bytes
         (1, hex!("2d3adedff11b61f14c886e35afa03673")),
         // input_len 64 (one block); digest 4eed7141... first 16 bytes
-        (
-            64,
-            hex!("4eed7141ea4a5cd4b788606bd23f46e2"),
-        ),
+        (64, hex!("4eed7141ea4a5cd4b788606bd23f46e2")),
         // input_len 128 (two blocks); digest f17e5705... first 16 bytes
-        (
-            128,
-            hex!("f17e570564b26578c33bb7f44643f539"),
-        ),
+        (128, hex!("f17e570564b26578c33bb7f44643f539")),
     ];
 
     for (len, expected) in cases {

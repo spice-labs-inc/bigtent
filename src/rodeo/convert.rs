@@ -48,17 +48,18 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[cfg(test)]
 use crate::item::Item;
 use crate::rodeo::cluster::ClusterFileEnvelope;
 use crate::rodeo::data::DataFile;
 use crate::rodeo::goat::GoatRodeoCluster;
 use crate::rodeo::goat_trait::GoatRodeoTrait;
-use crate::rodeo::index::ItemOffset;
 use crate::rodeo::member::{HerdMember, member_core};
 use crate::rodeo::writer::ClusterWriter;
 use crate::util::{KeyAlg, KeyHash, blake3hash_str, byte_slice_to_u63, sha256_for_slice};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Options for a conversion run.
 pub struct ConversionOptions {
@@ -115,6 +116,7 @@ pub(crate) static TEST_FAIL_AFTER_CHUNKS: AtomicUsize = AtomicUsize::new(0);
 /// When true, the verification step is skipped (a test then exercises the
 /// verify helper directly against a tampered file).
 #[cfg(test)]
+#[cfg(test)]
 pub(crate) static TEST_FAIL_BEFORE_VERIFY: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
@@ -158,7 +160,10 @@ fn chunk_limits() -> (usize, usize) {
 
 #[cfg(not(test))]
 fn chunk_limits() -> (usize, usize) {
-    (ClusterWriter::max_data_file_size(), ClusterWriter::max_index_entries())
+    (
+        ClusterWriter::max_data_file_size(),
+        ClusterWriter::max_index_entries(),
+    )
 }
 
 /// One-field partial deserialization target: serde skips the remaining
@@ -381,7 +386,50 @@ pub async fn convert_cluster_for_merge(
     }
 
     let run_dir = create_run_dir(&options.temp_root)?;
+    let chunks = convert_chunks(cluster, run_dir.path()).await?;
+    let members = chunks
+        .into_iter()
+        .map(|(_, loaded)| member_core(loaded))
+        .collect();
 
+    Ok(Some(ConvertedClusters {
+        members,
+        guard: run_dir,
+    }))
+}
+
+/// Convert a version 3 source cluster into PERMANENT version 4-keyed
+/// clusters under `dest_dir` (the standalone `--convert-to-v4` path).
+///
+/// Each chunk cluster is written into `dest_dir` (created if absent) and
+/// returned by its `.grc` path. The clusters are ordinary clusters: the
+/// caller keeps them. The conversion is byte-copy re-keying: item bytes
+/// are copied verbatim, so the converted items are rust-equal to the
+/// source's.
+///
+/// Returns an empty vector when the cluster needs no conversion.
+pub async fn convert_cluster_to_dir(
+    cluster: &GoatRodeoCluster,
+    dest_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    if cluster.key_alg() != KeyAlg::Md5 {
+        return Ok(vec![]);
+    }
+    if !dest_dir.exists() {
+        std::fs::create_dir_all(dest_dir)
+            .with_context(|| format!("Creating conversion dest {:?}", dest_dir))?;
+    }
+    let chunks = convert_chunks(cluster, dest_dir).await?;
+    Ok(chunks.into_iter().map(|(grc, _)| grc).collect())
+}
+
+/// The core conversion: one re-keying pass over the source, writing
+/// chunks under `chunk_root` (one subdirectory per chunk) and returning
+/// each chunk's `.grc` path and loaded cluster.
+async fn convert_chunks(
+    cluster: &GoatRodeoCluster,
+    chunk_root: &Path,
+) -> Result<Vec<(PathBuf, Arc<GoatRodeoCluster>)>> {
     // every index entry, in source order (the full read is what a
     // conversion costs anyway; the source's own order does not matter
     // because the chunks are sorted)
@@ -403,7 +451,7 @@ pub async fn convert_cluster_for_merge(
     }
 
     let (max_bytes, max_entries) = chunk_limits();
-    let mut members: Vec<Arc<HerdMember>> = vec![];
+    let mut chunks: Vec<(PathBuf, Arc<GoatRodeoCluster>)> = vec![];
     let mut chunk_idx: usize = 0usize;
     let mut iter = entries.into_iter().peekable();
     while iter.peek().is_some() {
@@ -413,9 +461,7 @@ pub async fn convert_cluster_for_merge(
         let mut bytes: usize = 0;
         while let Some(e) = iter.peek() {
             let framed = 4 + e.3;
-            if !chunk.is_empty()
-                && (bytes + framed > max_bytes || chunk.len() + 1 > max_entries)
-            {
+            if !chunk.is_empty() && (bytes + framed > max_bytes || chunk.len() + 1 > max_entries) {
                 break;
             }
             bytes += framed;
@@ -425,7 +471,7 @@ pub async fn convert_cluster_for_merge(
         // deterministic order: (key, old grd file hash, old offset)
         chunk.sort();
 
-        let chunk_dir = run_dir.path().join(format!("chunk_{:06}", chunk_idx));
+        let chunk_dir = chunk_root.join(format!("chunk_{:06}", chunk_idx));
         tokio::fs::create_dir_all(&chunk_dir).await?;
         // the shared writer path: same code the normal merge writes with,
         // with a bounded destination buffer
@@ -437,14 +483,15 @@ pub async fn convert_cluster_for_merge(
         )
         .await?;
         for (key, file_hash, offset, len) in &chunk {
-            let df = cluster
-                .data_file_for(*file_hash)
-                .ok_or_else(|| anyhow::anyhow!("Data file {:016x} vanished during conversion", file_hash))?;
+            let df = cluster.data_file_for(*file_hash).ok_or_else(|| {
+                anyhow::anyhow!("Data file {:016x} vanished during conversion", file_hash)
+            })?;
             let payload_end = offset + 4 + len;
             if payload_end > df.file.len() {
                 bail!(
                     "Item at offset {} in data file {:016x}.grd grew past the mapped bytes",
-                    offset, file_hash
+                    offset,
+                    file_hash
                 );
             }
             // copy the item bytes verbatim: no deserialization, no re-encode
@@ -466,21 +513,16 @@ pub async fn convert_cluster_for_merge(
         let loaded = GoatRodeoCluster::new(&grc_path, false, None, vec![])
             .await
             .with_context(|| format!("Loading converted chunk {}", chunk_idx))?;
-        let expected_count: usize = {
-            let start_idx = members.len();
-            let _ = start_idx;
-            chunk.len()
-        };
-        if loaded.number_of_items() != expected_count {
+        if loaded.number_of_items() != chunk.len() {
             bail!(
                 "Converted chunk {} holds {} items but its index declares {}",
                 chunk_idx,
-                expected_count,
+                chunk.len(),
                 loaded.number_of_items()
             );
         }
-        members.push(member_core(loaded));
         chunk_idx += 1;
+        chunks.push((grc_path, loaded));
 
         // deterministic failure hook (tests)
         if test_fail_after(chunk_idx) {
@@ -492,14 +534,12 @@ pub async fn convert_cluster_for_merge(
     }
     let _ = framed_total; // running total is available for metrics
 
-    Ok(Some(ConvertedClusters {
-        members,
-        guard: run_dir,
-    }))
+    Ok(chunks)
 }
 
 #[cfg(test)]
 pub(crate) mod phase3_tests {
+    #![allow(clippy::await_holding_lock)] // the hook guard intentionally serializes tests across awaits
     use super::*;
     use crate::item::ITEM_METADATA_MIME_TYPE;
 
@@ -526,7 +566,9 @@ pub(crate) mod phase3_tests {
         Item {
             identifier: identifier.to_string(),
             connections: crate::item::Connections(
-                [("contained:up".to_string(), targets)].into_iter().collect(),
+                [("contained:up".to_string(), targets)]
+                    .into_iter()
+                    .collect(),
             ),
             body_mime_type: Some(ITEM_METADATA_MIME_TYPE.to_string()),
             body: Some(serde_cbor::Value::Map(Default::default())),
@@ -534,10 +576,10 @@ pub(crate) mod phase3_tests {
     }
 
     pub(crate) fn write_raw_v3_cluster(dir: &Path, items: &[Item]) -> Result<PathBuf> {
+        use crate::rodeo::cluster::V3_CLUSTER_ENCODING;
         use crate::rodeo::cluster::{ClusterFileMagicNumber, MinClusterVersion};
         use crate::rodeo::data::{DataFileEnvelope, DataFileMagicNumber};
         use crate::rodeo::index::{IndexEnvelope, IndexFileMagicNumber};
-        use crate::rodeo::cluster::V3_CLUSTER_ENCODING;
         use std::collections::BTreeMap;
         use std::io::Write;
 
@@ -638,8 +680,7 @@ pub(crate) mod phase3_tests {
                 )
             })
             .collect();
-        let source_identifiers: Vec<String> =
-            items.iter().map(|i| i.identifier.clone()).collect();
+        let source_identifiers: Vec<String> = items.iter().map(|i| i.identifier.clone()).collect();
         let source = load_v3_cluster(base.path(), &items).await.unwrap();
         assert_eq!(source.key_alg(), KeyAlg::Md5);
 
@@ -678,24 +719,15 @@ pub(crate) mod phase3_tests {
         };
         let out_index = out_cluster.full_index().await.unwrap();
         for io in out_index.iter() {
-            let out_bytes = &out_cluster
-                .data_file_for(io.loc.1)
-                .unwrap()
-                .file[io.loc.0..];
-            let src_offset = src_data
-                .file
-                .windows(4)
-                .position(|_| false); // placeholder, replaced below
+            let out_bytes = &out_cluster.data_file_for(io.loc.1).unwrap().file[io.loc.0..];
+            let src_offset = src_data.file.windows(4).position(|_| false); // placeholder, replaced below
             let _ = src_offset;
             // byte-identity: every converted item payload must exist in the
             // source data file verbatim
             let len = u32::from_be_bytes(out_bytes[0..4].try_into().unwrap()) as usize;
             let payload = &out_bytes[4..4 + len];
             assert!(
-                src_data
-                    .file
-                    .windows(payload.len())
-                    .any(|w| w == payload),
+                src_data.file.windows(payload.len()).any(|w| w == payload),
                 "converted item payload must be copied verbatim from the source"
             );
         }
@@ -791,9 +823,12 @@ pub(crate) mod phase3_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_single_item_v3_cluster_conversion() {
         let base = tempfile::TempDir::new().unwrap();
-        let source = load_v3_cluster(base.path(), &[v3_item("gitoid:blob:sha256:solo3", "pkg:x@1")])
-            .await
-            .unwrap();
+        let source = load_v3_cluster(
+            base.path(),
+            &[v3_item("gitoid:blob:sha256:solo3", "pkg:x@1")],
+        )
+        .await
+        .unwrap();
         let c = convert_cluster_for_merge(
             &source,
             &ConversionOptions {
@@ -837,12 +872,25 @@ pub(crate) mod phase3_tests {
                     if p.is_dir() {
                         walk(&p, files);
                     } else {
-                        files.push((p.file_name().unwrap().to_string_lossy().to_string(), std::fs::read(p).unwrap()));
+                        let name = p.file_name().unwrap().to_string_lossy().to_string();
+                        // .grc names carry a wall-clock timestamp prefix;
+                        // two conversions in different seconds would then
+                        // differ in NAME alone. Determinism is about
+                        // content, so compare by the content-derived
+                        // suffix (the trailing 20 chars: _<16 hex>.grc,
+                        // <16 hex>.grd, <16 hex>.gri).
+                        let normalized = {
+                            let l = name.len();
+                            if l > 20 {
+                                name[l - 20..].to_string()
+                            } else {
+                                name
+                            }
+                        };
+                        files.push((normalized, std::fs::read(p).unwrap()));
                     }
                 }
             }
-            let guard_dir = base.path().join("unused");
-            let _ = guard_dir;
             // walk the conversion run dirs via the members' cluster paths
             for m in cc.members() {
                 if let HerdMember::Cluster(c) = m.as_ref() {
@@ -895,12 +943,7 @@ pub(crate) mod phase3_tests {
         let run_root = base.path().join("runroot");
         std::fs::create_dir(&run_root).unwrap();
         let items: Vec<Item> = (0..5)
-            .map(|i| {
-                v3_item(
-                    &format!("gitoid:blob:sha256:spill_{:04}", i),
-                    "pkg:npm/x@1",
-                )
-            })
+            .map(|i| v3_item(&format!("gitoid:blob:sha256:spill_{:04}", i), "pkg:npm/x@1"))
             .collect();
         let source = load_v3_cluster(base.path(), &items).await.unwrap();
         let c = convert_cluster_for_merge(
@@ -959,7 +1002,10 @@ pub(crate) mod phase3_tests {
             },
         )
         .await;
-        assert!(result.is_err(), "the injected failure must fail the conversion");
+        assert!(
+            result.is_err(),
+            "the injected failure must fail the conversion"
+        );
         // non-empty root was asserted by the chunks having been written:
         // after the failure the guarded dir is dropped (guard dropped with
         // the Err), so the run root holds only empty leftovers
@@ -970,9 +1016,9 @@ pub(crate) mod phase3_tests {
             .map(|e| e.unwrap().path())
             .collect();
         assert!(
-            leftover.iter().all(|p| std::fs::read_dir(p)
-                .map(|d| d.count() == 0)
-                .unwrap_or(true)),
+            leftover
+                .iter()
+                .all(|p| std::fs::read_dir(p).map(|d| d.count() == 0).unwrap_or(true)),
             "the failed conversion's guarded dir must be cleaned: {:?}",
             leftover
         );
@@ -1000,7 +1046,7 @@ pub(crate) mod phase3_tests {
 
         let run_root_in_task = run_root.clone();
         let handle = tokio::spawn(async move {
-            let c = convert_cluster_for_merge(
+            let _ = convert_cluster_for_merge(
                 &source,
                 &ConversionOptions {
                     temp_root: run_root_in_task.clone(),
@@ -1012,8 +1058,6 @@ pub(crate) mod phase3_tests {
             let dirs_before: usize = std::fs::read_dir(&run_root_in_task).unwrap().count();
             assert!(dirs_before > 0, "the guarded run dir must exist");
             panic!("injected panic while holding the guard");
-            #[allow(unreachable_code)]
-            c
         });
         let result = handle.await;
         assert!(result.is_err(), "the panic must propagate");
@@ -1021,7 +1065,12 @@ pub(crate) mod phase3_tests {
         let leftover_files: Vec<_> = std::fs::read_dir(&run_root)
             .unwrap()
             .map(|e| e.unwrap().path())
-            .flat_map(|p| std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()).collect::<Vec<_>>())
+            .flat_map(|p| {
+                std::fs::read_dir(&p)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect::<Vec<_>>()
+            })
             .collect();
         assert!(
             leftover_files.is_empty(),
@@ -1096,10 +1145,22 @@ pub(crate) mod phase3_tests {
     #[test]
     fn test_temp_root_ownership_predicate() {
         assert!(temp_root_ownership_ok(1000, 0o040700, 1000));
-        assert!(!temp_root_ownership_ok(1000, 0o040700, 1001), "foreign owner");
-        assert!(!temp_root_ownership_ok(1000, 0o040770, 1000), "group writable");
-        assert!(!temp_root_ownership_ok(1000, 0o040707, 1000), "world writable");
-        assert!(!temp_root_ownership_ok(1000, 0o040730, 1000), "group writable");
+        assert!(
+            !temp_root_ownership_ok(1000, 0o040700, 1001),
+            "foreign owner"
+        );
+        assert!(
+            !temp_root_ownership_ok(1000, 0o040770, 1000),
+            "group writable"
+        );
+        assert!(
+            !temp_root_ownership_ok(1000, 0o040707, 1000),
+            "world writable"
+        );
+        assert!(
+            !temp_root_ownership_ok(1000, 0o040730, 1000),
+            "group writable"
+        );
     }
 
     /// Tests 16 (overlap rejection, canonicalized) — unit-level over real
@@ -1116,24 +1177,28 @@ pub(crate) mod phase3_tests {
         // root inside an input dir: rejected
         let inside_input = input.join("scratch");
         std::fs::create_dir(&inside_input).unwrap();
-        assert!(validate_temp_root(&inside_input, &[input.clone()], &dest, false).is_err());
+        assert!(
+            validate_temp_root(&inside_input, std::slice::from_ref(&input), &dest, false).is_err()
+        );
 
         // root == dest: rejected
-        assert!(validate_temp_root(&dest, &[input.clone()], &dest, false).is_err());
+        assert!(validate_temp_root(&dest, std::slice::from_ref(&input), &dest, false).is_err());
 
         // root containing the dest: rejected (dest inside root)
-        assert!(validate_temp_root(base.path(), &[input.clone()], &dest, false).is_err());
+        assert!(
+            validate_temp_root(base.path(), std::slice::from_ref(&input), &dest, false).is_err()
+        );
 
         // a safe sibling root: accepted
         let safe = base.path().join("scratch");
         std::fs::create_dir(&safe).unwrap();
-        assert!(validate_temp_root(&safe, &[input.clone()], &dest, false).is_ok());
+        assert!(validate_temp_root(&safe, std::slice::from_ref(&input), &dest, false).is_ok());
 
         // a symlinked root is allowed (canonicalized to the same safe dir)
         #[allow(clippy::redundant_clone)]
         let link = base.path().join("scratch_link");
         std::os::unix::fs::symlink(&safe, &link).unwrap();
-        assert!(validate_temp_root(&link, &[input.clone()], &dest, false).is_ok());
+        assert!(validate_temp_root(&link, std::slice::from_ref(&input), &dest, false).is_ok());
     }
 
     /// Test (free-space preflight): a preflight over a real directory

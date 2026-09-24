@@ -239,7 +239,6 @@ the ordering of the keys and other information is preserved.
 
 
 ## HTTP Item Wire Shapes
-
 The HTTP API emits `Item` objects in two wire shapes. The **map shape**
 (version 4) is the default: `connections` is a JSON object mapping edge
 type to an array of target identifiers. Passing `?item_format=v3` on any
@@ -272,3 +271,39 @@ and `test_item_format_v3_shape_is_legacy_pairs`.
   `test_openapi_schema_contains_both_shapes`.
 * The two shapes are two views of the same edges — semantically equal
   (`prop_default_and_v3_responses_are_semantically_equal`).
+
+## Conversion and Comparison CLIs
+
+### `--convert-to-v4 <dirs...> --dest <dir>`
+
+Converts version 3 clusters to version 4 (BLAKE3[0..16]) clusters as
+**permanent** output. Each input cluster (a directory of clusters, like
+`--fresh-merge`) is re-keyed into `--dest/<input-dir-name>/` as one or
+more chunk clusters (bounded by the writer split limits: 15 GB per data
+file / 25M entries per index). Conversion is a byte-copy re-keying pass:
+item bytes are copied verbatim, so the converted items are rust-equal to
+the source items (`test_convert_output_items_equal_to_source`), and the
+converted clusters resolve lookups with the declared algorithm
+(`test_convert_writes_blake3_keyed_clusters`). Sources already in
+BLAKE3 are skipped.
+
+### `--compare <left> <right>`
+
+Compares two clusters (or directories of clusters) for full **item
+equality**: every item on either side must have an identical
+(rust-`equal`) counterpart on the other — identifier, connections, body
+mime type, and body. Prints a summary; exits 0 on equality, 1 otherwise.
+
+* **Cross-algorithm:** the two sides may use different index key
+  algorithms (V3/MD5 vs V4/BLAKE3); the left side's identifiers are
+  probed through the right side's algorithm
+  (`test_convert_output_items_equal_to_source`).
+* **Scale:** sides at or above 50M items use the bounded strategy — only
+  `[probe key, position]` tuples are retained (~28 bytes per item) and
+  the left items are re-materialized transiently for matched keys; a
+  223M×2 comparison runs in ~25 minutes with tens of GB of RSS instead
+  of hundreds (`prop_worker_count`-independent; see the compare module
+  docs for the memory model). Small sides use the materializing
+  strategy; both agree on the verdict (`bounded_and_materializing_agree_on_fixture`).
+* **Semantics:** mixed key algorithms within one side are refused
+  (`test_compare_rejects_mixed_algorithm_side`).

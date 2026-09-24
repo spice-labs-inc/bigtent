@@ -27,9 +27,12 @@ fn test_item(identifier: &str, target: &str) -> Item {
     // in the phase 2 execution state per D10.
     Item {
         identifier: identifier.to_string(),
-        connections: [("contained:up".to_string(), [target.to_string()].into_iter().collect())]
-            .into_iter()
-            .collect(),
+        connections: [(
+            "contained:up".to_string(),
+            [target.to_string()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
         body_mime_type: None,
         body: None,
     }
@@ -88,10 +91,7 @@ async fn test_on_disk_index_entry_is_32_bytes() {
         "entry stride must be exactly 32 bytes"
     );
     let entry_count = entries_bytes.len() / 32;
-    assert_eq!(
-        entry_count, 2,
-        "two items must produce two index entries"
-    );
+    assert_eq!(entry_count, 2, "two items must produce two index entries");
     assert_eq!(
         envelope.size as usize, entry_count,
         "envelope size must match entry count"
@@ -132,9 +132,5 @@ async fn test_on_disk_index_entry_is_32_bytes() {
         );
         let _ = u64::from_be_bytes(offset); // offset is position-dependent; stride is the constraint
     }
-    assert_eq!(
-        expected_by_key.len(),
-        2,
-        "both identifiers' keys appear"
-    );
+    assert_eq!(expected_by_key.len(), 2, "both identifiers' keys appear");
 }

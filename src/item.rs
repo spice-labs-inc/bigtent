@@ -90,7 +90,6 @@ use utoipa::ToSchema;
 ///
 /// - `v1`, `v2`: The values to merge
 /// - `depth`: Current recursion depth (0 = top level)
-
 fn merge_values(v1: &Value, v2: &Value, depth: usize) -> Value {
     // Extract string(s) from a Value (handles both single strings and arrays)
     fn fix_uno(s: &Value) -> Vec<String> {
@@ -193,7 +192,7 @@ fn test_merge() {
     let merged_key = match merge1 {
         Value::Map(map) => {
             let m2 = map.clone();
-            m2.get(&foo).map(|v| v.clone())
+            m2.get(&foo).cloned()
         }
         _ => None,
     };
@@ -366,15 +365,12 @@ impl<'de> Deserialize<'de> for Connections {
             {
                 let mut ret: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
                 let mut index = 0usize;
-                while let Some(key) = map
-                    .next_key::<String>()
-                    .map_err(|e| {
-                        de::Error::custom(format!(
-                            "connections[{}]: edge type must be a string: {}",
-                            index, e
-                        ))
-                    })?
-                {
+                while let Some(key) = map.next_key::<String>().map_err(|e| {
+                    de::Error::custom(format!(
+                        "connections[{}]: edge type must be a string: {}",
+                        index, e
+                    ))
+                })? {
                     let targets: Vec<String> = map.next_value::<Vec<String>>().map_err(|e| {
                         de::Error::custom(format!(
                             "connections[{:?}]: targets must be an array of strings: {}",
@@ -394,16 +390,13 @@ impl<'de> Deserialize<'de> for Connections {
             {
                 let mut ret = Connections(BTreeMap::new());
                 let mut index = 0usize;
-                while let Some(pair) = seq
-                    .next_element::<(String, String)>()
-                    .map_err(|e| {
-                        de::Error::custom(format!(
-                            "connections[{}]: each entry must be a \
+                while let Some(pair) = seq.next_element::<(String, String)>().map_err(|e| {
+                    de::Error::custom(format!(
+                        "connections[{}]: each entry must be a \
                              (edge type, target) pair of two strings: {}",
-                            index, e
-                        ))
-                    })?
-                {
+                        index, e
+                    ))
+                })? {
                     ret.fold_pair(pair.0, pair.1);
                     index += 1;
                 }
@@ -567,7 +560,7 @@ impl Item {
         // Decision depends only on the edge type, so iterating the
         // edge-type map in sorted order is equivalent to the legacy
         // pair-set iteration (both see the decisive type first).
-        for (edge_type, _targets) in &self.connections.0 {
+        for edge_type in self.connections.0.keys() {
             if edge_type.is_alias_to() {
                 return false;
             }
@@ -586,14 +579,12 @@ impl Item {
             // from connections
             .connections
             .0
-            .iter()
+            .keys()
             // find all aliases to this thing that start with `pkg:`
-            .filter(|(edge_type, _)| edge_type.is_alias_from())
-            .flat_map(|(_, targets)| targets.iter())
+            .filter(|edge_type| edge_type.is_alias_from())
+            .flat_map(|edge_type| self.connections.0[edge_type].iter())
             .filter(|t| t.starts_with("pkg:"))
-            // make into a string
-            .map(|c| c.clone())
-            // turn into a Vec<String>
+            .cloned()
             .collect()
     }
 
@@ -874,10 +865,7 @@ mod phase2_item_shape {
                     serde_cbor::Value::Text("identifier".into()),
                     serde_cbor::Value::Text("gitoid:blob:sha256:test".into()),
                 ),
-                (
-                    serde_cbor::Value::Text("connections".into()),
-                    pairs_cbor,
-                ),
+                (serde_cbor::Value::Text("connections".into()), pairs_cbor),
             ]
             .into_iter()
             .collect(),
@@ -900,8 +888,8 @@ mod phase2_item_shape {
     /// directory) and contains duplicate pairs on purpose.
     #[test]
     fn test_item_legacy_pairs_json_deserialize() {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test_data/legacy_item_v3.json");
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/legacy_item_v3.json");
         let text = std::fs::read_to_string(fixture).expect("fixture readable");
         let item: Item = serde_json::from_str(&text).expect("legacy JSON reads");
         assert_eq!(
@@ -910,7 +898,10 @@ mod phase2_item_shape {
         );
         let targets = item.connections.0.get("contained:up").expect("folded");
         assert_eq!(targets.len(), 1, "duplicate pair in fixture deduplicates");
-        assert!(item.find_purls().contains(&"pkg:npm/example@1.0.0".to_string()));
+        assert!(
+            item.find_purls()
+                .contains(&"pkg:npm/example@1.0.0".to_string())
+        );
     }
 
     /// Test 4: serialization is canonical and deterministic — the same
@@ -993,8 +984,14 @@ mod phase2_item_shape {
     fn test_flattened_map_order_equals_legacy_pair_order() {
         let pairs: Vec<(String, String)> = vec![
             ("alias:from".to_string(), "pkg:x@1".to_string()),
-            ("contained:up".to_string(), "gitoid:blob:sha256:t2".to_string()),
-            ("contained:up".to_string(), "gitoid:blob:sha256:t1".to_string()),
+            (
+                "contained:up".to_string(),
+                "gitoid:blob:sha256:t2".to_string(),
+            ),
+            (
+                "contained:up".to_string(),
+                "gitoid:blob:sha256:t1".to_string(),
+            ),
             ("tag:to".to_string(), "gitoid:blob:sha256:tt".to_string()),
         ];
         let item = Item {
@@ -1061,7 +1058,10 @@ mod phase2_item_shape {
         assert!(contained.contains("gitoid:blob:sha256:keep"));
         assert!(!contained.contains(&blocked));
         let tagged = item.connections.0.get("tag:to").expect("type kept");
-        assert!(tagged.is_empty(), "blocked target removed even if now empty");
+        assert!(
+            tagged.is_empty(),
+            "blocked target removed even if now empty"
+        );
     }
 
     /// Test 10: malformed legacy connections are rejected with an

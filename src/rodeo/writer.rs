@@ -45,10 +45,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     mem::{self, swap},
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::AtomicUsize,
-    },
+    sync::{Arc, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 
@@ -58,8 +55,8 @@ use crate::{
     item::Item,
     rodeo::index::{IndexEnvelope, IndexFileMagicNumber},
     util::{
-        KeyHash, byte_slice_to_u63, path_plus_timed, sha256_for_slice, write_envelope,
-        write_int, write_long, write_short_signed, write_usize_sync,
+        KeyHash, byte_slice_to_u63, path_plus_timed, sha256_for_slice, write_envelope, write_int,
+        write_long, write_short_signed, write_usize_sync,
     },
 };
 
@@ -183,13 +180,7 @@ impl ClusterWriter {
         key_alg: crate::util::KeyAlg,
         dest_buffer_capacity: usize,
     ) -> Result<ClusterWriter> {
-        Self::new_full(
-            dir,
-            max_data_file_size,
-            key_alg,
-            Some(dest_buffer_capacity),
-        )
-        .await
+        Self::new_full(dir, max_data_file_size, key_alg, Some(dest_buffer_capacity)).await
     }
 
     async fn new_full<I: Into<PathBuf>>(
@@ -260,6 +251,7 @@ impl ClusterWriter {
     /// carries `previous: 0` and an empty `depends_on`, and BigTent
     /// neither maintains nor consults the chain, which keeps multi-file
     /// output byte-deterministic (H5).
+    #[allow(clippy::collapsible_if)] // nested check keeps the out-of-order guard readable
     pub async fn write_item_with_hash(
         &mut self,
         cbor_bytes: Vec<u8>,

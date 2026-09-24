@@ -92,6 +92,7 @@ impl SyntheticItemGenerator {
         items
     }
 
+    #[allow(clippy::collapsible_if)] // nested offset/item chain reads in write order
     fn generate_item(&self, idx: usize, rng: &mut StdRng) -> Item {
         let gitoid = format!("gitoid:blob:sha256:{:016x}", idx);
         let file_size = rng.random_range(100..10000);
@@ -193,11 +194,12 @@ pub async fn write_cluster_to_disk_with_max_size(
     // Write all items
     let num_items = cluster.number_of_items();
     for pos in 0..num_items {
-        if let Some(offset) = cluster.offset_from_pos(pos) {
-            if let Some(item) = cluster.item_from_item_offset(&offset) {
-                let cbor_bytes = serde_cbor::to_vec(&item)?;
-                cluster_writer.write_item(item, cbor_bytes).await?;
-            }
+        if let Some(item) = cluster
+            .offset_from_pos(pos)
+            .and_then(|offset| cluster.item_from_item_offset(&offset))
+        {
+            let cbor_bytes = serde_cbor::to_vec(&item)?;
+            cluster_writer.write_item(item, cbor_bytes).await?;
         }
     }
 

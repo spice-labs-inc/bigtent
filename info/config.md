@@ -40,6 +40,8 @@ bigtent --rodeo /data/clusters/ --cache-index true
 | `--merge-temp-dir <path>` | Path | random dir under system temp | Directory for the merge's temporary files (converted sources). Explicit roots are never deleted; only per-run directories inside them are. Defaults are cleaned on success and failure. Parse test: `test_merge_temp_dir_flags_parse` |
 | `--force-temp-dir` | flag | off | Accept a `--merge-temp-dir` that is not owned by the effective user or is writable by group/other; the override is logged. Check test: `test_temp_root_ownership_predicate` |
 | `--block-list <path>` | Path | none | File of identifiers to exclude from the merge |
+| `--convert-to-v4 <dirs>...` | Path(s) | - | Convert version 3 clusters to version 4 (BLAKE3[0..16]) clusters. Each input cluster is re-keyed byte-copy into `--dest/<input-dir-name>/` as one or more chunk clusters. Converted items are rust-equal to the source items. Tests: `test_convert_output_items_equal_to_source` |
+| `--compare <left> <right>` | Path | - | Compare two clusters (or directories of clusters) for item equality (rust `equal`: identifier, connections, body, mime). Works across key algorithms (V3/MD5 vs V4/BLAKE3). Prints a summary; exits 0 on equality, 1 otherwise. Memory-bounded at scale (probe-index strategy). Tests: `test_convert_output_items_equal_to_source`, `test_compare_identity_holds`, `test_compare_detects_difference` |
 
 #### Examples
 
