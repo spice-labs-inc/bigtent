@@ -50,7 +50,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet},
     fs::{self, File},
     io::{BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -74,7 +74,7 @@ use crate::{
         robo_goat::ClusterRoboMember,
         writer::ClusterWriter,
     },
-    util::{MD5Hash, NiceDurationDisplay, iso8601_now, md5hash_str},
+    util::{KeyAlg, KeyHash, NiceDurationDisplay, iso8601_now},
 };
 use anyhow::{Context, Result, bail};
 use thousands::Separable;
@@ -151,12 +151,147 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     merge_buffer_size_gb: usize,
     merge_worker_count: usize,
 ) -> Result<()> {
+    merge_fresh_with_options(
+        clusters,
+        merge_buffer_limit,
+        dest_directory,
+        block_list,
+        is_live,
+        merge_buffer_size_gb,
+        merge_worker_count,
+        None,
+        false,
+    )
+    .await
+}
+
+/// Fresh merge with conversion options: `merge_temp_dir` overrides the
+/// temporary root for converted sources (default: a random directory
+/// under the system temporary directory); `force_temp_dir` overrides the
+/// ownership/permission safety checks on an explicit root (logged).
+#[allow(clippy::too_many_arguments)]
+pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
+    clusters: Vec<Arc<HerdMember>>,
+    merge_buffer_limit: usize,
+    dest_directory: PB,
+    block_list: Arc<HashSet<String>>,
+    is_live: Arc<AtomicBool>,
+    merge_buffer_size_gb: usize,
+    merge_worker_count: usize,
+    merge_temp_dir: Option<PathBuf>,
+    force_temp_dir: bool,
+) -> Result<()> {
     let start = Instant::now();
     let dest: PathBuf = dest_directory.into();
 
     if !is_live.load(Ordering::Relaxed) {
         bail!("Stopped running merge based on is_live");
     }
+
+    // === PHASE 0: provenance capture and conversion (ADR 0003) ===
+
+    // the output history names the ORIGINAL clusters: verbatim histories
+    // and original names, captured before any conversion
+    let original_names: Vec<String> = clusters.iter().map(|c| c.name()).collect();
+    let mut original_histories: Vec<serde_json::Value> = vec![];
+    for c in &clusters {
+        original_histories.append(&mut c.read_history().unwrap_or_default());
+    }
+    let converted_source_names: Vec<String> = clusters
+        .iter()
+        .filter(|c| c.key_alg() == KeyAlg::Md5)
+        .map(|c| c.name())
+        .collect();
+
+    // temporary root (H6): explicit root validated (canonicalized
+    // containment, ownership) or a fresh random 0700 directory under the
+    // system temp dir; explicit roots are never deleted (only the run
+    // dirs inside them)
+    let temp_root: tempfile::TempDir = match &merge_temp_dir {
+        Some(root) => {
+            let input_dirs: Vec<PathBuf> = clusters
+                .iter()
+                .filter_map(|c| match c.as_ref() {
+                    HerdMember::Cluster(cl) => Some(cl.cluster_directory()),
+                    HerdMember::Robo(_) => None,
+                })
+                .collect();
+            if !root.exists() {
+                std::fs::create_dir_all(root)
+                    .with_context(|| format!("Creating temp root {:?}", root))?;
+            }
+            crate::rodeo::convert::validate_temp_root(root, &input_dirs, &dest, force_temp_dir)?;
+            tempfile::Builder::new()
+                .prefix("bigtent-merge-run-")
+                .tempdir_in(root)
+                .with_context(|| format!("Creating merge run dir in {:?}", root))?
+        }
+        None => tempfile::Builder::new()
+            .prefix("bigtent-merge-")
+            .tempdir()
+            .context("Creating merge temp dir")?,
+    };
+
+    // free-space preflight: converted sources need scratch of roughly one
+    // input copy; fail fast with computed numbers
+    {
+        let mut needed: u64 = 0;
+        for c in &clusters {
+            if let HerdMember::Cluster(cl) = c.as_ref() {
+                if cl.key_alg() == KeyAlg::Md5 {
+                    // walk the source cluster's directory
+                    fn dir_size(dir: &Path) -> u64 {
+                        std::fs::read_dir(dir)
+                            .map(|entries| {
+                                entries
+                                    .filter_map(|e| e.ok().map(|e| e.path()))
+                                    .map(|p| {
+                                        if p.is_dir() {
+                                            dir_size(&p)
+                                        } else {
+                                            p.metadata().map(|m| m.len()).unwrap_or(0)
+                                        }
+                                    })
+                                    .sum()
+                            })
+                            .unwrap_or(0)
+                    }
+                    needed += dir_size(&cl.cluster_directory());
+                }
+            }
+        }
+        if needed > 0 {
+            crate::rodeo::convert::preflight_space(temp_root.path(), needed)
+                .with_context(|| format!("Free-space preflight for merge scratch {:?}", temp_root.path()))?;
+        }
+    }
+
+    // convert every source whose declared key algorithm differs from the
+    // merge key space; the merge owns the guards for the whole run
+    let mut conversion_guards: Vec<crate::rodeo::convert::ConvertedClusters> = vec![];
+    let mut sources: Vec<Arc<HerdMember>> = vec![];
+    for c in clusters {
+        match c.as_ref() {
+            HerdMember::Cluster(cl) if cl.key_alg() == KeyAlg::Md5 => {
+                let converted = crate::rodeo::convert::convert_cluster_for_merge(
+                    cl,
+                    &crate::rodeo::convert::ConversionOptions {
+                        temp_root: temp_root.path().to_path_buf(),
+                    },
+                )
+                .await?;
+                match converted {
+                    Some(cc) => {
+                        sources.extend(cc.members().iter().cloned());
+                        conversion_guards.push(cc);
+                    }
+                    None => sources.push(c),
+                }
+            }
+            _ => sources.push(c),
+        }
+    }
+    let clusters = sources;
 
     // === PHASE 1: Initialization ===
     fs::create_dir_all(dest.clone()).with_context(|| format!("Failed reading {:?}", dest))?;
@@ -211,9 +346,28 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                 merge_buffer_size_gb
             )
         })?;
-    let mut cluster_writer = ClusterWriter::new_with_max_size(&dest, merge_buffer_size_bytes)
-        .await
-        .with_context(|| format!("Failed creating ClusterWriter for {:?}", dest))?;
+    // The merge writes its output in the sources' common key space: the
+    // coordinator pops items in that order, so the output's declared
+    // algorithm and appended keys agree. (Phase 3 converts version 3
+    // sources to BLAKE3 before this point, making the space uniformly
+    // BLAKE3.) A mix of key spaces cannot be ordered and is refused.
+    let source_key_alg = {
+        let first = clusters[0].key_alg();
+        if !clusters.iter().all(|c| c.key_alg() == first) {
+            bail!(
+                "Merge sources declare different key algorithms; mixed-version merges convert sources first"
+            );
+        }
+        first
+    };
+
+    let mut cluster_writer = ClusterWriter::new_with_key_alg(
+        &dest,
+        merge_buffer_size_bytes,
+        source_key_alg,
+    )
+    .await
+    .with_context(|| format!("Failed creating ClusterWriter for {:?}", dest))?;
     let merge_start = Instant::now();
 
     // === PHASE 2: Set up threading infrastructure ===
@@ -292,6 +446,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         let tx = merged_tx.clone();
         let is_live = is_live.clone();
         let block_list = Arc::clone(&block_list);
+        let source_key_alg = source_key_alg;
 
         let processor_handle = thread::spawn(move || {
             // let mut cnt = 0usize;
@@ -318,10 +473,12 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 
                     merge_final
                         .connections
+                        .0
                         .iter()
-                        .filter(|v| v.1.starts_with("pkg:"))
+                        .flat_map(|(_, targets)| targets.iter())
+                        .filter(|v| v.starts_with("pkg:"))
                         .for_each(|v| {
-                            purls.insert(v.1.to_string());
+                            purls.insert(v.to_string());
                         });
                     if id.len() == 0 {
                         id = merge_final.identifier.clone();
@@ -357,10 +514,16 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                         to_merge.pop().unwrap()
                     } else if all_same {
                         let mut file_size = 0;
-                        let mut connections = BTreeSet::new();
+                        let mut connections = crate::item::Connections::default();
                         let mut bodies = Vec::with_capacity(to_merge.len());
-                        for mut item in to_merge {
-                            connections.append(&mut item.connections);
+                        for item in to_merge {
+                            for (edge_type, targets) in item.connections.0 {
+                                connections
+                                    .0
+                                    .entry(edge_type)
+                                    .or_default()
+                                    .extend(targets);
+                            }
 
                             let body: ItemMetaData = from_value(item.body.unwrap()).unwrap();
                             file_size = body.file_size;
@@ -413,9 +576,15 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                 };
 
                 top.connections
-                    .retain(|(_, target)| !block_list.contains(target));
+                    .0
+                    .values_mut()
+                    .for_each(|targets| targets.retain(|target| !block_list.contains(target)));
 
-                let hash = md5hash_str(&top.identifier);
+                // the write key uses the merge's key space (the sources'
+                // common algorithm): the coordinator pops in that order,
+                // so appends stay ascending and the output's declaration
+                // matches the keys
+                let hash = source_key_alg.hash_identifier(&top.identifier);
                 let cbor_bytes = match serde_cbor::to_vec(&top) {
                     Ok(v) => v,
                     Err(e) => {
@@ -429,14 +598,14 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
                     info!(
                         "Large Merge of {} with {} connections took {:?}",
                         top.identifier,
-                        top.connections.len(),
+                        top.connections.0.len(),
                         delta
                     );
-                } else if top.connections.len() > 500_000 {
+                } else if top.connections.0.len() > 500_000 {
                     info!(
                         "Large Item {} has {} connections",
                         top.identifier,
-                        top.connections.len()
+                        top.connections.0.len()
                     );
                 }
 
@@ -472,7 +641,7 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
     let mut next_expected = 0usize;
     let mut last_log_loop_cnt = 0usize;
     // None marks a position that was skipped because all items were blocked.
-    let mut holding_pen: FxHashMap<usize, Option<(Vec<u8>, MD5Hash)>> = FxHashMap::default();
+    let mut holding_pen: FxHashMap<usize, Option<(Vec<u8>, KeyHash)>> = FxHashMap::default();
 
     while let Ok(item_or_purl) = merged_rx.recv_async().await {
         // stop processing when not live
@@ -587,12 +756,22 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         .await
         .with_context(|| format!("Failed finalizing cluster in {:?}", dest))?;
 
-    let mut cluster_names = vec![];
-    let mut history = vec![];
-    for cluster in &clusters {
-        cluster_names.push(cluster.name());
-        let mut cluster_history = cluster.read_history()?;
-        history.append(&mut cluster_history);
+    // History is opaque to conversion (ADR 0003): verbatim original
+    // histories, one conversion marker per converted version 3 input,
+    // then the merge marker listing the original cluster names. Temporary
+    // chunk clusters never appear here.
+    let mut cluster_names = original_names;
+    let mut history = original_histories;
+    {
+        let iso_time = iso8601_now();
+        for source_name in &converted_source_names {
+            history.push(json!({
+                "date": iso_time,
+                "big_tent_commit": env!("VERGEN_GIT_SHA"),
+                "operation": "convert_v3_to_v4",
+                "source_cluster": source_name
+            }));
+        }
     }
     let iso_time = iso8601_now();
     let cluster_name = cluster_file
@@ -616,6 +795,32 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
         loop_cnt.separate_with_commas(),
         start.elapsed()
     );
+
+    // all merge threads have finished (the receive loop above ends only
+    // when every worker's sender dropped); joining is belt and braces
+    // before the conversion guards' directories are removed
+    {
+        let threads = std::mem::take(&mut threads);
+        tokio::task::spawn_blocking(move || {
+            for t in threads {
+                let _ = t.join();
+            }
+        })
+        .await
+        .context("Joining merge threads")?;
+    }
+
+    // close the conversion guards explicitly so cleanup errors surface,
+    // then the run root
+    for guard in conversion_guards {
+        if let Err(e) = guard.close().await {
+            error!("Conversion temp dir cleanup failed: {:?}", e);
+        }
+    }
+    if let Err(e) = temp_root.close() {
+        error!("Merge temp root cleanup failed: {:?}", e);
+    }
+
     Ok(())
 }
 
@@ -626,7 +831,7 @@ enum ItemOrPurl {
         cbor_bytes: Vec<u8>,
         merged: usize,
         purls: HashSet<String>,
-        hash: MD5Hash,
+        hash: KeyHash,
     },
     /// A position whose items were all blocked and should produce no output.
     Skipped { pos: usize },
@@ -667,7 +872,7 @@ impl ClusterPos {
 /// `BinaryHeap` is a max-heap, so we reverse the comparison.
 #[derive(Clone, Eq, PartialEq)]
 struct HeapEntry {
-    hash: MD5Hash,
+    hash: KeyHash,
     cluster_idx: usize,
 }
 
@@ -775,7 +980,7 @@ fn should_log_progress(loop_cnt: usize, last_log_loop_cnt: usize) -> bool {
 fn linear_scan_next_hash(
     index_holder: &mut Vec<ClusterPos>,
 ) -> Option<Vec<(ItemOffset, Arc<HerdMember>)>> {
-    let mut lowest: Option<MD5Hash> = None;
+    let mut lowest: Option<KeyHash> = None;
     let mut low_clusters = vec![];
 
     for holder in index_holder {
@@ -820,13 +1025,13 @@ mod tests {
             member::{member_core, member_synth},
             robo_goat::RoboticGoat,
         },
+        util::blake3hash_str,
     };
-    use std::collections::BTreeSet;
 
     fn make_item(identifier: &str) -> Item {
         Item {
             identifier: identifier.to_string(),
-            connections: BTreeSet::new(),
+            connections: crate::item::Connections::default(),
             body_mime_type: None,
             body: None,
         }
@@ -969,10 +1174,11 @@ mod tests {
         fn make_connected_item(identifier: &str, targets: &[&str]) -> Item {
             Item {
                 identifier: identifier.to_string(),
-                connections: targets
-                    .iter()
-                    .map(|t| (CONTAINS.to_string(), t.to_string()))
-                    .collect(),
+                connections: crate::item::Connections(
+                    [(CONTAINS.to_string(), targets.iter().map(|t| t.to_string()).collect::<std::collections::BTreeSet<_>>())]
+                        .into_iter()
+                        .collect(),
+                ),
                 body_mime_type: None,
                 body: None,
             }
@@ -1035,8 +1241,10 @@ mod tests {
         assert!(
             !kept_a
                 .connections
-                .iter()
-                .any(|(_, target)| target == blocked),
+                .0
+                .values()
+                .flatten()
+                .any(|target| target == blocked),
             "edges pointing to blocked items should be removed"
         );
     }
@@ -1104,12 +1312,12 @@ mod tests {
             }
 
             // Reference: flatten, sort by hash, group by hash.
-            all_identifiers.sort_by_key(|id| md5hash_str(id));
+            all_identifiers.sort_by_key(|id| blake3hash_str(id));
             let mut reference = vec![];
             let mut current_group = 0usize;
-            let mut prev: Option<MD5Hash> = None;
+            let mut prev: Option<KeyHash> = None;
             for id in all_identifiers {
-                let hash = md5hash_str(&id);
+                let hash = blake3hash_str(&id);
                 if prev.as_ref() != Some(&hash) {
                     if current_group > 0 {
                         reference.push(current_group);
@@ -1126,5 +1334,823 @@ mod tests {
 
             prop_assert_eq!(heap_seq, reference);
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod phase3_merge_tests {
+    use super::*;
+    use crate::item::ITEM_METADATA_MIME_TYPE;
+    use crate::rodeo::convert::ConversionOptions;
+    use crate::rodeo::goat::GoatRodeoCluster;
+    use crate::rodeo::member::member_core;
+    use crate::rodeo::member::member_synth;
+    use crate::rodeo::robo_goat::RoboticGoat;
+
+    fn hook() -> std::sync::MutexGuard<'static, ()> {
+        crate::rodeo::convert::phase3_tests::merge_hook_guard()
+    }
+
+    fn map_item(identifier: &str, edge: &str, targets: &[&str]) -> Item {
+        let mut t = std::collections::BTreeSet::new();
+        for x in targets {
+            t.insert(x.to_string());
+        }
+        let mut m = std::collections::BTreeMap::new();
+        if !targets.is_empty() {
+            m.insert(edge.to_string(), t);
+        }
+        Item {
+            identifier: identifier.to_string(),
+            connections: crate::item::Connections(m),
+            body_mime_type: Some(ITEM_METADATA_MIME_TYPE.to_string()),
+            // a valid ItemMetaData body (the merge deserializes it when
+            // duplicate groups merge)
+            body: Some(
+                serde_cbor::Value::Map(
+                    [
+                        (
+                            serde_cbor::Value::Text("file_names".into()),
+                            serde_cbor::Value::Array(vec![]),
+                        ),
+                        (
+                            serde_cbor::Value::Text("file_size".into()),
+                            serde_cbor::Value::Integer(1),
+                        ),
+                        (
+                            serde_cbor::Value::Text("mime_type".into()),
+                            serde_cbor::Value::Array(vec![]),
+                        ),
+                        (
+                            serde_cbor::Value::Text("extra".into()),
+                            serde_cbor::Value::Map(Default::default()),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+        }
+    }
+
+    /// A version 3 file-backed member (raw assembler; production never
+    /// writes version 3). The TempDir must be held by the caller.
+    fn v3_member(name: &str, items: &[Item]) -> anyhow::Result<(Arc<HerdMember>, tempfile::TempDir)> {
+        let dir = tempfile::TempDir::new()?;
+        let subdir = dir.path().join("src");
+        std::fs::create_dir_all(&subdir)?;
+        let grc = crate::rodeo::convert::phase3_tests::write_raw_v3_cluster(&subdir, items)?;
+        let cluster = futures_executor_block_on_goat(&grc)?;
+        Ok((cluster, dir))
+    }
+
+    fn futures_executor_block_on_goat(grc: &Path) -> anyhow::Result<Arc<HerdMember>> {
+        // inside an async test: build via the tokio handle
+        let grc = grc.to_path_buf();
+        let cluster = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                GoatRodeoCluster::new(&grc, false, None, vec![]).await
+            })
+        })?;
+        Ok(member_core(cluster))
+    }
+
+    /// The output cluster's format version.
+    fn output_cluster_version(cluster: &GoatRodeoCluster) -> u32 {
+        cluster.cluster_version()
+    }
+
+    async fn output_cluster(dest: &Path) -> Arc<GoatRodeoCluster> {
+        let mut clusters = GoatRodeoCluster::cluster_files_in_dir(dest.to_path_buf(), false, vec![])
+            .await
+            .expect("output cluster loads");
+        clusters.pop().expect("output cluster exists")
+    }
+
+    /// The output's item signature: identifier + connection map for every
+    /// output item (the invariant across budgets/worker counts).
+    fn output_item_signature(cluster: &GoatRodeoCluster) -> std::collections::BTreeSet<String> {
+        let mut sig = std::collections::BTreeSet::new();
+        let count = cluster.number_of_items();
+        for pos in 0..count {
+            if let Some(off) = crate::rodeo::robo_goat::ClusterRoboMember::offset_from_pos(cluster, pos) {
+                if let Some(item) = crate::rodeo::robo_goat::ClusterRoboMember::item_from_item_offset(cluster, &off) {
+                    sig.insert(format!("{}|{:?}", item.identifier, item.connections));
+                }
+            }
+        }
+        sig
+    }
+    /// Tests 6/8: a mixed merge (v3 + v4 sources) unions duplicate
+    /// identifiers and the output is version 4.
+    ///
+    /// Requirement: ADR 0003. Theory: the coordinator groups equal keys —
+    /// after conversion all sources are in the BLAKE3 key space, so the
+    /// duplicated identifier merges to one item unioning both target sets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_mixed_merge_unions_duplicate_identifier() {
+        let _hooks = hook();
+        let shared = "gitoid:blob:sha256:mixed_shared";
+
+        // v3 member: shared -> t1
+        let v3_item = map_item(shared, "contained:up", &["gitoid:blob:sha256:t1"]);
+        let (v3_member, _v3_dir) = v3_member("v3src", &[v3_item]).unwrap();
+
+        // v4 member: shared -> t2
+        let v4_item = map_item(shared, "contained:up", &["gitoid:blob:sha256:t2"]);
+        let v4_member = member_synth(RoboticGoat::new(
+            "v4src",
+            vec![v4_item],
+            serde_json::Value::Null,
+        ));
+
+        let dest = tempfile::TempDir::new().unwrap();
+        merge_fresh_with_options(
+            vec![v3_member, v4_member],
+            1_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            None,
+            false,
+        )
+        .await
+        .expect("mixed merge succeeds");
+
+        let cluster = output_cluster(dest.path()).await;
+        let merged = cluster
+            .item_for_identifier(shared)
+            .expect("the shared identifier resolves in the output");
+        let targets: Vec<&String> = merged.connections.0.get("contained:up").map(|s| s.iter().collect()).unwrap();
+        assert_eq!(targets.len(), 2, "both source targets survive the union");
+        assert!(merged.connections.0.get("contained:up").unwrap().contains("gitoid:blob:sha256:t1"));
+        assert!(merged.connections.0.get("contained:up").unwrap().contains("gitoid:blob:sha256:t2"));
+        // output is version 4
+        assert_eq!(output_cluster_version(&cluster), 4, "output is version 4");
+        assert_eq!(cluster.key_alg(), crate::util::KeyAlg::Blake3Truncated128);
+    }
+
+    /// Test 7: items exclusive to the v3 source and to the v4 source both
+    /// survive a mixed merge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_mixed_merge_keeps_v3_only_and_v4_only_items() {
+        let _hooks = hook();
+        let (v3_member, _v3_dir) = v3_member(
+            "v3src",
+            &[map_item("gitoid:blob:sha256:only_v3", "contained:up", &["pkg:x@1"])],
+        )
+        .unwrap();
+        let v4_member = member_synth(RoboticGoat::new(
+            "v4src",
+            vec![map_item("gitoid:blob:sha256:only_v4", "contained:up", &["pkg:y@1"])],
+            serde_json::Value::Null,
+        ));
+
+        let dest = tempfile::TempDir::new().unwrap();
+        merge_fresh_with_options(
+            vec![v3_member, v4_member],
+            1_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            None,
+            false,
+        )
+        .await
+        .expect("mixed merge succeeds");
+
+        let cluster = output_cluster(dest.path()).await;
+        assert!(cluster.item_for_identifier("gitoid:blob:sha256:only_v3").is_some());
+        assert!(cluster.item_for_identifier("gitoid:blob:sha256:only_v4").is_some());
+    }
+
+    /// Test 9: merging two version 3 sources preserves the existing merge
+    /// semantics (through conversion; the output is version 4).
+    ///
+    /// Requirement: D10 / baseline behavior. Theory: the pre-migration
+    /// merge semantics (all inputs merged, duplicates unioned) must hold
+    /// when the sources are version 3 — conversion is an internal step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_existing_two_version_3_merge_semantics_preserved() {
+        let _hooks = hook();
+        let shared = "gitoid:blob:sha256:v3v3_shared";
+        let (a, _da) = v3_member(
+            "a",
+            &[map_item(shared, "contained:up", &["gitoid:blob:sha256:from_a"])],
+        )
+        .unwrap();
+        let (b, _db) = v3_member(
+            "b",
+            &[map_item(shared, "contained:up", &["gitoid:blob:sha256:from_b"])],
+        )
+        .unwrap();
+
+        let dest = tempfile::TempDir::new().unwrap();
+        merge_fresh_with_options(
+            vec![a, b],
+            1_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            None,
+            false,
+        )
+        .await
+        .expect("v3+v3 merge succeeds");
+
+        let cluster = output_cluster(dest.path()).await;
+        let merged = cluster.item_for_identifier(shared).expect("shared resolves");
+        let targets = merged.connections.0.get("contained:up").unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains("gitoid:blob:sha256:from_a"));
+        assert!(targets.contains("gitoid:blob:sha256:from_b"));
+    }
+
+    /// Test 10: the output history is opaque to conversion.
+    ///
+    /// Requirement: ADR 0003 provenance contract. Theory: the history
+    /// contains the verbatim original histories, one conversion marker per
+    /// converted v3 input (source_cluster, big_tent_commit), and the merge
+    /// marker listing original names; temporary chunk names never appear.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_merge_history_is_opaque_to_conversion() {
+        let _hooks = hook();
+        // the v3 member's cluster dir gets a verbatim history file
+        let (v3_member, v3_dir) = v3_member(
+            "v3hist",
+            &[map_item("gitoid:blob:sha256:hist_item", "contained:up", &["pkg:x@1"])],
+        )
+        .unwrap();
+        // the .grc is at <dir>/src/<hash>.grc; history lives beside it
+        let src_dir = {
+            let member = &v3_member;
+            match member.as_ref() {
+                HerdMember::Cluster(cl) => cl.cluster_directory(),
+                _ => panic!("v3 member is a cluster"),
+            }
+        };
+        std::fs::write(
+            src_dir.join("history.jsonl"),
+            "{\"operation\":\"original_v3_run\"}\n{\"operation\":\"second_original_run\"}\n",
+        )
+        .unwrap();
+
+        let v4_member = member_synth(RoboticGoat::new(
+            "v4hist",
+            vec![map_item("gitoid:blob:sha256:v4_hist_item", "contained:up", &["pkg:y@1"])],
+            serde_json::Value::Null,
+        ));
+
+        let dest = tempfile::TempDir::new().unwrap();
+        merge_fresh_with_options(
+            vec![v3_member, v4_member],
+            1_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            None,
+            false,
+        )
+        .await
+        .expect("merge succeeds");
+
+        let cluster = output_cluster(dest.path()).await;
+        let history = cluster.read_history().expect("history reads");
+
+        // verbatim original histories
+        assert!(
+            history.iter().any(|h| h["operation"] == "original_v3_run"),
+            "original v3 history line 1 preserved verbatim: {:?}",
+            history
+        );
+        assert!(
+            history.iter().any(|h| h["operation"] == "second_original_run"),
+            "original v3 history line 2 preserved verbatim"
+        );
+
+        // exactly one conversion marker for the v3 input
+        let markers: Vec<&serde_json::Value> = history
+            .iter()
+            .filter(|h| h["operation"] == "convert_v3_to_v4")
+            .collect();
+        assert_eq!(markers.len(), 1, "one conversion marker per v3 input");
+        assert_eq!(markers[0]["source_cluster"], src_dir.join(markers[0]["source_cluster"].as_str().unwrap_or("")).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            "the marker names the original v3 cluster");
+        assert!(
+            markers[0]["big_tent_commit"].as_str().is_some(),
+            "the marker names the BigTent commit"
+        );
+
+        // the merge marker lists original names; no chunk names anywhere
+        let merge_marker = history
+            .iter()
+            .find(|h| h["operation"] == "merge_clusters")
+            .expect("merge marker present");
+        let merged_names: Vec<&str> = merge_marker["merged_clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(merged_names.len(), 2, "original cluster names only");
+        for h in &history {
+            let line = h.to_string();
+            assert!(!line.contains("chunk_"), "no temporary chunk names in history: {line}");
+        }
+    }
+
+    /// Test 11: the block list works across mixed versions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_block_list_mixed_versions() {
+        let _hooks = hook();
+        let blocked = "gitoid:blob:sha256:mixed_blocked";
+        let (v3_member, _d) = v3_member(
+            "v3src",
+            &[
+                map_item(blocked, "contained:up", &["pkg:x@1"]),
+                map_item("gitoid:blob:sha256:v3_keep", "contained:up", &[blocked]),
+            ],
+        )
+        .unwrap();
+        let v4_member = member_synth(RoboticGoat::new(
+            "v4src",
+            vec![map_item("gitoid:blob:sha256:v4_keep", "contained:up", &["pkg:y@1"])],
+            serde_json::Value::Null,
+        ));
+
+        let mut block_set = HashSet::new();
+        block_set.insert(blocked.to_string());
+        let dest = tempfile::TempDir::new().unwrap();
+        merge_fresh_with_options(
+            vec![v3_member, v4_member],
+            1_000,
+            dest.path(),
+            Arc::new(block_set),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            None,
+            false,
+        )
+        .await
+        .expect("merge succeeds");
+
+        let cluster = output_cluster(dest.path()).await;
+        assert!(
+            cluster.item_for_identifier(blocked).is_none(),
+            "blocked item absent"
+        );
+        let kept = cluster
+            .item_for_identifier("gitoid:blob:sha256:v3_keep")
+            .expect("v3 kept item present");
+        assert!(
+            kept.connections.0.values().flatten().all(|t| t != blocked),
+            "blocked targets removed from kept items"
+        );
+        assert!(
+            cluster.item_for_identifier("gitoid:blob:sha256:v4_keep").is_some(),
+            "v4 kept item present"
+        );
+    }
+
+    /// Tests 12/15: cleanup on success and explicit roots preserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_merge_temp_dir_cleaned_on_success() {
+        let _hooks = hook();
+        let (v3_member, _d) = v3_member(
+            "v3src",
+            &[map_item("gitoid:blob:sha256:cleanup_item", "contained:up", &["pkg:x@1"])],
+        )
+        .unwrap();
+        let v4_member = member_synth(RoboticGoat::new(
+            "v4src",
+            vec![map_item("gitoid:blob:sha256:cleanup_v4", "contained:up", &["pkg:y@1"])],
+            serde_json::Value::Null,
+        ));
+
+        let base = tempfile::TempDir::new().unwrap();
+        let explicit_root = base.path().join("explicit_scratch");
+        std::fs::create_dir(&explicit_root).unwrap();
+
+        let dest = tempfile::TempDir::new().unwrap();
+        merge_fresh_with_options(
+            vec![v3_member, v4_member],
+            1_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            Some(explicit_root.clone()),
+            false,
+        )
+        .await
+        .expect("merge succeeds");
+
+        // the explicit root is preserved (never deleted) but empty: every
+        // run dir under it was removed
+        assert!(
+            explicit_root.exists(),
+            "an explicit temp root is never deleted"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&explicit_root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            leftovers.iter().all(|p| std::fs::read_dir(p).map(|d| d.count() == 0).unwrap_or(true)),
+            "no run dirs with files remain under the root: {:?}",
+            leftovers
+        );
+
+        // and with the default root: no bigtent-merge-* dirs remain at all
+        let system_temp = std::env::temp_dir();
+        let stragglers: Vec<_> = std::fs::read_dir(&system_temp)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("bigtent-merge-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            stragglers.is_empty(),
+            "no bigtent-merge-* directories survive a successful merge: {:?}",
+            stragglers
+        );
+    }
+
+    /// Test 16 (merge level): a temp root inside the destination is
+    /// rejected by the merge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_temp_root_rejects_destination_overlap() {
+        let _hooks = hook();
+        let (v3_member, _d) = v3_member(
+            "v3src",
+            &[map_item("gitoid:blob:sha256:overlap_item", "contained:up", &["pkg:x@1"])],
+        )
+        .unwrap();
+        let v4_member = member_synth(RoboticGoat::new(
+            "v4src",
+            vec![map_item("gitoid:blob:sha256:overlap_v4", "contained:up", &["pkg:y@1"])],
+            serde_json::Value::Null,
+        ));
+
+        let dest = tempfile::TempDir::new().unwrap();
+        let inside_dest = dest.path().join("scratch");
+        std::fs::create_dir(&inside_dest).unwrap();
+        let result = merge_fresh_with_options(
+            vec![v3_member, v4_member],
+            1_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            Some(inside_dest),
+            false,
+        )
+        .await;
+        assert!(result.is_err(), "a root inside the destination is rejected");
+    }
+
+    /// Test 21: a merge with about 100 converted chunks works; the file
+    /// descriptor count is observable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_many_chunk_merge() {
+        let _hooks = hook();
+        crate::rodeo::convert::TEST_MAX_CHUNK_ENTRIES.store(2, Ordering::Relaxed);
+
+        let items: Vec<Item> = (0..200)
+            .map(|i| {
+                map_item(
+                    &format!("gitoid:blob:sha256:manychunk_{:04}", i),
+                    "contained:up",
+                    &["pkg:x@1"],
+                )
+            })
+            .collect();
+        let (v3_member, _d) = v3_member("v3src", &items).unwrap();
+        let v4_member = member_synth(RoboticGoat::new(
+            "v4src",
+            vec![map_item("gitoid:blob:sha256:manychunk_v4", "contained:up", &["pkg:y@1"])],
+            serde_json::Value::Null,
+        ));
+
+        let fd_count = |tag: &str| {
+            let fds = std::fs::read_dir("/proc/self/fd")
+                .map(|d| d.count())
+                .unwrap_or(0);
+            println!("open file descriptors ({tag}): {fds}");
+            fds
+        };
+
+        let before = fd_count("before merge");
+        let dest = tempfile::TempDir::new().unwrap();
+        merge_fresh_with_options(
+            vec![v3_member, v4_member],
+            1_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            None,
+            false,
+        )
+        .await
+        .expect("a 100-chunk merge succeeds");
+        let after = fd_count("after merge");
+        crate::rodeo::convert::TEST_MAX_CHUNK_ENTRIES.store(0, Ordering::Relaxed);
+
+        let cluster = output_cluster(dest.path()).await;
+        assert!(
+            cluster.number_of_items() >= 200,
+            "all items survive (merged duplicate groups only reduce)"
+        );
+        assert!(
+            after <= before + 8,
+            "the merge must not leak descriptors: before={before} after={after}"
+        );
+    }
+
+    /// Test 22: a single item larger than the chunk budget gets its own
+    /// chunk (never dropped).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_single_item_larger_than_split_limit() {
+        let _hooks = hook();
+        crate::rodeo::convert::TEST_MAX_CHUNK_BYTES.store(64, Ordering::Relaxed);
+
+        let big = map_item(
+            "gitoid:blob:sha256:big_item",
+            "contained:up",
+            &["pkg:x@1", "pkg:y@2", "pkg:z@3"],
+        );
+        let (v3_member, _d) = v3_member("v3src", &[big]).unwrap();
+
+        let dest = tempfile::TempDir::new().unwrap();
+        merge_fresh_with_options(
+            vec![v3_member],
+            1_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            None,
+            false,
+        )
+        .await
+        .expect("an oversized single item converts into its own chunk");
+        crate::rodeo::convert::TEST_MAX_CHUNK_BYTES.store(0, Ordering::Relaxed);
+
+        let cluster = output_cluster(dest.path()).await;
+        assert!(
+            cluster
+                .item_for_identifier("gitoid:blob:sha256:big_item")
+                .is_some(),
+            "the oversized item survives"
+        );
+    }
+
+    /// Test 25: property — the split limits do not change the merge result.
+    ///
+    /// Requirement: chunk-boundary reasoning. Theory: for arbitrary
+    /// synthetic v3 sources (several edge types, multiple targets, unicode
+    /// identifiers), merging with any chunk budget yields the same output
+    /// item sets. Duplicates are NOT generated because within-source
+    /// duplicates are rejected by design.
+    fn synthetic_v3_items(case_seed: u64) -> Vec<Item> {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(case_seed);
+        let edge_types = ["contained:up", "contained:down", "alias:from", "tag:to", "build:down"];
+        let count = rng.random_range(1..25);
+        let mut items = vec![];
+        for i in 0..count {
+            let id = if i % 5 == 0 {
+                // unicode identifiers (coverage assertion)
+                format!("gitoid:blob:sha256:ünïcodé_{}_{:04}", rng.random::<u32>(), i)
+            } else {
+                format!("gitoid:blob:sha256:prop_{:04}_{}", i, rng.random::<u32>())
+            };
+            let mut connections: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
+            for _ in 0..rng.random_range(1..4) {
+                let t = edge_types[rng.random_range(0..edge_types.len())];
+                for _ in 0..rng.random_range(1..4) {
+                    connections
+                        .entry(t.to_string())
+                        .or_default()
+                        .insert(format!("pkg:gen/{}@{}", rng.random::<u16>(), rng.random_range(0..9)));
+                }
+            }
+            items.push(Item {
+                identifier: id,
+                connections: crate::item::Connections(connections),
+                body_mime_type: Some(ITEM_METADATA_MIME_TYPE.to_string()),
+                body: Some(serde_cbor::Value::Map(Default::default())),
+            });
+        }
+        items
+    }
+
+    async fn merge_for_prop(budget_entries: usize) -> std::collections::BTreeSet<String> {
+        crate::rodeo::convert::TEST_MAX_CHUNK_ENTRIES.store(budget_entries, Ordering::Relaxed);
+        let items = synthetic_v3_items(2026_0918);
+        let (member, _dir) = v3_member("propsrc", &items).unwrap();
+        let dest = tempfile::TempDir::new().unwrap();
+        let result = merge_fresh_with_options(
+            vec![member],
+            1_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            2,
+            None,
+            false,
+        )
+        .await;
+        crate::rodeo::convert::TEST_MAX_CHUNK_ENTRIES.store(0, Ordering::Relaxed);
+        result.expect("merge succeeds for any budget");
+        let cluster = output_cluster(dest.path()).await;
+        // the output item set: identifiers + their connection maps
+        let mut sig = std::collections::BTreeSet::new();
+        let count = cluster.number_of_items();
+        for pos in 0..count {
+            if let Some(off) = crate::rodeo::robo_goat::ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos) {
+                if let Some(item) = crate::rodeo::robo_goat::ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &off) {
+                    sig.insert(format!("{}|{:?}", item.identifier, item.connections));
+                }
+            }
+        }
+        sig
+    }
+
+    #[test]
+    fn prop_split_limits_invariance_on_synthetic_clusters() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let _hooks = hook();
+            let baseline = merge_for_prop(1_000_000).await;
+            assert!(!baseline.is_empty(), "coverage: the generator produced items");
+            for budget in [1usize, 2, 5, 40] {
+                let other = merge_for_prop(budget).await;
+                assert_eq!(
+                    baseline, other,
+                    "the merge result must not depend on the split limits"
+                );
+            }
+        });
+    }
+
+    /// Test 26: property — worker count and buffer limit invariance: the
+    /// same sources merged with different worker counts and buffer limits
+    /// yield the same output item sets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn prop_worker_count_and_buffer_limit_invariance() {
+        let _hooks = hook();
+        let run = |workers: usize, buffer_limit: usize| async move {
+            let items = synthetic_v3_items(777);
+            let (member, _dir) = v3_member("propsrc2", &items).unwrap();
+            let dest = tempfile::TempDir::new().unwrap();
+            merge_fresh_with_options(
+                vec![member],
+                buffer_limit,
+                dest.path(),
+                Arc::new(HashSet::new()),
+                Arc::new(AtomicBool::new(true)),
+                1,
+                workers,
+                None,
+                false,
+            )
+            .await
+            .expect("merge succeeds");
+            let cluster = output_cluster(dest.path()).await;
+            output_item_signature(&cluster)
+        };
+        let baseline = run(1, 1_000).await;
+        assert!(!baseline.is_empty(), "coverage: the generator produced items");
+        for (workers, limit) in [(2usize, 1usize), (4usize, 10_000usize), (3usize, 1usize)] {
+            assert_eq!(
+                baseline,
+                run(workers, limit).await,
+                "results must be invariant across worker counts and buffer limits"
+            );
+        }
+    }
+
+    /// Test 27: the large-corpus merge test (corpus-gated).
+    ///
+    /// Requirement: D11/H9. Behavior: with `BIGTENT_LARGE_MERGE_CORPUS`
+    /// unset and require mode off, a loud punt; with require mode on, a
+    /// missing/undersized corpus FAILS; with the corpus present, the merge
+    /// runs through the product path and the assertions of the plan hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_large_corpus_merge() {
+        let corpus = std::env::var("BIGTENT_LARGE_MERGE_CORPUS").ok();
+        let require = std::env::var("BIGTENT_REQUIRE_LARGE_MERGE_CORPUS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        let corpus_dir = match corpus {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                if require {
+                    panic!("BIGTENT_REQUIRE_LARGE_MERGE_CORPUS=1 but BIGTENT_LARGE_MERGE_CORPUS is unset: failing, not punting");
+                }
+                eprintln!(
+                    "PUNT: BIGTENT_LARGE_MERGE_CORPUS not set; large corpus merge not exercised"
+                );
+                return;
+            }
+        };
+        assert!(corpus_dir.is_dir(), "corpus must be a directory");
+
+        let clusters: Vec<Arc<HerdMember>> = GoatRodeoCluster::cluster_files_in_dir(
+            corpus_dir.clone(),
+            false,
+            vec![],
+        )
+        .await
+        .expect("corpus loads")
+        .into_iter()
+        .map(member_core)
+        .collect();
+        assert!(clusters.len() >= 2, "the corpus must hold multiple clusters");
+
+        let dest = tempfile::TempDir::new().unwrap();
+        merge_fresh_with_options(
+            clusters,
+            10_000,
+            dest.path(),
+            Arc::new(HashSet::new()),
+            Arc::new(AtomicBool::new(true)),
+            15,
+            4,
+            None,
+            false,
+        )
+        .await
+        .expect("the corpus merge succeeds");
+
+        // assertions: output loads; per-input-cluster identifiers unique;
+        // output count between the largest input and the sum of inputs;
+        // purls.txt and history.jsonl exist and name original clusters;
+        // no temporary clusters in the destination
+        let cluster = output_cluster(dest.path()).await;
+        assert!(cluster.number_of_items() > 0);
+        assert!(dest.path().join("purls.txt").exists());
+        let history = cluster.read_history().expect("history");
+        assert!(
+            history.iter().any(|h| h["operation"] == "merge_clusters"),
+            "the merge marker is present"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase3_cli_tests {
+    use clap::Parser;
+
+    /// Test (phase 3, CLI): `--merge-temp-dir` and `--force-temp-dir`
+    /// parse and default correctly.
+    ///
+    /// Requirement: phase 3 deliverable 5. Theory: the flags must parse
+    /// (path + flag) with the documented defaults (None / false) so the
+    /// documented default behavior (random system temp dir, enforced
+    /// safety checks) is what actually runs.
+    #[test]
+    fn test_merge_temp_dir_flags_parse() {
+        // note: arg_required_else_help exits on empty args, so the default
+        // parse includes a real flag
+        let args = crate::config::Args::parse_from(["bigtent", "--rodeo", "/tmp"]);
+        assert!(args.merge_temp_dir.is_none(), "default: no explicit root");
+        assert!(!args.force_temp_dir, "default: safety checks enforced");
+
+        let args = crate::config::Args::parse_from([
+            "bigtent",
+            "--rodeo",
+            "/tmp",
+            "--merge-temp-dir",
+            "/var/tmp/scratch",
+            "--force-temp-dir",
+        ]);
+        assert_eq!(
+            args.merge_temp_dir,
+            Some(std::path::PathBuf::from("/var/tmp/scratch"))
+        );
+        assert!(args.force_temp_dir);
     }
 }

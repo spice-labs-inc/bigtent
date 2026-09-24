@@ -95,6 +95,20 @@ pub struct Args {
     #[arg(long)]
     pub merge_worker_count: Option<usize>,
 
+    /// Applies to `fresh_merge` jobs: directory for the merge's temporary
+    /// files (converted sources live here during the merge). The default is
+    /// a fresh random directory under the system temporary directory.
+    /// Explicit roots are never deleted; only the per-run directories
+    /// inside them are.
+    #[arg(long)]
+    pub merge_temp_dir: Option<PathBuf>,
+
+    /// Applies to `fresh_merge` jobs with `--merge-temp-dir`: accept a
+    /// temporary root that is not owned by the effective user or is
+    /// writable by group/other. The override is recorded in the logs.
+    #[arg(long)]
+    pub force_temp_dir: bool,
+
     /// Path to a plain-text file containing identifiers to exclude from a `fresh_merge`.
     /// One identifier per line; empty lines and lines starting with `#` are ignored.
     /// Requires `--fresh-merge`.

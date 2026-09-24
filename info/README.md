@@ -5,8 +5,13 @@ This directory contains technical documentation for Big Tent.
 ## Documentation in This Directory
 
 * [Files and Formats](files_and_formats.md) - Detailed file format specifications (.grc, .gri, .grd)
+  ([LLM companion](llm/files_and_formats_llm.md))
+* [Goat Rodeo Producer Upgrade Guide](goat_rodeo_upgrade.md) - What changes when writing version 4 clusters
+  ([LLM companion](llm/goat_rodeo_upgrade_llm.md))
 * [Configuration Reference](config.md) - CLI arguments, environment variables, and tuning
+  ([LLM companion](llm/config_llm.md))
 * [Operations Guide](operations.md) - Production deployment, TLS, monitoring, upgrades, and runbook
+  ([LLM companion](llm/operations_llm.md))
 
 ## Top-Level Documentation
 

@@ -171,7 +171,8 @@ my_cluster/
   (`YYYY_MM_DD_HH_MM_SS_<hash>.grc`) so the most recent cluster is easy to
   identify. A directory may contain multiple `.grc` files; BigTent loads
   the most recent.
-- **`.gri` (Index files)** -- sorted indexes that map MD5 hashes of
+- **`.gri` (Index files)** -- sorted indexes that map 16-byte index keys
+  (BLAKE3-derived for version 4 clusters, MD5 for version 3) of
   identifiers to data file locations. Named `<hash>.gri`.
 - **`.grd` (Data files)** -- CBOR-encoded Items stored at specific offsets.
   Named `<hash>.grd`.

@@ -38,13 +38,13 @@
 //! Like data files, index files are memory-mapped for efficient access.
 
 use crate::util::{
-    MD5Hash, byte_slice_to_u63, read_len_and_cbor_sync, read_u32_sync, sha256_for_reader_sync,
+    KeyHash, byte_slice_to_u63, read_len_and_cbor_sync, read_u32_sync, sha256_for_reader_sync,
 };
 use anyhow::{Result, bail};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
     path::PathBuf,
     sync::Arc,
@@ -65,7 +65,7 @@ pub struct IndexEnvelope {
     pub size: u32,
 
     /// Hashes of data files referenced by this index
-    pub data_files: HashSet<u64>,
+    pub data_files: BTreeSet<u64>,
 
     /// Encoding format for index entries (e.g., "md5_u64_u64")
     pub encoding: String,
@@ -135,6 +135,16 @@ impl IndexFile {
         }
 
         let idx_env: IndexEnvelope = read_len_and_cbor_sync(&mut ifp)?;
+
+        // the envelope repeats its magic inside; validate it (H3)
+        if idx_env.magic != IndexFileMagicNumber {
+            bail!(
+                "Index envelope for {:016x}.{} has invalid magic {:x}",
+                hash,
+                GOAT_RODEO_INDEX_FILE_SUFFIX,
+                idx_env.magic
+            );
+        }
 
         // the "position" is the starting length of the byte array less the
         // current length... that's the number of bytes we read
@@ -209,11 +219,11 @@ pub struct ItemOffset {
 }
 
 pub trait HasHash {
-    fn hash(&self) -> &MD5Hash;
+    fn hash(&self) -> &KeyHash;
 }
 
 impl HasHash for ItemOffset {
-    fn hash(&self) -> &MD5Hash {
+    fn hash(&self) -> &KeyHash {
         &self.hash
     }
 }

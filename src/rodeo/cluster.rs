@@ -19,7 +19,7 @@
 //!
 //! ## ClusterFileEnvelope Fields
 //!
-//! - `version` - Format version (currently 3)
+//! - `version` - Format version (4 is current; 3 stays readable)
 //! - `magic` - Magic number for validation
 //! - `data_files` - SHA256 hashes of referenced `.grd` data files
 //! - `index_files` - SHA256 hashes of referenced `.gri` index files
@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 /// cluster file (after the magic number and length prefix).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClusterFileEnvelope {
-    /// File format version (currently 3)
+    /// File format version (version 4 is current; version 3 stays readable)
     pub version: u32,
 
     /// Magic number for file type validation (should be `ClusterFileMagicNumber`)
@@ -56,6 +56,17 @@ pub struct ClusterFileEnvelope {
 
     /// Arbitrary metadata (creation time, source info, build details, etc.)
     pub info: BTreeMap<String, String>,
+
+    /// The cluster's index key algorithm declaration (ADR 0002).
+    ///
+    /// Version 4 clusters written by BigTent always carry
+    /// [`V4_CLUSTER_ENCODING`]. Version 3 clusters have no declaration
+    /// (the field is absent and reads as `None`); for them the reader
+    /// falls back to the first `.gri` file's `encoding` description.
+    /// The declared algorithm is honored regardless of the version
+    /// number: readers use the algorithm the files declare.
+    #[serde(default)]
+    pub encoding: Option<String>,
 }
 
 /// Magic number identifying cluster (.grc) files: 0xba4a4a ("Banana")
@@ -72,7 +83,34 @@ pub const ClusterFileMagicNumber: u32 = 0xba4a4a; // Banana
 pub const MinClusterVersion: u32 = 3;
 
 /// Current cluster file format version used when writing new clusters.
-pub const CLUSTER_VERSION: u32 = MinClusterVersion;
+pub const CLUSTER_VERSION: u32 = 4;
+
+/// Index key algorithm declaration for version 4 clusters (ADR 0002):
+/// the first 16 bytes (128 bits) of the BLAKE3 digest over the
+/// identifier's UTF-8 bytes, followed by the two big-endian u64 fields
+/// of the index entry.
+pub const V4_CLUSTER_ENCODING: &str = "BLAKE3[0..16]/Long/Long";
+
+/// Index key algorithm declaration used by version 3 clusters
+/// (carried in the `.gri` envelopes).
+pub const V3_CLUSTER_ENCODING: &str = "MD5/Long/Long";
+
+/// Parse an index key algorithm declaration into its [`KeyAlg`].
+///
+/// An unknown declaration fails closed: the reader cannot honor an
+/// algorithm it does not know.
+pub fn parse_encoding(encoding: &str) -> Result<crate::util::KeyAlg> {
+    match encoding {
+        V3_CLUSTER_ENCODING => Ok(crate::util::KeyAlg::Md5),
+        V4_CLUSTER_ENCODING => Ok(crate::util::KeyAlg::Blake3Truncated128),
+        other => bail!(
+            "Unknown index key encoding {:?} (known: {:?}, {:?})",
+            other,
+            V3_CLUSTER_ENCODING,
+            V4_CLUSTER_ENCODING
+        ),
+    }
+}
 
 impl ClusterFileEnvelope {
     pub fn validate(&self) -> Result<()> {
@@ -80,12 +118,21 @@ impl ClusterFileEnvelope {
             bail!("Loaded a cluster with an invalid magic number: {:?}", self);
         }
 
-        if self.version != MinClusterVersion {
+        // readers accept versions 3 and 4; everything else is rejected
+        if self.version < MinClusterVersion || self.version > CLUSTER_VERSION {
             bail!(
-                "Loaded a Cluster with version {} but this code only supports version {} Clusters",
+                "Loaded a Cluster with version {} but this code only supports versions {} through {}",
                 self.version,
-                MinClusterVersion
+                MinClusterVersion,
+                CLUSTER_VERSION
             );
+        }
+
+        // an unknown declaration cannot be honored; fail closed naming the
+        // constant. A known declaration is accepted regardless of version
+        // (the algorithm is what the files declare, per ADR 0002).
+        if let Some(encoding) = &self.encoding {
+            parse_encoding(encoding)?;
         }
 
         Ok(())

@@ -62,6 +62,7 @@ pub mod server;
 
 pub mod rodeo {
     pub mod cluster;
+    pub mod convert;
     pub mod data;
     pub mod goat;
     pub mod goat_herd;

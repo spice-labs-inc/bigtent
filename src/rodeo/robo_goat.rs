@@ -30,12 +30,12 @@
 //! Implements both [`GoatRodeoTrait`] and [`ClusterRoboMember`] for full
 //! compatibility with the cluster ecosystem.
 
-use std::{collections::BTreeSet, fmt::Debug, fs::File, io::Write, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, fmt::Debug, fs::File, io::Write, path::PathBuf, sync::Arc};
 
 use crate::{
     item::{Item, TAG_FROM, TAG_TO},
     rodeo::goat_trait::{impl_antialias_for, impl_north_send, impl_stream_flattened_items},
-    util::{MD5Hash, iso8601_now, md5hash_str, sha256_for_slice},
+    util::{blake3hash_str, iso8601_now, sha256_for_slice},
 };
 use anyhow::Result;
 use serde_json::{Map, json};
@@ -88,7 +88,9 @@ impl RoboticGoat {
         let mut offsets = vec![];
         for (idx, item) in items.iter().enumerate() {
             offsets.push(ItemOffset {
-                hash: md5hash_str(&item.identifier),
+                // RoboticGoat is an in-memory version 4 member: offsets are
+                // keyed with the v4 key algorithm (ADR 0002)
+                hash: blake3hash_str(&item.identifier),
                 loc: (idx, 0),
             });
         }
@@ -132,10 +134,10 @@ impl RoboticGoat {
 
             let i = Item {
                 identifier: identifier.clone(),
-                connections: BTreeSet::from([
-                    (TAG_FROM.to_string(), base_name.to_string()),
-                    (TAG_TO.to_string(), name.clone()),
-                ]),
+                connections: crate::item::Connections(BTreeMap::from([
+                    (TAG_FROM.to_string(), [base_name.to_string()].into_iter().collect()),
+                    (TAG_TO.to_string(), [name.clone()].into_iter().collect()),
+                ])),
                 body_mime_type: Some("application/vnd.cc.goatrodeo.tag".to_string()),
                 body: Some(body),
             };
@@ -143,18 +145,25 @@ impl RoboticGoat {
             // create the "back link"
             robo_items.push(Item {
                 identifier: name,
-                connections: BTreeSet::from([(TAG_FROM.to_string(), identifier)]),
+                connections: crate::item::Connections(BTreeMap::from([(
+                    TAG_FROM.to_string(),
+                    [identifier].into_iter().collect(),
+                )])),
                 body_mime_type: None,
                 body: None,
             });
         }
-        let mut connections = BTreeSet::new();
+        let mut connections = crate::item::Connections::default();
 
         // backlinks from the tags to the root tag
         for i in &robo_items {
             // only for the actual tags, not for the synthetic back-link
             if i.body.is_some() {
-                connections.insert((TAG_TO.to_string(), i.identifier.to_string()));
+                connections
+                    .0
+                    .entry(TAG_TO.to_string())
+                    .or_default()
+                    .insert(i.identifier.to_string());
             }
         }
         let tags = Item {
@@ -207,9 +216,10 @@ async fn test_synthetic() {
 
     let tagged: Vec<String> = tags
         .connections
+        .0
         .iter()
-        .filter(|conn| conn.0.is_tag_to())
-        .map(|conn| conn.1.clone())
+        .filter(|(edge_type, _)| edge_type.is_tag_to())
+        .flat_map(|(_, targets)| targets.iter().cloned())
         .collect();
 
     assert_eq!(tagged.len(), 1, "Expecting 1 tag, got {:?}", tagged);
@@ -217,19 +227,22 @@ async fn test_synthetic() {
     for t in &tagged {
         let the_tag = herd.item_for_identifier(&t).expect("Get tag");
         let the_tag_id = &the_tag.identifier;
-        for (t, v) in &the_tag.connections {
+        for (t, targets) in &the_tag.connections.0 {
             if t.is_tag_to() {
-                let tagged_item = herd
-                    .item_for_identifier(v)
-                    .expect(&format!("Should load {}", v));
-                assert_eq!(
-                    1,
-                    tagged_item
-                        .connections
-                        .iter()
-                        .filter(|c| c.0.is_tag_from() && the_tag_id == &c.1)
-                        .count()
-                );
+                for v in targets {
+                    let tagged_item = herd
+                        .item_for_identifier(v)
+                        .expect(&format!("Should load {}", v));
+                    assert_eq!(
+                        1,
+                        tagged_item
+                            .connections
+                            .0
+                            .get("tag:from")
+                            .map(|s| s.iter().filter(|c| *c == the_tag_id).count())
+                            .unwrap_or(0)
+                    );
+                }
             }
         }
     }
@@ -283,10 +296,7 @@ impl GoatRodeoTrait for RoboticGoat {
     }
 
     fn item_for_identifier(&self, data: &str) -> Option<Item> {
-        self.item_for_hash(md5hash_str(data))
-    }
-
-    fn item_for_hash(&self, hash: MD5Hash) -> Option<Item> {
+        let hash = blake3hash_str(data);
         let found = match self.offsets.binary_search_by_key(&hash, |v| v.hash) {
             Ok(v) => v,
             Err(_) => return None,
@@ -308,11 +318,7 @@ impl GoatRodeoTrait for RoboticGoat {
 
     fn has_identifier(&self, identifier: &str) -> bool {
         self.offsets
-            .binary_search_by_key(&md5hash_str(identifier), |v| v.hash)
+            .binary_search_by_key(&blake3hash_str(identifier), |v| v.hash)
             .is_ok()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
     }
 }

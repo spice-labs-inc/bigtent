@@ -28,7 +28,7 @@
 //! - [`member_core`] - Wrap a `GoatRodeoCluster` in a `HerdMember`
 //! - [`member_synth`] - Wrap a `RoboticGoat` in a `HerdMember`
 
-use crate::{item::Item, util::MD5Hash};
+use crate::item::Item;
 
 use super::{
     goat::GoatRodeoCluster,
@@ -55,10 +55,13 @@ pub fn member_synth(it: Arc<RoboticGoat>) -> Arc<HerdMember> {
 }
 
 impl HerdMember {
-    pub fn get_blob(&self) -> Option<String> {
+    /// The index key algorithm this member's files declare (ADR 0002):
+    /// file-backed members resolve it from their declarations; in-memory
+    /// members are always version 4 (BLAKE3).
+    pub fn key_alg(&self) -> crate::util::KeyAlg {
         match self {
-            HerdMember::Robo(_robotic_goat) => None,
-            HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.get_blob(),
+            HerdMember::Robo(_) => crate::util::KeyAlg::Blake3Truncated128,
+            HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.key_alg(),
         }
     }
 
@@ -67,13 +70,6 @@ impl HerdMember {
         match self {
             HerdMember::Robo(_robotic_goat) => vec![],
             HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.get_sha(),
-        }
-    }
-
-    pub fn get_directory(&self) -> Option<PathBuf> {
-        match self {
-            HerdMember::Robo(_robotic_goat) => None,
-            HerdMember::Cluster(goat_rodeo_cluster) => Some(goat_rodeo_cluster.get_directory()),
         }
     }
 }
@@ -168,13 +164,6 @@ impl GoatRodeoTrait for HerdMember {
         }
     }
 
-    fn item_for_hash(&self, hash: MD5Hash) -> Option<Item> {
-        match self {
-            HerdMember::Robo(goat_synth) => goat_synth.item_for_hash(hash),
-            HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.item_for_hash(hash),
-        }
-    }
-
     fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item> {
         match &*self {
             HerdMember::Robo(goat_synth) => goat_synth.clone().antialias_for(data),
@@ -211,13 +200,6 @@ impl GoatRodeoTrait for HerdMember {
             HerdMember::Cluster(goat_rodeo_cluster) => {
                 goat_rodeo_cluster.has_identifier(identifier)
             }
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        match self {
-            HerdMember::Robo(goat_synth) => goat_synth.is_empty(),
-            HerdMember::Cluster(goat_rodeo_cluster) => goat_rodeo_cluster.is_empty(),
         }
     }
 }
