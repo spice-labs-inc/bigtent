@@ -26,6 +26,7 @@ impl PidFile {
     /// 3. Atomically renames the temp file to the target.
     /// 4. Opens the target and acquires an exclusive advisory lock (`flock`).
     /// 5. Sets permissions to 0644.
+    #[allow(clippy::collapsible_if)] // symlink guard reads best nested
     pub fn create(path: &Path) -> Result<PidFile> {
         // Reject symlinks
         if let Ok(meta) = fs::symlink_metadata(path) {

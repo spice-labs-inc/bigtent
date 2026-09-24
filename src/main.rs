@@ -224,7 +224,8 @@ async fn run_convert(inputs: Vec<PathBuf>, dest: PathBuf) -> Result<()> {
         if !input_dir.is_dir() {
             bail!("Input must be a directory of clusters: {:?}", input_dir);
         }
-        let clusters = GoatRodeoCluster::cluster_files_in_dir(input_dir.clone(), false, vec![]).await?;
+        let clusters =
+            GoatRodeoCluster::cluster_files_in_dir(input_dir.clone(), false, vec![]).await?;
         let name = match input_dir.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => bail!("Input directory has no name: {:?}", input_dir),
@@ -331,7 +332,9 @@ async fn run_merge(paths: Vec<PathBuf>, args: Args) -> Result<()> {
         );
     }
 
-    let merge_worker_count = args.merge_worker_count.unwrap_or_else(default_merge_worker_count);
+    let merge_worker_count = args
+        .merge_worker_count
+        .unwrap_or_else(default_merge_worker_count);
     info!("Using {} merge worker threads", merge_worker_count);
 
     let ret = merge_fresh_with_options(

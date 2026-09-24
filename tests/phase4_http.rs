@@ -10,15 +10,13 @@
 //! rejected with static messages; OpenAPI documents both shapes. H10:
 //! `/openapi.json` is the only specification.
 
-use bigtent::item::Item;
-use bigtent::rodeo::goat::GoatRodeoCluster;
-use bigtent::rodeo::goat_trait::GoatRodeoTrait;
-use bigtent::rodeo::holder::ClusterHolder;
-use bigtent::rodeo::member::member_core;
-use bigtent::rodeo::writer::ClusterWriter;
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
+use bigtent::item::Item;
+use bigtent::rodeo::goat::GoatRodeoCluster;
+use bigtent::rodeo::holder::ClusterHolder;
+use bigtent::rodeo::writer::ClusterWriter;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -33,15 +31,27 @@ async fn make_app() -> (Router, tempfile::TempDir) {
         Item {
             identifier: "gitoid:blob:sha256:file_1".into(),
             connections: [
-                ("contained:up".to_string(), ["pkg:npm:container@1".to_string()].into_iter().collect()),
-                ("alias:from".to_string(), ["pkg:npm/left@1.0.0".to_string()].into_iter().collect()),
+                (
+                    "contained:up".to_string(),
+                    ["pkg:npm:container@1".to_string()].into_iter().collect(),
+                ),
+                (
+                    "alias:from".to_string(),
+                    ["pkg:npm/left@1.0.0".to_string()].into_iter().collect(),
+                ),
             ]
             .into_iter()
             .collect(),
             body_mime_type: Some(bigtent::item::ITEM_METADATA_MIME_TYPE.into()),
-            body: Some(serde_cbor::from_slice(&serde_cbor::to_vec(
-                &serde_json::json!({"file_names": ["f1.txt"], "file_size": 7})
-            ).unwrap()).unwrap()),
+            body: Some(
+                serde_cbor::from_slice(
+                    &serde_cbor::to_vec(
+                        &serde_json::json!({"file_names": ["f1.txt"], "file_size": 7}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
         },
         Item {
             identifier: "gitoid:blob:sha256:file_2".into(),
@@ -52,9 +62,15 @@ async fn make_app() -> (Router, tempfile::TempDir) {
             .into_iter()
             .collect(),
             body_mime_type: Some(bigtent::item::ITEM_METADATA_MIME_TYPE.into()),
-            body: Some(serde_cbor::from_slice(&serde_cbor::to_vec(
-                &serde_json::json!({"file_names": ["f2.txt"], "file_size": 9})
-            ).unwrap()).unwrap()),
+            body: Some(
+                serde_cbor::from_slice(
+                    &serde_cbor::to_vec(
+                        &serde_json::json!({"file_names": ["f2.txt"], "file_size": 9}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
         },
         // the container: contains the two files
         Item {
@@ -71,9 +87,15 @@ async fn make_app() -> (Router, tempfile::TempDir) {
             .into_iter()
             .collect(),
             body_mime_type: Some(bigtent::item::ITEM_METADATA_MIME_TYPE.into()),
-            body: Some(serde_cbor::from_slice(&serde_cbor::to_vec(
-                &serde_json::json!({"file_names": ["container"], "file_size": 16})
-            ).unwrap()).unwrap()),
+            body: Some(
+                serde_cbor::from_slice(
+                    &serde_cbor::to_vec(
+                        &serde_json::json!({"file_names": ["container"], "file_size": 16}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
         },
         // an alias item pointing at the container
         Item {
@@ -113,7 +135,12 @@ async fn make_app() -> (Router, tempfile::TempDir) {
 async fn send(app: &Router, request: Request<Body>) -> (StatusCode, axum::body::Bytes) {
     let response = app.clone().oneshot(request).await.expect("request");
     let status = response.status();
-    let bytes = response.into_body().collect().await.expect("body").to_bytes();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
     (status, bytes)
 }
 
@@ -164,11 +191,7 @@ async fn test_item_default_shape_is_map() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_item_format_v3_shape_is_legacy_pairs() {
     let (app, _dir) = make_app().await;
-    let (status, body) = send(
-        &app,
-        get("/item/gitoid:blob:sha256:file_1?item_format=v3"),
-    )
-    .await;
+    let (status, body) = send(&app, get("/item/gitoid:blob:sha256:file_1?item_format=v3")).await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let connections = json.get("connections").expect("connections present");
@@ -189,11 +212,8 @@ async fn test_item_format_v3_shape_is_legacy_pairs() {
 async fn test_item_format_explicit_v4() {
     let (app, _dir) = make_app().await;
     let (_, default_body) = send(&app, get("/item/gitoid:blob:sha256:file_1")).await;
-    let (_, explicit_body) = send(
-        &app,
-        get("/item/gitoid:blob:sha256:file_1?item_format=v4"),
-    )
-    .await;
+    let (_, explicit_body) =
+        send(&app, get("/item/gitoid:blob:sha256:file_1?item_format=v4")).await;
     assert_eq!(default_body, explicit_body, "v4 == default");
 }
 
@@ -211,14 +231,11 @@ async fn test_item_format_invalid_rejected() {
     for bad in [
         "item_format=v2",
         "item_format=",
-        "item_format=V3",   // wrong case
+        "item_format=V3",                // wrong case
         "item_format=v3&item_format=v4", // conflicting duplicates
     ] {
-        let (status, body) = send(
-            &app,
-            get(&format!("/item/gitoid:blob:sha256:file_1?{bad}")),
-        )
-        .await;
+        let (status, body) =
+            send(&app, get(&format!("/item/gitoid:blob:sha256:file_1?{bad}"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400 for {bad}");
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(
@@ -275,11 +292,7 @@ async fn test_item_format_applies_to_aa_endpoints() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["connections"].is_object(), "default aa: map shape");
 
-    let (status, body) = send(
-        &app,
-        get("/aa/pkg:npm/container@1.0.0?item_format=v3"),
-    )
-    .await;
+    let (status, body) = send(&app, get("/aa/pkg:npm/container@1.0.0?item_format=v3")).await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["connections"].is_array(), "v3 aa: pair shape");
@@ -345,7 +358,10 @@ async fn test_item_format_applies_to_north_full_items() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("[\"contained:down\""), "bulk north honors it: {text}");
+    assert!(
+        text.contains("[\"contained:down\""),
+        "bulk north honors it: {text}"
+    );
 }
 
 /// Test 8: flatten output is identifiers with and without the parameter.
@@ -413,7 +429,9 @@ fn test_openapi_schema_contains_both_shapes() {
         "/north",
     ];
     for path in applicable {
-        let node = paths.get(path).unwrap_or_else(|| panic!("{path} present in spec"));
+        let node = paths
+            .get(path)
+            .unwrap_or_else(|| panic!("{path} present in spec"));
         let text = serde_json::to_string(node).unwrap();
         assert!(
             text.contains("item_format"),
@@ -422,7 +440,12 @@ fn test_openapi_schema_contains_both_shapes() {
     }
 
     // flatten paths document identifier strings, not item bodies
-    for path in ["/flatten/{gitoid}", "/flatten", "/flatten_source/{gitoid}", "/flatten_source"] {
+    for path in [
+        "/flatten/{gitoid}",
+        "/flatten",
+        "/flatten_source/{gitoid}",
+        "/flatten_source",
+    ] {
         let node = paths
             .get(path)
             .unwrap_or_else(|| panic!("{path} present in spec"));

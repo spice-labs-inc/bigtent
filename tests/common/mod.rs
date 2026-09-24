@@ -82,7 +82,10 @@ pub fn spec_key(spec: &RawClusterSpec, identifier: &str) -> KeyHash {
 /// first 8 bytes of SHA256, high bit masked, 16 lowercase hex digits,
 /// with a deterministic prefix on the `.grc` (the loader parses the name
 /// positionally from the end).
-pub fn assemble_raw_cluster(dir: &Path, spec: &RawClusterSpec) -> anyhow::Result<std::path::PathBuf> {
+pub fn assemble_raw_cluster(
+    dir: &Path,
+    spec: &RawClusterSpec,
+) -> anyhow::Result<std::path::PathBuf> {
     use std::io::Write;
 
     // ---- .grd: magic, envelope, then [u32 len][item cbor] per item ----

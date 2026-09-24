@@ -66,12 +66,13 @@ fn main() -> Result<()> {
         );
 
         let cluster_dir = args.output.join(format!("cluster_{}", i));
-        let cluster_file = tokio::runtime::Runtime::new()?.block_on(generate_synthetic_cluster_with_max_size(
-            &format!("cluster_{}", i),
-            cluster_items,
-            cluster_dir.clone(),
-            args.max_data_file_size,
-        ))?;
+        let cluster_file =
+            tokio::runtime::Runtime::new()?.block_on(generate_synthetic_cluster_with_max_size(
+                &format!("cluster_{}", i),
+                cluster_items,
+                cluster_dir.clone(),
+                args.max_data_file_size,
+            ))?;
 
         cluster_files.push(cluster_file);
         println!(
@@ -207,7 +208,9 @@ fn print_help() {
     println!("  -o, --overlap <PCT>      Percentage of items that overlap between clusters");
     println!("                           Default: {}%", DEFAULT_OVERLAP);
     println!("      --seed <N>           Random seed for reproducible data");
-    println!("      --max-data-file-size <N>  Cap each output .grd file size (e.g. 20k) so multi-file output is produced");
+    println!(
+        "      --max-data-file-size <N>  Cap each output .grd file size (e.g. 20k) so multi-file output is produced"
+    );
     println!("                           Default: {}", DEFAULT_SEED);
     println!("  -d, --output <PATH>      Output directory for generated clusters");
     println!("                           Default: ./benches/test_data/test");

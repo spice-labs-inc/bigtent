@@ -60,8 +60,7 @@ use tokio::{
 use crate::{
     item::Item,
     util::{
-        KeyHash, byte_slice_to_u63, hex_to_u64,
-        read_len_and_cbor, read_u32, sha256_for_reader,
+        KeyHash, byte_slice_to_u63, hex_to_u64, read_len_and_cbor, read_u32, sha256_for_reader,
     },
 };
 #[cfg(not(test))]
@@ -278,12 +277,12 @@ impl GoatRodeoTrait for GoatRodeoCluster {
 
         tokio::spawn(async move {
             for offset in 0..self.number_of_items {
-                if let Some(item_offset) = self.offset_from_pos(offset) {
-                    if let Some(item) = self.item_from_item_offset(&item_offset) {
-                        if item.is_root_item() {
-                            let _ = tx.send(item).await;
-                        }
-                    }
+                if let Some(item) = self
+                    .offset_from_pos(offset)
+                    .and_then(|o| self.item_from_item_offset(&o))
+                    .filter(|item| item.is_root_item())
+                {
+                    let _ = tx.send(item).await;
                 }
             }
         });
@@ -362,14 +361,16 @@ impl GoatRodeoCluster {
         self.key_alg
     }
 
-    /// The cluster's file format version (crate-internal accessor for
-    /// tests and the conversion path).
+    /// The cluster's file format version (crate-internal accessor; its
+    /// consumers are the test targets).
+    #[allow(dead_code)] // exercised from cfg(test) consumers
     pub(crate) fn cluster_version(&self) -> u32 {
         self.envelope.version
     }
 
-    /// The `.grc` path of this cluster (crate-internal; the conversion's
-    /// verify step reads the written chunk files).
+    /// The `.grc` path of this cluster (crate-internal; its consumers are
+    /// the test targets).
+    #[allow(dead_code)] // exercised from cfg(test) consumers
     pub(crate) fn cluster_path(&self) -> PathBuf {
         self.cluster_path.clone()
     }
@@ -513,7 +514,8 @@ impl GoatRodeoCluster {
         // version 3 clusters carry data envelope 1; version 4 carries 2
         let expected_data_envelope_version = if env.version >= 4 { 2 } else { 1 };
         for data_file in &env.data_files {
-            let the_file = Arc::new(DataFile::new(&parent, *data_file, expected_data_envelope_version).await?);
+            let the_file =
+                Arc::new(DataFile::new(&parent, *data_file, expected_data_envelope_version).await?);
             data_files.insert(*data_file, the_file);
         }
 
@@ -735,6 +737,7 @@ impl GoatRodeoCluster {
         hash: u64,
         suffix: &str,
     ) -> Result<File> {
+        #[allow(clippy::collapsible_if)] // nested recursion reads clearer than a let-chain
         fn find(name: &str, dir: &Path) -> Result<Option<PathBuf>> {
             for entry in dir.read_dir()? {
                 let entry = entry?;
@@ -938,8 +941,7 @@ async fn test_antialias() {
                 .0
                 .values()
                 .flatten()
-                .any(|x| *x == ai.identifier)
-                ,
+                .any(|x| *x == ai.identifier),
             "Expecting a match for {}",
             ai.identifier
         );
@@ -1025,8 +1027,7 @@ async fn test_files_in_dir() {
     {
         Ok(v) => v,
         Err(e) => {
-            assert!(false, "Failure to read files {:?}", e);
-            return;
+            panic!("Failure to read files {:?}", e);
         }
     };
 
@@ -1140,8 +1141,7 @@ async fn test_generated_cluster_no_index() {
             match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), false, vec![]).await {
                 Ok(v) => v,
                 Err(e) => {
-                    assert!(false, "Failure to read files {:?}", e);
-                    return;
+                    panic!("Failure to read files {:?}", e);
                 }
             };
 
@@ -1198,16 +1198,15 @@ async fn test_files_in_dir_no_index_load() {
     {
         Ok(v) => v,
         Err(e) => {
-            assert!(false, "Failure to read files {:?}", e);
-            return;
+            panic!("Failure to read files {:?}", e);
         }
     };
 
-    assert!(files.len() > 0, "We should find some files");
+    assert!(!files.is_empty(), "We should find some files");
     let mut total_index_size = 0;
     for cluster in &files {
-        assert!(cluster.data_files.len() > 0);
-        assert!(cluster.index_files.len() > 0);
+        assert!(!cluster.data_files.is_empty());
+        assert!(!cluster.index_files.is_empty());
 
         let start = Instant::now();
         let complete_index_len = cluster.number_of_items();
@@ -1268,7 +1267,9 @@ mod phase2_dispatch_tests {
 
         // writer-built cluster: declares BLAKE3 in the .grc
         let dir = tempfile::TempDir::new().unwrap();
-        let mut writer = crate::rodeo::writer::ClusterWriter::new(dir.path()).await.unwrap();
+        let mut writer = crate::rodeo::writer::ClusterWriter::new(dir.path())
+            .await
+            .unwrap();
         let item = Item {
             identifier: "gitoid:blob:sha256:dispatch".to_string(),
             connections: Default::default(),

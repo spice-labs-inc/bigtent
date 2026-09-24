@@ -5,12 +5,14 @@
 //! identifier, connections, body mime type, and body — rust `equal`
 //! (`Item::PartialEq`). Equality is exact; the report distinguishes:
 //!
-//! * `matched`: items found identical on both sides (by identifier),
-//! * `left_unaccounted`: left items with no identical counterpart on the
-//!   right (missing from the right, or present but not equal),
-//! * `right_unaccounted`: right items with no identical counterpart on
-//!   the left,
-//! and the sides are equal iff both unaccounted counts are zero.
+//! * `matched` — items found identical on both sides (by identifier)
+//! * `left_unaccounted` — left items with no identical counterpart on
+//!   the right (missing from the right, or present but not equal)
+//! * `right_unaccounted` — right items with no identical counterpart on
+//!   the left
+//! * `first_differences` — a bounded sample of the differing items
+//!
+//! The sides are equal iff both unaccounted counts are zero.
 //!
 //! ## Cross-algorithm comparison
 //!
@@ -45,7 +47,7 @@
 //! full 223M×2 comparison is a multi-pass job measured in tens of
 //! minutes to a couple of hours under load.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::sync::Arc;
 
 use crate::item::Item;
@@ -145,10 +147,7 @@ fn alg_constant(alg: KeyAlg) -> &'static str {
 }
 
 /// Materialize an item from its source position.
-fn item_at<'a>(
-    side: &'a [Arc<GoatRodeoCluster>],
-    src: &ItemSource,
-) -> Option<Item> {
+fn item_at(side: &[Arc<GoatRodeoCluster>], src: &ItemSource) -> Option<Item> {
     let cluster = side.get(src.cluster as usize)?;
     let offset = ClusterRoboMember::offset_from_pos(cluster.as_ref(), src.pos)?;
     ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &offset)
@@ -187,8 +186,8 @@ pub fn compare_clusters_bounded(
     for (ci, cluster) in left.iter().enumerate() {
         let count = cluster.number_of_items();
         for pos in 0..count {
-            if let Some(item) =
-                ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos).and_then(|o| ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &o))
+            if let Some(item) = ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos)
+                .and_then(|o| ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &o))
             {
                 let key = right_alg.hash_identifier(&item.identifier);
                 probes.push((key, probes.len() as u32));
@@ -218,8 +217,8 @@ pub fn compare_clusters_bounded(
     for cluster in right {
         let count = cluster.number_of_items();
         for pos in 0..count {
-            let Some(r_item) =
-                ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos).and_then(|o| ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &o))
+            let Some(r_item) = ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos)
+                .and_then(|o| ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &o))
             else {
                 continue;
             };
@@ -229,7 +228,8 @@ pub fn compare_clusters_bounded(
                 Ok(center) => center,
                 Err(_) => {
                     if first_differences.len() < MAX_REPORTED_DIFFERENCES {
-                        first_differences.push(format!("right-only/unmatched: {}", r_item.identifier));
+                        first_differences
+                            .push(format!("right-only/unmatched: {}", r_item.identifier));
                     }
                     continue;
                 }
@@ -244,25 +244,22 @@ pub fn compare_clusters_bounded(
                 hi += 1;
             }
             let mut found = false;
-            for cand in lo..=hi {
-                let si = probes[cand].1 as usize;
-                if !matched[si] {
-                    if let Some(l_item) = item_at(left, &sources[si]) {
-                        if l_item == r_item {
-                            matched[si] = true;
-                            matched_count += 1;
-                            found = true;
-                            break;
-                        }
-                    }
+            for &(_, si) in &probes[lo..=hi] {
+                let si = si as usize;
+                if !matched[si]
+                    && let Some(l_item) = item_at(left, &sources[si])
+                    && l_item == r_item
+                {
+                    matched[si] = true;
+                    matched_count += 1;
+                    found = true;
+                    break;
                 }
             }
-            if !found {
-                if first_differences.len() < MAX_REPORTED_DIFFERENCES {
-                    first_differences.push(format!("right-only/unmatched: {}", r_item.identifier));
-                }
+            if !found && first_differences.len() < MAX_REPORTED_DIFFERENCES {
+                first_differences.push(format!("right-only/unmatched: {}", r_item.identifier));
             }
-            if right_streamed % 10_000_000 == 0 {
+            if right_streamed.is_multiple_of(10_000_000) {
                 tracing::info!(
                     "Compare(bounded): right streamed {} of {} in {:?}",
                     right_streamed,
@@ -277,10 +274,10 @@ pub fn compare_clusters_bounded(
     for (si, m) in matched.iter().enumerate() {
         if !m {
             left_unaccounted += 1;
-            if first_differences.len() < MAX_REPORTED_DIFFERENCES + 10 {
-                if let Some(l_item) = item_at(left, &sources[si]) {
-                    first_differences.push(format!("left-only/unmatched: {}", l_item.identifier));
-                }
+            if first_differences.len() < MAX_REPORTED_DIFFERENCES + 10
+                && let Some(l_item) = item_at(left, &sources[si])
+            {
+                first_differences.push(format!("left-only/unmatched: {}", l_item.identifier));
             }
         }
     }
@@ -317,10 +314,13 @@ pub fn compare_clusters_materializing(
     for cluster in left {
         let count = cluster.number_of_items();
         for pos in 0..count {
-            if let Some(item) =
-                ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos).and_then(|o| ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &o))
+            if let Some(item) = ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos)
+                .and_then(|o| ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &o))
             {
-                probes.push((right_alg.hash_identifier(&item.identifier), left_items.len() as u32));
+                probes.push((
+                    right_alg.hash_identifier(&item.identifier),
+                    left_items.len() as u32,
+                ));
                 left_items.push(item);
             }
         }
@@ -342,8 +342,8 @@ pub fn compare_clusters_materializing(
     for cluster in right {
         let count = cluster.number_of_items();
         for pos in 0..count {
-            let Some(item) =
-                ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos).and_then(|o| ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &o))
+            let Some(item) = ClusterRoboMember::offset_from_pos(cluster.as_ref(), pos)
+                .and_then(|o| ClusterRoboMember::item_from_item_offset(cluster.as_ref(), &o))
             else {
                 continue;
             };
@@ -353,7 +353,8 @@ pub fn compare_clusters_materializing(
                 Ok(center) => center,
                 Err(_) => {
                     if first_differences.len() < MAX_REPORTED_DIFFERENCES {
-                        first_differences.push(format!("right-only/unmatched: {}", item.identifier));
+                        first_differences
+                            .push(format!("right-only/unmatched: {}", item.identifier));
                     }
                     continue;
                 }
@@ -367,8 +368,8 @@ pub fn compare_clusters_materializing(
                 hi += 1;
             }
             let mut found = false;
-            for cand in lo..=hi {
-                let si = probes[cand].1 as usize;
+            for &(_, si) in &probes[lo..=hi] {
+                let si = si as usize;
                 if !matched[si] && left_items[si] == item {
                     matched[si] = true;
                     matched_count += 1;
@@ -379,7 +380,7 @@ pub fn compare_clusters_materializing(
             if !found && first_differences.len() < MAX_REPORTED_DIFFERENCES {
                 first_differences.push(format!("right-only/unmatched: {}", item.identifier));
             }
-            if right_streamed % 10_000_000 == 0 {
+            if right_streamed.is_multiple_of(10_000_000) {
                 tracing::info!(
                     "Compare(materializing): streamed {} of {} right items in {:?}",
                     right_streamed,
@@ -395,7 +396,10 @@ pub fn compare_clusters_materializing(
         if !m {
             left_unaccounted += 1;
             if first_differences.len() < MAX_REPORTED_DIFFERENCES + 10 {
-                first_differences.push(format!("left-only/unmatched: {}", left_items[si].identifier));
+                first_differences.push(format!(
+                    "left-only/unmatched: {}",
+                    left_items[si].identifier
+                ));
             }
         }
     }
@@ -477,7 +481,11 @@ mod tests {
                 !outcome.equal() || outcome.total_left == outcome.total_right,
                 "{outcome:?}"
             );
-            assert!(outcome.missing_count() > 0 || outcome.right_unaccounted > 0 || outcome.matched == outcome.total_left);
+            assert!(
+                outcome.missing_count() > 0
+                    || outcome.right_unaccounted > 0
+                    || outcome.matched == outcome.total_left
+            );
         });
     }
 }

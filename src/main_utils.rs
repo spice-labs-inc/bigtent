@@ -48,7 +48,9 @@ pub fn mode_from_args(args: &Args) -> Result<Mode> {
             );
         }
         if !args.convert_to_v4.is_empty() || !args.fresh_merge.is_empty() || args.rodeo.is_some() {
-            bail!("The --compare option is mutually exclusive with --convert-to-v4, --fresh-merge, and --rodeo");
+            bail!(
+                "The --compare option is mutually exclusive with --convert-to-v4, --fresh-merge, and --rodeo"
+            );
         }
         return Ok(Mode::Compare {
             left: args.compare[0].clone(),

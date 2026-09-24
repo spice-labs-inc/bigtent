@@ -11,10 +11,9 @@
 //! conversion must re-key them to BLAKE3 with byte-identical items, and
 //! compare must prove Item equality across the two key spaces.
 
-use bigtent::compare::{compare_clusters, CompareOutcome};
+use bigtent::compare::{CompareOutcome, compare_clusters};
 use bigtent::rodeo::convert::convert_cluster_to_dir;
 use bigtent::rodeo::goat::GoatRodeoCluster;
-use bigtent::rodeo::goat_trait::GoatRodeoTrait;
 use bigtent::util::KeyAlg;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -161,9 +160,9 @@ fn test_compare_rejects_mixed_algorithm_side() {
         let dest = tempfile::TempDir::new().unwrap();
         let grcs = convert_fixture_async("cluster_a", dest.path()).await;
         let mut mixed: Vec<Arc<GoatRodeoCluster>> = a.clone();
-        for grc in &grcs {
+        if let Some(grc) = grcs.first() {
+            // one converted cluster makes the side mixed
             mixed.push(load_async(grc).await);
-            break; // one converted cluster makes the side mixed
         }
         assert!(
             compare_clusters(&a, &mixed).is_err(),
