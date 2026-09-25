@@ -25,3 +25,7 @@ harness = false
 [[bench]]
 name = "comparison"
 harness = false
+
+[[bench]]
+name = "source_paths"
+harness = false

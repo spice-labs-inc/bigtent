@@ -9,8 +9,9 @@ use sansho::corpus::{Driver, DriverOutcome, load_corpus, run_corpus};
 use sansho::{compile, evaluate_cbor, parse};
 use std::path::Path;
 
-/// The cursor driver: the corpus's JSON givens encode to CBOR (they are
-/// pure JSON data) and evaluate over the byte slice.
+/// The byte-source driver: the corpus's JSON givens encode to CBOR
+/// (they are pure JSON data) and evaluate through the zero-copy byte
+/// source.
 struct CursorEngine;
 
 impl Driver for CursorEngine {

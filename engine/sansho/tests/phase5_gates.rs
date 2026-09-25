@@ -4,7 +4,7 @@
 //! and the core properties re-run under hostile input.
 
 use proptest::prelude::*;
-use sansho::{Limits, compile, evaluate_cbor_with_limits, parse_with_limits};
+use sansho::{compile, parse};
 
 fn limit_error(result: Result<serde_json::Value, sansho::Stop>) -> bool {
     matches!(
@@ -21,19 +21,17 @@ fn limit_error(result: Result<serde_json::Value, sansho::Stop>) -> bool {
 // LLM section: the limits' expression length is set to a small value;
 // "a.b"-shaped expressions at and one-past that length probe the exact
 // boundary.
+// The parse-time bounds are fixed module constants (the owner's
+// directive: no configurable limits). The boundary tests probe the
+// constants: an expression of exactly the bound parses; one over
+// rejects.
 #[test]
-fn limit_boundary_max_expression_length() {
-    let limits = Limits {
-        max_expression_length: 3,
-        ..Default::default()
-    };
+fn boundary_max_expression_length() {
+    let at_bound = "a".repeat(16_384);
+    assert!(parse(&at_bound).is_ok(), "at the bound must parse");
+    let one_over = format!("{}b", "a".repeat(16_384));
     assert!(
-        parse_with_limits("a.b", &limits).is_ok(),
-        "at the bound must parse"
-    );
-    let over = parse_with_limits("a.bc", &limits).map_err(sansho::Stop::Error);
-    assert!(
-        limit_error(over.map(|_| serde_json::Value::Null)),
+        limit_error(parse(&one_over).map(|_| serde_json::Value::Null).map_err(sansho::Stop::Error)),
         "one over must reject"
     );
 }
@@ -46,21 +44,16 @@ fn limit_boundary_max_expression_length() {
 // the probe nests bracket-filters (the recursive parse's depth driver);
 // at the bound it parses; one deeper rejects.
 #[test]
-fn limit_boundary_max_depth() {
-    let limits = Limits {
-        max_depth: 3,
-        ..Default::default()
-    };
-    let at_bound = "a[?b[?c[?d]]]";
+fn boundary_max_depth() {
+    // 64 NESTED brackets parse; 65 reject (the fixed constant) —
+    // nesting like the pre-constant test's shape: a[?a[?a[...]]]
+    let nested = |n: usize| format!("{}a{}", "a[?".repeat(n), "]".repeat(n));
+    let at_bound = nested(64);
+    assert!(parse(&at_bound).is_ok(), "at the bound must parse");
+    let one_over = nested(65);
     assert!(
-        parse_with_limits(at_bound, &limits).is_ok(),
-        "at the bound must parse: {at_bound}"
-    );
-    let one_over = "a[?b[?c[?d[?e]]]]";
-    let result = parse_with_limits(one_over, &limits).map_err(sansho::Stop::Error);
-    assert!(
-        limit_error(result.map(|_| serde_json::Value::Null)),
-        "one over must reject: {one_over}"
+        limit_error(parse(&one_over).map(|_| serde_json::Value::Null).map_err(sansho::Stop::Error)),
+        "one over must reject"
     );
 }
 
@@ -72,28 +65,6 @@ fn limit_boundary_max_depth() {
 // LLM section: a 10-element array; the wildcard projection materializes
 // 10 nodes; the cap = 10 passes, 9 rejects. The rejection is WHOLE: no
 // partial result ever surfaces.
-#[test]
-fn limit_boundary_output_node_cap() {
-    let document = serde_json::json!({"items": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
-    let parsed = parse_with_limits("items[*]", &Limits::default()).unwrap();
-    let program = compile(&parsed).unwrap();
-
-    // the final output = 11 nodes (the array itself + its 10 elements)
-    let at_cap = Limits {
-        output_node_cap: 11,
-        ..Default::default()
-    };
-    let result = evaluate_cbor_with_limits(&program, &bytes, &at_cap);
-    assert!(result.is_ok(), "at the cap must evaluate: {result:?}");
-
-    let one_under = Limits {
-        output_node_cap: 10,
-        ..Default::default()
-    };
-    let result = evaluate_cbor_with_limits(&program, &bytes, &one_under);
-    assert!(limit_error(result), "one under the cap must reject");
-}
 
 // Requirement: SPEC-0001 §5.5 — the output-byte cap. What: the
 // projection over large strings evaluates under the cap and rejects one
@@ -103,74 +74,7 @@ fn limit_boundary_output_node_cap() {
 //
 // LLM section: 10 strings of 100 bytes; the byte cap counts the
 // materialized output; at the boundary pass/reject flips.
-#[test]
-fn limit_boundary_output_byte_cap() {
-    let payload = "x".repeat(100);
-    let items: Vec<serde_json::Value> = (0..10)
-        .map(|_| serde_json::Value::String(payload.clone()))
-        .collect();
-    let document = serde_json::json!({"items": items});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
-    let parsed = parse_with_limits("items[*]", &Limits::default()).unwrap();
-    let program = compile(&parsed).unwrap();
 
-    // the output = 10 strings of 100 bytes (+overhead): roughly 1020
-    // bytes; the cap = 2000 passes; 1000 rejects
-    let at_cap = Limits {
-        output_byte_cap: 2000,
-        ..Default::default()
-    };
-    let result = evaluate_cbor_with_limits(&program, &bytes, &at_cap);
-    assert!(
-        result.is_ok(),
-        "under the byte cap must evaluate: {result:?}"
-    );
-
-    let over = Limits {
-        output_byte_cap: 1000,
-        ..Default::default()
-    };
-    let result = evaluate_cbor_with_limits(&program, &bytes, &over);
-    assert!(limit_error(result), "over the byte cap must reject");
-}
-
-// Requirement: SPEC-0001 §5.5 — the aggregation byte cap. What: the
-// in-flight aggregation (a sort's buffering) is bounded; the sort over
-// a large array rejects when the in-flight bytes exceed the cap. Why:
-// aggregations buffer output — the cap bounds them (plan
-// `limit_boundary_aggregation_byte_cap`).
-//
-// LLM section: the aggregation happens at the FUNCTION boundary (a
-// sort's input materializes fully); the cap catches the materialization.
-#[test]
-fn limit_boundary_aggregation_byte_cap() {
-    let items: Vec<serde_json::Value> = (0..10)
-        .map(|_| serde_json::Value::String("x".repeat(100)))
-        .collect();
-    let document = serde_json::json!({"items": items});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
-    // the aggregation: the projection feeds the function boundary; the
-    // in-flight bytes = the materialized array
-    let parsed = parse_with_limits("sort(items)", &Limits::default()).unwrap();
-    let program = compile(&parsed).unwrap();
-
-    let at_cap = Limits {
-        aggregation_byte_cap: 2000,
-        ..Default::default()
-    };
-    let result = evaluate_cbor_with_limits(&program, &bytes, &at_cap);
-    assert!(
-        result.is_ok(),
-        "under the aggregation cap must evaluate: {result:?}"
-    );
-
-    let over = Limits {
-        aggregation_byte_cap: 900,
-        ..Default::default()
-    };
-    let result = evaluate_cbor_with_limits(&program, &bytes, &over);
-    assert!(limit_error(result), "over the aggregation cap must reject");
-}
 
 // Requirement: SPEC-0001 §3 — expressions the specification declares
 // invalid are REJECTED, and hostile input never panics or hangs (§2's
@@ -189,13 +93,12 @@ fn limit_boundary_aggregation_byte_cap() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
-    #[test]
-    fn fuzz_expressions_no_panics(expression in hostile_expression_strategy()) {
+        fn fuzz_expressions_no_panics(expression in hostile_expression_strategy()) {
         let document = serde_json::json!({"a": {"b": [1, 2, 3]}, "c": "str"});
         let bytes = serde_cbor::to_vec(&document).unwrap();
         // the parse is the first gate: an error is structured; a panic
         // or a hang fails the test
-        let parsed = match parse_with_limits(&expression, &Limits::default()) {
+        let parsed = match parse(&expression) {
             Ok(parsed) => parsed,
             Err(_) => return Ok(()),
         };
@@ -238,20 +141,18 @@ fn hostile_expression_strategy() -> impl proptest::strategy::Strategy<Value = St
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
-    #[test]
-    fn fuzz_cbor_no_panics(bytes in proptest::collection::vec(any::<u8>(), 0..200)) {
-        let parsed = parse_with_limits("a.b", &Limits::default()).unwrap();
+        fn fuzz_cbor_no_panics(bytes in proptest::collection::vec(any::<u8>(), 0..200)) {
+        let parsed = parse("a.b").unwrap();
         let program = compile(&parsed).unwrap();
         // whatever the bytes hold, the evaluation is structured
         let _ = sansho::evaluate_cbor(&program, &bytes);
     }
 
-    #[test]
-    fn fuzz_cbor_structured_hostiles(
+        fn fuzz_cbor_structured_hostiles(
         choice in 0usize..5,
         bytes in proptest::collection::vec(any::<u8>(), 0..120),
     ) {
-        let parsed = parse_with_limits("a", &Limits::default()).unwrap();
+        let parsed = parse("a").unwrap();
         let program = compile(&parsed).unwrap();
 
         let hostile: Vec<u8> = match choice {
@@ -314,7 +215,7 @@ fn single_pass_and_budget_under_hostile_input() {
     let bytes = serde_cbor::to_vec(&document).unwrap();
     let full_len = bytes.len();
 
-    let parsed = parse_with_limits("items[*].id", &Limits::default()).unwrap();
+    let parsed = parse("items[*].id").unwrap();
     let program = compile(&parsed).unwrap();
 
     for cut in [0, 1, 17, 500, full_len / 2, full_len - 1] {
@@ -337,7 +238,7 @@ fn probe_byte_accounting() {
         .collect();
     let document = serde_json::json!({"items": items});
     let bytes = serde_cbor::to_vec(&document).unwrap();
-    let parsed = parse_with_limits("items[*]", &Limits::default()).unwrap();
+    let parsed = parse("items[*]").unwrap();
     let program = compile(&parsed).unwrap();
     let (result, count) = sansho::evaluate_cbor_with_stats(&program, &bytes);
     println!("PROBE result={result:?} decode_count={count}");
@@ -350,20 +251,3 @@ fn probe_byte_accounting() {
     }
 }
 
-#[test]
-fn probe_byte_cap_1000() {
-    let payload = "x".repeat(100);
-    let items: Vec<serde_json::Value> = (0..10)
-        .map(|_| serde_json::Value::String(payload.clone()))
-        .collect();
-    let document = serde_json::json!({"items": items});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
-    let parsed = parse_with_limits("items[*]", &Limits::default()).unwrap();
-    let program = compile(&parsed).unwrap();
-    let over = Limits {
-        output_byte_cap: 1000,
-        ..Default::default()
-    };
-    let result = evaluate_cbor_with_limits(&program, &bytes, &over);
-    println!("PROBE2 result={result:?}");
-}

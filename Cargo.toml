@@ -104,5 +104,5 @@ vergen = { version = "9", features = ["build", "cargo", "rustc", "si"] }
 vergen-git2 = {version = "9", features = ["build", "cargo", "rustc", "si"]}
 
 [workspace]
-members = ["engine/sansho"]
+members = ["engine/sansho", "engine/sansho-derive"]
 

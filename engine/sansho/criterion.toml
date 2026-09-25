@@ -1,0 +1,11 @@
+[benches]
+warm_up_time = 5
+sample_size = 100
+noise_threshold = 0.05
+
+[output]
+plots = true
+html = true
+
+[plotters]
+force_line_plot = true

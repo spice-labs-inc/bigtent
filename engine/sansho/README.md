@@ -45,16 +45,22 @@ never materializes the unselected payloads (as demonstrated by
   evaluation; identical navigations share one decode (as demonstrated
   by `shared_navigation_decodes_once`).
 - **Selective materialization** — memory tracks the output, not the
-  input (as demonstrated by `selective_materialization_budget`).
+  input: the byte source reads string leaves by reference (zero-copy;
+  as demonstrated by `text_string_borrows_bytes`), the seek shape
+  scans raw key bytes without materializing keys (as demonstrated by
+  `raw_key_scan_finds_keys`), and the scan shape's per-element cost is
+  a borrowed read + a boolean (as demonstrated by the `scan/cbor_node`
+  benchmark arm: 103.6 ms → 23.4 ms at 100k connections against the
+  recorded baseline).
 - **No input/output in the evaluation path** — parse, compile,
   evaluate, and the program cache do no network, filesystem, or
   clock work; the corpus-driver module (the test harness's entry
   point) reads the vendored corpus files only when invoked.
-- **Bounded resources** — every limit (expression length, nesting
-  depth, instruction budget, output nodes, output bytes, in-flight
-  aggregation bytes) is configurable, and exceeding any limit aborts
-  the whole evaluation with a structured error; results are never
-  partial (as demonstrated by the `limit_boundary_*` tests).
+- **Bounded at the edges** — the parser's two parse-time expression
+  bounds (length 16,384, nesting depth 64) reject hostile queries
+  before parsing (as demonstrated by `boundary_max_expression_length`
+  and `boundary_max_depth`); the evaluation path itself carries no
+  limits or data caps.
 
 ## Where to read next
 

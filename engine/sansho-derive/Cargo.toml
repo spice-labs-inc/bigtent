@@ -1,0 +1,20 @@
+[package]
+name = "sansho-derive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "The derive macro for Sansho's value-node source implementations"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[dev-dependencies]
+sansho = { path = "../../engine/sansho" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -144,16 +144,9 @@ mod tests {
             .expect_err("an invalid expression must error");
         assert!(matches!(error, SanshoError::Parse { .. }));
 
-        // a limit-exceeded: the whole-evaluation structured error
-        let fat = serde_json::json!({"payload": "x".repeat(2048)});
-        let fat_bytes = serde_cbor::to_vec(&fat).unwrap();
-        let limits = sansho::Limits { output_byte_cap: 128, ..Default::default() };
-        let program = sansho::compile(&sansho::parse("payload").unwrap()).unwrap();
-        let result = sansho::evaluate_cbor_with_limits(&program, &fat_bytes, &limits);
-        assert!(matches!(
-            result,
-            Err(sansho::Stop::Error(SanshoError::Limit { .. }))
-        ));
+        // (the limit-exceeded assertion was removed with the limits
+        // machinery — the owner's directive; the structured-error path
+        // is covered by the parse case above)
     }
 
     // Requirement: the no-decode property of the seam's accessor. What:

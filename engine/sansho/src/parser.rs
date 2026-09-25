@@ -16,21 +16,20 @@ use nom::combinator::{cut, eof, opt, recognize, value};
 use nom::multi::separated_list1;
 use nom::sequence::{delimited, preceded, terminated, tuple};
 
+/// The parse-time expression bounds (SPEC-0001 §5.5, kept as module
+/// constants — one-time parse checks; not traversal accounting).
+const MAX_EXPRESSION_LENGTH: usize = 16_384;
+const MAX_NESTING_DEPTH: usize = 64;
+
 /// Parse a complete JMESPath expression.
 pub fn parse(input: &str) -> Result<Expr, SanshoError> {
-    parse_with_limits(input, &crate::limits::Limits::default())
-}
-
-/// The limit-configurable parse: the expression-length and nesting-depth
-/// bounds come from the limits (SPEC-0001 §5.5).
-pub fn parse_with_limits(input: &str, limits: &crate::limits::Limits) -> Result<Expr, SanshoError> {
     // the length bound first (the cheapest rejection)
-    if input.chars().count() > limits.max_expression_length {
+    if input.chars().count() > MAX_EXPRESSION_LENGTH {
         return Err(SanshoError::Limit {
             message: format!(
                 "expression length {} exceeds the maximum of {}",
                 input.chars().count(),
-                limits.max_expression_length
+                MAX_EXPRESSION_LENGTH
             ),
         });
     }
@@ -38,11 +37,11 @@ pub fn parse_with_limits(input: &str, limits: &crate::limits::Limits) -> Result<
     // scan over the expression's structural characters (skipping string,
     // raw-string, and literal contexts) rejects hostile nesting without
     // recursing at all.
-    if let Some(position) = excessive_depth_at(input, limits.max_depth) {
+    if let Some(position) = excessive_depth_at(input, MAX_NESTING_DEPTH) {
         return Err(SanshoError::Limit {
             message: format!(
-                "expression nesting exceeds the maximum depth of {} at byte {position}",
-                limits.max_depth
+                "expression nesting exceeds the maximum of {} at position {}",
+                MAX_NESTING_DEPTH, position
             ),
         });
     }

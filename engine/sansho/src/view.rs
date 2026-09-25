@@ -119,4 +119,23 @@ pub trait Node<'d>: Clone {
     /// position — the fusion point that keeps every byte decoded at
     /// most once per evaluation (SPEC-0001 §5.1).
     fn materialize(&self) -> Result<J, SanshoError>;
+
+    /// The output-boundary materialization: decode the position without
+    /// storing it in the decode memo. For positions consumed EXACTLY
+    /// ONCE by the output (a projection's kept elements), the memo's
+    /// dedup is never hit — its per-position insert + clone is pure
+    /// overhead; the unmemoized form decodes and returns. The default
+    /// is the memoized materialize (sources that cannot avoid the memo
+    /// keep the shared-decode guarantee).
+    fn materialize_unmemoized(&self) -> Result<J, SanshoError> {
+        self.materialize()
+    }
+
+    /// The raw bytes of a text string, WITHOUT the UTF-8 validation —
+    /// the filter-predicate fast path's comparison input. The default
+    /// is None (only the byte source implements it); byte strings
+    /// (major 2) also return None and keep the base64url path.
+    fn raw_text_bytes(&self) -> Option<&[u8]> {
+        None
+    }
 }
