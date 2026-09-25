@@ -24,3 +24,6 @@ benches/target/
 
 # Temporary workspace for spikes and exploration (not committed)
 /workspace/
+
+# Core dumps from crashed test binaries (never commit)
+core.*
