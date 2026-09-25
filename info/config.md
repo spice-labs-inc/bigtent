@@ -36,6 +36,12 @@ bigtent --rodeo /data/clusters/ --cache-index true
 | `--dest <path>` | Path | Required | Output directory for merged cluster |
 | `--buffer-limit <n>` | usize | `10000` | Max items in merge queue |
 | `--merge-worker-count <n>` | usize | 75% of cores | Number of parallel merge worker threads |
+| `--merge-buffer-size <gb>` | usize | `15` | Max size of each in-memory `.grd` data buffer in gigabytes |
+| `--merge-temp-dir <path>` | Path | random dir under system temp | Directory for the merge's temporary files (converted sources). Explicit roots are never deleted; only per-run directories inside them are. Defaults are cleaned on success and failure. Parse test: `test_merge_temp_dir_flags_parse` |
+| `--force-temp-dir` | flag | off | Accept a `--merge-temp-dir` that is not owned by the effective user or is writable by group/other; the override is logged. Check test: `test_temp_root_ownership_predicate` |
+| `--block-list <path>` | Path | none | File of identifiers to exclude from the merge |
+| `--convert-to-v4 <dirs>...` | Path(s) | - | Convert version 3 clusters to version 4 (BLAKE3[0..16]) clusters. Each input cluster is re-keyed byte-copy into `--dest/<input-dir-name>/` as one or more chunk clusters. Converted items are rust-equal to the source items. Tests: `test_convert_output_items_equal_to_source` |
+| `--compare <left> <right>` | Path | - | Compare two clusters (or directories of clusters) for item equality (rust `equal`: identifier, connections, body, mime). Works across key algorithms (V3/MD5 vs V4/BLAKE3). Prints a summary; exits 0 on equality, 1 otherwise. Memory-bounded at scale (probe-index strategy). Tests: `test_convert_output_items_equal_to_source`, `test_compare_identity_holds`, `test_compare_detects_difference` |
 
 #### Examples
 
@@ -52,7 +58,15 @@ bigtent --fresh-merge /data/cluster1/ /data/cluster2/ \
 bigtent --fresh-merge /data/cluster1/ /data/cluster2/ \
     --dest /data/merged/ \
     --merge-worker-count 4
+
+# Mixed-version merge with a dedicated scratch volume
+bigtent --fresh-merge /data/cluster1/ /data/cluster2/ \
+    --dest /data/merged/ \
+    --merge-temp-dir /scratch
 ```
+
+The mixed-version (version 3 + version 4) merge converts version 3
+sources first: see the [Operations Guide](operations.md#mixed-version-merge).
 
 ### Lookup Mode Arguments
 
@@ -92,7 +106,7 @@ The output is a JSON object mapping each identifier to its Item (as JSON) or `nu
 {
   "gitoid:blob:sha256:abc123...": {
     "identifier": "gitoid:blob:sha256:abc123...",
-    "connections": [["contained:up", "gitoid:blob:sha256:..."]],
+    "connections": {"contained:up": ["gitoid:blob:sha256:..."]},
     "body_mime_type": "application/vnd.cc.goatrodeo",
     "body": { ... }
   },
@@ -172,10 +186,10 @@ Each line is a self-contained JSON object:
 
 ### Metrics and Health Checks
 
-BigTent does not expose a Prometheus or metrics endpoint. To collect metrics:
-- Parse the structured JSON logs with a log aggregator (ELK, Datadog,
-  Fluentd, CloudWatch, etc.)
-- Use `GET /node_count` as a lightweight health check endpoint
+BigTent exposes Prometheus metrics at `GET /metrics` (text exposition
+format) (`test_metrics_endpoint_responds`), plus `GET /node_count` and
+`GET /health` for lightweight checks. Structured JSON logs can also be
+parsed by a log aggregator.
 
 ## Authentication and Authorization
 

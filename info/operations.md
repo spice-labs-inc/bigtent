@@ -352,8 +352,14 @@ Useful PromQL queries for a Grafana dashboard:
 ### Cluster File Versioning
 
 Big Tent cluster files (`.grc`) contain a version field and magic number
-(`0xba4a4a`). The current format version is 3. Big Tent validates the magic
-number and version on load — incompatible files produce clear error messages.
+(`0xba4a4a`). Version 4 is current and is what Big Tent writes; version
+3 clusters remain readable and version 4 clusters carry the index key
+algorithm declaration (`BLAKE3[0..16]/Long/Long`) in the `.grc` and
+`.gri` files. Big Tent validates the magic number and version on load —
+incompatible files produce clear error messages
+(`test_writer_emits_version_4_envelopes`,
+`test_cluster_envelope_rejects_unknown_versions`,
+`test_v3_fixture_clusters_load_and_resolve`).
 
 ### Upgrade Procedure
 
@@ -431,3 +437,70 @@ Big Tent follows semantic versioning (semver):
 | **Slow queries** | Check `bigtent_http_request_duration_seconds` p99 by path | Enable `--cache-index true`. Use SSD storage. Check if the slow path is `/north` or `/flatten` (graph traversals are inherently slower). |
 | **5xx errors** | Check `bigtent_http_requests_total{status=~"5.."}` and logs | Usually indicates cluster file I/O errors. Check disk health and file permissions. |
 | **Readyz returns 503** | `curl /readyz` returns `{"ready":false}` | Cluster loading is still in progress, or no clusters were found. Check `--rodeo` paths and logs. |
+
+---
+
+## Mixed-Version Merge
+
+Big Tent reads cluster versions 3 and 4 and writes version 4 only. A
+merge may combine version 3 and version 4 sources: version 3 sources are
+**converted** to the merge key space first
+(`test_mixed_merge_unions_duplicate_identifier`), and the output cluster
+is always version 4 (`test_mixed_merge_output_is_version_4`).
+
+### How conversion works
+
+Conversion is a re-keying pass, not a decode/re-encode pass. For each
+version 3 source, Big Tent reads every index entry, skims only each
+item's identifier (the item bytes are never deserialized into a full
+Item), computes the version 4 key (`BLAKE3[0..16]/Long/Long` — the first
+16 bytes of the BLAKE3 digest), and copies the item bytes **verbatim**
+into temporary clusters sorted by the new key. The temporary clusters
+carry the source's version and item shape with the re-keyed index
+(`test_convert_v3_cluster_matches_source_items` — byte-identical item
+payloads). Conversion output is deterministic
+(`test_conversion_output_is_deterministic`), and the split limits do not
+change the merge result (`prop_split_limits_invariance_on_synthetic_clusters`).
+
+### Scratch space (labeled estimate)
+
+Conversion needs scratch disk of roughly **2x the converted input**: one
+temporary copy of the converted items, plus merge-side buffering. This is
+an estimate; the free-space preflight runs before work and fails fast
+with computed numbers if the scratch volume is insufficient
+(`test_free_space_preflight`).
+
+### Temporary directory lifecycle
+
+* The default temporary directory is a fresh random 0700 directory under
+  the system temporary directory, named `bigtent-merge-*`. It is removed
+  when the merge finishes — on success, on error, and on panic
+  (`test_merge_temp_dir_cleaned_on_success`,
+  `test_merge_temp_dir_cleaned_after_conversion_failure`,
+  `test_merge_temp_dir_cleaned_on_panic`).
+* `--merge-temp-dir <path>` selects an explicit root. Roots that overlap
+  a merge input or the destination are rejected after canonicalization
+  (`test_temp_root_rejects_destination_overlap`,
+  `test_temp_root_rejects_input_overlap` in the conversion unit tests,
+  and the merge-level overlap test). A symlinked root is allowed
+  (canonicalization resolves it). An explicit root is **never deleted** —
+  only the per-run directories inside it are
+  (`test_merge_temp_dir_cleaned_on_success`).
+* A root that is not owned by the effective user or is writable by
+  group/other is rejected unless `--force-temp-dir` is supplied (the
+  override is logged) (`test_temp_root_ownership_predicate`).
+* A `SIGKILL`, crash, or machine loss can strand `bigtent-merge-*`
+  directories. Stale-sweep guidance: periodically remove
+  `bigtent-merge-*` directories under the temp root older than your
+  longest expected merge by prefix and age, e.g.:
+
+  ```bash
+  find /tmp -maxdepth 1 -name 'bigtent-merge-*' -mtime +2 -exec rm -rf {} +
+  ```
+
+### Verification
+
+After a mixed-version merge, `bigtent --rodeo <dest> --check` validates
+the output cluster, and lookups against the output must resolve source
+identifiers (`test_mixed_herd_lookup_resolves_both_versions` at the herd
+level; the corpus test `test_large_corpus_merge` for large runs).

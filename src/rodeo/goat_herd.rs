@@ -125,20 +125,6 @@ impl GoatRodeoTrait for GoatHerd {
         Item::merge_items(items)
     }
 
-    fn item_for_hash(&self, hash: crate::util::MD5Hash) -> Option<Item> {
-        let mut items = vec![];
-        for grc in &self.herd {
-            match grc.item_for_hash(hash) {
-                None => {}
-                Some(item) => {
-                    items.push(item);
-                }
-            }
-        }
-
-        Item::merge_items(items)
-    }
-
     fn antialias_for(self: Arc<Self>, data: &str) -> Option<Item> {
         impl_antialias_for(self, data)
     }
@@ -158,10 +144,6 @@ impl GoatRodeoTrait for GoatHerd {
             }
         }
         false
-    }
-
-    fn is_empty(&self) -> bool {
-        self.herd.is_empty()
     }
 
     fn node_count(&self) -> u64 {
@@ -195,7 +177,10 @@ async fn call_root(hm: &Arc<HerdMember>) -> Receiver<Item> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+#[allow(clippy::await_holding_lock)] // the hook guard intentionally serializes tests across awaits
 async fn test_purls_and_merge() {
+    // serialize against the conversion tests' global injection hooks
+    let _hook_guard = crate::rodeo::convert::phase3_tests::merge_hook_guard();
     use crate::item::EdgeType;
     use crate::rodeo::goat::GoatRodeoCluster;
     let path = PathBuf::from("test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc");
@@ -240,8 +225,8 @@ async fn test_purls_and_merge() {
         &dest_dir,
         Arc::new(std::collections::HashSet::new()),
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        15,  /* default merge buffer size in GB */
-        2,   /* a small, deterministic worker count for tests */
+        15, /* default merge buffer size in GB */
+        2,  /* a small, deterministic worker count for tests */
     )
     .await
     .expect("Should do a merge");
@@ -265,9 +250,10 @@ async fn test_purls_and_merge() {
         .expect("Should get tags from option");
     let tagged: Vec<String> = tags
         .connections
+        .0
         .iter()
-        .filter(|conn| conn.0.is_tag_to())
-        .map(|conn| conn.1.clone())
+        .filter(|(edge_type, _)| edge_type.is_tag_to())
+        .flat_map(|(_, targets)| targets.iter().cloned())
         .collect();
 
     assert_eq!(tagged.len(), 2, "Expecting 2 tags, got {:?}", tagged);

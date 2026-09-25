@@ -89,7 +89,7 @@ The input file must be a JSON array of identifier strings:
 Output is a JSON object mapping each identifier to its Item or `null`:
 ```json
 {
-  "gitoid:blob:sha256:abc123...": { "identifier": "...", "connections": [...], ... },
+  "gitoid:blob:sha256:abc123...": { "identifier": "...", "connections": {"contained:up": ["..."]}, ... },
   "pkg:npm/lodash@4.17.21": null
 }
 ```
@@ -187,9 +187,9 @@ RUST_LOG=info bigtent --rodeo /path/to/cluster/
 ```
 
 Every HTTP request is logged with URI, status code, and response time.
-There is no built-in metrics endpoint; parse the JSON logs or use an
-external observability tool. The `GET /node_count` endpoint serves as a
-basic health check.
+The `GET /metrics` endpoint serves Prometheus text exposition metrics
+(`test_metrics_endpoint_responds`). The `GET /node_count` endpoint serves
+as a basic health check.
 
 ## Environment Variables
 

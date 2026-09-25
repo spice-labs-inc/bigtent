@@ -1,0 +1,10 @@
+{
+  "identifier": "gitoid:blob:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "connections": [
+    ["contained:up", "gitoid:blob:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
+    ["alias:from", "pkg:npm/example@1.0.0"],
+    ["contained:up", "gitoid:blob:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"]
+  ],
+  "body_mime_type": "application/vnd.cc.goatrodeo",
+  "body": {"file_names": ["example.txt"], "file_size": 42}
+}

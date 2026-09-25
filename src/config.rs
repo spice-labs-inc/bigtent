@@ -95,6 +95,35 @@ pub struct Args {
     #[arg(long)]
     pub merge_worker_count: Option<usize>,
 
+    /// Applies to `fresh_merge` jobs: directory for the merge's temporary
+    /// files (converted sources live here during the merge). The default is
+    /// a fresh random directory under the system temporary directory.
+    /// Explicit roots are never deleted; only the per-run directories
+    /// inside them are.
+    #[arg(long)]
+    pub merge_temp_dir: Option<PathBuf>,
+
+    /// Applies to `fresh_merge` jobs with `--merge-temp-dir`: accept a
+    /// temporary root that is not owned by the effective user or is
+    /// writable by group/other. The override is recorded in the logs.
+    #[arg(long)]
+    pub force_temp_dir: bool,
+
+    /// Convert version 3 clusters to version 4 (BLAKE3[0..16]) clusters.
+    /// Takes directories of clusters (like `--fresh-merge`); each input
+    /// cluster is re-keyed byte-copy into `--dest/<input-dir-name>/` as
+    /// one or more clusters, chunked at the writer split limits. The
+    /// converted items are rust-equal to the source items.
+    #[arg(long, num_args = 1..)]
+    pub convert_to_v4: Vec<PathBuf>,
+
+    /// Compare two clusters for item equality. Exactly two paths, each a
+    /// cluster directory or a `.grc` file. Works across key algorithms
+    /// (V3/MD5 vs V4/BLAKE3). Prints a summary; exits 0 when every item
+    /// on both sides is rust-equal, 1 otherwise.
+    #[arg(long, num_args = 1..)]
+    pub compare: Vec<PathBuf>,
+
     /// Path to a plain-text file containing identifiers to exclude from a `fresh_merge`.
     /// One identifier per line; empty lines and lines starting with `#` are ignored.
     /// Requires `--fresh-merge`.

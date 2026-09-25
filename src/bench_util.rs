@@ -12,7 +12,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde_cbor::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -92,11 +92,12 @@ impl SyntheticItemGenerator {
         items
     }
 
+    #[allow(clippy::collapsible_if)] // nested offset/item chain reads in write order
     fn generate_item(&self, idx: usize, rng: &mut StdRng) -> Item {
         let gitoid = format!("gitoid:blob:sha256:{:016x}", idx);
         let file_size = rng.random_range(100..10000);
 
-        let mut connections = BTreeSet::new();
+        let mut connections = crate::item::Connections::default();
 
         // Add some random connections
         let num_connections = rng.random_range(0..5);
@@ -105,9 +106,17 @@ impl SyntheticItemGenerator {
                 let target_idx = if idx > 0 { rng.random_range(0..idx) } else { 0 };
                 let target = format!("gitoid:blob:sha256:{:016x}", target_idx);
                 if rng.random_bool(0.5) {
-                    connections.insert((CONTAINS.to_string(), target));
+                    connections
+                        .0
+                        .entry(CONTAINS.to_string())
+                        .or_default()
+                        .insert(target);
                 } else {
-                    connections.insert((CONTAINED_BY.to_string(), target));
+                    connections
+                        .0
+                        .entry(CONTAINED_BY.to_string())
+                        .or_default()
+                        .insert(target);
                 }
             }
         }
@@ -123,7 +132,11 @@ impl SyntheticItemGenerator {
                 let minor = rng.random_range(0..10);
                 format!("pkg:maven/org.example{}@{}.{}", idx % 100, major, minor)
             };
-            connections.insert(("alias:from".to_string(), purl));
+            connections
+                .0
+                .entry("alias:from".to_string())
+                .or_default()
+                .insert(purl);
         }
 
         let body = Some(Value::Map(BTreeMap::from_iter(vec![
@@ -162,18 +175,31 @@ pub async fn write_cluster_to_disk(
     cluster: Arc<RoboticGoat>,
     output_dir: &PathBuf,
 ) -> Result<PathBuf> {
+    write_cluster_to_disk_with_max_size(cluster, output_dir, None).await
+}
+
+/// Write a synthetic cluster to disk with an optional per-data-file cap.
+pub async fn write_cluster_to_disk_with_max_size(
+    cluster: Arc<RoboticGoat>,
+    output_dir: &PathBuf,
+    max_data_file_size: Option<usize>,
+) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir).await?;
 
-    let mut cluster_writer = ClusterWriter::new(output_dir).await?;
+    let mut cluster_writer = match max_data_file_size {
+        Some(size) => ClusterWriter::new_with_max_size(output_dir, size).await?,
+        None => ClusterWriter::new(output_dir).await?,
+    };
 
     // Write all items
     let num_items = cluster.number_of_items();
     for pos in 0..num_items {
-        if let Some(offset) = cluster.offset_from_pos(pos) {
-            if let Some(item) = cluster.item_from_item_offset(&offset) {
-                let cbor_bytes = serde_cbor::to_vec(&item)?;
-                cluster_writer.write_item(item, cbor_bytes).await?;
-            }
+        if let Some(item) = cluster
+            .offset_from_pos(pos)
+            .and_then(|offset| cluster.item_from_item_offset(&offset))
+        {
+            let cbor_bytes = serde_cbor::to_vec(&item)?;
+            cluster_writer.write_item(item, cbor_bytes).await?;
         }
     }
 
@@ -197,6 +223,17 @@ pub async fn generate_synthetic_cluster(
     items: Vec<Item>,
     output_dir: PathBuf,
 ) -> Result<PathBuf> {
+    generate_synthetic_cluster_with_max_size(name, items, output_dir, None).await
+}
+
+/// Generate a synthetic cluster with an optional per-data-file size cap,
+/// so multi-file output can be produced for determinism tests.
+pub async fn generate_synthetic_cluster_with_max_size(
+    name: &str,
+    items: Vec<Item>,
+    output_dir: PathBuf,
+    max_data_file_size: Option<usize>,
+) -> Result<PathBuf> {
     let cluster = RoboticGoat::new(name, items, serde_json::json!({}));
-    write_cluster_to_disk(cluster, &output_dir).await
+    write_cluster_to_disk_with_max_size(cluster, &output_dir, max_data_file_size).await
 }

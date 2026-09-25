@@ -38,19 +38,17 @@ fn run_merge(clusters: Vec<Arc<bigtent::rodeo::member::HerdMember>>, buffer_limi
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dest = tempfile::tempdir().unwrap().path().to_path_buf();
     rt.block_on(async {
-        black_box(
-            merge_fresh(
-                black_box(clusters),
-                black_box(buffer_limit),
-                black_box(dest),
-                black_box(Arc::new(HashSet::new())),
-                black_box(Arc::new(std::sync::atomic::AtomicBool::new(true))),
-                black_box(15),
-                black_box(bigtent::fresh_merge::default_merge_worker_count()),
-            )
-            .await
-            .unwrap(),
-        );
+        merge_fresh(
+            black_box(clusters),
+            black_box(buffer_limit),
+            black_box(dest),
+            black_box(Arc::new(HashSet::new())),
+            black_box(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+            black_box(15),
+            black_box(bigtent::fresh_merge::default_merge_worker_count()),
+        )
+        .await
+        .unwrap();
     });
 }
 

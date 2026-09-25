@@ -109,8 +109,17 @@ When limits are reached, new files are created automatically.
 | Thread Type | Count | Role |
 |-------------|-------|------|
 | Coordinator | 1 | Finds items to merge |
-| Workers | 20 | Fetch and merge items |
+| Workers | 75% of available cores (default; `--merge-worker-count` overrides) | Fetch and merge items |
 | Writer | 1 (main) | Write output cluster |
+
+The default worker count is 75% of available CPU cores, cgroup-aware,
+with a minimum of 1 (`test_default_merge_worker_count_is_75_percent_of_cores`,
+`test_default_merge_worker_count_is_at_least_one`).
+
+Mixed-version merges convert version 3 sources first; conversion chunk
+sizes share the writer's split limits
+(`prop_split_limits_invariance_on_synthetic_clusters`). See the
+[Operations Guide](info/operations.md#mixed-version-merge).
 
 Communication via bounded channels prevents memory exhaustion.
 

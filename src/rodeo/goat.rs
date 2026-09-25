@@ -37,7 +37,6 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
-use memmap2::Mmap;
 use serde_jsonlines::json_lines;
 use std::{
     cmp::Ordering,
@@ -61,8 +60,7 @@ use tokio::{
 use crate::{
     item::Item,
     util::{
-        MD5Hash, byte_slice_to_u63, find_common_root_dir, hex_to_u64, md5hash_str,
-        read_len_and_cbor, read_u32, sha256_for_reader,
+        KeyHash, byte_slice_to_u63, hex_to_u64, read_len_and_cbor, read_u32, sha256_for_reader,
     },
 };
 #[cfg(not(test))]
@@ -140,6 +138,11 @@ pub struct GoatRodeoCluster {
     /// Metadata from the .grc cluster file
     envelope: ClusterFileEnvelope,
 
+    /// The index key algorithm this cluster's files declare (ADR 0002):
+    /// from the `.grc` declaration when present, else the first `.gri`'s
+    /// `encoding` description. Lookups hash identifiers with this.
+    key_alg: crate::util::KeyAlg,
+
     /// SHA256 hash of the cluster file (truncated to u64)
     cluster_file_hash: u64,
 
@@ -168,6 +171,11 @@ pub struct GoatRodeoCluster {
     directory: PathBuf,
 
     /// Optional blob identifier from cluster info
+    ///
+    /// Stored for provenance; the public `get_blob` accessor was removed
+    /// as dead API (no in-repo or known downstream callers). The field is
+    /// kept so cluster provenance captured at load time is not discarded.
+    #[allow(dead_code)]
     blob: Option<String>,
 
     /// SHA256 hashes of source clusters (for provenance)
@@ -213,12 +221,9 @@ impl GoatRodeoTrait for GoatRodeoCluster {
     }
 
     fn item_for_identifier(&self, data: &str) -> Option<Item> {
-        let md5_hash = md5hash_str(data);
-        self.item_for_hash(md5_hash)
-    }
-
-    fn item_for_hash(&self, hash: MD5Hash) -> Option<Item> {
-        match self.hash_to_item_offset(hash) {
+        // hash with the algorithm this cluster's files declare (ADR 0002)
+        let key = self.key_alg.hash_identifier(data);
+        match self.hash_to_item_offset(key) {
             Some(eo) => self.item_from_index_loc(&eo.loc),
             None => None,
         }
@@ -230,10 +235,6 @@ impl GoatRodeoTrait for GoatRodeoCluster {
 
     fn has_identifier(&self, identifier: &str) -> bool {
         self.identifier_to_item_offset(identifier).is_some()
-    }
-
-    fn is_empty(&self) -> bool {
-        false
     }
 
     fn read_history(&self) -> Result<Vec<serde_json::Value>> {
@@ -276,12 +277,12 @@ impl GoatRodeoTrait for GoatRodeoCluster {
 
         tokio::spawn(async move {
             for offset in 0..self.number_of_items {
-                if let Some(item_offset) = self.offset_from_pos(offset) {
-                    if let Some(item) = self.item_from_item_offset(&item_offset) {
-                        if item.is_root_item() {
-                            let _ = tx.send(item).await;
-                        }
-                    }
+                if let Some(item) = self
+                    .offset_from_pos(offset)
+                    .and_then(|o| self.item_from_item_offset(&o))
+                    .filter(|item| item.is_root_item())
+                {
+                    let _ = tx.send(item).await;
                 }
             }
         });
@@ -353,27 +354,60 @@ impl ClusterRoboMember for GoatRodeoCluster {
     }
 }
 impl GoatRodeoCluster {
+    /// The index key algorithm this cluster's files declare (ADR 0002):
+    /// the `.grc` declaration when present, else the first `.gri`'s
+    /// `encoding` description.
+    pub fn key_alg(&self) -> crate::util::KeyAlg {
+        self.key_alg
+    }
+
+    /// The cluster's file format version (crate-internal accessor; its
+    /// consumers are the test targets).
+    #[allow(dead_code)] // exercised from cfg(test) consumers
+    pub(crate) fn cluster_version(&self) -> u32 {
+        self.envelope.version
+    }
+
+    /// The `.grc` path of this cluster (crate-internal; its consumers are
+    /// the test targets).
+    #[allow(dead_code)] // exercised from cfg(test) consumers
+    pub(crate) fn cluster_path(&self) -> PathBuf {
+        self.cluster_path.clone()
+    }
+
+    /// Full index (crate-internal): every entry, in source order. The
+    /// conversion reads all entries anyway; this is its entry source.
+    /// Unlike the pre-cache path it does not depend on the `load_index`
+    /// flag — it reads the mapped index files directly.
+    pub(crate) async fn full_index(&self) -> Result<Arc<Vec<ItemOffset>>> {
+        let mut ret = vec![];
+        for index_hash in &self.envelope.index_files {
+            let index = self
+                .index_files
+                .get(index_hash)
+                .context("Index file referenced but not loaded")?;
+            ret.extend(index.read_index()?);
+        }
+        Ok(Arc::new(ret))
+    }
+
+    /// The loaded data file for a truncated-SHA256 name hash, if present.
+    pub(crate) fn data_file_for(&self, hash: u64) -> Option<Arc<DataFile>> {
+        self.data_files.get(&hash).cloned()
+    }
+
     /// get the cluster file hash
     pub fn get_cluster_file_hash(&self) -> u64 {
         self.cluster_file_hash
     }
 
-    /// Get the data file mapping
-    pub fn get_data_files(&self) -> &HashMap<u64, Arc<DataFile>> {
-        &self.data_files
-    }
-
-    /// Get the index file mapping
-    pub fn get_index_files(&self) -> &HashMap<u64, Arc<IndexFile>> {
-        &self.index_files
-    }
-
-    pub fn get_directory(&self) -> PathBuf {
+    /// The directory holding this cluster's files.
+    ///
+    /// Phase 3 needs each source cluster's directory for
+    /// temporary-root overlap validation, so this narrower accessor
+    /// replaces the former `get_directory`.
+    pub fn cluster_directory(&self) -> PathBuf {
         self.directory.clone()
-    }
-
-    pub fn get_blob(&self) -> Option<String> {
-        self.blob.clone()
     }
 
     pub fn get_sha(&self) -> Vec<[u8; 32]> {
@@ -392,6 +426,16 @@ impl GoatRodeoCluster {
             Some(n) => n.to_string(),
             _ => bail!("Unable to get filename for {:?}", file_path),
         };
+
+        // H3: the hash is parsed positionally from the end of the name
+        // (16 hex digits + ".grc"); a shorter name would underflow the
+        // slice, so reject it with an error naming the file.
+        if file_name.len() < 20 {
+            bail!(
+                "Cluster file name {:?} is too short to contain the positional hash",
+                file_name
+            );
+        }
 
         let hash: u64 = match hex_to_u64(&file_name[(file_name.len() - 20)..(file_name.len() - 4)])
         {
@@ -467,8 +511,11 @@ impl GoatRodeoCluster {
         }
 
         let mut data_files = HashMap::new();
+        // version 3 clusters carry data envelope 1; version 4 carries 2
+        let expected_data_envelope_version = if env.version >= 4 { 2 } else { 1 };
         for data_file in &env.data_files {
-            let the_file = Arc::new(DataFile::new(&parent, *data_file).await?);
+            let the_file =
+                Arc::new(DataFile::new(&parent, *data_file, expected_data_envelope_version).await?);
             data_files.insert(*data_file, the_file);
         }
 
@@ -495,8 +542,25 @@ impl GoatRodeoCluster {
 
         info!("New cluster load time {:?}", start.elapsed());
 
+        // resolve the declared key algorithm (ADR 0002): the `.grc`
+        // declaration when present, else the first `.gri`'s encoding
+        // description (version 3 clusters declare in the `.gri` only)
+        let key_alg = match &env.encoding {
+            Some(enc) => super::cluster::parse_encoding(enc)?,
+            None => {
+                let first = index_vec.first().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cluster {:?} has no index files to declare its key algorithm",
+                        cluster_path
+                    )
+                })?;
+                super::cluster::parse_encoding(&first.envelope.encoding)?
+            }
+        };
+
         let ret = Arc::new(GoatRodeoCluster {
             envelope: env,
+            key_alg,
             cluster_path: cluster_path.clone(),
             data_files,
             index_files: IndexFile::vec_of_index_files_to_hash_lookup(&index_vec),
@@ -527,11 +591,6 @@ impl GoatRodeoCluster {
                 let _ = self.get_md5_to_item_offset_index_if_load_index_true().await;
             });
         }
-    }
-
-    pub fn common_parent_dir(clusters: &[GoatRodeoCluster]) -> Result<PathBuf> {
-        let paths = clusters.iter().map(|b| b.cluster_path.clone()).collect();
-        find_common_root_dir(paths)
     }
 
     /// Big Tent has an in-memory index of MD5 hash of identifier to the
@@ -668,18 +727,6 @@ impl GoatRodeoCluster {
         Ok(ret_arc)
     }
 
-    /// Data files (files that contain `Item`s) are named based on the 8 most significant
-    /// bytes of their sha256 (with the most significant bit set to 0). This data structure
-    /// opens each of the data files so that when an `Item` needs to be read, the
-    /// `Mutex`ed file handle can be looked up in a hash table. This function
-    /// Does the lookup
-    pub fn find_data_file_from_sha256(&self, hash: u64) -> Result<Arc<Mmap>> {
-        match self.data_files.get(&hash) {
-            Some(df) => Ok(df.file.clone()),
-            None => bail!("Data file '{:016x}.grd' not found", hash),
-        }
-    }
-
     /// Big Tent and Goat Rodeo store data and index files with names based on the
     /// sha256 of the file contents. This function, given a root_path, finds
     /// the file with the correct hash. Note that this is the most significant
@@ -690,6 +737,7 @@ impl GoatRodeoCluster {
         hash: u64,
         suffix: &str,
     ) -> Result<File> {
+        #[allow(clippy::collapsible_if)] // nested recursion reads clearer than a let-chain
         fn find(name: &str, dir: &Path) -> Result<Option<PathBuf>> {
             for entry in dir.read_dir()? {
                 let entry = entry?;
@@ -774,12 +822,16 @@ impl GoatRodeoCluster {
     /// index. This is a fast operation as it's just a binary search of the index which is
     /// in memory
     pub fn identifier_to_item_offset(&self, identifier: &str) -> Option<ItemOffset> {
-        let hash = md5hash_str(identifier);
+        // hash with the algorithm this cluster's files declare (ADR 0002)
+        let hash = self.key_alg.hash_identifier(identifier);
         self.hash_to_item_offset(hash)
     }
 
     /// from a hash, find the ItemOffset
-    pub fn hash_to_item_offset(&self, hash: MD5Hash) -> Option<ItemOffset> {
+    /// Map a 16-byte index key to the offset of the matching item.
+    /// Crate-private: the public lookup path is
+    /// `item_for_identifier`, which computes the key from the identifier.
+    pub(crate) fn hash_to_item_offset(&self, hash: KeyHash) -> Option<ItemOffset> {
         if self.load_index && self.index.load().is_some() {
             match &**self.index.load() {
                 Some(index) => find_item_offset(hash, index),
@@ -812,11 +864,15 @@ impl GoatRodeoCluster {
         let data_files = &self.data_files;
         let data_file = data_files.get(&file_hash);
         match data_file {
-            Some(df) => {
-                let item = df.read_item_at(offset)?;
-
-                Some(item)
-            }
+            Some(df) => match df.read_item_at(offset) {
+                Ok(item) => Some(item),
+                Err(e) => {
+                    // the file-level failure is logged here; the lookup
+                    // boundary reports the item as absent
+                    error!("Reading item at offset {} failed: {:?}", offset, e);
+                    None
+                }
+            },
             None => {
                 panic!(
                     "Couldn't find file for hash {:x} this indicates a corrupted index file and justifies a panic!",
@@ -860,8 +916,10 @@ async fn test_antialias() {
 
     let mut aliases = vec![];
     for v in index.iter() {
+        // Adapted (phase 1, D9): fetch through item_from_item_offset with
+        // identical assertions; item_for_hash was removed from the trait.
         let item = cluster
-            .item_for_hash(v.hash)
+            .item_from_item_offset(v)
             .expect("And it should be a Some");
         if item.is_alias() {
             aliases.push(item);
@@ -880,10 +938,10 @@ async fn test_antialias() {
         assert!(
             new_item
                 .connections
-                .iter()
-                .filter(|x| x.1 == ai.identifier)
-                .count()
-                > 0,
+                .0
+                .values()
+                .flatten()
+                .any(|x| *x == ai.identifier),
             "Expecting a match for {}",
             ai.identifier
         );
@@ -969,8 +1027,7 @@ async fn test_files_in_dir() {
     {
         Ok(v) => v,
         Err(e) => {
-            assert!(false, "Failure to read files {:?}", e);
-            return;
+            panic!("Failure to read files {:?}", e);
         }
     };
 
@@ -1084,8 +1141,7 @@ async fn test_generated_cluster_no_index() {
             match GoatRodeoCluster::cluster_files_in_dir(test_path.into(), false, vec![]).await {
                 Ok(v) => v,
                 Err(e) => {
-                    assert!(false, "Failure to read files {:?}", e);
-                    return;
+                    panic!("Failure to read files {:?}", e);
                 }
             };
 
@@ -1142,16 +1198,15 @@ async fn test_files_in_dir_no_index_load() {
     {
         Ok(v) => v,
         Err(e) => {
-            assert!(false, "Failure to read files {:?}", e);
-            return;
+            panic!("Failure to read files {:?}", e);
         }
     };
 
-    assert!(files.len() > 0, "We should find some files");
+    assert!(!files.is_empty(), "We should find some files");
     let mut total_index_size = 0;
     for cluster in &files {
-        assert!(cluster.data_files.len() > 0);
-        assert!(cluster.index_files.len() > 0);
+        assert!(!cluster.data_files.is_empty());
+        assert!(!cluster.index_files.is_empty());
 
         let start = Instant::now();
         let complete_index_len = cluster.number_of_items();
@@ -1172,4 +1227,65 @@ async fn test_files_in_dir_no_index_load() {
         "must read at least 7,000 items, but only got {}",
         total_index_size
     );
+}
+
+#[cfg(test)]
+mod phase2_dispatch_tests {
+    use super::*;
+    use crate::util::KeyAlg;
+
+    /// Test 28 (phase 2): key-algorithm dispatch is per cluster.
+    ///
+    /// Requirement: ADR 0002 (readers use the algorithm the files
+    /// declare). Theory: a version 3 fixture resolves via the first
+    /// `.gri`'s MD5 description; an in-memory (RoboticGoat) member is
+    /// version 4 and keys with BLAKE3; a writer-built cluster declares
+    /// BLAKE3 in its `.grc`. The algorithm is selected per cluster, not
+    /// per process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_key_algorithm_dispatch_per_cluster() {
+        // v3 fixture: declaration lives in the first .gri (MD5)
+        let v3_path = PathBuf::from("test_data/cluster_a/2025_04_19_17_10_26_012a73d9c40dc9c0.grc");
+        let v3 = GoatRodeoCluster::new(&v3_path, false, None, vec![])
+            .await
+            .expect("v3 fixture loads");
+        assert_eq!(v3.key_alg(), KeyAlg::Md5);
+
+        // in-memory member: version 4, BLAKE3
+        let robo = crate::rodeo::robo_goat::RoboticGoat::new(
+            "robo",
+            vec![Item {
+                identifier: "gitoid:blob:sha256:dispatch".to_string(),
+                connections: Default::default(),
+                body_mime_type: None,
+                body: None,
+            }],
+            serde_json::Value::Null,
+        );
+        let _ = robo.item_for_identifier("gitoid:blob:sha256:dispatch");
+        assert!(robo.has_identifier("gitoid:blob:sha256:dispatch"));
+
+        // writer-built cluster: declares BLAKE3 in the .grc
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut writer = crate::rodeo::writer::ClusterWriter::new(dir.path())
+            .await
+            .unwrap();
+        let item = Item {
+            identifier: "gitoid:blob:sha256:dispatch".to_string(),
+            connections: Default::default(),
+            body_mime_type: None,
+            body: None,
+        };
+        let cbor = serde_cbor::to_vec(&item).unwrap();
+        writer.write_item(item, cbor).await.unwrap();
+        writer.finalize_cluster().await.unwrap();
+        let v4 = &GoatRodeoCluster::cluster_files_in_dir(dir.path().to_path_buf(), false, vec![])
+            .await
+            .unwrap()[0];
+        assert_eq!(v4.key_alg(), KeyAlg::Blake3Truncated128);
+        assert!(
+            v4.item_for_identifier("gitoid:blob:sha256:dispatch")
+                .is_some()
+        );
+    }
 }

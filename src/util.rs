@@ -4,7 +4,8 @@
 //! organized into several categories:
 //!
 //! ## Hashing Functions
-//! - [`md5hash_str`] - Compute MD5 hash of a string (used for index keys)
+//! - [`md5hash_str`], [`blake3hash_str`] - Index key derivation (version 3
+//!   and version 4 key spaces)
 //! - [`sha256_for_slice`], [`sha256_for_reader`] - SHA256 hashing (file integrity)
 //! - [`hex_to_md5bytes`], [`hex_to_u64`] - Parse hex strings to bytes
 //!
@@ -23,7 +24,6 @@
 //! - [`NiceDurationDisplay`] - Human-readable duration formatting
 //!
 //! ## CBOR Utilities
-//! - [`traverse_value`] - Walk CBOR value trees
 //! - [`read_cbor_sync`] - Deserialize CBOR from bytes
 
 use anyhow::{Context, Result, bail};
@@ -31,7 +31,7 @@ use chrono::{DateTime, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_cbor::Value;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     ffi::OsStr,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -47,21 +47,21 @@ use std::println as info;
 /// Buffer size for streaming hash operations (4 KB)
 const BYTE_BUFFER_SIZE: usize = 4096;
 
-/// Parse a hex string into an MD5 hash (16 bytes).
+/// Parse a hex string into a 16-byte index key.
 ///
 /// # Arguments
-/// * `it` - A 32-character hex string representing the MD5 hash
+/// * `it` - A 32-character hex string representing the key
 ///
 /// # Returns
-/// * `Some(MD5Hash)` - The parsed 16-byte hash
+/// * `Some(KeyHash)` - The parsed 16-byte key
 /// * `None` - If the string is not valid hex or too short
-pub fn hex_to_md5bytes(it: &str) -> Option<MD5Hash> {
+pub fn hex_to_md5bytes(it: &str) -> Option<KeyHash> {
     hex::decode(it)
         .map(|bytes| {
-            if bytes.len() < std::mem::size_of::<MD5Hash>() {
+            if bytes.len() < std::mem::size_of::<KeyHash>() {
                 None
             } else {
-                let (int_bytes, _) = bytes.split_at(std::mem::size_of::<MD5Hash>());
+                let (int_bytes, _) = bytes.split_at(std::mem::size_of::<KeyHash>());
                 let slice: [u8; 16] = int_bytes.try_into().ok()?;
                 Some(slice)
             }
@@ -119,33 +119,27 @@ pub fn byte_slice_to_u63(it: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(buff) & 0x7fffffffffffffff)
 }
 
-/// Check if a string is a valid MD5 hash and parse it.
-///
-/// Handles both raw 32-char hex and filenames like "abc123...def.json".
-pub fn check_md5(it: Option<&String>) -> Option<MD5Hash> {
-    match it {
-        Some(v) if v.len() == 32 => hex_to_md5bytes(v),
-        Some(v) if v.len() == 37 && v.ends_with(".json") => hex_to_md5bytes(&v[0..32]),
-        _ => None,
-    }
-}
-
-/// Get current time as milliseconds since Unix epoch.
-pub fn millis_now() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
-
 /// Compute MD5 hash of a string.
 ///
 /// Used for index key generation. Note: MD5 is used for lookup efficiency,
 /// not security. Data integrity uses SHA256.
-pub fn md5hash_str(st: &str) -> MD5Hash {
+pub fn md5hash_str(st: &str) -> KeyHash {
     let res = md5::compute(st);
 
     res.into()
+}
+
+/// Compute the version 4 index key: BLAKE3 over the UTF-8 bytes of the
+/// identifier, truncated to the first 16 bytes of the 32-byte digest.
+///
+/// Compared as unsigned byte strings, with the existing big-endian binary
+/// search unchanged (ADR 0002). Data integrity uses SHA256; BLAKE3 here is
+/// only the index key derivation.
+pub fn blake3hash_str(st: &str) -> KeyHash {
+    let digest = blake3::hash(st.as_bytes());
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest.as_bytes()[0..16]);
+    key
 }
 
 /// Compute SHA256 hash of a byte slice.
@@ -226,10 +220,6 @@ pub fn iso8601_now() -> String {
     let dt: DateTime<Utc> = SystemTime::now().into();
     format!("{}", dt.format("%+"))
     // formats like "2001-07-08T00:34:60.026490+09:30"
-}
-
-pub fn current_date_string() -> String {
-    format!("{:?}", chrono::offset::Utc::now())
 }
 
 pub fn is_child_dir(root: &Path, potential_child: &PathBuf) -> Result<bool> {
@@ -365,33 +355,6 @@ pub fn timed_filename(suffix: &str) -> String {
     )
 }
 
-pub async fn read_all<R: AsyncReadExt + Unpin>(r: &mut R, max: usize) -> Result<Vec<u8>> {
-    let mut ret = vec![];
-    let mut buf = [0u8; BYTE_BUFFER_SIZE];
-    let mut read: usize = 0;
-    loop {
-        let to_read = BYTE_BUFFER_SIZE.min(max - read);
-        if to_read == 0 {
-            break;
-        }
-        match r.read(&mut buf[0..to_read]).await {
-            Ok(0) => {
-                break;
-            }
-            Ok(n) => {
-                read += n;
-                let mut to_str = vec![];
-                to_str.extend_from_slice(&buf[..n]);
-                let qq = &buf[..n];
-                ret.extend_from_slice(qq);
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    Ok(ret)
-}
-
 pub async fn read_u16<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<u16> {
     let mut buf = [0u8; 2];
     r.read_exact(&mut buf).await?;
@@ -463,7 +426,7 @@ pub async fn read_cbor<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
                 Err(e2) => {
                     info!(
                         "Failed to do basic deserialization of {} with errors e {} and e2 {}",
-                        unsafe { String::from_utf8_unchecked(buffer) },
+                        escape_bytes_for_log(&buffer),
                         e,
                         e2
                     )
@@ -489,7 +452,7 @@ pub fn read_cbor_sync<T: DeserializeOwned, R: Read + Unpin>(file: &mut R, len: u
                 Err(e2) => {
                     info!(
                         "Failed to do basic deserialization of {} with errors e {} and e2 {}",
-                        unsafe { String::from_utf8_unchecked(buffer) },
+                        escape_bytes_for_log(&buffer),
                         e,
                         e2
                     )
@@ -498,6 +461,26 @@ pub fn read_cbor_sync<T: DeserializeOwned, R: Read + Unpin>(file: &mut R, len: u
             bail!("Failed to deserialize with error {}", e);
         }
     }
+}
+
+/// Render raw bytes safely for a log line.
+///
+/// Every byte outside printable ASCII (0x20..=0x7e) is hex-escaped as
+/// `\xNN`, so attacker-controlled payload bytes cannot forge log lines
+/// with control characters (newlines, backspaces) or invalid UTF-8
+/// sequences. Printable ASCII is passed through readably. This replaces
+/// the former `String::from_utf8_unchecked` diagnostic, which was
+/// undefined behavior on non-UTF-8 payloads (phase 1, H1).
+fn escape_bytes_for_log(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 4);
+    for &b in bytes {
+        if (0x20..=0x7e).contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\x{:02x}", b));
+        }
+    }
+    out
 }
 
 pub async fn write_int<W: AsyncWriteExt + Unpin>(target: &mut W, val: u32) -> Result<()> {
@@ -547,34 +530,6 @@ pub async fn write_envelope_and_payload<W: AsyncWriteExt + Unpin, T: Serialize, 
     target.write_all(&env_bytes).await?;
     target.write_all(&payload_bytes).await?;
     Ok(())
-}
-
-pub fn traverse_value(v: &Value, path: Vec<&str>) -> Option<Value> {
-    let mut first = v;
-    for p in path {
-        match first {
-            Value::Map(m) => match m.get(&Value::Text(p.to_string())) {
-                Some(v) => first = v,
-                None => return None,
-            },
-            _ => return None,
-        }
-    }
-    Some(first.clone())
-}
-
-pub fn as_obj(v: &Value) -> Option<&BTreeMap<Value, Value>> {
-    match v {
-        Value::Map(m) => Some(m),
-        _ => None,
-    }
-}
-
-pub fn as_array(v: &Value) -> Option<&Vec<Value>> {
-    match v {
-        Value::Array(m) => Some(m),
-        _ => None,
-    }
 }
 
 pub fn as_str(v: &Value) -> Option<&String> {
@@ -633,11 +588,191 @@ impl std::fmt::Display for NiceDurationDisplay {
     }
 }
 
-/// A 16-byte MD5 hash used as index keys.
+/// A 16-byte index key (the output of a key-space algorithm).
 ///
-/// MD5 is used for index lookups due to its compact size (16 bytes vs 32 for SHA256).
-/// This is purely for efficiency - data integrity uses SHA256.
+/// The 16-byte width keeps the on-disk index entry (16 key + 8 data-file
+/// hash + 8 offset = 32 bytes) and the big-endian binary-search rules
+/// unchanged across algorithms (ADR 0002).
 ///
-/// Note: MD5 is cryptographically broken and should never be used for security.
-/// Here it's used only as a fast hash function for identifier lookup.
-pub type MD5Hash = [u8; 16];
+/// Data integrity uses SHA256; this type is only the identifier index key.
+/// It is not used for security.
+pub type KeyHash = [u8; 16];
+
+/// The key-space algorithm used by a file format version.
+///
+/// Version 3 clusters use MD5 keys; version 4 clusters use BLAKE3
+/// truncated to the first 16 bytes of the 32-byte digest (ADR 0002).
+/// The algorithm a reader uses is the one the cluster's files declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAlg {
+    /// MD5 over the identifier (version 3 key space).
+    Md5,
+    /// BLAKE3 truncated to the first 16 bytes (version 4 key space).
+    Blake3Truncated128,
+}
+
+impl KeyAlg {
+    /// Hash an identifier into this algorithm's 16-byte key space.
+    ///
+    /// Both algorithms consume the UTF-8 bytes of the identifier and are
+    /// deterministic for a given input.
+    pub fn hash_identifier(&self, identifier: &str) -> KeyHash {
+        match self {
+            KeyAlg::Md5 => md5hash_str(identifier),
+            KeyAlg::Blake3Truncated128 => blake3hash_str(identifier),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 tests (plan: plans/2026_09_16_connection_map_and_blake3/
+// phase_1_hash_primitives_and_removals.md).
+//
+// Requirement provenance and test theory are documented per project rule 3.
+// ---------------------------------------------------------------------------
+
+/// Requirement: phase 1, deliverable 1 (D2).
+///
+/// What this test tests: the `KeyAlg::Blake3Truncated128` key derivation is
+/// unkeyed BLAKE3 over the UTF-8 bytes of the identifier, truncated to the
+/// first 16 bytes (128 bits) of the 32-byte digest.
+///
+/// Why this test tests it: it uses the official BLAKE3 test vectors
+/// (BLAKE3-team/BLAKE3 test_vectors.json) at four input lengths — empty,
+/// short (1 byte), one-block boundary (64 bytes), and multi-block (128
+/// bytes) — and asserts the first 16 bytes of the official digest. Multiple
+/// lengths are required because a single short input cannot distinguish
+/// truncated BLAKE3 from BLAKE2 or a folded digest; the block and multi-block
+/// cases pin the construction across BLAKE3's chunk structure. The official
+/// vector inputs are the repeating byte pattern 0, 1, 2, ...; for lengths
+/// up to 128 every byte is ASCII and therefore a valid UTF-8 `String`, so
+/// the vectors exercise the same UTF-8 path production identifiers use.
+#[test]
+fn test_blake3_known_answer_vectors() {
+    use crate::util::KeyAlg;
+    use hex_literal::hex;
+
+    // Official BLAKE3 test vectors: input is bytes [0, 1, ..., len-1]
+    // (the 251-byte repeating pattern starts with 0,1,2,... which for
+    // len <= 128 is exactly the byte sequence itself, all valid UTF-8).
+    let cases: Vec<(usize, [u8; 16])> = vec![
+        // input_len 0: digest af1349b9... first 16 bytes
+        (0, hex!("af1349b9f5f9a1a6a0404dea36dcc949")),
+        // input_len 1: input [0x00]; digest 2d3adedf... first 16 bytes
+        (1, hex!("2d3adedff11b61f14c886e35afa03673")),
+        // input_len 64 (one block); digest 4eed7141... first 16 bytes
+        (64, hex!("4eed7141ea4a5cd4b788606bd23f46e2")),
+        // input_len 128 (two blocks); digest f17e5705... first 16 bytes
+        (128, hex!("f17e570564b26578c33bb7f44643f539")),
+    ];
+
+    for (len, expected) in cases {
+        let input_bytes: Vec<u8> = (0..len as u8).collect();
+        let input = String::from_utf8(input_bytes).expect("vector input is valid UTF-8");
+        let key = KeyAlg::Blake3Truncated128.hash_identifier(&input);
+        assert_eq!(
+            key, expected,
+            "BLAKE3[0..16] KAT mismatch at input length {}",
+            len
+        );
+    }
+}
+
+/// Requirement: phase 1, deliverable 1 (D2).
+///
+/// What this test tests: `KeyAlg::Md5` dispatch still produces the standard
+/// MD5 digest for the version 3 key space.
+///
+/// Why this test tests it: version 3 clusters keep MD5 keys, so the MD5
+/// path must be provably unchanged. A fixed known-answer vector (MD5 of
+/// "abc", the classic RFC 1321-adjacent reference digest) proves the
+/// dispatch selects MD5 and that the primitive is untouched by the
+/// introduction of the BLAKE3 path.
+#[test]
+fn test_md5_known_answer_vector() {
+    use crate::util::KeyAlg;
+    use hex_literal::hex;
+
+    let key = KeyAlg::Md5.hash_identifier("abc");
+    assert_eq!(key, hex!("900150983cd24fb0d6963f7d28e17f72"));
+}
+
+/// Requirement: phase 1, H1 (owner-accepted).
+///
+/// What this test tests: rendering raw payload bytes for a log line is safe
+/// — control characters (including newlines) and non-printable bytes are
+/// hex-escaped so attacker-controlled bytes cannot forge log lines, and the
+/// CBOR error path never converts non-UTF-8 bytes with
+/// `String::from_utf8_unchecked` (undefined behavior).
+///
+/// Why this test tests it: the pre-phase-1 code logged raw payload bytes
+/// with `String::from_utf8_unchecked`, which is UB on non-UTF-8 input. The
+/// substantive property of the fix is that no byte outside printable ASCII
+/// is ever emitted raw. The helper is asserted directly over a crafted
+/// payload, and `read_cbor_sync` is driven with a crafted non-UTF-8,
+/// non-CBOR buffer to prove the failure path returns an error rather than
+/// panicking or invoking UB. Miri, where available, checks the UB
+/// elimination; the execution state records whether Miri ran.
+#[test]
+fn test_cbor_error_logging_does_not_panic_on_non_utf8() {
+    use crate::util::escape_bytes_for_log;
+
+    // Crafted payload: valid neither as CBOR nor as UTF-8, with control
+    // characters and non-ASCII bytes a log-forger would want to abuse.
+    let payload: Vec<u8> = vec![0xbf, 0x78, 0xff, 0xfe, 0x0a, 0x01, 0x1b];
+
+    // The escaped rendering contains no raw control/non-printable bytes
+    // and explicitly escapes the ones we injected.
+    let rendered = escape_bytes_for_log(&payload);
+    for b in rendered.bytes() {
+        assert!(
+            (0x20..0x7f).contains(&b),
+            "log rendering emitted raw byte {:#04x}",
+            b
+        );
+    }
+    assert!(rendered.contains("\\xbf"));
+    assert!(rendered.contains("\\x0a"), "newline must be escaped");
+
+    // Drive the real failure path: the typed parse and the generic parse
+    // both fail on this buffer, so the (formerly unsafe) diagnostic branch
+    // runs. It must return an Err, not panic and not invoke UB.
+    let buffer: &[u8] = &payload;
+    let result: Result<String> = crate::util::read_cbor_sync(&mut &buffer[..], payload.len());
+    assert!(result.is_err(), "crafted garbage must fail to deserialize");
+}
+
+/// Requirement: phase 1, deliverable 1 (D2).
+///
+/// What this test tests: hashing is deterministic — repeated hashing with
+/// the same algorithm returns identical keys, and the two algorithms do not
+/// return the same key for the same input.
+///
+/// Why this test tests it: index keys and file names are content-addressed,
+/// so the same identifier must always produce the same key within an
+/// algorithm. The cross-algorithm inequality is a sanity property of the
+/// dispatch (MD5 and BLAKE3 are different functions). Distribution
+/// properties are not asserted by tests; they follow from the BLAKE3 and
+/// MD5 designs as recorded in ADR 0002.
+#[cfg(test)]
+mod prop_hash_determinism {
+    use crate::util::{KeyAlg, blake3hash_str, md5hash_str};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_hash_is_deterministic(s in ".*") {
+            let m1 = KeyAlg::Md5.hash_identifier(&s);
+            let m2 = KeyAlg::Md5.hash_identifier(&s);
+            prop_assert_eq!(m1, m2);
+            prop_assert_eq!(m1, md5hash_str(&s));
+
+            let b1 = KeyAlg::Blake3Truncated128.hash_identifier(&s);
+            let b2 = KeyAlg::Blake3Truncated128.hash_identifier(&s);
+            prop_assert_eq!(b1, b2);
+            prop_assert_eq!(b1, blake3hash_str(&s));
+
+            prop_assert_ne!(m1, b1);
+        }
+    }
+}

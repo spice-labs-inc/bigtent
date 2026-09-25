@@ -2,13 +2,20 @@
 
 Big Tent is a Graph Database that is based on a high performance Key/Value store.
 
-There are five basic file types in Big Tent:
+There are four basic file types in Big Tent:
 
 * Clusters -- pointers to Index and Data files denoted by the `.grc` suffix
 * Indexes -- Ordered collections of hashed primary keys, file names, and offsets denoted by the `.gri` suffix
 * Data -- files that contain records, denoted by the `.grd` suffix
 * `purls.txt` -- the file that contains the [Package URLs](https://github.com/package-url/purl-spec)
-* `config.toml` -- the configuration file that points to the Cluster files
+
+## Version support
+
+Big Tent reads cluster versions 3 and 4 and writes version 4 only. Version
+4 changes the `Item` connection shape (below), the index key algorithm
+(the constant `BLAKE3[0..16]/Long/Long`), and the data envelope version.
+As demonstrated by `test_v3_fixture_clusters_load_and_resolve` and
+`test_writer_emits_version_4_envelopes`.
 
 ## Hashes and File
 
@@ -53,10 +60,13 @@ pub struct ClusterFileEnvelope {
   pub data_files: Vec<u64>,
   pub index_files: Vec<u64>,
   pub info: BTreeMap<String, String>,
+  pub encoding: Option<String>,
 }
 ```
 
-The `version` should be 1.
+The `version` is 4 for current clusters. Readers accept versions 3 and 4
+and reject other versions (`test_cluster_envelope_rejects_unknown_versions`,
+`test_envelope_version_cross_check`).
 
 The `magic` is equal to `ClusterFileMagicNumber`.
 
@@ -70,6 +80,16 @@ read into memory in order and no sorting is required.
 
 The `info` field provides a place to store metadata about the Cluster. Currently, that metadata is not consulted
 during the operation of Big Tent.
+
+The `encoding` field is the cluster's index key algorithm declaration: for
+version 4 clusters it is present and equals `"BLAKE3[0..16]/Long/Long"` —
+the first 16 bytes (128 bits) of the BLAKE3 digest over the identifier's
+UTF-8 bytes, followed by the two big-endian u64 fields of the index entry
+(`test_writer_emits_version_4_envelopes`). Version 3 clusters have no
+declaration; readers fall back to the first `.gri` file's hash description
+(`test_v3_fixture_clusters_load_and_resolve`). Readers use the algorithm
+the files declare, and an unknown declaration fails cluster load
+(`test_reader_follows_declared_algorithm`).
 
 ## The Index File
 
@@ -94,13 +114,14 @@ pub struct IndexEnvelope {
     pub version: u32,
     pub magic: u32,
     pub size: u32,
-    pub data_files: HashSet<u64>,
+    pub data_files: BTreeSet<u64>,
     pub encoding: String,
     pub info: BTreeMap<String, String>,
 }
 ```
 
-The `version` should be 1.
+The `version` is unchanged across the format change (the current writer
+emits 1); it is the `encoding` string that names the key algorithm.
 
 The `magic` is equal to `IndexFileMagicNumber`.
 
@@ -109,13 +130,17 @@ The `magic` is equal to `IndexFileMagicNumber`.
 `data_files` is the set of files referenced by indexes in this file. Note that this should
 be a subset of the `data_files` entry in the Cluster Envelope.
 
-`encoding` is currently `"MD5/Long/Long"`. If the hash or other formats change, the encoding may vary.
+`encoding` is `"BLAKE3[0..16]/Long/Long"` for version 4 clusters and
+`"MD5/Long/Long"` for version 3 clusters. Readers use the algorithm the
+files declare (`test_reader_follows_declared_algorithm`).
 
 `info` provides a place to store metadata about the Index. Currently, that metadata is not consulted
 during the operation of Big Tent.
 
-Then there are `size` records: MD5 hash (16 bytes), 8 most significant bytes of the SHA of the data file,
-and the offset (u64) of the record within the data file.
+Then there are `size` records: the 16-byte index key (the declared
+algorithm's digest of the identifier — BLAKE3 truncated to 128 bits for
+version 4, MD5 for version 3), 8 most significant bytes of the SHA of the
+data file, and the offset (u64) of the record within the data file.
 
 ## The Data File
 
@@ -139,17 +164,15 @@ pub struct DataFileEnvelope {
 }
 ```
 
-`version` == 1
+`version` == 2 for version 4 clusters; version 3 clusters carry data
+envelope version 1 (`test_envelope_version_cross_check`).
 
 `magic` == `DataFileMagicNumber`
 
-`previous` contains the most significant 8 bytes of the hash of the previous data file in
-a particular set of data files. This allows for the potential reconstruction of Index and Cluster
-files from a set of data files.
-
-`depends_on` when Big Tent databases are merged, there is a history kept of the previous data records
-that are merged into a new data record. The `depends_on` field lists all the other Data Files that
-resulted in the records merged into this Data File.
+`previous` and `depends_on` are inert in version 4: the writer always
+emits `previous: 0` and an empty `depends_on`, and BigTent neither
+maintains nor consults the data-file chain
+(`test_writer_emits_version_4_envelopes`).
 
 `built_from_merge` was this Data File built by merging other Data Files together or was it created
 "fresh" by a tool like [Goat Rodeo](https://github.com/spice-labs-inc/goatrodeo)
@@ -162,7 +185,7 @@ The balance of the Data File is a series of length fields as u32 Big Endian and 
 ```rust
 pub struct Item {
     pub identifier: String,
-    pub connections: BTreeSet<Edge>,
+    pub connections: Connections, // ordered map of edge type to target set
     pub body: Option<Value>,
     pub body_mime_type: Option<String>
 }
@@ -170,8 +193,18 @@ pub struct Item {
 
 `identifier` is the primary key of the record.
 
-`connections`: an ordered list of a tuple of `EdgeType` and `String` where `EdgeType` is an enumeration of `AliasTo`, `AliasFrom`, `Contains`, `ContainedBy`,
-  `BuildsTo`, and `BuiltFrom`. It's ordered to ensure reproducibility.
+`connections`: an ordered map (`BTreeMap<String, BTreeSet<String>>`) of
+edge type to the set of target identifiers, so "all connections of type
+X" is a single map lookup. Serialization emits sorted keys and sorted
+target sets. Deserialization also accepts the version 3 legacy shape —
+an array of `(edge type, target)` pairs — folding each target under its
+edge type, with duplicates deduplicated; a missing field reads as an
+empty map; wrong-arity pairs, non-string elements, and nested arrays are
+rejected with an error naming the entry. As demonstrated by
+`test_item_v4_cbor_round_trip`, `test_item_legacy_pairs_cbor_deserialize`,
+`test_item_missing_connections_field_is_empty_map`,
+`test_legacy_connections_malformed_rejected`, and
+`test_item_serialize_canonical_deterministic`.
 
 `body`: The optional JSON/CBOR body for this item. Typically it's something like `ItemMetaData`
 
@@ -204,3 +237,76 @@ pub struct ItemMetaData {
 Note the use of `BTreeSet`s This is to ensure that `ItemMetaData` records can be merged together losslessly and that
 the ordering of the keys and other information is preserved.
 
+
+## HTTP Item Wire Shapes
+The HTTP API emits `Item` objects in two wire shapes. The **legacy pair
+shape** (version 3) is the default: `connections` is a JSON array of
+two-element `[edge_type, target]` arrays, shaped like the version 3
+output — current endpoints stay byte-compatible with the previous wire
+format. Passing `?item_format=v4` on any item-emitting endpoint selects
+the **map shape** (version 4): `connections` is a JSON object mapping
+edge type to an array of target identifiers. As demonstrated by
+`test_item_default_shape_is_legacy_pairs`,
+`test_item_format_v3_shape_is_legacy_pairs`, and
+`test_item_format_explicit_v4`.
+
+* Accepted values: absent, `v4`, `v3`. Anything else — including wrong
+  case, empty, and conflicting duplicate parameters — is rejected with
+  400 and a static message naming the accepted values
+  (`test_item_format_invalid_rejected`).
+* Identical duplicate parameters are accepted
+  (`test_item_format_invalid_rejected`).
+* Endpoints that emit items honor the parameter: `/item/{gitoid}`,
+  `/item`, `POST /bulk`, all `/aa` forms, and the full-item `/north`
+  forms (`test_item_format_applies_to_bulk`,
+  `test_item_format_applies_to_aa_endpoints`,
+  `test_item_format_applies_to_north_full_items`).
+* Endpoints that emit identifier strings (`/flatten`, `/flatten_source`)
+  and metadata endpoints (`/purls`, `/node_count`, `/health`) are
+  unaffected; passing the parameter there is accepted and has no effect
+  (`test_flatten_returns_identifiers_regardless_of_item_format`,
+  `test_identifier_streams_unaffected_by_item_format`).
+* Error responses are static strings; no parser output, filesystem
+  paths, or internal type names are echoed
+  (`test_item_format_invalid_rejected`).
+* Both shapes are documented in `/openapi.json` from a running server —
+  the only specification (no static spec file is checked in);
+  `test_openapi_schema_contains_both_shapes`.
+* The two shapes are two views of the same edges — semantically equal
+  (`prop_default_and_v3_responses_are_semantically_equal`).
+
+## Conversion and Comparison CLIs
+
+### `--convert-to-v4 <dirs...> --dest <dir>`
+
+Converts version 3 clusters to version 4 (BLAKE3[0..16]) clusters as
+**permanent** output. Each input cluster (a directory of clusters, like
+`--fresh-merge`) is re-keyed into `--dest/<input-dir-name>/` as one or
+more chunk clusters (bounded by the writer split limits: 15 GB per data
+file / 25M entries per index). Conversion is a byte-copy re-keying pass:
+item bytes are copied verbatim, so the converted items are rust-equal to
+the source items (`test_convert_output_items_equal_to_source`), and the
+converted clusters resolve lookups with the declared algorithm
+(`test_convert_writes_blake3_keyed_clusters`). Sources already in
+BLAKE3 are skipped.
+
+### `--compare <left> <right>`
+
+Compares two clusters (or directories of clusters) for full **item
+equality**: every item on either side must have an identical
+(rust-`equal`) counterpart on the other — identifier, connections, body
+mime type, and body. Prints a summary; exits 0 on equality, 1 otherwise.
+
+* **Cross-algorithm:** the two sides may use different index key
+  algorithms (V3/MD5 vs V4/BLAKE3); the left side's identifiers are
+  probed through the right side's algorithm
+  (`test_convert_output_items_equal_to_source`).
+* **Scale:** sides at or above 50M items use the bounded strategy — only
+  `[probe key, position]` tuples are retained (~28 bytes per item) and
+  the left items are re-materialized transiently for matched keys; a
+  223M×2 comparison runs in ~25 minutes with tens of GB of RSS instead
+  of hundreds (`prop_worker_count`-independent; see the compare module
+  docs for the memory model). Small sides use the materializing
+  strategy; both agree on the verdict (`bounded_and_materializing_agree_on_fixture`).
+* **Semantics:** mixed key algorithms within one side are refused
+  (`test_compare_rejects_mixed_algorithm_side`).

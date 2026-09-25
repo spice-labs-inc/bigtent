@@ -66,7 +66,7 @@ use utoipa::OpenApi;
 use serde::Serialize;
 
 use crate::{
-    item::Item,
+    item::{Item, ItemV3},
     rodeo::{goat_trait::GoatRodeoTrait, holder::ClusterHolder},
 };
 #[cfg(test)]
@@ -107,7 +107,7 @@ use std::println as info;
         readyz,
         serve_metrics,
     ),
-    components(schemas(Item, HealthResponse, LivezResponse, ReadyzResponse)),
+    components(schemas(Item, ItemV3, HealthResponse, LivezResponse, ReadyzResponse)),
     tags(
         (name = "items", description = "Item retrieval endpoints"),
         (name = "anti-alias", description = "Alias resolution endpoints"),
@@ -118,6 +118,79 @@ use std::println as info;
 )]
 pub struct ApiDoc;
 
+use axum::extract::RawQuery;
+
+/// The requested item wire shape (D8).
+///
+/// The legacy pair shape (version 3) is the default, keeping the current
+/// API endpoints byte-compatible with BigTent's previous wire format;
+/// `?item_format=v4` selects the version 4 map shape. Any other value —
+/// including wrong case or empty — is rejected with 400 and a static
+/// message. Conflicting duplicate parameters are rejected; identical
+/// duplicates are accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ItemFormat {
+    /// the version 3 legacy pair shape (default; keeps current endpoints
+    /// byte-compatible with the previous wire format)
+    #[default]
+    V3,
+    /// the version 4 map shape
+    V4,
+}
+
+impl ItemFormat {
+    /// The static rejection message (no internal details).
+    pub const BAD_FORMAT_MESSAGE: &str = "The 'item_format' parameter must be one of: v3, v4";
+
+    /// Parse the `item_format` parameter out of the raw query string.
+    ///
+    /// The handlers use `Query<HashMap<String, String>>`, which is
+    /// silently last-wins on duplicates; conflicting duplicates must be
+    /// detected, so this parses the raw query itself.
+    pub fn from_raw_query(raw: Option<&str>) -> Result<Self, String> {
+        let mut chosen: Option<ItemFormat> = None;
+        if let Some(query) = raw {
+            for pair in query.split('&') {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next().unwrap_or("");
+                if key != "item_format" {
+                    continue;
+                }
+                let value = parts.next().unwrap_or("");
+                let this = match value {
+                    "v4" => ItemFormat::V4,
+                    "v3" => ItemFormat::V3,
+                    _ => return Err(ItemFormat::BAD_FORMAT_MESSAGE.to_string()),
+                };
+                match chosen {
+                    Some(existing) if existing != this => {
+                        return Err(ItemFormat::BAD_FORMAT_MESSAGE.to_string());
+                    }
+                    _ => chosen = Some(this),
+                }
+            }
+        }
+        Ok(chosen.unwrap_or(ItemFormat::V3))
+    }
+}
+
+/// Render an item in the requested wire shape (D8).
+fn item_json(item: &Item, format: ItemFormat) -> serde_json::Value {
+    match format {
+        ItemFormat::V4 => item.to_json(),
+        ItemFormat::V3 => item.to_v3().into(),
+    }
+}
+
+/// Parse the item format from the raw query (duplicate detection reads
+/// the raw string, so conflicting duplicates are rejected).
+fn parse_item_format(
+    raw: &RawQuery,
+) -> Result<ItemFormat, (axum::http::StatusCode, axum::Json<String>)> {
+    ItemFormat::from_raw_query(raw.0.as_deref())
+        .map_err(|m| (axum::http::StatusCode::BAD_REQUEST, axum::Json(m)))
+}
+
 async fn stream_items<GRT: GoatRodeoTrait + 'static>(
     rodeo: Arc<ClusterHolder<GRT>>,
     items: Vec<String>,
@@ -126,10 +199,10 @@ async fn stream_items<GRT: GoatRodeoTrait + 'static>(
 
     tokio::spawn(async move {
         for item_id in items {
-            if let Some(i) = rodeo.get_cluster().item_for_identifier(&item_id) {
-                if !mtx.is_closed() {
-                    let _ = mtx.send(i).await;
-                }
+            if let Some(i) = rodeo.get_cluster().item_for_identifier(&item_id)
+                && !mtx.is_closed()
+            {
+                let _ = mtx.send(i).await;
             }
         }
     });
@@ -163,14 +236,22 @@ impl<T> Stream for TokioReceiverToStream<T> {
     path = "/bulk",
     tag = "items",
     request_body(content = Vec<String>, description = "Array of GitOID identifiers to retrieve"),
+    params(
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
+    ),
     responses(
         (status = 200, description = "Stream of items", body = Vec<Item>)
     )
 )]
 async fn serve_bulk<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+    raw: RawQuery,
     Json(payload): Json<Vec<String>>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, axum::Json<String>)> {
+    let format = match ItemFormat::from_raw_query(raw.0.as_deref()) {
+        Ok(f) => f,
+        Err(m) => return Err((StatusCode::BAD_REQUEST, axum::Json(m))),
+    };
     let start = Instant::now();
     let payload_len = payload.len();
     scopeguard::defer! {
@@ -178,9 +259,12 @@ async fn serve_bulk<GRT: GoatRodeoTrait + 'static>(
       start.elapsed());
     }
 
-    StreamBodyAs::json_array(TokioReceiverToStream {
-        receiver: stream_items(rodeo, payload).await,
-    })
+    Ok(StreamBodyAs::json_array(
+        TokioReceiverToStream {
+            receiver: stream_items(rodeo, payload).await,
+        }
+        .map(move |v| item_json(&v, format)),
+    ))
 }
 
 /// Returns the total item count as a bare decimal integer.
@@ -329,21 +413,23 @@ async fn serve_metrics<GRT: GoatRodeoTrait + 'static>(
 async fn do_serve_gitoid<GRT: GoatRodeoTrait + 'static>(
     rodeo: Arc<ClusterHolder<GRT>>,
     maybe_gitoid: Option<&String>,
-) -> Result<Json<Item>, (StatusCode, Json<String>)> {
+    format: ItemFormat,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<String>)> {
     if let Some(gitoid) = maybe_gitoid {
         let ret = rodeo.get_cluster().item_for_identifier(gitoid);
 
         match ret {
-            Some(item) => Ok(Json(item)),
+            Some(item) => Ok(axum::Json(item_json(&item, format))),
             _ => Err((
+                // static: no user input echoed back (error hygiene)
                 StatusCode::NOT_FOUND,
-                Json(format!("No item found for key {}", gitoid)),
+                axum::Json("No item found for the given identifier".to_string()),
             )),
         }
     } else {
         Err((
             StatusCode::NOT_FOUND,
-            Json("No 'identifier' supplied".to_string()),
+            axum::Json("No 'identifier' supplied".to_string()),
         ))
     }
 }
@@ -353,7 +439,8 @@ async fn do_serve_gitoid<GRT: GoatRodeoTrait + 'static>(
     path = "/item/{gitoid}",
     tag = "items",
     params(
-        ("gitoid" = String, Path, description = "The GitOID identifier of the item")
+        ("gitoid" = String, Path, description = "The GitOID identifier of the item"),
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Item found", body = Item),
@@ -363,8 +450,10 @@ async fn do_serve_gitoid<GRT: GoatRodeoTrait + 'static>(
 async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
     Path(gitoid): Path<String>,
-) -> Result<Json<Item>, (StatusCode, Json<String>)> {
-    do_serve_gitoid(rodeo, Some(&gitoid)).await
+    raw: RawQuery,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<String>)> {
+    let format = parse_item_format(&raw)?;
+    do_serve_gitoid(rodeo, Some(&gitoid), format).await
 }
 
 /// Retrieve a single item by its GitOID identifier (query parameter).
@@ -373,7 +462,8 @@ async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
     path = "/item",
     tag = "items",
     params(
-        ("identifier" = String, Query, description = "The GitOID identifier of the item")
+        ("identifier" = String, Query, description = "The GitOID identifier of the item"),
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Item found", body = Item),
@@ -383,8 +473,10 @@ async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
 async fn serve_gitoid_query<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
     Query(query): Query<HashMap<String, String>>,
-) -> Result<Json<Item>, (StatusCode, Json<String>)> {
-    do_serve_gitoid(rodeo, query.get("identifier")).await
+    raw: RawQuery,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<String>)> {
+    let format = parse_item_format(&raw)?;
+    do_serve_gitoid(rodeo, query.get("identifier"), format).await
 }
 
 /// Resolve multiple identifiers to their canonical (non-alias) items.
@@ -396,42 +488,52 @@ async fn serve_gitoid_query<GRT: GoatRodeoTrait + 'static>(
     path = "/aa",
     tag = "anti-alias",
     request_body(content = Vec<String>, description = "Array of identifiers to resolve"),
+    params(
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
+    ),
     responses(
         (status = 200, description = "Map of identifier to resolved item", body = HashMap<String, Item>)
     )
 )]
 async fn anti_alias_bulk<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+    raw: RawQuery,
     Json(payload): Json<Vec<String>>,
-) -> Result<Json<HashMap<String, Item>>, (StatusCode, Json<String>)> {
-    let mut ret = HashMap::new();
+) -> Result<axum::Json<HashMap<String, serde_json::Value>>, (StatusCode, axum::Json<String>)> {
+    let format = match ItemFormat::from_raw_query(raw.0.as_deref()) {
+        Ok(f) => f,
+        Err(m) => return Err((StatusCode::BAD_REQUEST, axum::Json(m))),
+    };
+    let mut ret: HashMap<String, serde_json::Value> = HashMap::new();
     let cluster = rodeo.get_cluster();
     for key in payload {
         if let Some(item) = cluster.clone().antialias_for(&key) {
-            ret.insert(key, item);
+            ret.insert(key, item_json(&item, format));
         }
     }
 
-    Ok(Json(ret))
+    Ok(axum::Json(ret))
 }
 async fn do_serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
     rodeo: Arc<ClusterHolder<GRT>>,
     gitoid: Option<&String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<String>)> {
+    format: ItemFormat,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<String>)> {
     if let Some(to_find) = gitoid {
         let ret = rodeo.get_cluster().antialias_for(to_find);
 
         match ret {
-            Some(item) => Ok(Json(item.to_json())),
+            Some(item) => Ok(axum::Json(item_json(&item, format))),
             _ => Err((
+                // static: no user input echoed back (error hygiene)
                 StatusCode::NOT_FOUND,
-                Json(format!("No item found for key {}", to_find)),
+                axum::Json("No item found for the given identifier".to_string()),
             )),
         }
     } else {
         Err((
             StatusCode::NOT_FOUND,
-            Json("No 'identifier' supplied".to_string()),
+            axum::Json("No 'identifier' supplied".to_string()),
         ))
     }
 }
@@ -443,7 +545,8 @@ async fn do_serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
     path = "/aa/{gitoid}",
     tag = "anti-alias",
     params(
-        ("gitoid" = String, Path, description = "The identifier to resolve (may be an alias)")
+        ("gitoid" = String, Path, description = "The identifier to resolve (may be an alias)"),
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Resolved item", body = Item),
@@ -453,8 +556,10 @@ async fn do_serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
 async fn serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
     Path(gitoid): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<String>)> {
-    do_serve_anti_alias(rodeo, Some(&gitoid)).await
+    raw: RawQuery,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<String>)> {
+    let format = parse_item_format(&raw)?;
+    do_serve_anti_alias(rodeo, Some(&gitoid), format).await
 }
 
 /// Resolve an identifier to its canonical (non-alias) item (query parameter).
@@ -473,15 +578,17 @@ async fn serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
 async fn serve_anti_alias_query<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
     Query(query): Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<String>)> {
-    do_serve_anti_alias(rodeo, query.get("identifier")).await
+    raw: RawQuery,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<String>)> {
+    let format = parse_item_format(&raw)?;
+    do_serve_anti_alias(rodeo, query.get("identifier"), format).await
 }
 
 async fn serve_flatten_both<GRT: GoatRodeoTrait + 'static>(
     rodeo: Arc<ClusterHolder<GRT>>,
     payload: Vec<String>,
     source: bool,
-) -> Result<impl IntoResponse, impl IntoResponse> {
+) -> Result<impl IntoResponse, (StatusCode, axum::Json<String>)> {
     let start = Instant::now();
     let payload_len = payload.len();
     scopeguard::defer! {
@@ -495,7 +602,13 @@ async fn serve_flatten_both<GRT: GoatRodeoTrait + 'static>(
         .await
     {
         Ok(s) => s,
-        Err(e) => return Err((StatusCode::NOT_FOUND, Json(format!("{}", e)))),
+        Err(_e) => {
+            // static: no error internals leaked (error hygiene)
+            return Err((
+                StatusCode::NOT_FOUND,
+                axum::Json("One or more identifiers were not found".to_string()),
+            ));
+        }
     };
 
     let tok_stream = TokioReceiverToStream { receiver: stream };
@@ -517,7 +630,7 @@ async fn serve_flatten_both<GRT: GoatRodeoTrait + 'static>(
         ("gitoid" = String, Path, description = "The GitOID of the item to flatten")
     ),
     responses(
-        (status = 200, description = "Stream of items with source info", body = Vec<Item>),
+        (status = 200, description = "Stream of identifier strings", body = Vec<String>),
         (status = 404, description = "Item not found", body = String)
     )
 )]
@@ -537,7 +650,7 @@ async fn serve_flatten_source<GRT: GoatRodeoTrait + 'static>(
         ("identifier" = String, Query, description = "The GitOID of the item to flatten")
     ),
     responses(
-        (status = 200, description = "Stream of items with source info", body = Vec<Item>),
+        (status = 200, description = "Stream of identifier strings", body = Vec<String>),
         (status = 404, description = "Item not found", body = String)
     )
 )]
@@ -566,7 +679,7 @@ async fn serve_flatten_source_query<GRT: GoatRodeoTrait + 'static>(
     tag = "traversal",
     request_body(content = Vec<String>, description = "Array of GitOID identifiers to flatten"),
     responses(
-        (status = 200, description = "Stream of items with source info", body = Vec<Item>),
+        (status = 200, description = "Stream of identifier strings", body = Vec<String>),
         (status = 404, description = "Item not found", body = String)
     )
 )]
@@ -588,7 +701,7 @@ async fn serve_flatten_source_bulk<GRT: GoatRodeoTrait + 'static>(
         ("gitoid" = String, Path, description = "The GitOID of the item to flatten")
     ),
     responses(
-        (status = 200, description = "Stream of contained items", body = Vec<Item>),
+        (status = 200, description = "Stream of identifier strings", body = Vec<String>),
         (status = 404, description = "Item not found", body = String)
     )
 )]
@@ -608,7 +721,7 @@ async fn serve_flatten<GRT: GoatRodeoTrait + 'static>(
         ("identifier" = String, Query, description = "The GitOID of the item to flatten")
     ),
     responses(
-        (status = 200, description = "Stream of contained items", body = Vec<Item>),
+        (status = 200, description = "Stream of identifier strings", body = Vec<String>),
         (status = 404, description = "Item not found", body = String)
     )
 )]
@@ -637,7 +750,7 @@ async fn serve_flatten_query<GRT: GoatRodeoTrait + 'static>(
     tag = "traversal",
     request_body(content = Vec<String>, description = "Array of GitOID identifiers to flatten"),
     responses(
-        (status = 200, description = "Stream of contained items", body = Vec<Item>),
+        (status = 200, description = "Stream of identifier strings", body = Vec<String>),
         (status = 404, description = "Item not found", body = String)
     )
 )]
@@ -656,7 +769,8 @@ async fn serve_flatten_bulk<GRT: GoatRodeoTrait + 'static>(
     path = "/north/{gitoid}",
     tag = "traversal",
     params(
-        ("gitoid" = String, Path, description = "The GitOID of the item to traverse from")
+        ("gitoid" = String, Path, description = "The GitOID of the item to traverse from"),
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Stream of containing/building items", body = Vec<Item>),
@@ -666,8 +780,10 @@ async fn serve_flatten_bulk<GRT: GoatRodeoTrait + 'static>(
 async fn serve_north<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
     Path(gitoid): Path<String>,
-) -> impl IntoResponse {
-    do_north(rodeo, vec![gitoid], false).await
+    raw: RawQuery,
+) -> Result<impl IntoResponse, (StatusCode, axum::Json<String>)> {
+    let format = parse_item_format(&raw)?;
+    do_north(rodeo, vec![gitoid], false, format).await
 }
 
 /// Traverse north (upward) to find containers and builders of an item (query parameter).
@@ -686,7 +802,9 @@ async fn serve_north<GRT: GoatRodeoTrait + 'static>(
 async fn serve_north_query<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
     Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+    raw: RawQuery,
+) -> Result<impl IntoResponse, (StatusCode, axum::Json<String>)> {
+    let format = parse_item_format(&raw)?;
     do_north(
         rodeo,
         match query.get("identifier") {
@@ -694,6 +812,7 @@ async fn serve_north_query<GRT: GoatRodeoTrait + 'static>(
             None => vec![],
         },
         false,
+        format,
     )
     .await
 }
@@ -717,7 +836,8 @@ async fn serve_north_purls<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
     Path(gitoid): Path<String>,
 ) -> impl IntoResponse {
-    do_north(rodeo, vec![gitoid], true).await
+    // PURL streams are identifier strings; item_format has no effect
+    do_north(rodeo, vec![gitoid], true, ItemFormat::V3).await
 }
 
 /// Traverse north filtering for items with Package URLs only (query parameter).
@@ -737,6 +857,7 @@ async fn serve_north_purls_query<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    // PURL streams are identifier strings; item_format has no effect
     do_north(
         rodeo,
         match query.get("identifier") {
@@ -744,6 +865,7 @@ async fn serve_north_purls_query<GRT: GoatRodeoTrait + 'static>(
             None => vec![],
         },
         true,
+        ItemFormat::V3,
     )
     .await
 }
@@ -756,6 +878,9 @@ async fn serve_north_purls_query<GRT: GoatRodeoTrait + 'static>(
     path = "/north",
     tag = "traversal",
     request_body(content = Vec<String>, description = "Array of GitOID identifiers to traverse from"),
+    params(
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
+    ),
     responses(
         (status = 200, description = "Stream of containing/building items", body = Vec<Item>),
         (status = 500, description = "Internal error", body = String)
@@ -763,9 +888,11 @@ async fn serve_north_purls_query<GRT: GoatRodeoTrait + 'static>(
 )]
 async fn serve_north_bulk<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
+    raw: RawQuery,
     Json(payload): Json<Vec<String>>,
-) -> impl IntoResponse {
-    do_north(rodeo, payload, false).await
+) -> Result<impl IntoResponse, (StatusCode, axum::Json<String>)> {
+    let format = parse_item_format(&raw)?;
+    do_north(rodeo, payload, false, format).await
 }
 
 /// Traverse north filtering for items with Package URLs only (bulk).
@@ -783,7 +910,8 @@ async fn serve_north_purls_bulk<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
     Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
-    do_north(rodeo, payload, true).await
+    // PURL streams are identifier strings; item_format has no effect
+    do_north(rodeo, payload, true, ItemFormat::V3).await
 }
 
 /// Download the purls.txt file containing all Package URLs in the cluster.
@@ -820,7 +948,8 @@ async fn do_north<GRT>(
     rodeo: Arc<ClusterHolder<GRT>>,
     gitoids: Vec<String>,
     purls_only: bool,
-) -> Result<impl IntoResponse, (StatusCode, Json<String>)>
+    format: ItemFormat,
+) -> Result<impl IntoResponse, (StatusCode, axum::Json<String>)>
 where
     GRT: GoatRodeoTrait + 'static,
 {
@@ -837,11 +966,18 @@ where
         .await
     {
         Ok(mrx) => mrx,
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(format!("{:?}", e)))),
+        Err(_e) => {
+            // static: no error internals leaked (error hygiene; the
+            // former path formatted the error with {:?})
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json("An internal error occurred while traversing the graph".to_string()),
+            ));
+        }
     };
     Ok(StreamBodyAs::json_array(
-        TokioReceiverToStream { receiver: mrx }.map(|v| match v {
-            Either::Left(item) => Into::<serde_json::Value>::into(item),
+        TokioReceiverToStream { receiver: mrx }.map(move |v| match v {
+            Either::Left(item) => item_json(&item, format),
             Either::Right(string) => string.into(),
         }),
     ))
