@@ -89,8 +89,10 @@ version 4 output (`test_mixed_merge_output_is_version_4`, phase 3).
 
 ## HTTP wire shapes (D8)
 
-* Default = map shape (`connections` object of arrays); `?item_format=v3`
-  = legacy pair array; `?item_format=v4` = explicit default.
+* Default = legacy pair shape (array of `[edge_type, target]` arrays),
+  keeping current endpoints byte-compatible with the previous wire
+  format; `?item_format=v3` = explicit same; `?item_format=v4` = map
+  shape (`connections` object of arrays), the opt-in.
 * Rejected (400, static message): unknown/empty/wrong-case values,
   conflicting duplicate params; identical duplicates accepted.
 * Applies to: `/item/{gitoid}`, `/item`, `POST /bulk`, all `/aa` forms,
@@ -99,7 +101,7 @@ version 4 output (`test_mixed_merge_output_is_version_4`, phase 3).
 * Errors are static strings; nothing internal is echoed.
 * Spec: `/openapi.json` from a running server only; documents both
   `Item` and `ItemV3` schemas plus the parameter on applicable paths.
-* Tests: `test_item_default_shape_is_map`,
+* Tests: `test_item_default_shape_is_legacy_pairs`,
   `test_item_format_v3_shape_is_legacy_pairs`,
   `test_item_format_explicit_v4`, `test_item_format_invalid_rejected`,
   `test_item_format_applies_to_bulk`,

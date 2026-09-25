@@ -239,13 +239,16 @@ the ordering of the keys and other information is preserved.
 
 
 ## HTTP Item Wire Shapes
-The HTTP API emits `Item` objects in two wire shapes. The **map shape**
-(version 4) is the default: `connections` is a JSON object mapping edge
-type to an array of target identifiers. Passing `?item_format=v3` on any
-item-emitting endpoint selects the **legacy pair shape**: `connections`
-is a JSON array of two-element `[edge_type, target]` arrays, shaped like
-the version 3 output. As demonstrated by `test_item_default_shape_is_map`
-and `test_item_format_v3_shape_is_legacy_pairs`.
+The HTTP API emits `Item` objects in two wire shapes. The **legacy pair
+shape** (version 3) is the default: `connections` is a JSON array of
+two-element `[edge_type, target]` arrays, shaped like the version 3
+output — current endpoints stay byte-compatible with the previous wire
+format. Passing `?item_format=v4` on any item-emitting endpoint selects
+the **map shape** (version 4): `connections` is a JSON object mapping
+edge type to an array of target identifiers. As demonstrated by
+`test_item_default_shape_is_legacy_pairs`,
+`test_item_format_v3_shape_is_legacy_pairs`, and
+`test_item_format_explicit_v4`.
 
 * Accepted values: absent, `v4`, `v3`. Anything else — including wrong
   case, empty, and conflicting duplicate parameters — is rejected with

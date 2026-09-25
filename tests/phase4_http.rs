@@ -1,14 +1,16 @@
-//! Phase 4 integration tests: HTTP `?item_format=v3` and OpenAPI.
+//! Phase 4 integration tests: HTTP `?item_format` and OpenAPI.
 //!
 //! Requirement: plans/2026_09_16_connection_map_and_blake3/
 //! phase_4_http_item_format.md — tests 1-10 (11 and 12 are item-level
 //! property tests in `src/item.rs`).
 //!
-//! Requirement provenance and test theory per project rule 3. D8: the map
-//! shape is the default HTTP JSON; `?item_format=v3` returns the legacy
-//! pair shape on every item-emitting endpoint; invalid values are
-//! rejected with static messages; OpenAPI documents both shapes. H10:
-//! `/openapi.json` is the only specification.
+//! Requirement provenance and test theory per project rule 3. D8 as
+//! amended by the pull 167 discussion: the legacy pair shape is the
+//! default HTTP JSON (current endpoints stay byte-compatible with the
+//! previous wire format); `?item_format=v4` opts into the map shape on
+//! every item-emitting endpoint; invalid values are rejected with static
+//! messages; OpenAPI documents both shapes. H10: `/openapi.json` is the
+//! only specification.
 
 use axum::Router;
 use axum::body::Body;
@@ -161,38 +163,44 @@ fn post(path: &str, json: &str) -> Request<Body> {
         .unwrap()
 }
 
-/// Test 1: the default response shape has `connections` as a JSON object
-/// of arrays.
+/// Test 1: the default response shape has `connections` as the legacy
+/// array of two-element arrays.
 ///
-/// Requirement: D8. Theory: the map shape is the default wire shape —
-/// legacy clients must opt in explicitly.
+/// Requirement: D8 as amended by the PR 167 discussion. Theory: the
+/// legacy pair shape is the default wire shape — current endpoints stay
+/// byte-compatible with the previous version; the map shape is opt-in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_item_default_shape_is_map() {
+async fn test_item_default_shape_is_legacy_pairs() {
     let (app, _dir) = make_app().await;
     let (status, body) = send(&app, get("/item/gitoid:blob:sha256:file_1")).await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let connections = json.get("connections").expect("connections present");
     assert!(
-        connections.is_object(),
-        "default connections must be a JSON object: {connections}"
+        connections.is_array(),
+        "default connections must be an array of pairs: {connections}"
     );
-    assert!(
-        connections["contained:up"].is_array(),
-        "targets are arrays: {connections}"
-    );
+    for pair in connections.as_array().unwrap() {
+        assert!(
+            pair.is_array() && pair.as_array().unwrap().len() == 2,
+            "each legacy connection is a 2-element array: {pair}"
+        );
+    }
 }
 
-/// Test 2: `?item_format=v3` returns an array of two-element arrays in
-/// the legacy canonical order.
+/// Test 2: explicit `?item_format=v3` returns the same legacy pair shape
+/// (the default), in the legacy canonical order.
 ///
 /// Requirement: D8. Theory: the legacy shape must be byte-shaped like the
 /// version 3 output so legacy clients can parse it unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_item_format_v3_shape_is_legacy_pairs() {
     let (app, _dir) = make_app().await;
+    // explicit v3 equals the default (both pair-shaped)
+    let (_, default_body) = send(&app, get("/item/gitoid:blob:sha256:file_1")).await;
     let (status, body) = send(&app, get("/item/gitoid:blob:sha256:file_1?item_format=v3")).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(default_body, body, "v3 == default");
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let connections = json.get("connections").expect("connections present");
     assert!(
@@ -207,14 +215,25 @@ async fn test_item_format_v3_shape_is_legacy_pairs() {
     }
 }
 
-/// Test 3: `?item_format=v4` is accepted and equals the default output.
+/// Test 3: `?item_format=v4` opts into the map shape and differs from the
+/// default pair shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_item_format_explicit_v4() {
     let (app, _dir) = make_app().await;
     let (_, default_body) = send(&app, get("/item/gitoid:blob:sha256:file_1")).await;
-    let (_, explicit_body) =
+    let (status, explicit_body) =
         send(&app, get("/item/gitoid:blob:sha256:file_1?item_format=v4")).await;
-    assert_eq!(default_body, explicit_body, "v4 == default");
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        default_body, explicit_body,
+        "v4 is an opt-in, not the default"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&explicit_body).unwrap();
+    assert!(
+        json["connections"].is_object(),
+        "v4 connections must be a JSON object: {}",
+        json["connections"]
+    );
 }
 
 /// Test 4: invalid values are rejected with 400 and a static message;
@@ -267,16 +286,16 @@ async fn test_item_format_applies_to_bulk() {
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(
-        text.contains(r#"{"contained:up":"#) || text.contains(r#""contained:up":"#),
-        "default bulk stream emits map-shaped items: {text}"
+        text.contains("[\"contained:up\""),
+        "default bulk stream emits pair-shaped items: {text}"
     );
 
-    let (status_v3, body_v3) = send(&app, post("/bulk?item_format=v3", payload)).await;
-    assert_eq!(status_v3, StatusCode::OK);
-    let text_v3 = String::from_utf8(body_v3.to_vec()).unwrap();
+    let (status_v4, body_v4) = send(&app, post("/bulk?item_format=v4", payload)).await;
+    assert_eq!(status_v4, StatusCode::OK);
+    let text_v4 = String::from_utf8(body_v4.to_vec()).unwrap();
     assert!(
-        text_v3.contains("[\"contained:up\""),
-        "v3 bulk stream emits pair-shaped items: {text_v3}"
+        text_v4.contains(r#"{"contained:up":"#) || text_v4.contains(r#""contained:up":"#),
+        "v4 bulk stream emits map-shaped items: {text_v4}"
     );
 }
 
@@ -290,20 +309,20 @@ async fn test_item_format_applies_to_aa_endpoints() {
     let (status, body) = send(&app, get("/aa/pkg:npm/container@1.0.0")).await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["connections"].is_object(), "default aa: map shape");
+    assert!(json["connections"].is_array(), "default aa: pair shape");
 
-    let (status, body) = send(&app, get("/aa/pkg:npm/container@1.0.0?item_format=v3")).await;
+    let (status, body) = send(&app, get("/aa/pkg:npm/container@1.0.0?item_format=v4")).await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["connections"].is_array(), "v3 aa: pair shape");
+    assert!(json["connections"].is_object(), "v4 aa: map shape");
 
     // query form
     let (status, body) = send(&app, get("/aa?identifier=pkg:npm/container@1.0.0")).await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["connections"].is_object());
+    assert!(json["connections"].is_array());
 
-    // bulk: nested item values
+    // bulk: nested item values honor the parameter in both directions
     let (status, body) = send(
         &app,
         post("/aa?item_format=v3", r#"["pkg:npm/container@1.0.0"]"#),
@@ -315,11 +334,24 @@ async fn test_item_format_applies_to_aa_endpoints() {
     assert!(item.is_object(), "bulk aa returns a map of items: {json}");
     assert!(
         item["connections"].is_array(),
-        "the nested item honors the parameter: {json}"
+        "the nested item honors the v3 parameter: {json}"
+    );
+
+    let (status, body) = send(
+        &app,
+        post("/aa?item_format=v4", r#"["pkg:npm/container@1.0.0"]"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["pkg:npm/container@1.0.0"]["connections"].is_object(),
+        "the nested item honors the v4 parameter: {json}"
     );
 }
 
-/// Test 7: the full-item north stream honors the parameter.
+/// Test 7: the full-item north stream honors the parameter (default is
+/// the legacy pair shape; `?item_format=v4` opts into the map).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_item_format_applies_to_north_full_items() {
     let (app, _dir) = make_app().await;
@@ -328,29 +360,38 @@ async fn test_item_format_applies_to_north_full_items() {
         "/north/gitoid:blob:sha256:file_1",
         "/north?identifier=gitoid:blob:sha256:file_1",
     ] {
-        let v3_path = if path.contains('?') {
-            format!("{path}&item_format=v3")
+        let v4_path = if path.contains('?') {
+            format!("{path}&item_format=v4")
         } else {
-            format!("{path}?item_format=v3")
+            format!("{path}?item_format=v4")
         };
         let (status, body) = send(&app, get(path)).await;
         assert_eq!(status, StatusCode::OK, "{path}");
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(
-            text.contains(r#""contained:down""#),
-            "{path}: the north stream emits map-shaped items: {text}"
+            text.contains("[\"contained:down\""),
+            "{path}: the north stream emits pair-shaped items by default: {text}"
         );
 
-        let (status_v3, body_v3) = send(&app, get(&v3_path)).await;
-        assert_eq!(status_v3, StatusCode::OK);
-        let text_v3 = String::from_utf8(body_v3.to_vec()).unwrap();
+        let (status_v4, body_v4) = send(&app, get(&v4_path)).await;
+        assert_eq!(status_v4, StatusCode::OK);
+        let text_v4 = String::from_utf8(body_v4.to_vec()).unwrap();
         assert!(
-            text_v3.contains("[\"contained:down\""),
-            "{v3_path}: the v3 north stream emits pair-shaped items: {text_v3}"
+            text_v4.contains(r#""contained:down""#),
+            "{v4_path}: the v4 north stream emits map-shaped items: {text_v4}"
         );
     }
 
-    // bulk body form
+    // bulk body form defaults to pairs
+    let (status, body) = send(&app, post("/north", r#"["gitoid:blob:sha256:file_1"]"#)).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("[\"contained:down\""),
+        "bulk north defaults to pairs: {text}"
+    );
+
+    // bulk body form with explicit v3 keeps pairs
     let (status, body) = send(
         &app,
         post("/north?item_format=v3", r#"["gitoid:blob:sha256:file_1"]"#),
