@@ -9,6 +9,7 @@
 use anyhow::{Result, bail};
 use serde_json::Value;
 use std::collections::HashSet;
+
 pub trait ThingSanshoCanWalk {}
 
 pub struct WalkState {
@@ -16,7 +17,7 @@ pub struct WalkState {
     pub depth_cnt: usize,
 }
 
-pub trait AccountingAndBudget{
+pub trait AccountingAndBudget {
     fn should_stop(&self) -> Option<Vec<Value>>;
 
     // a super cheap test to see if the sink should continue
@@ -26,53 +27,52 @@ pub trait AccountingAndBudget{
 
 pub enum SinkOperation {
     NormalMessage,
-    ErrorMessage
+    ErrorMessage,
 }
 
 pub fn walk<
-    'a,
     THING: ThingSanshoCanWalk, // for an Item, it returns the materialized Item, for a CBOR byte array, the instance is something cheap thing that contains a slize to the mmap'ed memory for the the CBOR of the Item
     // given an identifer, return a reference to a thing
     ACCOUNTANT: AccountingAndBudget,
-    THING_FINDER: Fn(&str, &mut ACCOUNTANT) -> Result<Option<THING>>,
+    ThingFinder: Fn(&str, &mut ACCOUNTANT) -> Result<Option<THING>>,
     // whatever is done with the materialized JSON for an Emit
     SINK: Fn(Value, &mut ACCOUNTANT, SinkOperation) -> Result<()>,
     // for a given connection type (e.g., "connected:down" or "*:up"), return
     // the &str of each of the connections. Because the lifetime of the &str in the Vec
     // is the same as the THING, the &str's can be (and should be) zero copy
-    CON_FINDER: Fn(&'a THING, &str) -> Vec<&'a str>,
+    ConFinder: for<'b> Fn(&'b THING, &str) -> Vec<&'b str>,
     // filter the conn (note this is per connection type)
-    CON_FILTER_FN: Fn(&str) -> bool,
+    ConFilter: Fn(&str) -> bool,
     // Given an item, filter it... return true if the
     // item should be processed
-    ITEM_FILTER_FN: Fn(&THING, &WalkState) -> bool,
+    ItemFilter: Fn(&THING, &WalkState) -> bool,
     // materialize the Item into an array of Value. This allows
     // a single `emit` to emit many rows (e.g. all the pURLs in file_names)
     // and also allows multiple emit statements for a single Item
-    ITEM_TO_JSON_FN: Fn(&THING, &WalkState) -> Vec<Value>,
+    ItemToJson: Fn(&THING, &WalkState) -> Vec<Value>,
     // Should the walk stop? The first terminates the walk at
     // the end of this set of traversals (continuing to process other
     // items at this level), the second is "stop immediately".
     // If the option is Some, it means stop. The Vec<Value> is sent to
     // the SINK so that a downstream process can understand why the
     // Walk was stopped
-    SHOULD_STOP_FN: Fn(&THING, &WalkState) -> (Option<Vec<Value>>, Option<Vec<Value>>),
+    ShouldStop: Fn(&THING, &WalkState) -> (Option<Vec<Value>>, Option<Vec<Value>>),
 >(
     roots: Vec<String>,
-    lookup: THING_FINDER,
+    lookup: ThingFinder,
     sink: SINK,
-    connection_finder: CON_FINDER,
-    connections: Vec<(String, CON_FILTER_FN)>,
-    item_filter: ITEM_FILTER_FN,
-    emit: ITEM_TO_JSON_FN,
-    stop_fn: SHOULD_STOP_FN,
+    connection_finder: ConFinder,
+    connections: Vec<(String, ConFilter)>,
+    item_filter: ItemFilter,
+    emit: ItemToJson,
+    stop_fn: ShouldStop,
     accountant: &mut ACCOUNTANT,
 ) -> Result<()> {
     // keep track of depth
     let mut depth = 0usize;
 
     // the next set of identifiers
-    let mut next_round: HashSet<String> = roots.iter().collect();
+    let mut next_round: HashSet<String> = roots.into_iter().collect();
 
     // the identifiers we've seen... don't re-walk them
     let mut seen: HashSet<String> = HashSet::new();
@@ -86,9 +86,9 @@ pub fn walk<
         let mut this_round = HashSet::new();
 
         // update this round and seen
-        for v in next_round {
+        for v in &next_round {
             seen.insert(v.clone());
-            this_round.insert(v);
+            this_round.insert(v.clone());
         }
 
         // the place to store identifiers for the next round
@@ -96,8 +96,9 @@ pub fn walk<
 
         // the next thing to process
         for id in this_round {
+            let thing2: Option<THING> = lookup(&id, accountant)?;
             // get it
-            if let Some(thing) = lookup(&id, accountant)? {
+            if let Some(thing) = thing2 {
                 // pre-build stuff for the next round... why?
                 // We need to determine if this Item is terminal for
                 // some of the state to pass to the functions, so we
