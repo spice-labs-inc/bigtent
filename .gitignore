@@ -27,3 +27,14 @@ benches/target/
 
 # Core dumps from crashed test binaries (never commit)
 core.*
+
+# Editor backup and swap files
+*~
+*.swp
+*.swo
+
+# External source trees (large vendored clones; never commit)
+/external_repos/
+
+# Alternate bigtent copy (large; kept out of the repository)
+/other_bigtent/

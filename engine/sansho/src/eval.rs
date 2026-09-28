@@ -45,10 +45,17 @@ impl From<SanshoError> for Stop {
     }
 }
 
-/// What evaluation flows along.
-pub(crate) enum Flow<N> {
+/// What evaluation flows along: the reference-shaped intermediate
+/// representation. The design contract (SPEC-0001 §5): evaluation
+/// yields references into the document — `J` (owned values) exists only
+/// at the materialization boundary, which the caller controls via
+/// [`Flow::as_value`]/[`Flow::as_value_output`] (or a
+/// serialize-from-reference sink).
+#[derive(Debug)]
+pub enum Flow<N> {
     /// A backend position (lazy; materialization is the backend's
-    /// memoized decode).
+    /// memoized decode — this variant is a PURE REFERENCE into the
+    /// document: nothing is copied or decoded until materialized).
     One(N),
     /// A computed scalar or aggregate (functions, comparators, literals,
     /// multi-selects).
@@ -58,8 +65,9 @@ pub(crate) enum Flow<N> {
 }
 
 impl<'d, N: Node<'d>> Flow<N> {
-    /// Materialize the flow.
-    pub(crate) fn as_value(&self) -> Result<J, SanshoError> {
+    /// Materialize the flow (the emit boundary: every referenced
+    /// position becomes an owned JSON value).
+    pub fn as_value(&self) -> Result<J, SanshoError> {
         match self {
             Flow::One(node) => node.materialize(),
             Flow::Value(value) => Ok(value.clone()),
@@ -78,7 +86,7 @@ impl<'d, N: Node<'d>> Flow<N> {
     /// boundary decode (no memo insert, no clone). The byte-once
     /// property holds per position trivially (each output element is
     /// read once); shared navigations still flow through the memo.
-    pub(crate) fn as_value_output(&self) -> Result<J, SanshoError> {
+    pub fn as_value_output(&self) -> Result<J, SanshoError> {
         match self {
             Flow::One(node) => node.materialize_unmemoized(),
             Flow::Value(value) => Ok(value.clone()),
@@ -160,15 +168,31 @@ pub fn evaluate_cbor_stopped(program: &Program, document: &[u8]) -> Result<J, St
     eval(program, &root).and_then(|flow| flow.as_value().map_err(Stop::from))
 }
 
+/// Evaluate a program against any `Node` backend, returning the
+/// reference-shaped intermediate representation — the design's headline
+/// (zero-copy until emit). The result is a [`Flow`]: `One` positions
+/// are pure references into the document (nothing decoded or copied),
+/// `Value`s are computed scalars, `Proj`s are collections of references.
+/// Materialize with [`Flow::as_value`] at the emit boundary, or stream
+/// from references via a serialize-from-reference sink.
+pub fn evaluate_flow<'d, N: Node<'d>>(
+    program: &Program,
+    node: &N,
+) -> Result<Flow<N>, SanshoError> {
+    eval(program, node).map_err(|stop| stop.into_error())
+}
+
 /// Evaluate a program against any `Node` backend (the generic entry —
 /// the spike's public-surface deliverable, Phase 4): the byte source
 /// (`CborNode` over mmap'd cluster bytes) and the view sources
 /// (`MaterializedNode` over in-memory values; derived struct nodes)
 /// both implement `Node`.
+///
+/// The materialized convenience form: [`evaluate_flow`] collapsed at the
+/// emit boundary. Consumers that need the zero-copy path evaluate with
+/// [`evaluate_flow`] and materialize only what they emit.
 pub fn evaluate_over<'d, N: Node<'d>>(program: &Program, node: &N) -> Result<J, SanshoError> {
-    eval(program, node)
-        .and_then(|flow| flow.as_value().map_err(Stop::from))
-        .map_err(|stop| stop.into_error())
+    evaluate_flow(program, node).and_then(|flow| flow.as_value())
 }
 
 /// The generic evaluation entry returning the byte-once decode count
@@ -179,9 +203,7 @@ pub fn evaluate_over_with_stats<'d, N: Node<'d>>(
     node: &N,
     decode_count: impl Fn(&N) -> usize,
 ) -> (Result<J, SanshoError>, usize) {
-    let result = eval(program, node)
-        .and_then(|flow| flow.as_value().map_err(Stop::from))
-        .map_err(|stop| stop.into_error());
+    let result = evaluate_flow(program, node).and_then(|flow| flow.as_value());
     (result, decode_count(node))
 }
 

@@ -54,8 +54,8 @@ pub use corpus::{Driver, DriverOutcome, Unimplemented};
 pub use error::SanshoError;
 pub use eval::Stop;
 pub use eval::{
-    RealEngine, evaluate_cbor, evaluate_cbor_stopped, evaluate_cbor_with_stats,
-    evaluate_json,
+    Flow, RealEngine, evaluate_cbor, evaluate_cbor_stopped, evaluate_cbor_with_stats,
+    evaluate_flow, evaluate_json,
 };
 pub use materialized::MaterializedNode;
 pub use parser::parse;
