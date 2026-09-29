@@ -860,6 +860,33 @@ impl GoatRodeoCluster {
     }
 
     /// given a hash, find an item
+    pub fn bytes_for_file_and_offset<'a>(
+        &'a self,
+        file_hash: u64,
+        offset: usize,
+    ) -> Option<&'a [u8]> {
+        let data_files = &self.data_files;
+        let data_file = data_files.get(&file_hash);
+        match data_file {
+            Some(df) => match df.read_bytes_at(offset) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    // the file-level failure is logged here; the lookup
+                    // boundary reports the item as absent
+                    error!("Reading item at offset {} failed: {:?}", offset, e);
+                    None
+                }
+            },
+            None => {
+                panic!(
+                    "Couldn't find file for hash {:x} this indicates a corrupted index file and justifies a panic!",
+                    file_hash
+                );
+            }
+        }
+    }
+
+    /// given a hash, find an item
     pub fn item_for_file_and_offset(&self, file_hash: u64, offset: usize) -> Option<Item> {
         let data_files = &self.data_files;
         let data_file = data_files.get(&file_hash);

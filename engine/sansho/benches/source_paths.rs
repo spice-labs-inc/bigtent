@@ -18,7 +18,6 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use sansho::source::CborNode;
 
 /// The shared fixture builder (tests/common/mod.rs, included via
 /// #[path] — benches cannot import integration-test modules).
@@ -146,10 +145,8 @@ fn bench_paths(c: &mut Criterion) {
             &original_bytes,
             |b, bytes| {
                 let prog = scan_program();
-                b.iter(|| {
-                    let root = CborNode::root(black_box(bytes));
-                    black_box(sansho::eval::evaluate_over(black_box(&prog), &root))
-                })
+                let slice: &[u8] = &bytes;
+                b.iter(|| black_box(sansho::lookup_value(black_box(&slice), black_box(&prog))))
             },
         );
 
@@ -203,10 +200,8 @@ fn bench_paths(c: &mut Criterion) {
             &original_bytes,
             |b, bytes| {
                 let prog = seek_program();
-                b.iter(|| {
-                    let root = CborNode::root(black_box(bytes));
-                    black_box(sansho::eval::evaluate_over(black_box(&prog), &root))
-                })
+                let slice: &[u8] = &bytes;
+                b.iter(|| black_box(sansho::lookup_value(black_box(&slice), black_box(&prog))))
             },
         );
 

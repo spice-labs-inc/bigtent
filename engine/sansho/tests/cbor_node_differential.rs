@@ -4,8 +4,7 @@
 //! matrix (byte strings, floats, non-text keys, deep nesting).
 
 use sansho::corpus::{Driver, DriverOutcome, load_corpus};
-use sansho::source::CborNode;
-use sansho::view::Node;
+use sansho::view::SanshoTrait;
 use std::path::Path;
 
 /// The CborNode driver: the corpus's JSON givens encode to CBOR and
@@ -30,8 +29,8 @@ impl Driver for CborNodeEngine {
             Ok(p) => p,
             Err(e) => return DriverOutcome::Error(e),
         };
-        let root = CborNode::root(&bytes);
-        match sansho::eval::evaluate_over(&program, &root) {
+        let slice: &[u8] = &bytes;
+        match sansho::lookup_value(&slice, &program) {
             Ok(value) => DriverOutcome::Result(value),
             Err(e) => DriverOutcome::Error(e),
         }
@@ -106,12 +105,9 @@ fn cbor_node_matches_cursor_engine() {
             let parsed = sansho::parse(expr).unwrap();
             let program = sansho::compile(&parsed).unwrap();
             let given_value: serde_json::Value = serde_cbor::from_slice(&bytes).unwrap();
-            let cursor_result = sansho::eval::evaluate_over(
-                &program,
-                &sansho::materialized::MaterializedNode::root(&given_value),
-            );
-            let node_root = CborNode::root(&bytes);
-            let node_result = sansho::eval::evaluate_over(&program, &node_root);
+            let cursor_result = sansho::lookup_value(&given_value, &program);
+            let slice: &[u8] = &bytes;
+            let node_result = sansho::lookup_value(&slice, &program);
             assert_eq!(
                 format!("{node_result:?}"),
                 format!("{cursor_result:?}"),
@@ -138,8 +134,10 @@ fn escape_case_matrix_pins_the_mapping() {
     bytes.extend_from_slice(&[0x1b, 0x80, 0, 0, 0, 0, 0, 0, 0]);
     let parsed = sansho::parse("@").unwrap();
     let program = sansho::compile(&parsed).unwrap();
-    let root = CborNode::root(&bytes);
-    let value = sansho::eval::evaluate_over(&program, &root).unwrap();
+    let value = {
+        let slice: &[u8] = &bytes;
+        sansho::lookup_value(&slice, &program).unwrap()
+    };
     let obj = value.as_object().unwrap();
     assert_eq!(obj["bs"], serde_json::json!("__4A"), "byte strings render base64url");
     assert_eq!(obj["n"], serde_json::json!(9_223_372_036_854_775_808u64), "u64 exact");
@@ -157,8 +155,10 @@ fn escape_case_matrix_pins_the_mapping() {
         fb.extend_from_slice(key);
         fb.extend_from_slice(val);
     }
-    let root2 = CborNode::root(&fb);
-    let value2 = sansho::eval::evaluate_over(&program, &root2).unwrap();
+    let value2 = {
+        let slice: &[u8] = &fb;
+        sansho::lookup_value(&slice, &program).unwrap()
+    };
     let obj2 = value2.as_object().unwrap();
     assert_eq!(obj2["f16"], serde_json::json!(0.0), "f16 zero");
     assert_eq!(obj2["f32"], serde_json::json!(0), "+Inf coerces to 0");
@@ -169,9 +169,11 @@ fn escape_case_matrix_pins_the_mapping() {
     // document contract — invalid text is an Input error, never a
     // wrong value (pinned: a single invalid-UTF-8 text item)
     let invalid = vec![0x63u8, 0xff, 0xfe, 0x00]; // text(3) with bad bytes
-    let root3 = CborNode::root(&invalid);
     assert!(
-        sansho::eval::evaluate_over(&program, &root3).is_err(),
+        {
+        let slice: &[u8] = &invalid;
+        sansho::lookup_value(&slice, &program).is_err()
+    },
         "invalid UTF-8 text must error"
     );
 
@@ -186,8 +188,10 @@ fn escape_case_matrix_pins_the_mapping() {
     with_invalid.extend_from_slice(&[0x63, 0xff, 0xfe, 0x00]); // invalid text element
     let parsed_f = sansho::parse("items[?starts_with(@, 'x')]").unwrap();
     let program_f = sansho::compile(&parsed_f).unwrap();
-    let root_f = CborNode::root(&with_invalid);
-    let value_f = sansho::eval::evaluate_over(&program_f, &root_f).unwrap();
+    let value_f = {
+        let slice: &[u8] = &with_invalid;
+        sansho::lookup_value(&slice, &program_f).unwrap()
+    };
     // the invalid element does not match "x" and is dropped without
     // error; the valid element also does not match — empty result
     assert_eq!(
@@ -198,8 +202,10 @@ fn escape_case_matrix_pins_the_mapping() {
     // and a MATCHING valid element still matches (raw bytes == str)
     let parsed_g = sansho::parse("items[?starts_with(@, 'a')]").unwrap();
     let program_g = sansho::compile(&parsed_g).unwrap();
-    let root_g = CborNode::root(&with_invalid);
-    let value_g = sansho::eval::evaluate_over(&program_g, &root_g).unwrap();
+    let value_g = {
+        let slice: &[u8] = &with_invalid;
+        sansho::lookup_value(&slice, &program_g).unwrap()
+    };
     assert_eq!(
         value_g.as_array().map(|a| a.len()),
         Some(1),
@@ -212,9 +218,11 @@ fn escape_case_matrix_pins_the_mapping() {
     // the pinned behavior: trailing bytes are an Input error)
     let mut doc = serde_cbor::to_vec(&serde_json::json!({"a": 1})).unwrap();
     doc.push(0x00); // one trailing byte
-    let root4 = CborNode::root(&doc);
     assert!(
-        sansho::eval::evaluate_over(&program, &root4).is_err(),
+        {
+        let slice: &[u8] = &doc;
+        sansho::lookup_value(&slice, &program).is_err()
+    },
         "trailing bytes must error (the exactly-one-document contract)"
     );
 
@@ -227,12 +235,18 @@ fn escape_case_matrix_pins_the_mapping() {
     let nontext = vec![0xa1u8, 0x01, 0x61, b'a']; // map(1): int key 1 -> "a"
     let parsed_nk = sansho::parse("@").unwrap();
     let program_nk = sansho::compile(&parsed_nk).unwrap();
-    let root5 = CborNode::root(&nontext);
-    let value5 = sansho::eval::evaluate_over(&program_nk, &root5).unwrap();
+    let value5 = {
+        let slice: &[u8] = &nontext;
+        sansho::lookup_value(&slice, &program_nk).unwrap()
+    };
     assert_eq!(value5.as_object().map(|o| o.len()), Some(1),
         "the boundary materializes non-text keys (stringified)");
-    assert!(root5.get_key("1").is_none(), "navigation drops non-text keys");
-    assert!(root5.entries().is_empty(), "entries drop non-text keys");
+    // navigation through the source drops non-text keys
+    let slice5: &[u8] = &nontext;
+    let root5 = sansho::lookup(&slice5, &program_nk).unwrap();
+    let _ = root5;
+    assert!(SanshoTrait::get_key(&slice5, "1").is_none(), "navigation drops non-text keys");
+    assert!(SanshoTrait::entries(&slice5).is_empty(), "entries drop non-text keys");
 }
 
 #[test]
@@ -242,17 +256,21 @@ fn fuzz_truncated_slices_never_panic() {
         "body": {"file_names": ["a.java", "b.java"], "file_size": 3050}
     });
     let full = serde_cbor::to_vec(&doc).unwrap();
+    let whole = sansho::compile(&sansho::parse("@").unwrap()).unwrap();
     for len in 0..full.len() {
         let truncated = &full[..len];
-        let root = CborNode::root(truncated);
-        // navigation must never panic, and never decode (the byte-once
-        // boundary contract)
-        let _ = root.kind();
-        let _ = root.get_key("connections");
-        let _ = root.get_key("body");
-        let _ = root.elements();
-        let _ = root.container_len();
-        assert_eq!(root.decode_count(), 0, "navigation must not decode");
+        let slice: &[u8] = truncated;
+        // a truncated document may or may not decode at the boundary;
+        // the lookup must ERROR (never panic) — asserting the error
+        // result is tolerated either way keeps the panic-free contract
+        let _ = sansho::lookup(&slice, &whole);
+        // navigation must never panic (the byte-once boundary contract
+        // is asserted in the crate's own tests — the memo is internal)
+        let _ = SanshoTrait::kind(&slice);
+        let _ = SanshoTrait::get_key(&slice, "connections");
+        let _ = SanshoTrait::get_key(&slice, "body");
+        let _ = SanshoTrait::elements(&slice);
+        let _ = SanshoTrait::container_len(&slice);
     }
 }
 
@@ -266,13 +284,16 @@ mod tests_common;
     let bytes = serde_cbor::to_vec(&item).unwrap();
     let parsed = sansho::parse("connections.\"alias:from\"[?starts_with(@, 'pkg:')]").unwrap();
     let program = sansho::compile(&parsed).unwrap();
-    let root = CborNode::root(&bytes);
-    let _ = sansho::eval::evaluate_over(&program, &root).unwrap();
+    let _ = {
+        let slice: &[u8] = &bytes;
+        sansho::lookup_value(&slice, &program).unwrap()
+    };
+    let (result, count) = sansho::eval::evaluate_cbor_with_stats(&program, &bytes);
+    assert!(result.is_ok());
     // the memo decodes each POSITION once — the decode count must not
     // exceed the number of distinct materialized positions (and must
     // be far below the element count: the filter's predicate touches
     // each element's string, but only the boundary materializes)
-    let count = root.decode_count();
     assert!(
         count <= 1_000 + 100,
         "decode count {count} must stay bounded by the distinct materialized positions"

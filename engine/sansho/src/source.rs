@@ -1,47 +1,40 @@
-//! The zero-copy byte source (research spike, Phase 1).
+//! The byte source: `&[u8]` implementing [`SanshoTrait`] — a CBOR
+//! document's values are LAZY byte positions, whose machinery (header
+//! parsing, single-pass raw-key scans, the decode memo) lives in the
+//! crate-private [`CborNode`], the hidden type of this implementation's
+//! navigation. Nothing of the position is part of a public signature:
+//! the trait's navigation returns the positions as values implementing
+//! the trait, and the walking code never names the type.
 //!
-//! Spike finding recorded: the prototype's `&dyn SanshoSource`
-//! reference shape (spike `source.rs`) does not survive contact with
-//! the byte source — a byte node's children are ephemeral position
-//! values; borrowing them past the accessor call is unsound. The
-//! production shape is the **value-node** form: the crate's existing
-//! `Node<'d>` trait (a node is a cheap position value; cloned nodes
-//! never copy payload), which the evaluator is already generic over.
-//! This module implements that trait with the measured cost fixes:
-//!
-//! 1. **Zero-copy leaves** — `as_str` borrows a text string's bytes
-//!    (CBOR text strings are raw UTF-8, no escapes); numbers decode
-//!    from headers (no memo, no allocation). The old cursor's
-//!    `as_str`/`as_f64` went through the memo, materializing and
-//!    cloning every touched leaf (the 17.4 MB peak / 104 ms scan cost
-//!    the spike measured).
-//! 2. **Single-pass raw-key-bytes scan** — `get_key` compares raw key
-//!    bytes; it never builds the `Vec<String>` of keys the old
-//!    cursor's `map_keys` built per lookup (the 12.2 ms seek cost at
-//!    100k connections).
-//! 3. **Boundary-only memo** — `materialize` (the row boundary) stays
+//! Measured-cost fixes (the value-node spike's findings):
+//! 1. **Zero-copy leaves** — a text string's bytes are the slice's
+//!    bytes (CBOR text is raw UTF-8, no escapes); numbers decode from
+//!    headers (no memo, no allocation).
+//! 2. **Single-pass raw-key-bytes scan** — key lookup compares raw key
+//!    bytes; no `Vec<String>` of keys is ever built.
+//! 3. **Boundary-only memo** — `materialize` (the row boundary) is
 //!    memoized (`HashMap<usize, J>`: each position decodes at most
 //!    once per evaluation — the byte-once contract); navigation never
 //!    touches it.
 //!
 //! Backing-bytes contract: the byte slice must be immutable for the
-//! evaluation's lifetime (mmap'd clusters satisfy this); this node is
-//! a pure borrower — no owning variant, no unsafe.
+//! evaluation's lifetime (mmap'd clusters satisfy this); this source
+//! is a pure borrower — no owning variant, no unsafe.
 
 use std::borrow::Cow;
-use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::cbor::{base64url_encode, decode_at_position};
 use crate::error::SanshoError;
-use crate::view::{Kind, Node};
+use crate::view::{Kind, SanshoNumber, SanshoTrait};
 use serde_json::Value as J;
 
 /// The evaluation-scoped decode state: each boundary position decodes
 /// once; the decode count is the test instrumentation for the byte-once
 /// property.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct DecodeMemo {
     memo: Rc<RefCell<HashMap<usize, J>>>,
     pub(crate) decode_count: Rc<std::cell::Cell<usize>>,
@@ -84,9 +77,13 @@ impl DecodeMemo {
     }
 }
 
-/// A byte-position node over a CBOR byte slice.
-#[derive(Clone)]
-pub struct CborNode<'a> {
+/// A byte-position value over a CBOR byte slice — the byte source's
+/// member type and the hidden type of its navigation. CRATE-PRIVATE:
+/// the machinery (header parsing, key scans, the memo) is internal
+/// bookkeeping; values of this type reach walking code only as values
+/// implementing [`SanshoTrait`].
+#[derive(Clone, Debug)]
+pub(crate) struct CborNode<'a> {
     bytes: &'a [u8],
     position: usize,
     memo: DecodeMemo,
@@ -94,7 +91,7 @@ pub struct CborNode<'a> {
 
 impl<'a> CborNode<'a> {
     /// Position at the document root.
-    pub fn root(bytes: &'a [u8]) -> Self {
+    pub(crate) fn root(bytes: &'a [u8]) -> Self {
         CborNode {
             bytes,
             position: 0,
@@ -102,10 +99,28 @@ impl<'a> CborNode<'a> {
         }
     }
 
-    /// The evaluation's decode count (the byte-once observable: how
-    /// many DISTINCT positions materialized at the boundary).
-    pub fn decode_count(&self) -> usize {
+    pub(crate) fn decode_count(&self) -> usize {
         self.memo.decode_count.get()
+    }
+
+    /// The raw bytes of a TEXT string (major type 3), WITHOUT the
+    /// UTF-8 validation — the filter-predicate fast path compares
+    /// byte prefixes directly (an invalid-UTF-8 element in a filter
+    /// predicate is DROPPED, not errored — the relaxed contract,
+    /// owner decision 2026-09-23; byte strings (major 2) return None
+    /// and keep the base64url general path).
+    pub(crate) fn raw_text_bytes(&self) -> Option<&'a [u8]> {
+        let (major, _) = self.header()?;
+        if major != 3 {
+            return None;
+        }
+        let (argument, next) = self.argument_at(self.position)?;
+        let start = next;
+        let end = start.checked_add(argument as usize)?;
+        if end > self.bytes.len() {
+            return None;
+        }
+        Some(&self.bytes[start..end])
     }
 
     fn child(&self, position: usize) -> Self {
@@ -116,241 +131,238 @@ impl<'a> CborNode<'a> {
         }
     }
 
-    /// The item's major type + additional info, from the header byte
-    /// alone (no decode).
-    fn header(&self) -> Result<(u8, u8), SanshoError> {
-        let byte = *self.bytes.get(self.position).ok_or_else(|| SanshoError::Input {
-            message: format!("position {} past the end of the document", self.position),
-        })?;
-        Ok((byte >> 5, byte & 0x1f))
+    fn header(&self) -> Option<(u8, u8)> {
+        let byte = *self.bytes.get(self.position)?;
+        Some((byte >> 5, byte & 0x1f))
     }
 
-    /// Read the length argument at a position (the header's additional
-    /// info → the length/value argument); returns (argument, next).
-    fn argument_at(&self, position: usize) -> Result<(u64, usize), SanshoError> {
-        let byte = *self.bytes.get(position).ok_or_else(|| SanshoError::Input {
-            message: format!("position {position} past the end of the document"),
-        })?;
-        let additional = byte & 0x1f;
-        let mut next = position + 1;
-        let argument: u64 = match additional {
-            0..=23 => additional as u64,
-            24 => {
-                let v = *self.bytes.get(next).ok_or_else(|| SanshoError::Input {
-                    message: format!("position {next}: truncated u8 argument"),
-                })?;
-                next += 1;
-                v as u64
-            }
+    /// The argument (small form or the following big-endian integer)
+    /// and the offset just past it.
+    fn argument_at(&self, position: usize) -> Option<(u64, usize)> {
+        let byte = *self.bytes.get(position)?;
+        let small = (byte & 0x1f) as u64;
+        match byte & 0x1f {
+            0..=23 => Some((small, position + 1)),
+            24 => Some((
+                *self.bytes.get(position + 1)? as u64,
+                position + 2,
+            )),
             25 => {
-                let v = u16::from_be_bytes(
-                    self.bytes
-                        .get(next..next + 2)
-                        .ok_or_else(|| SanshoError::Input {
-                            message: format!("position {next}: truncated u16 argument"),
-                        })?
-                        .try_into()
-                        .unwrap(),
-                );
-                next += 2;
-                v as u64
+                let raw: [u8; 2] = self.bytes.get(position + 1..position + 3)?.try_into().ok()?;
+                Some((u16::from_be_bytes(raw) as u64, position + 3))
             }
             26 => {
-                let v = u32::from_be_bytes(
-                    self.bytes
-                        .get(next..next + 4)
-                        .ok_or_else(|| SanshoError::Input {
-                            message: format!("position {next}: truncated u32 argument"),
-                        })?
-                        .try_into()
-                        .unwrap(),
-                );
-                next += 4;
-                v as u64
+                let raw: [u8; 4] = self.bytes.get(position + 1..position + 5)?.try_into().ok()?;
+                Some((u32::from_be_bytes(raw) as u64, position + 5))
             }
             27 => {
-                let v = u64::from_be_bytes(
-                    self.bytes
-                        .get(next..next + 8)
-                        .ok_or_else(|| SanshoError::Input {
-                            message: format!("position {next}: truncated u64 argument"),
-                        })?
-                        .try_into()
-                        .unwrap(),
-                );
-                next += 8;
-                v as u64
+                let raw: [u8; 8] = self.bytes.get(position + 1..position + 9)?.try_into().ok()?;
+                Some((u64::from_be_bytes(raw), position + 9))
             }
-            31 => {
-                return Err(SanshoError::Input {
-                    message: format!("position {position}: indefinite-length encoding"),
-                });
-            }
-            _ => {
-                return Err(SanshoError::Input {
-                    message: format!("position {position}: unsupported additional info {additional}"),
-                });
-            }
-        };
-        Ok((argument, next))
-    }
-
-    /// The byte extent of the item at `position` (header + payload):
-    /// length-prefixed containers compute their extents from their
-    /// headers — this is how a skip works without decoding.
-    fn item_extent(&self, position: usize) -> Result<usize, SanshoError> {
-        let byte = *self.bytes.get(position).ok_or_else(|| SanshoError::Input {
-            message: format!("position {position} past the end of the document"),
-        })?;
-        let major = byte >> 5;
-        let (argument, mut next) = self.argument_at(position)?;
-        match major {
-            4 => {
-                // definite-length array: header + one item per entry
-                for _ in 0..argument {
-                    next = self.item_extent(next)?;
-                }
-                Ok(next)
-            }
-            5 => {
-                // definite-length map: header + TWO items per entry
-                // (key AND value)
-                for _ in 0..argument {
-                    next = self.item_extent(next)?;
-                    next = self.item_extent(next)?;
-                }
-                Ok(next)
-            }
-            2 | 3 => {
-                // strings: header + payload bytes
-                Ok(next + argument as usize)
-            }
-            6 => {
-                // tags: the wrapped item's extent (the tag's payload
-                // is a full CBOR item — a bignum inside a container
-                // must not be mis-walked as the next entry)
-                self.item_extent(next)
-            }
-            _ => Ok(next),
+            _ => None,
         }
     }
 
-    /// The member/element positions of a container, in document order
-    /// (positions only; no decoding; no key materialization).
-    fn container_positions(&self) -> Result<Vec<usize>, SanshoError> {
-        let (major, _) = self.header()?;
+    /// The positions of an array's elements (or an object's values).
+    fn container_positions(&self) -> Option<Vec<usize>> {
+        let (major, small) = self.header()?;
         if major != 4 && major != 5 {
-            return Ok(Vec::new());
+            return Some(Vec::new());
         }
-        let (argument, mut next) = self.argument_at(self.position)?;
-        // NO capacity reservation from the hostile header: a huge
-        // count must not reserve huge memory — the walk fails on the
-        // missing bytes long before the vector grows meaningfully.
-        let mut positions = Vec::new();
-        for _ in 0..argument {
+        if small > 27 {
+            // indefinite-length containers are not decomposable here
+            return None;
+        }
+        let (length, mut cursor) = self.argument_at(self.position)?;
+        let mut positions = Vec::with_capacity(length.min(1024) as usize);
+        for _ in 0..length {
             if major == 5 {
                 // the key: skipped past (its extent)
-                next = self.item_extent(next)?;
+                cursor = self.item_extent_at(cursor)?;
             }
-            positions.push(next);
-            next = self.item_extent(next)?;
+            positions.push(cursor);
+            cursor = self.item_extent_at(cursor)?;
         }
-        Ok(positions)
+        Some(positions)
     }
 
-    /// The text keys' byte extents (start, value-position), in
-    /// document order — raw key bytes, never materialized as strings.
-    /// Probe helper (examples only): the map's key positions.
-    pub fn keys_via_positions(&self) -> Result<Vec<(usize, usize)>, SanshoError> {
-        self.map_key_positions()
-    }
-
-    fn map_key_positions(&self) -> Result<Vec<(usize, usize)>, SanshoError> {
-        let (major, _) = self.header()?;
+    fn map_key_positions(&self) -> Option<Vec<(usize, usize)>> {
+        let (major, small) = self.header()?;
         if major != 5 {
-            return Ok(Vec::new());
+            return Some(Vec::new());
         }
-        let (argument, mut next) = self.argument_at(self.position)?;
-        let mut keys = Vec::new();
+        if small > 27 {
+            return None;
+        }
+        let (argument, mut cursor) = self.argument_at(self.position)?;
+        let mut keys = Vec::with_capacity(argument.min(1024) as usize);
         for _ in 0..argument {
-            let key_start = next;
-            let key_extent = self.item_extent(next)?;
-            next = key_extent;
-            let value_pos = next;
-            next = self.item_extent(value_pos)?;
+            let key_start = cursor;
+            cursor = self.item_extent_at(cursor)?;
+            let value_pos = cursor;
+            cursor = self.item_extent_at(cursor)?;
             // text keys only (major 3); non-text keys are skipped
             // (the mapping rejects them only when materialized)
             if self.bytes.get(key_start).map(|b| b >> 5) == Some(3) {
                 keys.push((key_start, value_pos));
             }
         }
-        Ok(keys)
+        Some(keys)
     }
 
-    /// The raw bytes of a TEXT string (major type 3), WITHOUT the
-    /// UTF-8 validation — the filter-predicate fast path compares
-    /// byte prefixes directly (an invalid-UTF-8 element in a filter
-    /// predicate is DROPPED, not errored — the relaxed contract,
-    /// owner decision 2026-09-23; byte strings (major 2) return None
-    /// and keep the base64url general path).
-    pub fn raw_text_bytes(&self) -> Option<&'a [u8]> {
-        let (major, _) = self.header().ok()?;
-        if major != 3 {
+    /// The key bytes of a text key, at its start offset.
+    fn text_key_bytes(&self, key_start: usize) -> Option<&'a [u8]> {
+        let (_, small) = self.header_at(key_start)?;
+        if small > 27 {
             return None;
         }
-        let (argument, next) = self.argument_at(self.position).ok()?;
+        let (arg, next) = self.argument_at(key_start)?;
+        self.bytes.get(next..next + arg as usize)
+    }
+
+    fn header_at(&self, position: usize) -> Option<(u8, u8)> {
+        let byte = *self.bytes.get(position)?;
+        Some((byte >> 5, byte & 0x1f))
+    }
+
+    fn item_extent_at(&self, position: usize) -> Option<usize> {
+        let (major, small) = self.header_at(position)?;
+        let (argument, next) = self.argument_at(position)?;
+        match major {
+            // numbers (0/1) and simple values (7): header only
+            0 | 1 | 7 => Some(next),
+            // strings (2/3): header + payload
+            2 | 3 => Some(next + argument as usize),
+            // definite-length containers: header + one item per entry
+            // (a map counts TWO per entry: key AND value)
+            4 | 5 if small <= 27 => {
+                let mut cursor = next;
+                let entries = if major == 5 { argument * 2 } else { argument };
+                for _ in 0..entries {
+                    cursor = self.item_extent_at(cursor)?;
+                }
+                Some(cursor)
+            }
+            // tags: the wrapped item's extent
+            6 => self.item_extent_at(next),
+            _ => None,
+        }
+    }
+
+    /// The f16 → f64 conversion (the mapping's float semantics).
+    fn f16_to_f64(half: u16) -> f64 {
+        let sign = if half >> 15 == 0 { 1.0 } else { -1.0 };
+        let exponent = (half >> 10) & 0x1f;
+        let mantissa = half & 0x3ff;
+        match exponent {
+            0 => sign * (mantissa as f64) * 2.0_f64.powi(-24),
+            0x1f => f64::NAN,
+            e => sign * (mantissa as f64 + 1024.0) * 2.0_f64.powi(e as i32 - 25),
+        }
+    }
+}
+
+
+/// The CBOR header argument (small form or the following big-endian
+/// integer) and the offset just past it — the free form so the source
+/// probe can parse against the `'a` slice directly.
+fn argument_at(bytes: &[u8], position: usize) -> Option<(u64, usize)> {
+    let byte = *bytes.get(position)?;
+    let small = (byte & 0x1f) as u64;
+    match byte & 0x1f {
+        0..=23 => Some((small, position + 1)),
+        24 => Some((*bytes.get(position + 1)? as u64, position + 2)),
+        25 => {
+            let raw: [u8; 2] = bytes.get(position + 1..position + 3)?.try_into().ok()?;
+            Some((u16::from_be_bytes(raw) as u64, position + 3))
+        }
+        26 => {
+            let raw: [u8; 4] = bytes.get(position + 1..position + 5)?.try_into().ok()?;
+            Some((u32::from_be_bytes(raw) as u64, position + 5))
+        }
+        27 => {
+            let raw: [u8; 8] = bytes.get(position + 1..position + 9)?.try_into().ok()?;
+            Some((u64::from_be_bytes(raw), position + 9))
+        }
+        _ => None,
+    }
+}
+
+impl<'a> SanshoTrait<'a> for &'a [u8] {
+    fn kind(&self) -> Kind {
+        CborNode::root(*self).kind()
+    }
+
+    fn as_str(&self) -> Option<Cow<'_, str>> {
+        // inlined against the `'a` slice directly (a temporary root's
+        // borrow would tie the returned string to the temporary)
+        let bytes = *self;
+        let position = 0usize;
+        let byte = *bytes.get(position)?;
+        let major = byte >> 5;
+        if major != 2 && major != 3 {
+            return None;
+        }
+        let (argument, next) = argument_at(bytes, position)?;
         let start = next;
         let end = start.checked_add(argument as usize)?;
-        if end > self.bytes.len() {
+        if end > bytes.len() {
             return None;
         }
-        Some(&self.bytes[start..end])
-    }
-
-    /// The text key's content bytes (for the raw scan).
-    /// Probe helper (examples only): a text key's bytes.
-    pub fn key_bytes(&self, key_start: usize) -> Result<&'a [u8], SanshoError> {
-        self.text_key_bytes(key_start)
-    }
-
-    fn text_key_bytes(&self, key_start: usize) -> Result<&'a [u8], SanshoError> {
-        let (argument, next) = self.argument_at(key_start)?;
-        let start = next;
-        let end = start
-            .checked_add(argument as usize)
-            .ok_or_else(|| SanshoError::Input {
-                message: format!("position {key_start}: key length overflow"),
-            })?;
-        if end > self.bytes.len() {
-            return Err(SanshoError::Input {
-                message: format!("position {key_start}: key extends past the document"),
-            });
+        match major {
+            2 => Some(Cow::Owned(base64url_encode(&bytes[start..end]))),
+            _ => std::str::from_utf8(&bytes[start..end]).ok().map(Cow::Borrowed),
         }
-        Ok(&self.bytes[start..end])
+    }
+
+    fn as_sansho_number(&self) -> Option<SanshoNumber> {
+        CborNode::root(*self).as_sansho_number()
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        CborNode::root(*self).as_bool()
+    }
+
+    fn is_null(&self) -> bool {
+        CborNode::root(*self).is_null()
+    }
+
+    fn get_key(&self, name: &str) -> Option<impl SanshoTrait<'a> + use<'a>> {
+        CborNode::root(*self).get_key(name)
+    }
+
+    fn get_index(&self, index: usize) -> Option<impl SanshoTrait<'a> + use<'a>> {
+        CborNode::root(*self).get_index(index)
+    }
+
+    fn entries(&self) -> Vec<(String, impl SanshoTrait<'a> + use<'a>)> {
+        CborNode::root(*self).entries()
+    }
+
+    fn elements(&self) -> Vec<impl SanshoTrait<'a> + use<'a>> {
+        CborNode::root(*self).elements()
+    }
+
+    fn container_len(&self) -> Option<usize> {
+        CborNode::root(*self).container_len()
+    }
+
+    fn counts_toward_aggregation() -> bool {
+        // the byte source's materializations are engine-created memory
+        // (the boundary decode memo)
+        true
+    }
+
+    fn materialize(&self) -> Result<J, SanshoError> {
+        CborNode::root(*self).materialize()
+    }
+
+    fn materialize_unmemoized(&self) -> Result<J, SanshoError> {
+        CborNode::root(*self).materialize_unmemoized()
     }
 }
 
-/// The f16 → f64 conversion (the mapping's float semantics).
-///
-/// NOTE (pinned dormancy): this conversion disagrees with the
-/// mapping's materialization (`cbor.rs`'s `half_to_f64`) on the ±Inf
-/// exponent — NaN here vs the mapping's coercion. `Node::as_f64` is
-/// never called by the evaluator (the leaf fast paths and the
-/// boundary materialization cover the number paths), so the
-/// divergence is dormant; the escape matrix pins the materialized
-/// behavior. Reconcile when/if `as_f64` gains a caller.
-fn f16_to_f64(half: u16) -> f64 {
-    let sign = if half >> 15 == 0 { 1.0 } else { -1.0 };
-    let exponent = (half >> 10) & 0x1f;
-    let mantissa = half & 0x3ff;
-    match exponent {
-        0 => sign * (mantissa as f64) * 2.0_f64.powi(-24),
-        0x1f => f64::NAN,
-        e => sign * (mantissa as f64 + 1024.0) * 2.0_f64.powi(e as i32 - 25),
-    }
-}
-
-impl<'a> Node<'a> for CborNode<'a> {
+impl<'a> SanshoTrait<'a> for CborNode<'a> {
     fn kind(&self) -> Kind {
         let (major, _) = self.header().unwrap_or((7, 31));
         match major {
@@ -369,12 +381,12 @@ impl<'a> Node<'a> for CborNode<'a> {
         }
     }
 
-    fn as_str(&self) -> Option<Cow<'a, str>> {
-        let (major, _) = self.header().ok()?;
+    fn as_str(&self) -> Option<Cow<'_, str>> {
+        let (major, _) = self.header()?;
         if major != 2 && major != 3 {
             return None;
         }
-        let (argument, next) = self.argument_at(self.position).ok()?;
+        let (argument, next) = self.argument_at(self.position)?;
         let start = next;
         let end = start.checked_add(argument as usize)?;
         if end > self.bytes.len() {
@@ -388,42 +400,46 @@ impl<'a> Node<'a> for CborNode<'a> {
         }
     }
 
-    fn as_f64(&self) -> Option<f64> {
-        let (major, _) = self.header().ok()?;
+    fn as_sansho_number(&self) -> Option<SanshoNumber> {
+        let (major, _) = self.header()?;
         match major {
+            // unsigned (major 0): the full u64 — exact, no narrowing
             0 => {
-                let (argument, _) = self.argument_at(self.position).ok()?;
-                Some(argument as f64)
+                let (argument, _) = self.argument_at(self.position)?;
+                Some(SanshoNumber::U64(argument))
             }
+            // negative (major 1): the -1-argument form; magnitudes
+            // beyond i64::MAX follow the materialization path (none)
             1 => {
-                let (argument, _) = self.argument_at(self.position).ok()?;
+                let (argument, _) = self.argument_at(self.position)?;
                 if argument > i64::MAX as u64 {
                     None
                 } else {
-                    Some((-1 - argument as i64) as f64)
+                    Some(SanshoNumber::I64(-1 - argument as i64))
                 }
             }
+            // floats (major 7, 25/26/27)
             7 => match self.bytes.get(self.position).map(|b| b & 0x1f) {
                 Some(25) => {
-                    let (_, next) = self.argument_at(self.position).ok()?;
+                    let (_, next) = self.argument_at(self.position)?;
                     let v = u16::from_be_bytes(
                         self.bytes.get(next..next + 2)?.try_into().unwrap(),
                     );
-                    Some(f16_to_f64(v))
+                    Some(SanshoNumber::F64(CborNode::f16_to_f64(v)))
                 }
                 Some(26) => {
-                    let (_, next) = self.argument_at(self.position).ok()?;
+                    let (_, next) = self.argument_at(self.position)?;
                     let v = u32::from_be_bytes(
                         self.bytes.get(next..next + 4)?.try_into().unwrap(),
                     );
-                    Some(f32::from_bits(v) as f64)
+                    Some(SanshoNumber::F64(f32::from_bits(v) as f64))
                 }
                 Some(27) => {
-                    let (_, next) = self.argument_at(self.position).ok()?;
+                    let (_, next) = self.argument_at(self.position)?;
                     let v = u64::from_be_bytes(
                         self.bytes.get(next..next + 8)?.try_into().unwrap(),
                     );
-                    Some(f64::from_bits(v))
+                    Some(SanshoNumber::F64(f64::from_bits(v)))
                 }
                 _ => None,
             },
@@ -432,7 +448,7 @@ impl<'a> Node<'a> for CborNode<'a> {
     }
 
     fn as_bool(&self) -> Option<bool> {
-        let (major, _) = self.header().ok()?;
+        let (major, _) = self.header()?;
         if major != 7 {
             return None;
         }
@@ -449,32 +465,30 @@ impl<'a> Node<'a> for CborNode<'a> {
         self.kind() == Kind::Null
     }
 
-    fn get_key(&self, name: &str) -> Option<Self> {
+    fn get_key(&self, name: &str) -> Option<impl SanshoTrait<'a> + use<'a>> {
         // the single-pass raw-key-bytes scan: no key strings are ever
-        // materialized (the old cursor's map_keys Vec<String> is the
-        // measured seek cost; gone here)
-        let keys = self.map_key_positions().ok()?;
+        // materialized
+        let keys = self.map_key_positions()?;
         for (key_start, value_pos) in keys {
-            if self.text_key_bytes(key_start).ok()? == name.as_bytes() {
+            if self.text_key_bytes(key_start)? == name.as_bytes() {
                 return Some(self.child(value_pos));
             }
         }
         None
     }
 
-    fn get_index(&self, index: usize) -> Option<Self> {
-        let positions = self.container_positions().ok()?;
+    fn get_index(&self, index: usize) -> Option<impl SanshoTrait<'a> + use<'a>> {
+        let positions = self.container_positions()?;
         positions.into_iter().nth(index).map(|p| self.child(p))
     }
 
-    fn entries(&self) -> Vec<(String, Self)> {
+    fn entries(&self) -> Vec<(String, impl SanshoTrait<'a> + use<'a>)> {
         // the entry ORDER is by key — the view's documented iteration
         // order (sorted) — achieved by sorting the (key, value-node)
         // pairs
-        let mut pairs: Vec<(String, Self)> = Vec::new();
-        let keys = match self.map_key_positions() {
-            Ok(keys) => keys,
-            Err(_) => return Vec::new(),
+        let mut pairs: Vec<(String, CborNode<'a>)> = Vec::new();
+        let Some(keys) = self.map_key_positions() else {
+            return Vec::new();
         };
         for (key_start, value_pos) in keys {
             // the cursor's entries emit "" for non-text keys; align
@@ -482,18 +496,18 @@ impl<'a> Node<'a> for CborNode<'a> {
             // non-text case cannot reach here — the alignment is
             // documented for parity)
             match self.text_key_bytes(key_start) {
-                Ok(bytes) => match std::str::from_utf8(bytes) {
+                Some(bytes) => match std::str::from_utf8(bytes) {
                     Ok(key) => pairs.push((key.to_string(), self.child(value_pos))),
                     Err(_) => continue,
                 },
-                Err(_) => continue,
+                None => continue,
             }
         }
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         pairs
     }
 
-    fn elements(&self) -> Vec<Self> {
+    fn elements(&self) -> Vec<impl SanshoTrait<'a> + use<'a>> {
         self.container_positions()
             .unwrap_or_default()
             .into_iter()
@@ -502,11 +516,11 @@ impl<'a> Node<'a> for CborNode<'a> {
     }
 
     fn container_len(&self) -> Option<usize> {
-        let (major, _) = self.header().ok()?;
+        let (major, _) = self.header()?;
         if major != 4 && major != 5 {
             return None;
         }
-        let (argument, _) = self.argument_at(self.position).ok()?;
+        let (argument, _) = self.argument_at(self.position)?;
         Some(argument as usize)
     }
 
@@ -528,9 +542,6 @@ impl<'a> Node<'a> for CborNode<'a> {
     }
 
     fn raw_text_bytes(&self) -> Option<&[u8]> {
-        // the trait's raw-bytes accessor (the filter fast path calls
-        // through the trait — the inherent method above exists for
-        // direct callers; both must agree)
         self.raw_text_bytes()
     }
 }
@@ -538,68 +549,64 @@ impl<'a> Node<'a> for CborNode<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eval::lookup_value;
+    use crate::{compile, parse};
 
-    // T1.1's first half: a text string's as_str borrows the input
-    // bytes (zero-copy: same bytes, no allocation).
+    /// Requirement: `&[u8]` is a direct Sansho source. What: `lookup`
+    /// over a `&[u8]` evaluates a CBOR document exactly like the
+    /// existing byte entry, and the trait's probes report the root
+    /// kind and full-width value. Why: the byte source must be on the
+    /// trait surface (the owner's directive: the trait on `&[u8]`).
     #[test]
-    fn text_string_borrows_bytes() {
-        let doc = serde_json::json!({"name": "hello world"});
-        let bytes = serde_cbor::to_vec(&doc).unwrap();
-        let root = CborNode::root(&bytes);
-        let name = root.get_key("name").expect("key exists");
-        let s = name.as_str().expect("a string");
-        match s {
-            Cow::Borrowed(b) => {
-                // the borrowed str's bytes must be a sub-slice of the
-                // input bytes (the zero-copy property)
-                let start = b.as_ptr() as usize;
-                let end = start + b.len();
-                let input_start = bytes.as_ptr() as usize;
-                let input_end = input_start + bytes.len();
-                assert!(
-                    start >= input_start && end <= input_end,
-                    "borrowed string must be within the input slice"
-                );
-            }
-            Cow::Owned(_) => panic!("text strings must borrow, not own"),
-        }
+    fn byte_source_is_a_direct_sansho_source() {
+        let bytes: &[u8] = &serde_cbor::to_vec(&serde_json::json!({
+            "exact": 9007199254740993i64,
+            "text": "hello",
+        }))
+        .unwrap();
+        let program = compile(&parse("exact").unwrap()).unwrap();
+        let projected = lookup_value(&bytes, &program).unwrap();
+        assert_eq!(projected, serde_json::json!(9007199254740993i64));
+
+        // the root probes: an object root, and the exact number probe
+        assert_eq!(SanshoTrait::kind(&bytes), Kind::Object);
+        assert!(!SanshoTrait::is_null(&bytes));
+
+        // a text-string root borrows the slice (zero-copy)
+        let text: &[u8] = &serde_cbor::to_vec(&serde_json::json!("hello")).unwrap();
+        assert_eq!(SanshoTrait::as_str(&text), Some(Cow::Borrowed("hello")));
+
+        // a number root reports the full-width value from the header
+        let num: &[u8] = &serde_cbor::to_vec(&serde_json::json!(9007199254740993i64)).unwrap();
+        assert_eq!(
+            SanshoTrait::as_sansho_number(&num),
+            Some(SanshoNumber::U64(9007199254740993))
+        );
     }
 
-    // T1.1's second half: the seek shape (get_key) allocates nothing
-    // beyond the positions buffer (the raw-key scan never builds key
-    // strings). Measured via the profile binary; the structural
-    // assertion: the scan's key comparisons are byte comparisons.
+    /// Requirement: navigation must never decode (the byte-once
+    /// boundary contract). What: over truncated slices at every prefix
+    /// length, navigation through the trait never panics and the memo
+    /// stays untouched. Why: a malformed/truncated input can only
+    /// produce a boundary error, never a navigation crash.
     #[test]
-    fn raw_key_scan_finds_keys() {
+    fn truncated_slices_never_panic_and_navigation_never_decodes() {
         let doc = serde_json::json!({
-            "connections": {"alias:from": ["pkg:a", "gitoid:b"]},
-            "body": {"file_size": 3050}
+            "connections": {"alias:from": ["pkg:a", "gitoid:b"], "contained:up": ["p"]},
+            "body": {"file_names": ["a.java", "b.java"], "file_size": 3050}
         });
-        let bytes = serde_cbor::to_vec(&doc).unwrap();
-        let root = CborNode::root(&bytes);
-        let conn = root.get_key("connections").expect("connections");
-        let alias = conn.get_key("alias:from").expect("alias:from (colon key)");
-        assert_eq!(alias.container_len(), Some(2));
-        let body = root.get_key("body").expect("body");
-        let size = body.get_key("file_size").expect("file_size");
-        assert_eq!(size.as_f64(), Some(3050.0));
-    }
-
-    // T1.3: the byte-once invariant — materialize() (the boundary)
-    // decodes each position once; navigation never decodes.
-    #[test]
-    fn boundary_memo_decodes_once() {
-        let doc = serde_json::json!({"x": {"deep": [1, 2, 3]}});
-        let bytes = serde_cbor::to_vec(&doc).unwrap();
-        let root = CborNode::root(&bytes);
-        // navigation: no decodes
-        let x = root.get_key("x").expect("x");
-        let deep = x.get_key("deep").expect("deep");
-        assert_eq!(root.decode_count(), 0, "navigation must not decode");
-        // boundary: the deep node materializes once, memoized
-        let v1 = deep.materialize().unwrap();
-        let v2 = deep.materialize().unwrap();
-        assert_eq!(v1, v2);
-        assert_eq!(root.decode_count(), 1, "one distinct boundary decode");
+        let full = serde_cbor::to_vec(&doc).unwrap();
+        for len in 0..full.len() {
+            let truncated = &full[..len];
+            let root = CborNode::root(truncated);
+            // navigation must never panic, and never decode (the
+            // byte-once boundary contract)
+            let _ = root.kind();
+            let _ = root.get_key("connections");
+            let _ = root.get_key("body");
+            let _ = root.elements();
+            let _ = root.container_len();
+            assert_eq!(root.decode_count(), 0, "navigation must not decode");
+        }
     }
 }

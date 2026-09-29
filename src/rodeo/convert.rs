@@ -119,9 +119,30 @@ pub(crate) static TEST_FAIL_AFTER_CHUNKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 pub(crate) static TEST_FAIL_BEFORE_VERIFY: AtomicBool = AtomicBool::new(false);
 
+/// True while THIS thread holds a hook guard. The injection statics
+/// are only honored by the guard-holding thread, so a concurrent
+/// conversion on another thread (the compare suite's cross-algorithm
+/// tests run real fixtures while the failure-injection tests are in
+/// flight) can never observe injected limits/failures.
+#[cfg(test)]
+static TEST_HOOK_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's latest hook token (0 = never took a guard).
+    static TEST_HOOK_TOKEN: AtomicUsize = AtomicUsize::new(0);
+}
+
+#[cfg(test)]
+fn test_hooks_active() -> bool {
+    TEST_HOOK_TOKEN.with(|mine| mine.load(Ordering::Relaxed) != 0)
+        && TEST_HOOK_TOKEN.with(|mine| mine.load(Ordering::Relaxed))
+            == TEST_HOOK_OWNER.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 fn test_skip_verify() -> bool {
-    TEST_FAIL_BEFORE_VERIFY.load(Ordering::Relaxed)
+    test_hooks_active() && TEST_FAIL_BEFORE_VERIFY.load(Ordering::Relaxed)
 }
 
 #[cfg(not(test))]
@@ -132,7 +153,7 @@ fn test_skip_verify() -> bool {
 #[cfg(test)]
 fn test_fail_after(chunk_idx: usize) -> bool {
     let fail_after = TEST_FAIL_AFTER_CHUNKS.load(Ordering::Relaxed);
-    fail_after != 0 && chunk_idx >= fail_after
+    test_hooks_active() && fail_after != 0 && chunk_idx >= fail_after
 }
 
 #[cfg(not(test))]
@@ -142,18 +163,22 @@ fn test_fail_after(_chunk_idx: usize) -> bool {
 
 #[cfg(test)]
 fn chunk_limits() -> (usize, usize) {
+    // the injected budgets apply only on the guard-holding thread (see
+    // test_hooks_active); unguarded conversions always use the real
+    // writer limits
     let bytes = TEST_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
     let entries = TEST_MAX_CHUNK_ENTRIES.load(Ordering::Relaxed);
+    let active = test_hooks_active();
     (
-        if bytes == 0 {
-            ClusterWriter::max_data_file_size()
-        } else {
+        if active && bytes != 0 {
             bytes
-        },
-        if entries == 0 {
-            ClusterWriter::max_index_entries()
         } else {
+            ClusterWriter::max_data_file_size()
+        },
+        if active && entries != 0 {
             entries
+        } else {
+            ClusterWriter::max_index_entries()
         },
     )
 }
@@ -548,7 +573,17 @@ pub(crate) mod phase3_tests {
     static HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn hook_guard() -> std::sync::MutexGuard<'static, ()> {
-        HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        let guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // claim the hook token for THIS thread: the injection statics
+        // (limits, fail-after, skip-verify) are honored only by the
+        // guard-holding thread, so concurrent unguarded conversions
+        // never observe test injections
+        static HOOK_TOKEN_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let token = HOOK_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::rodeo::convert::TEST_HOOK_OWNER.store(token, Ordering::Relaxed);
+        crate::rodeo::convert::TEST_HOOK_TOKEN.with(|mine| mine.store(token, Ordering::Relaxed));
+        guard
     }
 
     /// Lock serializing merge/conversion tests against the global test-only

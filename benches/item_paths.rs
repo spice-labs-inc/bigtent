@@ -1,34 +1,34 @@
-//! The real-Item benchmark: how fast the pure zero-copy, zero-`Value`
-//! evaluation works against the three input shapes — raw CBOR binary,
-//! a real `Item`, and a `serde_json::Value` in Item shape.
+//! The real-Item benchmark: how fast evaluation works against the
+//! three input shapes — raw CBOR binary, a real `Item`, and a
+//! `serde_json::Value` in Item shape — through the trait surface
+//! (`sansho::lookup_value` over the raw types: `&[u8]`, `&Item`,
+//! `&Value`).
 //!
-//! Every arm evaluates to the reference-shaped intermediate
-//! representation ([`sansho::Flow`]) via `evaluate_flow` — NOTHING is
-//! materialized to `serde_json::Value` inside the timed region: the
-//! scan counts its reference rows (a `Proj` of `One` references) without
-//! emitting; seek and full-item yield a single reference position.
+//! The timed region is the full evaluation INCLUDING the emit-boundary
+//! materialization (the walk's row boundary): the reference shape is
+//! internal to the engine by design, so the measured form is `lookup`
+//! collapsed at the boundary (`as_value`); the row count comes from
+//! the materialized result.
+//!
 //! The three inputs carry the SAME logical content:
-//! - `raw_cbor`: the item's CBOR bytes, walked by `CborNode`;
-//! - `item_node`: the real in-memory `Item` struct, walked by `ItemNode`;
-//! - `json_shape`: `serde_json::to_value(&item)`, walked by
-//!   `MaterializedNode` (the value source).
+//! - `raw_cbor`: the item's CBOR bytes (`&[u8]` — the byte source);
+//! - `item`: the real in-memory `Item` struct (`&Item` — via this
+//!   module's trait implementations);
+//! - `json_shape`: `serde_json::to_value(&item)` (`&Value`).
 //!
 //! Shapes: scan (`connections."alias:from"[?starts_with(@, 'pkg:')]`),
 //! seek (`body.file_size`), full-item (`@`).
 
 use bigtent::item::{Connections, Item};
-use bigtent::sansho_seam::ItemNode;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use sansho::materialized::MaterializedNode;
-use sansho::source::CborNode;
 use std::collections::BTreeSet;
 
-/// Count the reference rows in a flow without materializing anything
-/// (a projection's elements, or a single position/scalar).
-fn flow_row_count<N>(flow: &sansho::Flow<N>) -> usize {
-    match flow {
-        sansho::Flow::Proj(items) => items.len(),
-        sansho::Flow::One(_) | sansho::Flow::Value(_) => 1,
+/// The row count of a materialized result (a projection's elements, or
+/// a single value).
+fn row_count(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(items) => items.len(),
+        _ => 1,
     }
 }
 
@@ -107,23 +107,24 @@ fn bench_item_paths(c: &mut Criterion) {
             BenchmarkId::new("scan/raw_cbor", n),
             &bytes,
             |b, bytes| {
+                let slice: &[u8] = &bytes;
                 b.iter(|| {
-                    let root = CborNode::root(black_box(bytes));
-                    let flow =
-                        sansho::eval::evaluate_flow(black_box(&program), &root).expect("evaluates");
-                    black_box(flow_row_count(&flow))
+                    let value =
+                        sansho::lookup_value(black_box(&slice), black_box(&program))
+                            .expect("evaluates");
+                    black_box(row_count(&value))
                 })
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("scan/item_node", n),
+            BenchmarkId::new("scan/item", n),
             &item,
             |b, item| {
                 b.iter(|| {
-                    let node = ItemNode::wrap(black_box(item));
-                    let flow =
-                        sansho::eval::evaluate_flow(black_box(&program), &node).expect("evaluates");
-                    black_box(flow_row_count(&flow))
+                    let value =
+                        sansho::lookup_value(black_box(item), black_box(&program))
+                            .expect("evaluates");
+                    black_box(row_count(&value))
                 })
             },
         );
@@ -132,10 +133,10 @@ fn bench_item_paths(c: &mut Criterion) {
             &json,
             |b, json| {
                 b.iter(|| {
-                    let root = MaterializedNode::root(black_box(json));
-                    let flow =
-                        sansho::eval::evaluate_flow(black_box(&program), &root).expect("evaluates");
-                    black_box(flow_row_count(&flow))
+                    let value =
+                        sansho::lookup_value(black_box(json), black_box(&program))
+                            .expect("evaluates");
+                    black_box(row_count(&value))
                 })
             },
         );
@@ -146,23 +147,24 @@ fn bench_item_paths(c: &mut Criterion) {
             BenchmarkId::new("seek/raw_cbor", n),
             &bytes,
             |b, bytes| {
+                let slice: &[u8] = &bytes;
                 b.iter(|| {
-                    let root = CborNode::root(black_box(bytes));
-                    let flow =
-                        sansho::eval::evaluate_flow(black_box(&program), &root).expect("evaluates");
-                    black_box(flow_row_count(&flow))
+                    let value =
+                        sansho::lookup_value(black_box(&slice), black_box(&program))
+                            .expect("evaluates");
+                    black_box(row_count(&value))
                 })
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("seek/item_node", n),
+            BenchmarkId::new("seek/item", n),
             &item,
             |b, item| {
                 b.iter(|| {
-                    let node = ItemNode::wrap(black_box(item));
-                    let flow =
-                        sansho::eval::evaluate_flow(black_box(&program), &node).expect("evaluates");
-                    black_box(flow_row_count(&flow))
+                    let value =
+                        sansho::lookup_value(black_box(item), black_box(&program))
+                            .expect("evaluates");
+                    black_box(row_count(&value))
                 })
             },
         );
@@ -171,10 +173,10 @@ fn bench_item_paths(c: &mut Criterion) {
             &json,
             |b, json| {
                 b.iter(|| {
-                    let root = MaterializedNode::root(black_box(json));
-                    let flow =
-                        sansho::eval::evaluate_flow(black_box(&program), &root).expect("evaluates");
-                    black_box(flow_row_count(&flow))
+                    let value =
+                        sansho::lookup_value(black_box(json), black_box(&program))
+                            .expect("evaluates");
+                    black_box(row_count(&value))
                 })
             },
         );
@@ -187,25 +189,24 @@ fn bench_item_paths(c: &mut Criterion) {
                 BenchmarkId::new("full/raw_cbor", n),
                 &bytes,
                 |b, bytes| {
+                    let slice: &[u8] = &bytes;
                     b.iter(|| {
-                        let root = CborNode::root(black_box(bytes));
-                        let flow =
-                            sansho::eval::evaluate_flow(black_box(&program), &root)
+                        let value =
+                            sansho::lookup_value(black_box(&slice), black_box(&program))
                                 .expect("evaluates");
-                        black_box(flow_row_count(&flow))
+                        black_box(row_count(&value))
                     })
                 },
             );
             group.bench_with_input(
-                BenchmarkId::new("full/item_node", n),
+                BenchmarkId::new("full/item", n),
                 &item,
                 |b, item| {
                     b.iter(|| {
-                        let node = ItemNode::wrap(black_box(item));
-                        let flow =
-                            sansho::eval::evaluate_flow(black_box(&program), &node)
+                        let value =
+                            sansho::lookup_value(black_box(item), black_box(&program))
                                 .expect("evaluates");
-                        black_box(flow_row_count(&flow))
+                        black_box(row_count(&value))
                     })
                 },
             );
@@ -214,16 +215,14 @@ fn bench_item_paths(c: &mut Criterion) {
                 &json,
                 |b, json| {
                     b.iter(|| {
-                        let root = MaterializedNode::root(black_box(json));
-                        let flow =
-                            sansho::eval::evaluate_flow(black_box(&program), &root)
+                        let value =
+                            sansho::lookup_value(black_box(json), black_box(&program))
                                 .expect("evaluates");
-                        black_box(flow_row_count(&flow))
+                        black_box(row_count(&value))
                     })
                 },
             );
         }
-        group.finish();
     }
 }
 

@@ -36,12 +36,15 @@
 pub mod ast;
 pub mod cache;
 pub mod cbor;
+pub mod cbor_value;
+pub mod containers;
 pub mod corpus;
 pub mod error;
 pub mod eval;
 pub mod materialized;
 pub mod parser;
 pub mod program;
+pub mod scalars;
 pub mod source;
 pub mod view;
 
@@ -54,13 +57,12 @@ pub use corpus::{Driver, DriverOutcome, Unimplemented};
 pub use error::SanshoError;
 pub use eval::Stop;
 pub use eval::{
-    Flow, RealEngine, evaluate_cbor, evaluate_cbor_stopped, evaluate_cbor_with_stats,
-    evaluate_flow, evaluate_json,
+    RealEngine, ZeroCopySanshoResult, evaluate_cbor, evaluate_cbor_stopped, evaluate_cbor_with_stats,
+    evaluate_json, lookup, lookup_value,
 };
-pub use materialized::MaterializedNode;
 pub use parser::parse;
 pub use program::{Program, compile};
-pub use view::{Kind, Node};
+pub use view::{Kind, SanshoNumber, SanshoTrait};
 
 /// Evaluate a [Program] against one CBOR document.
 ///

@@ -96,8 +96,8 @@ pub fn read_item_bytes_at(data: &[u8], pos: usize) -> Option<&[u8]> {
     if pos + 4 > data.len() {
         return None;
     }
-    let length = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-        as usize;
+    let length =
+        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
     let start = pos + 4;
     let end = start.checked_add(length)?;
     if end > data.len() {
@@ -108,7 +108,7 @@ pub fn read_item_bytes_at(data: &[u8], pos: usize) -> Option<&[u8]> {
 
 impl DataFile {
     /// The raw byte span of the length-prefixed item at `pos`, WITHOUT
-    /// decoding it: the Sansho integration seam's no-decode accessor —
+    /// decoding it: the Sansho integration interface's no-decode accessor —
     /// the engine walks the bytes selectively, so the host must not
     /// decode first (that would defeat selective materialization).
     ///
@@ -172,6 +172,45 @@ impl DataFile {
             data_offset: cur_pos as usize,
             hash,
         })
+    }
+
+    /// Read the bytes at the given offset.
+    ///
+    /// Failures — an unreadable length, a length that claims more bytes
+    /// than the mapped file has remaining (which would otherwise permit a
+    /// multi-gigabyte allocation per lookup), or a payload that does not
+    /// deserialize — return an `Err` naming the file and offset (H3).
+    /// The lookup boundary logs the error and reports the item as absent.
+    pub fn read_bytes_at<'a>(&'a self, pos: usize) -> Result<&'a [u8]> {
+        let file_len = self.file.len();
+        if pos >= file_len || file_len - pos < 4 {
+            bail!(
+                "Offset {} is past the end of data file {:016x}.{} ({} bytes)",
+                pos,
+                self.hash,
+                GOAT_RODEO_DATA_FILE_SUFFIX,
+                file_len
+            );
+        }
+        let mut my_reader: &[u8] = &self.file[pos..];
+
+        let item_len = read_u32_sync(&mut my_reader)?;
+
+        // H3: reject lengths beyond the remaining mapped bytes BEFORE the
+        // allocation in read_cbor_sync, so a corrupt or malicious length
+        // cannot trigger a multi-gigabyte allocation.
+        if item_len as usize > my_reader.len() {
+            bail!(
+                "Item length {} at offset {} in data file {:016x}.{} exceeds the remaining {} bytes",
+                item_len,
+                pos,
+                self.hash,
+                GOAT_RODEO_DATA_FILE_SUFFIX,
+                my_reader.len()
+            );
+        }
+
+        Ok(&self.file[(pos + 4)..(pos + 4 + item_len as usize)])
     }
 
     /// Read the item at the given offset.

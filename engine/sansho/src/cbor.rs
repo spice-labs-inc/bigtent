@@ -231,7 +231,7 @@ fn bignum_to_number(bytes: &[u8], negative: bool, position: usize) -> Result<J, 
 }
 
 /// base64url, no padding (RFC 4648 §5, as the mapping requires).
-pub(crate) fn base64url_encode(bytes: &[u8]) -> String {
+pub fn base64url_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
