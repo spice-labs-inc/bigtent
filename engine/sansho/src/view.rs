@@ -127,6 +127,26 @@ pub trait SanshoTrait<'a>: 'a {
     /// mapping transforms it — a CBOR byte string renders as base64url.
     fn as_str(&self) -> Option<std::borrow::Cow<'_, str>>;
 
+    /// The string content of this value borrowed from the DOCUMENT — the
+    /// borrow a traversal needs in order to carry a string OUT of itself.
+    ///
+    /// [`Self::as_str`] lends for as long as the receiver is borrowed:
+    /// enough to read a value in place, not to return one, because a
+    /// member arrives as a value (a local) and its borrow cannot escape
+    /// the traversal that obtained it. This borrow belongs to the
+    /// document instead, so it outlives the member value carrying it.
+    ///
+    /// The default is `None`. The value forms (an owned `Value`, an
+    /// `Item`, a `String`) hold their text in themselves rather than in
+    /// the document and cannot lend it for `'a`; the borrowed forms (the
+    /// byte source's node and its `&[u8]` root, `&serde_json::Value`,
+    /// `&serde_cbor::Value`, `Cow<'a, str>`) can. A CBOR byte string
+    /// (major 2) renders as base64url — computed, never borrowed — so it
+    /// answers `None` here and keeps the [`Self::as_str`] path.
+    fn as_str_ref(&self) -> Option<&'a str> {
+        None
+    }
+
     /// The full-width number probe: the exact integer or float value,
     /// if this is a number. Backends with exact integer access (the
     /// byte header decode, the materialized JSON number, the in-memory

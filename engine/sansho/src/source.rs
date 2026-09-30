@@ -315,6 +315,21 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
         }
     }
 
+    fn as_str_ref(&self) -> Option<&'a str> {
+        // text (major 3) only: a byte string (major 2) renders as
+        // base64url, which is computed and cannot be borrowed
+        let bytes = *self;
+        if bytes.first().map(|byte| byte >> 5) != Some(3) {
+            return None;
+        }
+        let (argument, next) = argument_at(bytes, 0)?;
+        let end = next.checked_add(argument as usize)?;
+        if end > bytes.len() {
+            return None;
+        }
+        std::str::from_utf8(&bytes[next..end]).ok()
+    }
+
     fn as_sansho_number(&self) -> Option<SanshoNumber> {
         CborNode::root(*self).as_sansho_number()
     }
@@ -398,6 +413,21 @@ impl<'a> SanshoTrait<'a> for CborNode<'a> {
                 .ok()
                 .map(Cow::Borrowed),
         }
+    }
+
+    fn as_str_ref(&self) -> Option<&'a str> {
+        // text (major 3) only: a byte string (major 2) renders as
+        // base64url, which is computed and cannot be borrowed
+        let (major, _) = self.header()?;
+        if major != 3 {
+            return None;
+        }
+        let (argument, next) = self.argument_at(self.position)?;
+        let end = next.checked_add(argument as usize)?;
+        if end > self.bytes.len() {
+            return None;
+        }
+        std::str::from_utf8(&self.bytes[next..end]).ok()
     }
 
     fn as_sansho_number(&self) -> Option<SanshoNumber> {
@@ -582,6 +612,71 @@ mod tests {
             SanshoTrait::as_sansho_number(&num),
             Some(SanshoNumber::U64(9007199254740993))
         );
+    }
+
+    /// Requirement: a traversal can carry a string out of itself — the
+    /// walk's connection finder returns `Vec<&'b str>` borrowed from the
+    /// document, not from the member values it walked through. What:
+    /// navigating a CBOR document and collecting `as_str_ref` into a
+    /// `Vec<&str>` tied to the document compiles and yields the
+    /// document's own strings; a borrowed JSON document lends the same
+    /// way, the owned value forms do not, and a CBOR byte string (whose
+    /// rendering is computed) does not. Why: `as_str` lends from the
+    /// receiver, so a member — a value obtained inside the traversal —
+    /// cannot be returned from it; this is the borrow that can.
+    ///
+    /// LLM section: `targets` is deliberately a function whose return
+    /// type borrows from its document argument and from nothing local —
+    /// compiling it is half the assertion.
+    #[test]
+    fn document_borrows_escape_the_traversal_that_found_them() {
+        fn targets<'a>(document: &'a [u8], edge: &str) -> Vec<&'a str> {
+            let Some(connections) = SanshoTrait::get_key(&document, "connections") else {
+                return Vec::new();
+            };
+            let Some(edge_targets) = SanshoTrait::get_key(&connections, edge) else {
+                return Vec::new();
+            };
+            SanshoTrait::elements(&edge_targets)
+                .iter()
+                .filter_map(|target| SanshoTrait::as_str_ref(target))
+                .collect()
+        }
+
+        let bytes: &[u8] = &serde_cbor::to_vec(&serde_json::json!({
+            "connections": {
+                "alias:from": ["pkg:a", "gitoid:b"],
+                "contained:up": ["p"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(targets(bytes, "alias:from"), vec!["pkg:a", "gitoid:b"]);
+        assert_eq!(targets(bytes, "contained:up"), vec!["p"]);
+        assert_eq!(targets(bytes, "not-an-edge-type"), Vec::<&str>::new());
+
+        // a borrowed JSON document lends its own strings...
+        let document = serde_json::json!({"name": "hello"});
+        let borrowed: &serde_json::Value = &document;
+        let member = SanshoTrait::get_key(&borrowed, "name").expect("the member");
+        assert_eq!(SanshoTrait::as_str_ref(&member), Some("hello"));
+
+        // ...while the owned value form holds its text itself
+        let owned_member = SanshoTrait::get_key(&document, "name").expect("the member");
+        assert_eq!(SanshoTrait::as_str_ref(&owned_member), None);
+
+        // a byte string renders as base64url — computed, never borrowed
+        let encoded = serde_cbor::to_vec(&serde_cbor::Value::Bytes(vec![1, 2, 3])).unwrap();
+        let byte_string: &[u8] = &encoded;
+        assert_eq!(SanshoTrait::as_str_ref(&byte_string), None);
+        assert!(
+            SanshoTrait::as_str(&byte_string).is_some(),
+            "the computed rendering still reads through `as_str`"
+        );
+
+        // the option forms delegate to the value they carry
+        let carried: Option<std::borrow::Cow<'static, str>> =
+            Some(std::borrow::Cow::Borrowed("carried"));
+        assert_eq!(SanshoTrait::as_str_ref(&carried), Some("carried"));
     }
 
     /// Requirement: navigation must never decode (the byte-once

@@ -237,6 +237,13 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
         }
     }
 
+    fn as_str_ref(&self) -> Option<&'a str> {
+        match **self {
+            serde_cbor::Value::Text(ref text) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
     fn as_sansho_number(&self) -> Option<SanshoNumber> {
         match **self {
             serde_cbor::Value::Integer(n) => Some(SanshoNumber::from_i128(n)),

@@ -262,7 +262,6 @@ pub fn project_item_direct(
 mod tests {
     use super::*;
     use crate::item::Connections;
-    use std::borrow::Cow;
     use std::collections::BTreeSet;
 
     /// Build a REAL [`Item`] struct — not a JSON lookalike — with

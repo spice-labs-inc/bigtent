@@ -120,6 +120,13 @@ impl<'a> SanshoTrait<'a> for &'a J {
         }
     }
 
+    fn as_str_ref(&self) -> Option<&'a str> {
+        match **self {
+            J::String(ref text) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
     fn as_sansho_number(&self) -> Option<SanshoNumber> {
         let number = self.as_number()?;
         if let Some(v) = number.as_i64() {

@@ -284,6 +284,13 @@ impl<'a> SanshoTrait<'a> for std::borrow::Cow<'a, str> {
         Some(self.clone())
     }
 
+    fn as_str_ref(&self) -> Option<&'a str> {
+        match self {
+            std::borrow::Cow::Borrowed(text) => Some(text),
+            std::borrow::Cow::Owned(_) => None,
+        }
+    }
+
     fn as_sansho_number(&self) -> Option<SanshoNumber> {
         None
     }

@@ -48,6 +48,13 @@ impl<'a, T: SanshoTrait<'a>> SanshoTrait<'a> for Option<T> {
         }
     }
 
+    fn as_str_ref(&self) -> Option<&'a str> {
+        match self {
+            Some(inner) => inner.as_str_ref(),
+            None => None,
+        }
+    }
+
     fn as_sansho_number(&self) -> Option<SanshoNumber> {
         match self {
             Some(inner) => inner.as_sansho_number(),
@@ -125,6 +132,13 @@ impl<'a, T: SanshoTrait<'a>> SanshoTrait<'a> for &'a Option<T> {
     fn as_str(&self) -> Option<std::borrow::Cow<'_, str>> {
         match **self {
             Some(ref inner) => inner.as_str(),
+            None => None,
+        }
+    }
+
+    fn as_str_ref(&self) -> Option<&'a str> {
+        match **self {
+            Some(ref inner) => inner.as_str_ref(),
             None => None,
         }
     }
