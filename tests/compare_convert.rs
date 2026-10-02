@@ -8,8 +8,10 @@
 //! algorithm.
 //!
 //! Theory: the checked-in version 3 fixtures are real V3 clusters; the
-//! conversion must re-key them to BLAKE3 with byte-identical items, and
-//! compare must prove Item equality across the two key spaces.
+//! conversion must re-key them to BLAKE3 with items that are rust-equal
+//! (and re-serialized into the version 4 item format — version 4 files
+//! hold ONLY version 4 item bytes), and compare must prove Item equality
+//! across the two key spaces.
 
 use bigtent::compare::{CompareOutcome, compare_clusters};
 use bigtent::rodeo::convert::convert_cluster_to_dir;
