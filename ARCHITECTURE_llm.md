@@ -5,7 +5,7 @@ migration (claims name their tests; full context in the human document).
 
 ## Data model
 
-* `Item.connections`: `Connections(BTreeMap<String, BTreeSet<String>>)` —
+* `Item.connections`: `BTreeMap<String, BTreeSet<String>>` —
   ordered map of edge type → target set. Tests:
   `test_item_v4_cbor_round_trip`, `test_item_serialize_canonical_deterministic`.
 * Legacy view: `ItemV3` (pair set) with lossless conversions. Tests:
@@ -36,10 +36,13 @@ migration (claims name their tests; full context in the human document).
   are validated. Tests: `test_envelope_magic_validated`,
   `test_short_grc_filename_rejected`.
 * Mixed-version herds are supported; merges output v4; conversion
-  re-keys v3 sources (byte-copy) before the coordinator. Tests:
+  re-keys v3 sources (re-serialized into the version 4 item format;
+  version 4 files hold ONLY version 4 item bytes) before the
+  coordinator. Tests:
   `test_mixed_herd_lookup_resolves_both_versions`,
   `test_mixed_merge_output_is_version_4`,
-  `test_convert_v3_cluster_matches_source_items`.
+  `test_convert_v3_cluster_matches_source_items`,
+  `test_converted_items_are_v4_format`.
 
 ## Threading (unchanged claims)
 

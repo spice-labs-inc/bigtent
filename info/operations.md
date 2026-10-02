@@ -450,17 +450,23 @@ is always version 4 (`test_mixed_merge_output_is_version_4`).
 
 ### How conversion works
 
-Conversion is a re-keying pass, not a decode/re-encode pass. For each
-version 3 source, Big Tent reads every index entry, skims only each
-item's identifier (the item bytes are never deserialized into a full
-Item), computes the version 4 key (`BLAKE3[0..16]/Long/Long` — the first
-16 bytes of the BLAKE3 digest), and copies the item bytes **verbatim**
-into temporary clusters sorted by the new key. The temporary clusters
-carry the source's version and item shape with the re-keyed index
-(`test_convert_v3_cluster_matches_source_items` — byte-identical item
-payloads). Conversion output is deterministic
-(`test_conversion_output_is_deterministic`), and the split limits do not
-change the merge result (`prop_split_limits_invariance_on_synthetic_clusters`).
+Conversion is a re-keying pass with re-serialization into the version 4
+format. For each version 3 source, Big Tent reads every index entry,
+skims only each item's identifier for the version 4 key
+(`BLAKE3[0..16]/Long/Long` — the first 16 bytes of the BLAKE3 digest),
+decodes each item, and re-encodes it into the version 4 item shape
+(ordered-map connections) into temporary clusters sorted by the new key.
+Version 4 files hold ONLY version 4 item bytes: the `.grd` data envelope
+declares version 2 — the map shape — and version-specific readers (in
+and out of this project) deserialize strictly by the declared version
+and read the legacy pair-array shape as connection-less. The identifier
+is unchanged, so the key derivation and content addressing are
+untouched, and the converted items are rust-equal to their sources
+(`test_convert_v3_cluster_matches_source_items`,
+`test_converted_items_are_v4_format`). Conversion output is
+deterministic (`test_conversion_output_is_deterministic`), and the
+split limits do not change the merge result
+(`prop_split_limits_invariance_on_synthetic_clusters`).
 
 ### Scratch space (labeled estimate)
 

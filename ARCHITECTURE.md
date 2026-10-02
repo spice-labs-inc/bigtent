@@ -44,7 +44,7 @@ The fundamental unit of storage. Each Item represents a software artifact.
 ```rust
 pub struct Item {
     pub identifier: String,           // GitOID (e.g., "gitoid:blob:sha256:...")
-    pub connections: Connections,     // ordered map: edge type → target set
+    pub connections: BTreeMap<String, BTreeSet<String>>, // ordered map: edge type → target set
     pub body_mime_type: Option<String>,
     pub body: Option<Value>,          // CBOR-encoded metadata
 }

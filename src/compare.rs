@@ -426,12 +426,17 @@ mod tests {
     use super::*;
 
     /// Small cross-algorithm equality: the checked-in V3 fixture converts
-    /// to BLAKE3 with byte-identical items; the bounded and materializing
+    /// to BLAKE3 with rust-equal items; the bounded and materializing
     /// strategies must agree with each other and with the source.
     #[test]
     fn bounded_and_materializing_agree_on_fixture() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            // the conversion reads the test-only injection statics
+            // (chunk limits, fail-after) — plain globals in a test build,
+            // so this test must hold the hook guard or a concurrent
+            // conversion test's injections poison its conversion
+            let _hook_guard = crate::rodeo::convert::phase3_tests::merge_hook_guard();
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("test_data")
                 .join("cluster_a");

@@ -134,13 +134,13 @@ impl RoboticGoat {
 
             let i = Item {
                 identifier: identifier.clone(),
-                connections: crate::item::Connections(BTreeMap::from([
+                connections: BTreeMap::from([
                     (
                         TAG_FROM.to_string(),
                         [base_name.to_string()].into_iter().collect(),
                     ),
                     (TAG_TO.to_string(), [name.clone()].into_iter().collect()),
-                ])),
+                ]),
                 body_mime_type: Some("application/vnd.cc.goatrodeo.tag".to_string()),
                 body: Some(body),
             };
@@ -148,22 +148,24 @@ impl RoboticGoat {
             // create the "back link"
             robo_items.push(Item {
                 identifier: name,
-                connections: crate::item::Connections(BTreeMap::from([(
+                connections: BTreeMap::from([(
                     TAG_FROM.to_string(),
                     [identifier].into_iter().collect(),
-                )])),
+                )]),
                 body_mime_type: None,
                 body: None,
             });
         }
-        let mut connections = crate::item::Connections::default();
+        let mut connections: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<String>,
+        > = Default::default();
 
         // backlinks from the tags to the root tag
         for i in &robo_items {
             // only for the actual tags, not for the synthetic back-link
             if i.body.is_some() {
                 connections
-                    .0
                     .entry(TAG_TO.to_string())
                     .or_default()
                     .insert(i.identifier.to_string());
@@ -219,7 +221,6 @@ async fn test_synthetic() {
 
     let tagged: Vec<String> = tags
         .connections
-        .0
         .iter()
         .filter(|(edge_type, _)| edge_type.is_tag_to())
         .flat_map(|(_, targets)| targets.iter().cloned())
@@ -230,7 +231,7 @@ async fn test_synthetic() {
     for t in &tagged {
         let the_tag = herd.item_for_identifier(t).expect("Get tag");
         let the_tag_id = &the_tag.identifier;
-        for (t, targets) in &the_tag.connections.0 {
+        for (t, targets) in &the_tag.connections {
             if t.is_tag_to() {
                 for v in targets {
                     let tagged_item = herd
@@ -240,7 +241,6 @@ async fn test_synthetic() {
                         1,
                         tagged_item
                             .connections
-                            .0
                             .get("tag:from")
                             .map(|s| s.iter().filter(|c| *c == the_tag_id).count())
                             .unwrap_or(0)

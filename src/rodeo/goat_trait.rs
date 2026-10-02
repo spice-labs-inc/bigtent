@@ -125,7 +125,6 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
                 if let Some(item) = the_self.item_for_identifier(&identifier) {
                     // deal with anti-aliasing
                     item.connections
-                        .0
                         .iter()
                         .filter(|(edge_type, _)| edge_type.is_alias_to())
                         .flat_map(|(_, targets)| targets.iter())
@@ -138,7 +137,6 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
                     // process
                     for s in item
                         .connections
-                        .0
                         .iter()
                         .filter(|(edge_type, _)| {
                             edge_type.is_contains_down() || (source && edge_type.is_built_from())
@@ -149,7 +147,7 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
                             new_to_find.insert(s.clone());
 
                             // if we are looking at source only, only include build sources
-                            if !source || item.connections.0.keys().any(|k| k.is_built_from()) {
+                            if !source || item.connections.keys().any(|k| k.is_built_from()) {
                                 let _ = tx.send(Either::Right(s.clone())).await;
                             }
                         }
@@ -204,7 +202,6 @@ pub fn impl_antialias_for<GRT: GoatRodeoTrait + 'static>(
     while ret.is_alias() {
         match ret
             .connections
-            .0
             .iter()
             .find(|(edge_type, targets)| edge_type.is_alias_to() && !targets.is_empty())
             .and_then(|(_, targets)| targets.iter().next())
