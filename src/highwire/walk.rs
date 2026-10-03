@@ -45,9 +45,10 @@ pub enum SinkOperation {
 }
 
 pub fn walk<
-    THING: for<'a> SanshoTrait<'a>,
+    'a,
+    THING: SanshoTrait<'a>,
     ACCOUNTANT: AccountingAndBudget,
-    ThingFinder: Fn(&str, &Arc<ACCOUNTANT>) -> Result<Option<THING>>,
+    ThingFinder: Fn(&str, &Arc<ACCOUNTANT>) -> Result<Option<THING>> + 'a,
     // whatever is done with the materialized JSON for an Emit
     SINK: FnMut(Value, &Arc<ACCOUNTANT>, SinkOperation) -> Result<()>,
     // for a given connection type (e.g., "connected:down" only exact lookups), return
@@ -115,7 +116,7 @@ pub fn walk<
             let thing2: Option<THING> = lookup(&id, &accountant)?;
             // get it
             if let Some(thing) = thing2 {
-                // pre-build stuff for the next round... why?
+                // pre-build stuff for the next round
                 // We need to determine if this Item is terminal for
                 // some of the state to pass to the functions, so we
                 // don't want to actually add to `next_round`
@@ -212,9 +213,9 @@ pub fn find_func<'a, A: AccountingAndBudget>(
     }
 }
 
-pub fn find_func_for_herd<A: AccountingAndBudget>(
+pub fn find_func_for_herd<'a, A: AccountingAndBudget>(
     herd: Arc<GoatHerd>,
-) -> impl Fn(&str, &Arc<A>) -> Result<Option<Item>> {
+) -> impl Fn(&str, &Arc<A>) -> Result<Option<Item>> + 'a {
     move |id: &str, accounting: &Arc<A>| -> Result<Option<Item>> {
         accounting.event(AccountingEventType::LoadItem);
         Ok(herd.item_for_identifier(id))
