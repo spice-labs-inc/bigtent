@@ -30,7 +30,7 @@ fn v4_item(identifier: &str, target: &str) -> Item {
         connections: {
             let mut m = std::collections::BTreeMap::new();
             m.insert("contained:up".to_string(), targets);
-            bigtent::item::Connections(m)
+            m
         },
         body_mime_type: Some(bigtent::item::ITEM_METADATA_MIME_TYPE.to_string()),
         body: Some(body_cbor),
@@ -378,7 +378,7 @@ async fn test_v4_cluster_lookup_traversal_and_roots() {
     let file_item2 = v4_item("gitoid:blob:sha256:file_2", "pkg:npm/right@2.0.0");
     // pkg item contains the two files
     let mut pkg = v4_item("pkg:npm:container@1", "pkg:npm/container@1");
-    pkg.connections.0.insert(
+    pkg.connections.insert(
         "contained:down".to_string(),
         [
             "gitoid:blob:sha256:file_1".to_string(),
@@ -390,7 +390,7 @@ async fn test_v4_cluster_lookup_traversal_and_roots() {
     // the files' contained:up edges must point at the container
     let file_item = {
         let mut f = file_item;
-        f.connections.0.insert(
+        f.connections.insert(
             "contained:up".to_string(),
             ["pkg:npm:container@1".to_string()].into_iter().collect(),
         );
@@ -398,7 +398,7 @@ async fn test_v4_cluster_lookup_traversal_and_roots() {
     };
     let file_item2 = {
         let mut f = file_item2;
-        f.connections.0.insert(
+        f.connections.insert(
             "contained:up".to_string(),
             ["pkg:npm:container@1".to_string()].into_iter().collect(),
         );
@@ -407,7 +407,7 @@ async fn test_v4_cluster_lookup_traversal_and_roots() {
     let pkg_alias = v4_item("pkg:npm/container@1.0.0", "pkg:npm/container@1.0.0");
     let pkg_alias = {
         let mut a = pkg_alias;
-        a.connections.0 = [(
+        a.connections = [(
             "alias:to".to_string(),
             ["pkg:npm:container@1".to_string()].into_iter().collect(),
         )]

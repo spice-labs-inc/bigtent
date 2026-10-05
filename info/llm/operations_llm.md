@@ -10,11 +10,13 @@ Claims name their tests; execution evidence lives only in
   always. Tests: `test_mixed_merge_output_is_version_4`,
   `test_v3_fixture_clusters_load_and_resolve`,
   `test_checked_in_v4_fixtures_load`.
-* v3 sources are converted (re-keyed) before the coordinator: item bytes
-  copied verbatim, keys = `BLAKE3[0..16]`, chunks sorted by
+* v3 sources are converted (re-keyed) before the coordinator: items
+  re-serialized into the version 4 format (version 4 files hold ONLY
+  version 4 item bytes), keys = `BLAKE3[0..16]`, chunks sorted by
   `(key, old grd file hash, old offset)`; no duplicate detection anywhere;
   out-of-order/colliding data surfaces during the merge. Tests:
   `test_convert_v3_cluster_matches_source_items`,
+  `test_converted_items_are_v4_format`,
   `test_conversion_output_is_deterministic`,
   `test_conversion_chunk_count_is_controlled`,
   `test_mixed_merge_unions_duplicate_identifier`,

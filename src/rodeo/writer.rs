@@ -554,7 +554,7 @@ mod tests {
     fn tiny_item() -> Item {
         Item {
             identifier: "gitoid:test".to_string(),
-            connections: crate::item::Connections::default(),
+            connections: Default::default(),
             body_mime_type: None,
             body: None,
         }

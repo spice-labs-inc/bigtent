@@ -7,7 +7,7 @@
 //!
 //! ## What conversion is
 //!
-//! A **re-keying pass**, not a decode/re-encode pass:
+//! A **re-keying pass with re-serialization into the version 4 format**:
 //!
 //! 1. Walk the source `.gri` in order. For each entry, go to the `.grd`
 //!    file and offset, read the item length, and deserialize **only the
@@ -20,23 +20,30 @@
 //!    sort the tuples by `(key, old grd file hash, old offset)` and write
 //!    the chunk.
 //! 3. Writing a chunk writes the `.grd`, `.gri`, and `.grc` **through the
-//!    same writer code path the normal merge uses**. Item bytes are
-//!    **copied verbatim** — no item deserialization, no re-encoding.
+//!    same writer code path the normal merge uses**. Each item is decoded
+//!    and re-encoded into the **version 4 item format** (connections as
+//!    the ordered edge map): the chunks are version 4-declared files
+//!    (data envelope 2 — "the item shape changed (the connections map)"),
+//!    and a version 4 file holds ONLY version 4 item bytes (owner
+//!    directive 2026-09-30). External readers deserialize strictly by the
+//!    declared version, so a version 3 pair-array payload inside a
+//!    version 4 file would be read as connection-less. The identifier is
+//!    unchanged (the key derives from it, so content addressing is
+//!    untouched), and the re-encoded items are rust-equal to the
+//!    source's.
 //! 4. The chunk writer runs on the tokio blocking pool so the main task
 //!    can continue with the next batch.
 //!
-//! The temporary cluster files carry the **source's version and item
-//! shape** (for a version 3 source: version 3 `.grc`, data envelope 1,
-//! legacy pair items) with the index re-keyed to
+//! The chunk files are first-class version 4 clusters: version 4 `.grc`,
+//! data envelope 2, ordered-map item connections, the index re-keyed to
 //! `BLAKE3[0..16]/Long/Long`, declared in the `.gri`. Readers resolve the
 //! algorithm from the first `.gri` for version 3 clusters (ADR 0002), so
-//! the temporary clusters are first-class members of the merge. Nothing
-//! about the item is converted; item up-conversion happens at read time
-//! through dual-shape deserialization.
+//! the converted clusters are first-class members of the merge.
 //!
 //! Read cost: `.gri` and `.grd` files are memory-mapped; both passes touch
 //! pages in ascending order, so pages are warm or prefetched and the item
-//! bytes are physically read once.
+//! bytes are physically read once (then decoded and re-encoded — the cost
+//! of holding the version 4 format contract).
 //!
 //! ## Duplicate identifiers
 //!
@@ -49,8 +56,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(test)]
-use crate::item::Item;
+use crate::item::{Item, ItemV3};
 use crate::rodeo::cluster::ClusterFileEnvelope;
 use crate::rodeo::data::DataFile;
 use crate::rodeo::goat::GoatRodeoCluster;
@@ -403,11 +409,15 @@ pub async fn convert_cluster_for_merge(
 ///
 /// Each chunk cluster is written into `dest_dir` (created if absent) and
 /// returned by its `.grc` path. The clusters are ordinary clusters: the
-/// caller keeps them. The conversion is byte-copy re-keying: item bytes
-/// are copied verbatim, so the converted items are rust-equal to the
-/// source's.
+/// caller keeps them. The conversion re-keys and **re-serializes each
+/// item into the version 4 format** (ordered-map connections): a version
+/// 4 file holds ONLY version 4 item bytes (owner directive 2026-09-30),
+/// so the converted items are rust-equal to the source's — the version 3
+/// pair-array bytes do not pass through.
 ///
 /// Returns an empty vector when the cluster needs no conversion.
+/// Tests: `test_convert_output_items_equal_to_source`,
+/// `test_converted_items_are_v4_format`
 pub async fn convert_cluster_to_dir(
     cluster: &GoatRodeoCluster,
     dest_dir: &Path,
@@ -494,10 +504,26 @@ async fn convert_chunks(
                     file_hash
                 );
             }
-            // copy the item bytes verbatim: no deserialization, no re-encode
-            let item_bytes = df.file[offset + 4..payload_end].to_vec();
+            // Version 4-declared files hold ONLY version 4 item bytes
+            // (owner directive 2026-09-30): re-serialize each source item
+            // into the version 4 shape — connections as the ordered edge
+            // map — instead of copying bytes verbatim. The source is a
+            // version 3 cluster (the Md5 gate above), so its payload
+            // deserializes as an ItemV3 — the ONLY type that reads the
+            // version 3 shape — and upgrades through the destructive
+            // From<ItemV3> for Item. The identifier is
+            // unchanged, so the BLAKE3[0..16] key stays valid, and the
+            // item stays rust-equal to its source (the pair-form
+            // deserialization and the CBOR round-trip are item.rs's
+            // tested contracts).
+            let source_bytes = &df.file[offset + 4..payload_end];
+            let v3: ItemV3 = serde_cbor::from_slice(source_bytes).with_context(|| {
+                format!("Decoding the item at offset {offset} for version 4 conversion")
+            })?;
+            let v4_bytes = serde_cbor::to_vec(&Item::from(v3))
+                .with_context(|| format!("Re-encoding the item at offset {offset} as version 4"))?;
             writer
-                .write_item_with_hash(item_bytes, *key)
+                .write_item_with_hash(v4_bytes, *key)
                 .await
                 .with_context(|| format!("Writing converted chunk {}", chunk_idx))?;
         }
@@ -542,6 +568,7 @@ pub(crate) mod phase3_tests {
     #![allow(clippy::await_holding_lock)] // the hook guard intentionally serializes tests across awaits
     use super::*;
     use crate::item::ITEM_METADATA_MIME_TYPE;
+    use crate::rodeo::index::ItemOffset;
 
     /// Serialization for tests that touch the global test-only injection
     /// statics: without this, parallel tests observe each other's hooks.
@@ -557,6 +584,22 @@ pub(crate) mod phase3_tests {
         hook_guard()
     }
 
+    /// The per-test session root: a known-prefix (`bigtent-test-`),
+    /// otherwise-random directory under the system temp dir, wholly
+    /// removed on drop — by a normal completion and by panic unwinding.
+    /// Every filesystem-touching test does its work strictly inside its
+    /// own session root and asserts only within it: no test may scan the
+    /// shared top-level temp dir, where stale or concurrently created
+    /// entries (an earlier killed run, another bigtent process, sibling
+    /// test threads) would make the verdict global-state dependent.
+    /// One test = one session directory; cleanup is the whole directory.
+    pub(crate) fn session_root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("bigtent-test-")
+            .tempdir()
+            .expect("a session root under the system temp dir")
+    }
+
     // --- test-only version 3 cluster writer (raw bytes; production never
     // writes version 3) ---
 
@@ -565,11 +608,9 @@ pub(crate) mod phase3_tests {
         targets.insert(target.to_string());
         Item {
             identifier: identifier.to_string(),
-            connections: crate::item::Connections(
-                [("contained:up".to_string(), targets)]
-                    .into_iter()
-                    .collect(),
-            ),
+            connections: [("contained:up".to_string(), targets)]
+                .into_iter()
+                .collect(),
             body_mime_type: Some(ITEM_METADATA_MIME_TYPE.to_string()),
             body: Some(serde_cbor::Value::Map(Default::default())),
         }
@@ -660,14 +701,18 @@ pub(crate) mod phase3_tests {
         Ok(cluster)
     }
 
-    /// Test 1: conversion matches the source items — byte-identical item
-    /// payloads, BLAKE3 keys, and lookups resolve through the converted
-    /// member.
+    /// Test 1: conversion matches the source items — BLAKE3 keys, lookups
+    /// resolve through the converted member, and the converted item bytes
+    /// are in the VERSION 4 format.
     ///
-    /// Requirement: phase 3 conversion correctness (ADR 0003). Theory: the
-    /// conversion is a re-keying pass; any change to item bytes would
-    /// corrupt content addressing, and a wrong key derivation would break
-    /// every lookup.
+    /// Requirement: phase 3 conversion correctness (ADR 0003), amended by
+    /// the owner directive (2026-09-30): the chunks are version 4
+    /// -declared files, so their item bytes must be the version 4 shape —
+    /// the key derivation is what content addressing needs, and the keys
+    /// derive from the (unchanged) identifiers, so re-serialization does
+    /// not disturb addressing. Theory: a wrong key derivation would break
+    /// every lookup, and V3-shaped item bytes in a version 4 file break
+    /// version-specific readers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_convert_v3_cluster_matches_source_items() {
         let _hook_guard = hook_guard();
@@ -705,33 +750,127 @@ pub(crate) mod phase3_tests {
                 id
             );
         }
-        // and the item bytes are byte-identical to the source's
-        let src_data = source
-            .data_file_for(
-                // take any entry's file hash via the full index
-                source.full_index().await.unwrap()[0].loc.1,
-            )
-            .unwrap();
+        // and every converted item is in the VERSION 4 format (map-shaped
+        // connections): the conversion re-serializes instead of copying
+        // bytes verbatim, because these are version 4-declared files
+        // (data envelope 2) and version 4 files hold ONLY version 4 item
+        // bytes — see test_converted_items_are_v4_format
         let out_member = member.as_ref();
         let out_cluster = match out_member {
             HerdMember::Cluster(c) => c,
             _ => panic!("converted member must be a cluster"),
         };
         let out_index = out_cluster.full_index().await.unwrap();
-        for io in out_index.iter() {
-            let out_bytes = &out_cluster.data_file_for(io.loc.1).unwrap().file[io.loc.0..];
-            let src_offset = src_data.file.windows(4).position(|_| false); // placeholder, replaced below
-            let _ = src_offset;
-            // byte-identity: every converted item payload must exist in the
-            // source data file verbatim
-            let len = u32::from_be_bytes(out_bytes[0..4].try_into().unwrap()) as usize;
-            let payload = &out_bytes[4..4 + len];
+        for payload in raw_item_payloads(out_cluster, &out_index) {
+            let connections = raw_connections_of(&payload);
             assert!(
-                src_data.file.windows(payload.len()).any(|w| w == payload),
-                "converted item payload must be copied verbatim from the source"
+                matches!(connections, serde_cbor::Value::Map(_)),
+                "converted items are version 4 shaped, got: {connections:?}"
             );
         }
         converted.close().await.unwrap();
+    }
+
+    /// Raw framed item payloads of a cluster: for every index entry, the
+    /// exact item bytes in the `.grd` (the length prefix stripped). This
+    /// is the file-level content a reader sees — before any Item
+    /// deserialization can apply its dual-shape tolerance.
+    fn raw_item_payloads(cluster: &GoatRodeoCluster, index: &[ItemOffset]) -> Vec<Vec<u8>> {
+        index
+            .iter()
+            .map(|io| {
+                let df = cluster
+                    .data_file_for(io.loc.1)
+                    .unwrap_or_else(|| panic!("data file for index entry {:?}", io.loc));
+                let off = io.loc.0;
+                let len =
+                    u32::from_be_bytes(df.file[off..off + 4].try_into().expect("length prefix"))
+                        as usize;
+                df.file[off + 4..off + 4 + len].to_vec()
+            })
+            .collect()
+    }
+
+    /// The `connections` member of a serialized item, decoded without any
+    /// Item-level tolerance: whatever CBOR shape the file carries is what
+    /// comes back.
+    fn raw_connections_of(payload: &[u8]) -> serde_cbor::Value {
+        let value: serde_cbor::Value =
+            serde_cbor::from_slice(payload).expect("an item is valid CBOR");
+        match value {
+            serde_cbor::Value::Map(m) => m
+                .get(&serde_cbor::Value::Text("connections".to_string()))
+                .cloned()
+                .expect("an item carries connections"),
+            other => panic!("an item is a CBOR map, got {other:?}"),
+        }
+    }
+
+    /// Owner directive (2026-09-30): the file format is versioned, and the
+    /// version declares the item shape — a version 4 cluster's `.grd`
+    /// (data envelope 2: "the item shape changed (the connections map)")
+    /// holds ONLY version 4 items, connections as the ordered CBOR map of
+    /// edge type → target array. External readers deserialize strictly by
+    /// the declared version and have no legacy tolerance, so the shape
+    /// inside the file is part of the format contract, not an
+    /// implementation detail. What: EVERY item of the converted output
+    /// carries connections as a CBOR map. Why: the byte-copy re-keying
+    /// put version 3 pair-array item bytes into version 4-declared files
+    /// — a version-specific reader reads every converted item as
+    /// connection-less (the file declares envelope 2 while the payload is
+    /// envelope-1 shaped).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_converted_items_are_v4_format() {
+        let base = tempfile::TempDir::new().unwrap();
+        let items: Vec<Item> = (0..4)
+            .map(|i| v3_item(&format!("gitoid:blob:sha256:v4fmt_{:04}", i), "pkg:npm/x@1"))
+            .collect();
+        let source = load_v3_cluster(base.path(), &items).await.unwrap();
+
+        let dest = tempfile::TempDir::new().unwrap();
+        let grcs = convert_cluster_to_dir(source.as_ref(), dest.path())
+            .await
+            .unwrap();
+        assert!(!grcs.is_empty(), "the conversion produced chunks");
+
+        for grc in &grcs {
+            let converted = GoatRodeoCluster::new(grc, false, None, vec![])
+                .await
+                .unwrap();
+            let index = converted.full_index().await.unwrap();
+            assert!(!index.is_empty(), "every converted chunk carries items");
+            for payload in raw_item_payloads(&converted, &index) {
+                let connections = raw_connections_of(&payload);
+                assert!(
+                    matches!(connections, serde_cbor::Value::Map(_)),
+                    "a version 4 .grd holds ONLY map-shaped connections, got: {connections:?}"
+                );
+            }
+        }
+    }
+
+    /// The same contract on the version 3 side: a version 3 `.grd` (data
+    /// envelope 1) holds the legacy pair-array connections. What: every
+    /// item of a version 3 source parses as the pair shape. Why: the
+    /// discriminator makes `test_converted_items_are_v4_format`
+    /// meaningful — it distinguishes the versions instead of passing on
+    /// either shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_v3_items_are_v3_format() {
+        let base = tempfile::TempDir::new().unwrap();
+        let items: Vec<Item> = (0..3)
+            .map(|i| v3_item(&format!("gitoid:blob:sha256:v3fmt_{:04}", i), "pkg:npm/x@1"))
+            .collect();
+        let source = load_v3_cluster(base.path(), &items).await.unwrap();
+
+        let index = source.full_index().await.unwrap();
+        for payload in raw_item_payloads(&source, &index) {
+            let connections = raw_connections_of(&payload);
+            assert!(
+                matches!(connections, serde_cbor::Value::Array(_)),
+                "a version 3 .grd holds the pair-array connections, got: {connections:?}"
+            );
+        }
     }
 
     /// Test 2: the conversion chunk count is controlled by the injected
@@ -1163,15 +1302,25 @@ pub(crate) mod phase3_tests {
         );
     }
 
-    /// Tests 16 (overlap rejection, canonicalized) — unit-level over real
-    /// dirs; symlinked roots allowed.
+    /// Tests 16 (overlap rejection, canonicalized) and 17 (symlinked
+    /// roots allowed) — unit-level over real dirs inside the test's own
+    /// session root. The ACCEPTED roots are made 0700 explicitly so the
+    /// acceptance branch is judged on containment only, independent of
+    /// the ambient umask and default ACLs: production must reject a
+    /// group-writable fresh dir (the ownership predicate is unit-tested
+    /// over synthetic metadata so that branch is exercised
+    /// unprivileged), but the acceptance case must not silently flip to
+    /// rejection because the environment happens to create dirs 0775.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_temp_root_overlap_validation() {
-        let base = tempfile::TempDir::new().unwrap();
-        let input = base.path().join("input");
+        use std::os::unix::fs::PermissionsExt;
+
+        let session = session_root();
+        let base = session.path();
+        let input = base.join("input");
         std::fs::create_dir(&input).unwrap();
-        let dest = base.path().join("dest");
+        let dest = base.join("dest");
         std::fs::create_dir(&dest).unwrap();
 
         // root inside an input dir: rejected
@@ -1185,32 +1334,35 @@ pub(crate) mod phase3_tests {
         assert!(validate_temp_root(&dest, std::slice::from_ref(&input), &dest, false).is_err());
 
         // root containing the dest: rejected (dest inside root)
-        assert!(
-            validate_temp_root(base.path(), std::slice::from_ref(&input), &dest, false).is_err()
-        );
+        assert!(validate_temp_root(base, std::slice::from_ref(&input), &dest, false).is_err());
 
-        // a safe sibling root: accepted
-        let safe = base.path().join("scratch");
+        // a safe sibling root, made 0700 explicitly: accepted
+        let safe = base.join("scratch");
         std::fs::create_dir(&safe).unwrap();
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(validate_temp_root(&safe, std::slice::from_ref(&input), &dest, false).is_ok());
 
         // a symlinked root is allowed (canonicalized to the same safe dir)
-        #[allow(clippy::redundant_clone)]
-        let link = base.path().join("scratch_link");
+        let link = base.join("scratch_link");
         std::os::unix::fs::symlink(&safe, &link).unwrap();
         assert!(validate_temp_root(&link, std::slice::from_ref(&input), &dest, false).is_ok());
     }
 
     /// Test (free-space preflight): a preflight over a real directory
     /// reports a plausible number, and an absurd requirement fails fast.
+    /// The absurd requirement is `u64::MAX` — more than ANY filesystem
+    /// has — rather than `available + 1` from a fresh snapshot: the real
+    /// free space moves while the suite runs (sibling tests create and
+    /// delete gigabytes of scratch), so an assertion pinned to a stale
+    /// snapshot was a race, not a test.
     #[cfg(unix)]
     #[test]
     fn test_free_space_preflight() {
         let dir = tempfile::TempDir::new().unwrap();
         let available = free_space(dir.path()).expect("statvfs works");
         assert!(available > 0, "a real filesystem has free space");
-        assert!(preflight_space(dir.path(), available / 2).is_ok());
-        let err = preflight_space(dir.path(), available.saturating_add(1));
+        assert!(preflight_space(dir.path(), 1).is_ok());
+        let err = preflight_space(dir.path(), u64::MAX);
         assert!(err.is_err(), "asking for more than exists must fail fast");
     }
 }

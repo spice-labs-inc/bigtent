@@ -20,10 +20,13 @@ V4:  "connections": {"contained:up": ["gitoid:..."], "alias:from": ["pkg:..."]}
 ```
 
 Map keys and target arrays are in sorted order; target arrays are
-deduplicated. Big Tent's readers accept **both** shapes, so the change
-can ship independently of cluster rewrites
-(`test_item_legacy_pairs_cbor_deserialize`,
-`test_item_v4_cbor_round_trip`).
+deduplicated. The two shapes are version-scoped: a version 4 item reads
+ONLY the map (the checked-in legacy JSON does not deserialize into an
+`Item` — `test_item_rejects_v3_pair_shape_json`), the version 3 stream
+reads ONLY the pair array as `ItemV3`, and the upgrade to an `Item` is
+the destructive `From<ItemV3> for Item`
+(`test_item_rejects_v3_pair_shape_cbor`, `test_item_v4_cbor_round_trip`,
+`test_item_v3_round_trip`).
 
 ## 2. The version numbers change
 

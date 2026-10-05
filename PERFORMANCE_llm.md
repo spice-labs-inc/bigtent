@@ -9,9 +9,11 @@ version 4 migration (claims name their tests).
   `test_default_merge_worker_count_is_at_least_one`.
 * Tokio runtime: `worker_threads = 100` (server mode; unchanged).
 * Mixed-version merges convert version 3 sources first (re-keying pass,
-  items copied verbatim); conversion chunk budgets share the writer's
+  items re-serialized into the version 4 format); conversion chunk
+  budgets share the writer's
   split limits (15 GB per data file / 25M entries per index) and do not
   change the merge result. Tests: `test_convert_v3_cluster_matches_source_items`,
+  `test_converted_items_are_v4_format`,
   `prop_split_limits_invariance_on_synthetic_clusters`,
   `test_many_chunk_merge`.
 * The writer's output is byte-deterministic for identical items, options,

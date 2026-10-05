@@ -37,20 +37,22 @@ algorithm; a v4 cluster declaring MD5 resolves with MD5 keys).
 
 ## Item shape (version 4)
 
-* `identifier`: required string.
+ * `identifier`: required string.
 * `connections`: required (default empty) map: edge type string → array
   of target identifier strings; keys sorted, target arrays sorted and
   deduplicated; empty target arrays are preserved as given.
 * `body_mime_type`, `body`: optional.
-* Dual-shape reading: legacy pair arrays fold into the map (targets
-  inserted under their edge type; duplicates deduplicated); missing
-  field = empty map; wrong arity / non-strings / nested arrays are
-  rejected with entry-naming errors.
+* Version-scoped reading (owner directive 2026-09-30, amending D5): an
+  `Item` reads ONLY the map shape; the legacy pair array belongs to the
+  version 3 stream — it deserializes as `ItemV3` and upgrades via the
+  destructive `From<ItemV3> for Item`; a non-map `connections` is
+  rejected with an error naming the expected version 4 shape; missing
+  field = empty map.
 * Legacy view: `ItemV3` (public) — `connections` is the sorted pair set.
 
 Tests: `test_item_v4_cbor_round_trip`,
-`test_item_legacy_pairs_cbor_deserialize`,
-`test_item_legacy_pairs_json_deserialize`,
+`test_item_rejects_v3_pair_shape_cbor`,
+`test_item_rejects_v3_pair_shape_json`,
 `test_item_missing_connections_field_is_empty_map`,
 `test_item_v3_round_trip`, `test_item_serialize_canonical_deterministic`,
 `test_legacy_connections_malformed_rejected`,
@@ -115,10 +117,17 @@ version 4 output (`test_mixed_merge_output_is_version_4`, phase 3).
 ## Conversion & comparison CLIs
 
 * `--convert-to-v4 <dirs...> --dest <dir>`: permanent V3→V4 re-keying
-  (byte-copy; items rust-equal; chunks at 15GB/25M split limits;
-  per-input `dest/<name>/`). Skips BLAKE3 sources. Tests:
-  `test_convert_output_items_equal_to_source`,
-  `test_convert_writes_blake3_keyed_clusters`.
+  with re-serialization (items re-encoded into the version 4 format —
+  ordered-map connections; version 4 `.grd` files hold ONLY version 4
+  item bytes, since the data envelope declares version 2 and version
+  -specific readers have no legacy tolerance; items rust-equal; chunks
+  at 15GB/25M split limits; per-input `dest/<name>/`). Skips BLAKE3
+  sources. Tests: `test_convert_output_items_equal_to_source`,
+  `test_converted_items_are_v4_format`,
+  `test_convert_writes_blake3_keyed_clusters`. The read boundary
+  enforces the same contract: a data file's declared envelope version
+  carries only its own item shape
+  (`test_read_item_at_enforces_version_shape`).
 * `--compare <l> <r>`: full item-equality check (id, connections, body,
   mime) across key algorithms (probe through the right side's
   algorithm). Exit 0 equal / 1 not. ≥50M-item sides use the bounded

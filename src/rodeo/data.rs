@@ -28,13 +28,28 @@
 //!
 //! Items are accessed by byte offset (provided by the index file).
 //!
+//! ## The versioned item-shape contract
+//!
+//! The data envelope's `version` declares the item format the file
+//! carries, and reads DISPATCH on it — each version's deserializer reads
+//! ONLY its own shape: version 2 (version 4 clusters) deserializes the
+//! item as `Item` (map-shaped connections, the ONLY shape `Item`
+//! reads); version 1 (version 3 clusters) deserializes the item as
+//! `ItemV3` (the legacy pair array, the ONLY shape `ItemV3` reads) and
+//! upgrades it through `From<ItemV3> for Item`. A payload of the wrong
+//! shape fails its deserializer: a loud read error naming the file,
+//! offset, and declared version — never a silent dual-shape read
+//! (external readers deserialize strictly by the declared version and
+//! would answer wrong-shaped items with empty edges).
+//! Tests: `test_read_item_at_enforces_version_shape`.
+//!
 //! ## Memory Mapping
 //!
 //! Data files are memory-mapped for efficient random access without
 //! loading the entire file into memory.
 
 use crate::{
-    item::Item,
+    item::{Item, ItemV3},
     util::{read_cbor_sync, read_len_and_cbor_sync, read_u32_sync},
 };
 use anyhow::{Result, bail};
@@ -47,7 +62,6 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use tracing::error;
 
 use super::goat::GoatRodeoCluster;
 /// Metadata envelope stored at the beginning of .grd data files.
@@ -148,11 +162,26 @@ impl DataFile {
 
     /// Read the item at the given offset.
     ///
-    /// Failures — an unreadable length, a length that claims more bytes
-    /// than the mapped file has remaining (which would otherwise permit a
-    /// multi-gigabyte allocation per lookup), or a payload that does not
-    /// deserialize — return an `Err` naming the file and offset (H3).
-    /// The lookup boundary logs the error and reports the item as absent.
+    /// The read DISPATCHES on the declared data-envelope version, and
+    /// each version reads ONLY its own item format (owner directive
+    /// 2026-09-30):
+    ///
+    /// * version 2 (version 4 clusters): deserializes an [`Item`] — the
+    ///   connections map is the ONLY shape it reads;
+    /// * version 1 (version 3 clusters): deserializes an [`ItemV3`] (the
+    ///   legacy pair set is the ONLY shape it reads) and upgrades it
+    ///   through the destructive `From<ItemV3> for Item`.
+    ///
+    /// A payload of the OTHER version's shape fails its deserializer, so
+    /// a file that lies about its content is a loud error naming the
+    /// file and offset (H3) — never a silent dual-shape read.
+    /// Tests: `test_read_item_at_enforces_version_shape`.
+    ///
+    /// Other failures — an unreadable length, a length that claims more
+    /// bytes than the mapped file has remaining (which would otherwise
+    /// permit a multi-gigabyte allocation per lookup) — also return an
+    /// `Err` naming the file and offset. The lookup boundary logs the
+    /// error and reports the item as absent.
     pub fn read_item_at(&self, pos: usize) -> Result<Item> {
         let file_len = self.file.len();
         if pos >= file_len || file_len - pos < 4 {
@@ -182,11 +211,48 @@ impl DataFile {
             );
         }
 
-        read_cbor_sync(&mut my_reader, item_len as usize).map_err(|e| {
-            error!("Failed to read CBOR at offset {} error {:?}", pos, e);
-            e
-        })
+        // the version dispatch: the envelope version is authoritative,
+        // and each version's deserializer is strict to its own shape —
+        // no probe, no second parse, no shape capture needed
+        let item = match self.envelope.version {
+            2 => {
+                let item: Item = read_cbor_sync(&mut my_reader, item_len as usize)
+                    .map_err(|e| format_item_read_error(self, pos, e))?;
+                item
+            }
+            1 => {
+                let v3: ItemV3 = read_cbor_sync(&mut my_reader, item_len as usize)
+                    .map_err(|e| format_item_read_error(self, pos, e))?;
+                Item::from(v3)
+            }
+            other => bail!(
+                "Data file {:016x}.{} declares data envelope version {} — \
+                 no item format is defined for it",
+                self.hash,
+                GOAT_RODEO_DATA_FILE_SUFFIX,
+                other
+            ),
+        };
+        Ok(item)
     }
+}
+
+/// The H3 item-read failure: name the file, the offset, the declared
+/// format version, and the deserializer's reason (which is the version
+/// -shape violation when the payload carries the other version's item
+/// shape). The deserializer already logged the escaped payload bytes;
+/// the lookup boundary logs the returned error and reports the item as
+/// absent.
+fn format_item_read_error(df: &DataFile, pos: usize, e: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Item at offset {} in data file {:016x}.{} does not match its \
+         declared format (data envelope version {}): {}",
+        pos,
+        df.hash,
+        GOAT_RODEO_DATA_FILE_SUFFIX,
+        df.envelope.version,
+        e
+    )
 }
 
 /// Magic number identifying data (.grd) files: 0x00be1100 ("Bell" pepper)
@@ -195,3 +261,154 @@ impl DataFile {
 /// Data files contain CBOR-encoded Items at specific byte offsets.
 #[allow(non_upper_case_globals)]
 pub const DataFileMagicNumber: u32 = 0x00be1100; // Bell
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::item::Item;
+    use std::collections::BTreeMap;
+
+    /// Write a minimal `.grd` with the given data-envelope version and
+    /// framed item payloads, then return its name hash (the file name is
+    /// the hash, which is how `DataFile::new` finds it).
+    fn write_grd(
+        dir: &std::path::Path,
+        envelope_version: u32,
+        payloads: &[Vec<u8>],
+    ) -> Result<u64> {
+        use std::io::Write;
+        let mut grd: Vec<u8> = vec![];
+        grd.write_all(&DataFileMagicNumber.to_be_bytes())?;
+        let env = DataFileEnvelope {
+            version: envelope_version,
+            magic: DataFileMagicNumber,
+            previous: 0,
+            depends_on: BTreeSet::new(),
+            built_from_merge: false,
+            info: BTreeMap::new(),
+        };
+        let env_bytes = serde_cbor::to_vec(&env)?;
+        grd.write_all(&(env_bytes.len() as u16).to_be_bytes())?;
+        grd.write_all(&env_bytes)?;
+        for payload in payloads {
+            grd.write_all(&(payload.len() as u32).to_be_bytes())?;
+            grd.write_all(payload)?;
+        }
+        let hash = crate::util::byte_slice_to_u63(&crate::util::sha256_for_slice(&grd))?;
+        std::fs::write(dir.join(format!("{hash:016x}.grd")), &grd)?;
+        Ok(hash)
+    }
+
+    /// An item serialized in the VERSION 4 shape: connections as the
+    /// ordered map (what the merge and the conversion write).
+    fn v4_item_bytes(identifier: &str) -> Vec<u8> {
+        let mut connections: BTreeMap<String, BTreeSet<String>> = Default::default();
+        connections
+            .entry("contained:up".to_string())
+            .or_default()
+            .insert("pkg:npm/x@1".to_string());
+        let item = Item {
+            identifier: identifier.to_string(),
+            connections,
+            body_mime_type: None,
+            body: None,
+        };
+        serde_cbor::to_vec(&item).expect("the v4 item serializes")
+    }
+
+    /// The same item serialized in the VERSION 3 shape: connections as
+    /// the legacy pair array (what version 3 clusters hold).
+    fn v3_item_bytes(identifier: &str) -> Vec<u8> {
+        let v4 = serde_cbor::from_slice::<Item>(&v4_item_bytes(identifier)).expect("round trip");
+        serde_cbor::to_vec(&v4.to_v3()).expect("the v3 item serializes")
+    }
+
+    /// An item with NO connections member at all (the documented
+    /// `#[serde(default)]` tolerance).
+    fn item_bytes_without_connections(identifier: &str) -> Vec<u8> {
+        let mut map = BTreeMap::new();
+        map.insert(
+            serde_cbor::Value::Text("identifier".to_string()),
+            serde_cbor::Value::Text(identifier.to_string()),
+        );
+        serde_cbor::to_vec(&serde_cbor::Value::Map(map)).expect("serializes")
+    }
+
+    fn open(dir: &std::path::Path, hash: u64, envelope_version: u32) -> DataFile {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(DataFile::new(&dir.to_path_buf(), hash, envelope_version))
+            .expect("the data file loads")
+    }
+
+    /// The versioned-format contract, enforced at the read boundary: the
+    /// read DISPATCHES on the declared envelope version, and each
+    /// version's deserializer reads ONLY its own item shape — version 2
+    /// (version 4 clusters) the ordered-map connections, version 1
+    /// (version 3 clusters) the legacy pair array (up-converted through
+    /// `From<ItemV3> for Item`). A file that lies about its content (the
+    /// byte-copy conversion used to write version 3 pair bytes into
+    /// version 4 -declared files) fails its deserializer and is a loud
+    /// read error naming the file, offset, and declared version — not a
+    /// silent dual-shape read that version-specific readers answer with
+    /// empty edges. A missing `connections` member is tolerated in both
+    /// versions (the documented `#[serde(default)]`).
+    #[test]
+    fn test_read_item_at_enforces_version_shape() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // version 2 + the version 4 map shape: reads
+        let hash = write_grd(dir.path(), 2, &[v4_item_bytes("gitoid:blob:sha256:ok_v4")]).unwrap();
+        let df = open(dir.path(), hash, 2);
+        let item = df.read_item_at(df.data_offset).expect("v4 shape reads");
+        assert_eq!(item.identifier, "gitoid:blob:sha256:ok_v4");
+
+        // version 2 + the version 3 pair-array shape: the misdeclared
+        // file is a LOUD error (the version 4 item deserializer refuses
+        // the pair array)
+        let hash = write_grd(dir.path(), 2, &[v3_item_bytes("gitoid:blob:sha256:bad_v4")]).unwrap();
+        let df = open(dir.path(), hash, 2);
+        let err = df
+            .read_item_at(df.data_offset)
+            .expect_err("pair-array bytes must not read from a version 2 data file");
+        assert!(
+            err.to_string()
+                .contains("does not match its declared format"),
+            "the error names the file, offset, and declared version: {err:#}"
+        );
+
+        // version 1 + the version 3 pair-array shape: reads, and the
+        // ItemV3 is up-converted through the destructive From
+        let hash = write_grd(dir.path(), 1, &[v3_item_bytes("gitoid:blob:sha256:ok_v3")]).unwrap();
+        let df = open(dir.path(), hash, 1);
+        let item = df.read_item_at(df.data_offset).expect("v3 shape reads");
+        assert_eq!(item.identifier, "gitoid:blob:sha256:ok_v3");
+        assert_eq!(
+            item.connections.get("contained:up").map(|t| t.len()),
+            Some(1),
+            "the version 3 pair set folded into the version 4 map"
+        );
+
+        // version 1 + the version 4 map shape: equally misdeclared (the
+        // version 3 item deserializer refuses the map)
+        let hash = write_grd(dir.path(), 1, &[v4_item_bytes("gitoid:blob:sha256:bad_v3")]).unwrap();
+        let df = open(dir.path(), hash, 1);
+        let err = df
+            .read_item_at(df.data_offset)
+            .expect_err("map-shaped bytes must not read from a version 1 data file");
+        assert!(
+            err.to_string()
+                .contains("does not match its declared format"),
+            "the error names the file, offset, and declared version: {err:#}"
+        );
+
+        // a missing connections member is tolerated in both versions
+        let no_conn = item_bytes_without_connections("gitoid:blob:sha256:noconn");
+        let hash = write_grd(dir.path(), 2, &[no_conn.clone()]).unwrap();
+        let df = open(dir.path(), hash, 2);
+        assert!(df.read_item_at(df.data_offset).is_ok());
+        let hash = write_grd(dir.path(), 1, &[no_conn]).unwrap();
+        let df = open(dir.path(), hash, 1);
+        assert!(df.read_item_at(df.data_offset).is_ok());
+    }
+}

@@ -211,7 +211,7 @@ fn load_block_list(path: &PathBuf) -> Result<HashSet<String>> {
 ///
 /// Each input directory's clusters are converted into
 /// `dest/<input-dir-name>/` (one or more chunk clusters per input),
-/// using the same byte-copy re-keying the merge uses.
+/// using the same re-keying + version 4 re-serialization the merge uses.
 async fn run_convert(inputs: Vec<PathBuf>, dest: PathBuf) -> Result<()> {
     use bigtent::rodeo::convert::{ConversionOptions, convert_cluster_to_dir};
 

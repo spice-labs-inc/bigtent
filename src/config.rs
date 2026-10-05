@@ -111,9 +111,11 @@ pub struct Args {
 
     /// Convert version 3 clusters to version 4 (BLAKE3[0..16]) clusters.
     /// Takes directories of clusters (like `--fresh-merge`); each input
-    /// cluster is re-keyed byte-copy into `--dest/<input-dir-name>/` as
-    /// one or more clusters, chunked at the writer split limits. The
-    /// converted items are rust-equal to the source items.
+    /// cluster is re-keyed into `--dest/<input-dir-name>/` as one or
+    /// more clusters, chunked at the writer split limits. Every item is
+    /// re-serialized into the version 4 format (ordered-map
+    /// connections): version 4 `.grd` files hold ONLY version 4 item
+    /// bytes. The converted items are rust-equal to the source items.
     #[arg(long, num_args = 1..)]
     pub convert_to_v4: Vec<PathBuf>,
 
