@@ -122,17 +122,20 @@ use axum::extract::RawQuery;
 
 /// The requested item wire shape (D8).
 ///
-/// The map shape (version 4) is the default; `?item_format=v3` selects the
-/// legacy pair shape. Any other value — including wrong case or empty — is
-/// rejected with 400 and a static message. Conflicting duplicate
-/// parameters are rejected; identical duplicates are accepted.
+/// The legacy pair shape (version 3) is the default, keeping the current
+/// API endpoints byte-compatible with BigTent's previous wire format;
+/// `?item_format=v4` selects the version 4 map shape. Any other value —
+/// including wrong case or empty — is rejected with 400 and a static
+/// message. Conflicting duplicate parameters are rejected; identical
+/// duplicates are accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ItemFormat {
-    /// the version 4 map shape (default)
+    /// the version 3 legacy pair shape (default; keeps current endpoints
+    /// byte-compatible with the previous wire format)
     #[default]
-    V4,
-    /// the version 3 legacy pair shape
     V3,
+    /// the version 4 map shape
+    V4,
 }
 
 impl ItemFormat {
@@ -167,7 +170,7 @@ impl ItemFormat {
                 }
             }
         }
-        Ok(chosen.unwrap_or(ItemFormat::V4))
+        Ok(chosen.unwrap_or(ItemFormat::V3))
     }
 }
 
@@ -234,7 +237,7 @@ impl<T> Stream for TokioReceiverToStream<T> {
     tag = "items",
     request_body(content = Vec<String>, description = "Array of GitOID identifiers to retrieve"),
     params(
-        ("item_format" = String, Query, description = "The item wire shape: 'v4' (default, map) or 'v3' (legacy pairs)")
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Stream of items", body = Vec<Item>)
@@ -437,7 +440,7 @@ async fn do_serve_gitoid<GRT: GoatRodeoTrait + 'static>(
     tag = "items",
     params(
         ("gitoid" = String, Path, description = "The GitOID identifier of the item"),
-        ("item_format" = String, Query, description = "The item wire shape: 'v4' (default, map) or 'v3' (legacy pairs)")
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Item found", body = Item),
@@ -460,7 +463,7 @@ async fn serve_gitoid<GRT: GoatRodeoTrait + 'static>(
     tag = "items",
     params(
         ("identifier" = String, Query, description = "The GitOID identifier of the item"),
-        ("item_format" = String, Query, description = "The item wire shape: 'v4' (default, map) or 'v3' (legacy pairs)")
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Item found", body = Item),
@@ -486,7 +489,7 @@ async fn serve_gitoid_query<GRT: GoatRodeoTrait + 'static>(
     tag = "anti-alias",
     request_body(content = Vec<String>, description = "Array of identifiers to resolve"),
     params(
-        ("item_format" = String, Query, description = "The item wire shape: 'v4' (default, map) or 'v3' (legacy pairs)")
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Map of identifier to resolved item", body = HashMap<String, Item>)
@@ -543,7 +546,7 @@ async fn do_serve_anti_alias<GRT: GoatRodeoTrait + 'static>(
     tag = "anti-alias",
     params(
         ("gitoid" = String, Path, description = "The identifier to resolve (may be an alias)"),
-        ("item_format" = String, Query, description = "The item wire shape: 'v4' (default, map) or 'v3' (legacy pairs)")
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Resolved item", body = Item),
@@ -767,7 +770,7 @@ async fn serve_flatten_bulk<GRT: GoatRodeoTrait + 'static>(
     tag = "traversal",
     params(
         ("gitoid" = String, Path, description = "The GitOID of the item to traverse from"),
-        ("item_format" = String, Query, description = "The item wire shape: 'v4' (default, map) or 'v3' (legacy pairs)")
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Stream of containing/building items", body = Vec<Item>),
@@ -834,7 +837,7 @@ async fn serve_north_purls<GRT: GoatRodeoTrait + 'static>(
     Path(gitoid): Path<String>,
 ) -> impl IntoResponse {
     // PURL streams are identifier strings; item_format has no effect
-    do_north(rodeo, vec![gitoid], true, ItemFormat::V4).await
+    do_north(rodeo, vec![gitoid], true, ItemFormat::V3).await
 }
 
 /// Traverse north filtering for items with Package URLs only (query parameter).
@@ -862,7 +865,7 @@ async fn serve_north_purls_query<GRT: GoatRodeoTrait + 'static>(
             None => vec![],
         },
         true,
-        ItemFormat::V4,
+        ItemFormat::V3,
     )
     .await
 }
@@ -876,7 +879,7 @@ async fn serve_north_purls_query<GRT: GoatRodeoTrait + 'static>(
     tag = "traversal",
     request_body(content = Vec<String>, description = "Array of GitOID identifiers to traverse from"),
     params(
-        ("item_format" = String, Query, description = "The item wire shape: 'v4' (default, map) or 'v3' (legacy pairs)")
+        ("item_format" = String, Query, description = "The item wire shape: 'v3' (default, legacy pairs) or 'v4' (map)")
     ),
     responses(
         (status = 200, description = "Stream of containing/building items", body = Vec<Item>),
@@ -908,7 +911,7 @@ async fn serve_north_purls_bulk<GRT: GoatRodeoTrait + 'static>(
     Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
     // PURL streams are identifier strings; item_format has no effect
-    do_north(rodeo, payload, true, ItemFormat::V4).await
+    do_north(rodeo, payload, true, ItemFormat::V3).await
 }
 
 /// Download the purls.txt file containing all Package URLs in the cluster.

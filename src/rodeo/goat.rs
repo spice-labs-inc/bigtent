@@ -965,7 +965,6 @@ async fn test_antialias() {
         assert!(
             new_item
                 .connections
-                .0
                 .values()
                 .flatten()
                 .any(|x| *x == ai.identifier),

@@ -1,5 +1,5 @@
-//! The Item-side implementations of [`sansho::SanshoTrait`] (`Item`,
-//! `Connections`) and the item projection entries: project an item's
+//! The Item-side implementations of [`sansho::SanshoTrait`] (`Item`)
+//! and the item projection entries: project an item's
 //! fields through the Sansho engine, directly over the item's stored
 //! CBOR bytes.
 //!
@@ -17,7 +17,7 @@
 //! [`crate::rodeo::data::read_item_bytes_at`]) so selective
 //! materialization stays intact end to end.
 
-use crate::item::{Connections, Item};
+use crate::item::Item;
 use crate::rodeo::data::DataFile;
 use sansho::SanshoError;
 use serde_json::Value as J;
@@ -78,72 +78,13 @@ pub fn compiled_program(expression: &str) -> Result<Arc<sansho::Program>, Sansho
 // The item's Sansho surface
 // ---------------------------------------------------------------------------
 
-/// The item's connection map's own Sansho surface — "within Item":
-/// `Connections` (a bigtent type) implements the trait by DELEGATING
-/// to its inner map's implementation (a standard-library type, whose
-/// impl lives in Sansho) — the turtles compose: edge keys render
-/// through the map impl, target sets through the set impl, target
-/// strings through `String`'s impl.
-impl<'d> sansho::SanshoTrait<'d> for Connections {
-    fn kind(&self) -> sansho::view::Kind {
-        sansho::view::Kind::Object
-    }
-
-    fn as_str(&self) -> Option<std::borrow::Cow<'_, str>> {
-        None
-    }
-
-    fn as_sansho_number(&self) -> Option<sansho::view::SanshoNumber> {
-        None
-    }
-
-    fn as_bool(&self) -> Option<bool> {
-        None
-    }
-
-    fn is_null(&self) -> bool {
-        false
-    }
-
-    fn get_key(&self, name: &str) -> Option<impl sansho::SanshoTrait<'d> + use<'d>> {
-        self.0.get(name).map(|targets| targets.clone())
-    }
-
-    fn get_index(&self, _index: usize) -> Option<impl sansho::SanshoTrait<'d> + use<'d>> {
-        None::<J>
-    }
-
-    fn entries(&self) -> Vec<(String, impl sansho::SanshoTrait<'d> + use<'d>)> {
-        self.0
-            .iter()
-            .map(|(edge, targets)| (edge.clone(), targets.clone()))
-            .collect()
-    }
-
-    fn elements(&self) -> Vec<impl sansho::SanshoTrait<'d> + use<'d>> {
-        Vec::<J>::new()
-    }
-
-    fn container_len(&self) -> Option<usize> {
-        Some(self.0.len())
-    }
-
-    fn materialize(&self) -> Result<J, SanshoError> {
-        sansho::SanshoTrait::materialize(&self.0)
-    }
-
-    fn counts_toward_aggregation() -> bool {
-        false
-    }
-}
-
 /// The item's Sansho surface — "within Item for Item": the `Item`
 /// COMPOSES from its member types' implementations (the turtles
 /// contract): the four members route through the member type's own
-/// navigation — `String`'s for the identifier, [`Connections`]'s for
-/// the connection map (which routes through the map/set/string impls),
-/// `Option<String>`'s for the MIME type, `Option<serde_cbor::Value>`'s
-/// for the body. The VALUE form materializes its members (a value form
+/// navigation — `String`'s for the identifier, the connection map's own
+/// engine implementation (`BTreeMap<String, BTreeSet<String>>`, whose
+/// map/set/string impls live in Sansho), `Option<String>`'s for the MIME
+/// type, `Option<serde_cbor::Value>`'s for the body. The VALUE form materializes its members (a value form
 /// has no borrowable storage); the borrowed form ([`SanshoTrait`] for
 /// `&Item`) hands out borrowed members instead.
 impl<'d> sansho::SanshoTrait<'d> for Item {
@@ -225,7 +166,7 @@ impl<'d> sansho::SanshoTrait<'d> for Item {
 }
 
 /// The borrowed item surface would need one member type for four
-/// different field types (`String`, [`Connections`], `Option<String>`,
+/// different field types (`String`, the connection map, `Option<String>`,
 /// `Option<serde_cbor::Value>`) — the trait's return has ONE opaque
 /// type per method, so a borrowed multi-typed member set is a type-
 /// level impossibility without a wrapper carrier (rejected). The value
@@ -261,7 +202,6 @@ pub fn project_item_direct(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::item::Connections;
     use std::collections::BTreeSet;
 
     /// Build a REAL [`Item`] struct — not a JSON lookalike — with
@@ -288,14 +228,15 @@ mod tests {
             .collect();
         Item {
             identifier: format!("gitoid:blob:sha1:{}", "30e6".repeat(10)),
-            connections: Connections::from_iter(
-                [("alias:from".to_string(), alias_from)]
-                    .into_iter()
-                    .flat_map(|(edge, targets)| {
-                        targets.into_iter().map(move |t| (edge.clone(), t))
-                    })
-                    .chain([("contained:up".to_string(), "gitoid:blob:sha1:parent".to_string())]),
-            ),
+            connections: {
+                let mut map = std::collections::BTreeMap::new();
+                map.insert("alias:from".to_string(), alias_from);
+                map.insert(
+                    "contained:up".to_string(),
+                    ["gitoid:blob:sha1:parent".to_string()].into_iter().collect(),
+                );
+                map
+            },
             body_mime_type: Some("application/vnd.cc.goatrodeo".to_string()),
             body: Some(
                 serde_cbor::value::to_value(serde_json::json!({

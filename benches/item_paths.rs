@@ -19,7 +19,7 @@
 //! Shapes: scan (`connections."alias:from"[?starts_with(@, 'pkg:')]`),
 //! seek (`body.file_size`), full-item (`@`).
 
-use bigtent::item::{Connections, Item};
+use bigtent::item::Item;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use std::collections::BTreeSet;
 
@@ -55,14 +55,15 @@ fn real_item(n_connections: usize, n_file_names: usize) -> Item {
         .collect();
     Item {
         identifier: format!("gitoid:blob:sha1:{}", "30e6".repeat(10)),
-        connections: Connections::from_iter(
-            [("alias:from".to_string(), alias_from)]
-                .into_iter()
-                .flat_map(|(edge, targets)| {
-                    targets.into_iter().map(move |t| (edge.clone(), t))
-                })
-                .chain([("contained:up".to_string(), "gitoid:blob:sha1:parent".to_string())]),
-        ),
+        connections: {
+            let mut map = std::collections::BTreeMap::new();
+            map.insert("alias:from".to_string(), alias_from);
+            map.insert(
+                "contained:up".to_string(),
+                ["gitoid:blob:sha1:parent".to_string()].into_iter().collect(),
+            );
+            map
+        },
         body_mime_type: Some("application/vnd.cc.goatrodeo".to_string()),
         body: Some(
             serde_cbor::value::to_value(serde_json::json!({

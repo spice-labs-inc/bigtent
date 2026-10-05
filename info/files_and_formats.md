@@ -185,7 +185,7 @@ The balance of the Data File is a series of length fields as u32 Big Endian and 
 ```rust
 pub struct Item {
     pub identifier: String,
-    pub connections: Connections, // ordered map of edge type to target set
+    pub connections: BTreeMap<String, BTreeSet<String>>, // ordered map of edge type to target set
     pub body: Option<Value>,
     pub body_mime_type: Option<String>
 }
@@ -196,12 +196,17 @@ pub struct Item {
 `connections`: an ordered map (`BTreeMap<String, BTreeSet<String>>`) of
 edge type to the set of target identifiers, so "all connections of type
 X" is a single map lookup. Serialization emits sorted keys and sorted
-target sets. Deserialization also accepts the version 3 legacy shape —
-an array of `(edge type, target)` pairs — folding each target under its
-edge type, with duplicates deduplicated; a missing field reads as an
-empty map; wrong-arity pairs, non-string elements, and nested arrays are
-rejected with an error naming the entry. As demonstrated by
-`test_item_v4_cbor_round_trip`, `test_item_legacy_pairs_cbor_deserialize`,
+target sets. Deserialization reads ONLY this map shape (owner directive
+2026-09-30, amending D5): the version 3 legacy shape — an array of
+`(edge type, target)` pairs — belongs to the version 3 stream and
+deserializes as `ItemV3`, which upgrades to `Item` through the
+destructive `From<ItemV3> for Item`; a version 4 item reading version 3
+bytes would silently mask a misdeclared file, so the shape is refused.
+A missing field reads as an empty map; a non-map `connections` is
+rejected with an error naming the expected version 4 shape. As
+demonstrated by `test_item_v4_cbor_round_trip`,
+`test_item_rejects_v3_pair_shape_cbor`,
+`test_item_rejects_v3_pair_shape_json`,
 `test_item_missing_connections_field_is_empty_map`,
 `test_legacy_connections_malformed_rejected`, and
 `test_item_serialize_canonical_deterministic`.
@@ -239,13 +244,16 @@ the ordering of the keys and other information is preserved.
 
 
 ## HTTP Item Wire Shapes
-The HTTP API emits `Item` objects in two wire shapes. The **map shape**
-(version 4) is the default: `connections` is a JSON object mapping edge
-type to an array of target identifiers. Passing `?item_format=v3` on any
-item-emitting endpoint selects the **legacy pair shape**: `connections`
-is a JSON array of two-element `[edge_type, target]` arrays, shaped like
-the version 3 output. As demonstrated by `test_item_default_shape_is_map`
-and `test_item_format_v3_shape_is_legacy_pairs`.
+The HTTP API emits `Item` objects in two wire shapes. The **legacy pair
+shape** (version 3) is the default: `connections` is a JSON array of
+two-element `[edge_type, target]` arrays, shaped like the version 3
+output — current endpoints stay byte-compatible with the previous wire
+format. Passing `?item_format=v4` on any item-emitting endpoint selects
+the **map shape** (version 4): `connections` is a JSON object mapping
+edge type to an array of target identifiers. As demonstrated by
+`test_item_default_shape_is_legacy_pairs`,
+`test_item_format_v3_shape_is_legacy_pairs`, and
+`test_item_format_explicit_v4`.
 
 * Accepted values: absent, `v4`, `v3`. Anything else — including wrong
   case, empty, and conflicting duplicate parameters — is rejected with
@@ -280,12 +288,27 @@ Converts version 3 clusters to version 4 (BLAKE3[0..16]) clusters as
 **permanent** output. Each input cluster (a directory of clusters, like
 `--fresh-merge`) is re-keyed into `--dest/<input-dir-name>/` as one or
 more chunk clusters (bounded by the writer split limits: 15 GB per data
-file / 25M entries per index). Conversion is a byte-copy re-keying pass:
-item bytes are copied verbatim, so the converted items are rust-equal to
-the source items (`test_convert_output_items_equal_to_source`), and the
-converted clusters resolve lookups with the declared algorithm
-(`test_convert_writes_blake3_keyed_clusters`). Sources already in
-BLAKE3 are skipped.
+file / 25M entries per index). Every item is decoded and re-encoded into
+the **version 4 item format** (ordered-map connections): a version 4
+`.grd` declares data envelope 2 — "the item shape changed (the
+connections map)" — and holds ONLY version 4 item bytes, because
+version-specific readers (including readers outside this project)
+deserialize strictly by the declared version and read the legacy
+pair-array shape as connection-less. The converted items are rust-equal
+to the source items (`test_convert_output_items_equal_to_source`), every
+converted item is version 4 shaped
+(`test_converted_items_are_v4_format`), and the converted clusters
+resolve lookups with the declared algorithm
+(`test_convert_writes_blake3_keyed_clusters`). Sources already in BLAKE3
+are skipped.
+
+The format contract runs both ways: a version 3 `.grd` (data envelope 1)
+holds the legacy pair-array connections
+(`test_v3_items_are_v3_format`), and bigtent's own reader enforces the
+contract at read time — a data file's declared envelope version carries
+only its own item shape, so a misdeclared file (version 3 pair bytes
+inside a version 4 data file) is a loud read error, never a silent
+dual-shape read (`test_read_item_at_enforces_version_shape`).
 
 ### `--compare <left> <right>`
 

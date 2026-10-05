@@ -35,17 +35,17 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use bigtent::item::{Item, Connections};
-//! use std::collections::BTreeSet;
+//! use bigtent::item::Item;
+//! use std::collections::{BTreeMap, BTreeSet};
 //!
 //! // An item representing a source file contained in a package
 //! let mut targets = BTreeSet::new();
 //! targets.insert("gitoid:blob:sha256:pkg456...".to_string());
 //! let item = Item {
 //!     identifier: "gitoid:blob:sha256:abc123...".to_string(),
-//!     connections: Connections(
-//!         [("contained:up".to_string(), targets)].into_iter().collect(),
-//!     ),
+//!     connections: BTreeMap::from([
+//!         ("contained:up".to_string(), targets),
+//!     ]),
 //!     body_mime_type: Some("application/vnd.cc.goatrodeo".to_string()),
 //!     body: None,
 //! };
@@ -301,113 +301,6 @@ impl EdgeType for String {
     }
 }
 
-/// The connections of an [`Item`]: an ordered map of edge type to the set
-/// of target identifiers (ADR 0001).
-///
-/// Ordered containers are mandatory: the serialized bytes feed
-/// content-addressed file names, so iteration order must be deterministic.
-/// Maps serialize with keys in sorted order and target sets in sorted
-/// order (BTree containers).
-///
-/// Deserialization accepts both shapes for CBOR and JSON (D5):
-/// * the map shape: `{"contained:up": ["gitoid:..."]}`
-/// * the legacy pair-array shape: `[["contained:up", "gitoid:..."]]`,
-///   deduplicated by folding each target under its edge type
-/// * a missing field: an empty map
-///
-/// Wrong-arity pairs, non-string elements, and nested arrays are rejected
-/// with an error naming the offending entry. Values are preserved as
-/// given, including empty target arrays — no empty-set invariant exists.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, ToSchema)]
-pub struct Connections(pub BTreeMap<String, BTreeSet<String>>);
-
-impl Connections {
-    /// Fold one legacy `(edge type, target)` pair into the map: the target
-    /// is inserted into the set for that edge type (ADR 0001).
-    fn fold_pair(&mut self, edge_type: String, target: String) {
-        self.0.entry(edge_type).or_default().insert(target);
-    }
-}
-
-/// Build a `Connections` map by folding an iterator of legacy
-/// `(edge type, target)` pairs (ADR 0001).
-impl FromIterator<(String, String)> for Connections {
-    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
-        let mut ret = Connections::default();
-        for (edge_type, target) in iter {
-            ret.fold_pair(edge_type, target);
-        }
-        ret
-    }
-}
-
-impl<'de> Deserialize<'de> for Connections {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct ConnectionsVisitor;
-
-        impl<'de> Visitor<'de> for ConnectionsVisitor {
-            type Value = Connections;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str(
-                    "a map of edge type to target array, or an array of \
-                     (edge type, target) pairs",
-                )
-            }
-
-            /// The v4 map shape: edge type -> array of targets.
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                let mut ret: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-                let mut index = 0usize;
-                while let Some(key) = map.next_key::<String>().map_err(|e| {
-                    de::Error::custom(format!(
-                        "connections[{}]: edge type must be a string: {}",
-                        index, e
-                    ))
-                })? {
-                    let targets: Vec<String> = map.next_value::<Vec<String>>().map_err(|e| {
-                        de::Error::custom(format!(
-                            "connections[{:?}]: targets must be an array of strings: {}",
-                            key, e
-                        ))
-                    })?;
-                    ret.entry(key).or_default().extend(targets);
-                    index += 1;
-                }
-                Ok(Connections(ret))
-            }
-
-            /// The legacy pair-array shape: array of (edge type, target).
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let mut ret = Connections(BTreeMap::new());
-                let mut index = 0usize;
-                while let Some(pair) = seq.next_element::<(String, String)>().map_err(|e| {
-                    de::Error::custom(format!(
-                        "connections[{}]: each entry must be a \
-                             (edge type, target) pair of two strings: {}",
-                        index, e
-                    ))
-                })? {
-                    ret.fold_pair(pair.0, pair.1);
-                    index += 1;
-                }
-                Ok(ret)
-            }
-        }
-
-        deserializer.deserialize_any(ConnectionsVisitor)
-    }
-}
-
 /// A node in the BigTent graph database representing a software artifact.
 ///
 /// A legacy (version 3) edge: a tuple of (edge_type, target_id).
@@ -428,14 +321,15 @@ pub type Edge = (String, String);
 pub struct Item {
     /// The unique GitOID identifier for this item
     pub identifier: String,
-    /// Ordered map of edge type to the set of target identifiers (ADR 0001).
+    /// Ordered map of edge type to the set of target identifiers .
     /// Edge types include: "alias:to", "alias:from", "contained:up", "contained:down",
     /// "build:up", "build:down", "tag:to", "tag:from". Serialization emits
-    /// sorted keys and sorted target sets. Deserialization also accepts the
-    /// legacy pair-array shape (see [`Connections`]); a missing field reads
-    /// as an empty map.
+    /// sorted keys and sorted target sets. Deserialization reads ONLY this
+    /// map shape: version 3 pair-array bytes belong to [`ItemV3`] (the
+    /// version 3 stream) and upgrade via `From<ItemV3> for Item`; a
+    /// missing field reads as an empty map.
     #[serde(default)]
-    pub connections: Connections,
+    pub connections: BTreeMap<String, BTreeSet<String>>,
     /// MIME type of the body content, typically "application/vnd.cc.goatrodeo" for metadata
     pub body_mime_type: Option<String>,
     /// Optional metadata body in CBOR format, serialized as JSON in API responses
@@ -465,8 +359,13 @@ impl PartialEq for Item {
 pub struct ItemV3 {
     /// The unique GitOID identifier for this item
     pub identifier: String,
-    /// Legacy connections: a sorted set of (edge type, target) pairs
+    /// Legacy connections: a sorted set of (edge type, target) pairs —
+    /// the ONLY shape the version 3 stream deserializes (the version 4
+    /// map does not read here; an `Item` is produced by the upgrade
+    /// `From<ItemV3> for Item`). A missing field reads as an empty set
+    /// (legacy producers may omit connections entirely).
     #[schema(value_type = Vec<(String, String)>)]
+    #[serde(default)]
     pub connections: BTreeSet<Edge>,
     /// MIME type of the body content
     pub body_mime_type: Option<String>,
@@ -480,7 +379,7 @@ impl Item {
     /// folds back to the sorted set of pairs (ADR 0001/D4).
     pub fn to_v3(&self) -> ItemV3 {
         let mut connections = BTreeSet::new();
-        for (edge_type, targets) in &self.connections.0 {
+        for (edge_type, targets) in &self.connections {
             for target in targets {
                 connections.insert((edge_type.clone(), target.clone()));
             }
@@ -502,9 +401,9 @@ impl From<&Item> for ItemV3 {
 
 impl From<ItemV3> for Item {
     fn from(value: ItemV3) -> Self {
-        let mut connections = Connections(BTreeMap::new());
+        let mut connections: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (edge_type, target) in value.connections {
-            connections.fold_pair(edge_type, target);
+            connections.entry(edge_type).or_default().insert(target);
         }
         Item {
             identifier: value.identifier,
@@ -560,7 +459,7 @@ impl Item {
         // Decision depends only on the edge type, so iterating the
         // edge-type map in sorted order is equivalent to the legacy
         // pair-set iteration (both see the decisive type first).
-        for edge_type in self.connections.0.keys() {
+        for edge_type in self.connections.keys() {
             if edge_type.is_alias_to() {
                 return false;
             }
@@ -578,11 +477,10 @@ impl Item {
         self
             // from connections
             .connections
-            .0
             .keys()
             // find all aliases to this thing that start with `pkg:`
             .filter(|edge_type| edge_type.is_alias_from())
-            .flat_map(|edge_type| self.connections.0[edge_type].iter())
+            .flat_map(|edge_type| self.connections[edge_type].iter())
             .filter(|t| t.starts_with("pkg:"))
             .cloned()
             .collect()
@@ -592,7 +490,6 @@ impl Item {
     /// least one target)?
     pub fn is_alias(&self) -> bool {
         self.connections
-            .0
             .iter()
             .any(|(edge_type, targets)| edge_type.is_alias_to() && !targets.is_empty())
     }
@@ -603,7 +500,7 @@ impl Item {
     /// get all the connections that are either `contained_by_up` or `is_alias_to` or `is_tag_from`
     pub fn contained_by(&self) -> HashSet<String> {
         let mut ret = HashSet::new();
-        for (edge_type, targets) in &self.connections.0 {
+        for (edge_type, targets) in &self.connections {
             if edge_type.is_alias_to() || edge_type.is_tag_from() || edge_type.is_up() {
                 for target in targets {
                     ret.insert(target.clone());
@@ -669,8 +566,8 @@ impl Item {
                 // union per edge type (ADR 0001): each target set is the
                 // union of both items' target sets for that type
                 let mut it = self.connections.clone();
-                for (edge_type, targets) in other.connections.0 {
-                    it.0.entry(edge_type).or_default().extend(targets);
+                for (edge_type, targets) in other.connections {
+                    it.entry(edge_type).or_default().extend(targets);
                 }
                 it
             },
@@ -804,12 +701,16 @@ mod phase2_item_shape {
     use proptest::prelude::*;
 
     fn item_with_pairs(pairs: &[(&str, &str)]) -> Item {
+        let mut connections: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (t, g) in pairs {
+            connections
+                .entry((*t).to_string())
+                .or_default()
+                .insert((*g).to_string());
+        }
         Item {
             identifier: "gitoid:blob:sha256:test".to_string(),
-            connections: pairs
-                .iter()
-                .map(|(t, g)| (t.to_string(), g.to_string()))
-                .collect(),
+            connections,
             body_mime_type: None,
             body: None,
         }
@@ -832,17 +733,21 @@ mod phase2_item_shape {
         let back: Item = serde_cbor::from_slice(&bytes).expect("deserialize");
         assert_eq!(item, back);
         // and the stored shape is the map, not pairs
-        let targets = back.connections.0.get("contained:up").expect("edge type");
+        let targets = back.connections.get("contained:up").expect("edge type");
         assert_eq!(targets.len(), 2);
     }
 
     /// Test 2: the legacy pair-array CBOR shape deserializes into the map.
     ///
-    /// Requirement: D5 (dual-shape reading). Theory: version 3 clusters
-    /// store pair arrays; every reader must accept them by folding each
-    /// target under its edge type, with duplicates deduplicated.
+    /// Requirement: owner directive 2026-09-30 (amending D5) — an `Item`
+    /// deserializes ONLY the version 4 map shape. Theory: version 3
+    /// pair-array bytes belong to the version 3 stream (they deserialize
+    /// as `ItemV3` and upgrade via `From<ItemV3> for Item`); if an `Item`
+    /// still read them, a version 4 file carrying version 3 bytes would
+    /// silently answer every edge lookup with the folded map instead of
+    /// failing loudly at the version boundary.
     #[test]
-    fn test_item_legacy_pairs_cbor_deserialize() {
+    fn test_item_rejects_v3_pair_shape_cbor() {
         // CBOR: {"identifier": "...", "connections": [["contained:up", "t1"], ["contained:up", "t2"], ["contained:up", "t1"]]}
         let pairs_cbor = serde_cbor::Value::Array(vec![
             serde_cbor::Value::Array(vec![
@@ -872,32 +777,43 @@ mod phase2_item_shape {
         ))
         .expect("cbor");
 
-        let item: Item = serde_cbor::from_slice(&item_bytes).expect("dual-shape read");
-        let targets = item.connections.0.get("contained:up").expect("folded");
-        assert_eq!(targets.len(), 2, "duplicate pairs must deduplicate");
-        assert!(targets.contains("gitoid:blob:sha256:t1"));
-        assert!(targets.contains("gitoid:blob:sha256:t2"));
+        let err: Result<Item, _> = serde_cbor::from_slice(&item_bytes);
+        let msg = format!("{}", err.expect_err("an Item reads ONLY the map shape"));
+        assert!(
+            msg.contains("expected a map"),
+            "the error names the expected version 4 shape: {msg}"
+        );
+        // the same bytes ARE the version 3 stream: they read as ItemV3
+        // and upgrade through the destructive From without loss
+        let v3: ItemV3 = serde_cbor::from_slice(&item_bytes).expect("the version 3 stream reads");
+        let item = Item::from(v3);
+        let targets = item.connections.get("contained:up").expect("folded");
+        assert_eq!(targets.len(), 2);
     }
 
-    /// Test 3: the legacy pair-array JSON shape deserializes (checked-in
-    /// neutral fixture).
-    ///
-    /// Requirement: D5. Theory: downstream consumers have checked-in
-    /// legacy item JSON; the dual-shape read must work for JSON exactly as
-    /// for CBOR. The fixture lives in test_data/ (never an untracked
-    /// directory) and contains duplicate pairs on purpose.
+    /// Requirement: owner directive 2026-09-30 (amending D5) — the same
+    /// strictness for JSON: the checked-in legacy-pair fixture (real
+    /// version 3-shaped item JSON) must NOT deserialize into an `Item`.
+    /// Theory: downstream consumers hold legacy item JSON; reading it
+    /// into the version 4 type would paper over the version boundary.
     #[test]
-    fn test_item_legacy_pairs_json_deserialize() {
+    fn test_item_rejects_v3_pair_shape_json() {
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/legacy_item_v3.json");
         let text = std::fs::read_to_string(fixture).expect("fixture readable");
-        let item: Item = serde_json::from_str(&text).expect("legacy JSON reads");
+        let err: Result<Item, _> = serde_json::from_str(&text);
+        let msg = format!("{}", err.expect_err("an Item reads ONLY the map shape"));
+        assert!(
+            msg.contains("expected a map"),
+            "the error names the expected version 4 shape: {msg}"
+        );
+        // the fixture IS version 3-shaped data: it reads as ItemV3
+        let v3: ItemV3 = serde_json::from_str(&text).expect("the version 3 stream reads");
+        let item = Item::from(v3);
         assert_eq!(
             item.identifier,
             "gitoid:blob:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
-        let targets = item.connections.0.get("contained:up").expect("folded");
-        assert_eq!(targets.len(), 1, "duplicate pair in fixture deduplicates");
         assert!(
             item.find_purls()
                 .contains(&"pkg:npm/example@1.0.0".to_string())
@@ -947,7 +863,7 @@ mod phase2_item_shape {
         ))
         .expect("cbor");
         let item: Item = serde_cbor::from_slice(&item_bytes).expect("reads");
-        assert!(item.connections.0.is_empty());
+        assert!(item.connections.is_empty());
     }
 
     /// Test 6: ItemV3 round-trips the legacy shape.
@@ -1002,7 +918,7 @@ mod phase2_item_shape {
                 for (t, g) in &pairs {
                     m.entry(t.clone()).or_default().insert(g.clone());
                 }
-                Connections(m)
+                m
             },
             body_mime_type: None,
             body: None,
@@ -1029,10 +945,10 @@ mod phase2_item_shape {
             ("alias:from", "pkg:npm/x@1"),
         ]);
         let merged = a.merge(b);
-        let contained = merged.connections.0.get("contained:up").expect("union");
+        let contained = merged.connections.get("contained:up").expect("union");
         assert_eq!(contained.len(), 2);
-        assert!(merged.connections.0.contains_key("tag:to"));
-        assert!(merged.connections.0.contains_key("alias:from"));
+        assert!(merged.connections.contains_key("tag:to"));
+        assert!(merged.connections.contains_key("alias:from"));
     }
 
     /// Test 9: the block-list retain removes blocked targets and keeps
@@ -1051,26 +967,27 @@ mod phase2_item_shape {
             ("tag:to", "gitoid:blob:sha256:blocked"),
         ]);
         item.connections
-            .0
             .values_mut()
             .for_each(|targets| targets.retain(|t| *t != blocked));
-        let contained = item.connections.0.get("contained:up").expect("type kept");
+        let contained = item.connections.get("contained:up").expect("type kept");
         assert!(contained.contains("gitoid:blob:sha256:keep"));
         assert!(!contained.contains(&blocked));
-        let tagged = item.connections.0.get("tag:to").expect("type kept");
+        let tagged = item.connections.get("tag:to").expect("type kept");
         assert!(
             tagged.is_empty(),
             "blocked target removed even if now empty"
         );
     }
 
-    /// Test 10: malformed legacy connections are rejected with an
-    /// entry-naming error.
+    /// Test 10: wrong-shape and malformed `connections` are rejected with
+    /// a message naming the expected version 4 shape.
     ///
-    /// Requirement: D5 (reject wrong arity, non-strings, nested arrays).
-    /// Theory: silent acceptance of malformed shapes would corrupt the
-    /// fold; errors must name the offending entry so producers can fix
-    /// their data.
+    /// Requirement: owner directive 2026-09-30 (amending D5). Theory: a
+    /// payload whose connections are not the version 4 map — the legacy
+    /// pair array in any of its malformed variants included — must fail
+    /// the `Item` deserialization; the error names the ONLY shape the
+    /// version 4 item reads, so producers see the version boundary, not
+    /// a mystery.
     #[test]
     fn test_legacy_connections_malformed_rejected() {
         // wrong arity: [["contained:up"]] (single element)
@@ -1088,8 +1005,8 @@ mod phase2_item_shape {
         let err: Result<Item, _> = serde_cbor::from_slice(&bad_arity);
         let msg = format!("{}", err.expect_err("arity must fail"));
         assert!(
-            msg.to_lowercase().contains("connection"),
-            "error must name the entry: {msg}"
+            msg.contains("expected a map"),
+            "error must name the expected version 4 shape: {msg}"
         );
 
         // non-string target: [["contained:up", 42]]
@@ -1108,8 +1025,8 @@ mod phase2_item_shape {
         let err: Result<Item, _> = serde_cbor::from_slice(&bad_target);
         let msg = format!("{}", err.expect_err("non-string target must fail"));
         assert!(
-            msg.to_lowercase().contains("connection"),
-            "error must name the entry: {msg}"
+            msg.contains("expected a map"),
+            "error must name the expected version 4 shape: {msg}"
         );
 
         // nested arrays: [[["contained:up", "t"]]]
@@ -1130,8 +1047,8 @@ mod phase2_item_shape {
         let err: Result<Item, _> = serde_cbor::from_slice(&nested);
         let msg = format!("{}", err.expect_err("nested arrays must fail"));
         assert!(
-            msg.to_lowercase().contains("connection"),
-            "error must name the entry: {msg}"
+            msg.contains("expected a map"),
+            "error must name the expected version 4 shape: {msg}"
         );
     }
 
@@ -1149,13 +1066,13 @@ mod phase2_item_shape {
             }
             let item = Item {
                 identifier: "gitoid:blob:sha256:test".to_string(),
-                connections: Connections(m.clone()),
+                connections: m.clone(),
                 body_mime_type: None,
                 body: None,
             };
             let bytes = serde_cbor::to_vec(&item).expect("ser");
             let back: Item = serde_cbor::from_slice(&bytes).expect("de");
-            prop_assert_eq!(back.connections.0, m);
+            prop_assert_eq!(back.connections, m);
         });
     }
 
@@ -1173,13 +1090,13 @@ mod phase2_item_shape {
             }
             let item = Item {
                 identifier: "gitoid:blob:sha256:test".to_string(),
-                connections: Connections(m.clone()),
+                connections: m.clone(),
                 body_mime_type: None,
                 body: None,
             };
             let v3: ItemV3 = item.to_v3();
             let back: Item = v3.into();
-            prop_assert_eq!(back.connections.0, m);
+            prop_assert_eq!(back.connections, m);
         });
     }
 
@@ -1196,25 +1113,28 @@ mod phase2_item_shape {
             };
             let item_a = Item {
                 identifier: "x".to_string(),
-                connections: Connections(fold(a.clone())),
+                connections: fold(a.clone()),
                 body_mime_type: None,
                 body: None,
             };
             let item_b = Item {
                 identifier: "x".to_string(),
-                connections: Connections(fold(b.clone())),
+                connections: fold(b.clone()),
                 body_mime_type: None,
                 body: None,
             };
             let merged = item_a.merge(item_b);
             let mut expected = fold(a);
             for (t, g) in fold(b) { expected.entry(t).or_default().extend(g); }
-            prop_assert_eq!(merged.connections.0, expected);
+            prop_assert_eq!(merged.connections, expected);
         });
     }
 
     /// Test 14: property — any ordering of the same legacy pairs yields
-    /// identical item bytes.
+    /// identical items through the version boundary: the legacy bytes
+    /// read as [`ItemV3`] (the version 3 stream's ONLY shape) and upgrade
+    /// via `From<ItemV3> for Item`; arbitrary insertion history must not
+    /// change the resulting item.
     #[test]
     fn prop_legacy_pair_deserialization_is_permutation_invariant() {
         proptest!(|(seed in any::<u64>())| {
@@ -1243,17 +1163,18 @@ mod phase2_item_shape {
                 for (t, g) in pairs { m.entry(t).or_default().insert(g); }
                 Item {
                     identifier: "gitoid:blob:sha256:test".to_string(),
-                    connections: Connections(m),
+                    connections: m,
                     body_mime_type: None,
                     body: None,
                 }
             };
             // serialize through the LEGACY shape to simulate arbitrary
-            // insertion history, then read back dual-shape
+            // insertion history, then read back through the version 3
+            // stream and upgrade
             let legacy_a = serde_cbor::to_vec(&build(pairs.clone()).to_v3()).unwrap();
             let legacy_b = serde_cbor::to_vec(&build(permuted).to_v3()).unwrap();
-            let a: Item = serde_cbor::from_slice(&legacy_a).unwrap();
-            let b: Item = serde_cbor::from_slice(&legacy_b).unwrap();
+            let a: Item = Item::from(serde_cbor::from_slice::<ItemV3>(&legacy_a).unwrap());
+            let b: Item = Item::from(serde_cbor::from_slice::<ItemV3>(&legacy_b).unwrap());
             prop_assert_eq!(a, b);
         });
     }
@@ -1272,7 +1193,7 @@ mod phase2_item_shape {
             };
             let mk = |m: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>| Item {
                 identifier: "x".to_string(),
-                connections: Connections(m),
+                connections: m,
                 body_mime_type: None,
                 body: None,
             };
@@ -1282,16 +1203,16 @@ mod phase2_item_shape {
             // commutative
             let ab: Item = ia.merge(ib.clone());
             let ba: Item = ib.merge(ia.clone());
-            prop_assert_eq!(ab.connections.0, ba.connections.0);
+            prop_assert_eq!(ab.connections, ba.connections);
 
             // associative
             let ab_c = ia.merge(ib.clone()).merge(ic.clone());
             let a_bc = ia.clone().merge(ib.merge(ic.clone()));
-            prop_assert_eq!(ab_c.connections.0, a_bc.connections.0);
+            prop_assert_eq!(ab_c.connections, a_bc.connections);
 
             // idempotent
             let aa = ia.clone().merge(ia.clone());
-            prop_assert_eq!(aa.connections.0, ia.connections.0);
+            prop_assert_eq!(aa.connections, ia.connections);
         });
     }
 }
@@ -1318,7 +1239,7 @@ mod phase4_item_format_props {
             }
             let item = Item {
                 identifier: "gitoid:blob:sha256:test".to_string(),
-                connections: Connections(m),
+                connections: m,
                 body_mime_type: None,
                 body: None,
             };
@@ -1348,7 +1269,7 @@ mod phase4_item_format_props {
             }
             let item = Item {
                 identifier: "gitoid:blob:sha256:test".to_string(),
-                connections: Connections(m),
+                connections: m,
                 body_mime_type: None,
                 body: None,
             };

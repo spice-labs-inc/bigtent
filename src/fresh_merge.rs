@@ -476,7 +476,6 @@ pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
 
                     merge_final
                         .connections
-                        .0
                         .values()
                         .flat_map(|targets| targets.iter())
                         .filter(|v| v.starts_with("pkg:"))
@@ -517,11 +516,14 @@ pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
                         to_merge.pop().unwrap()
                     } else if all_same {
                         let mut file_size = 0;
-                        let mut connections = crate::item::Connections::default();
+                        let mut connections: std::collections::BTreeMap<
+                            String,
+                            std::collections::BTreeSet<String>,
+                        > = Default::default();
                         let mut bodies = Vec::with_capacity(to_merge.len());
                         for item in to_merge {
-                            for (edge_type, targets) in item.connections.0 {
-                                connections.0.entry(edge_type).or_default().extend(targets);
+                            for (edge_type, targets) in item.connections {
+                                connections.entry(edge_type).or_default().extend(targets);
                             }
 
                             let body: ItemMetaData = from_value(item.body.unwrap()).unwrap();
@@ -575,7 +577,6 @@ pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
                 };
 
                 top.connections
-                    .0
                     .values_mut()
                     .for_each(|targets| targets.retain(|target| !block_list.contains(target)));
 
@@ -597,14 +598,14 @@ pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
                     info!(
                         "Large Merge of {} with {} connections took {:?}",
                         top.identifier,
-                        top.connections.0.len(),
+                        top.connections.len(),
                         delta
                     );
-                } else if top.connections.0.len() > 500_000 {
+                } else if top.connections.len() > 500_000 {
                     info!(
                         "Large Item {} has {} connections",
                         top.identifier,
-                        top.connections.0.len()
+                        top.connections.len()
                     );
                 }
 
@@ -1030,7 +1031,7 @@ mod tests {
     fn make_item(identifier: &str) -> Item {
         Item {
             identifier: identifier.to_string(),
-            connections: crate::item::Connections::default(),
+            connections: Default::default(),
             body_mime_type: None,
             body: None,
         }
@@ -1177,17 +1178,15 @@ mod tests {
         fn make_connected_item(identifier: &str, targets: &[&str]) -> Item {
             Item {
                 identifier: identifier.to_string(),
-                connections: crate::item::Connections(
-                    [(
-                        CONTAINS.to_string(),
-                        targets
-                            .iter()
-                            .map(|t| t.to_string())
-                            .collect::<std::collections::BTreeSet<_>>(),
-                    )]
-                    .into_iter()
-                    .collect(),
-                ),
+                connections: [(
+                    CONTAINS.to_string(),
+                    targets
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<std::collections::BTreeSet<_>>(),
+                )]
+                .into_iter()
+                .collect(),
                 body_mime_type: None,
                 body: None,
             }
@@ -1250,7 +1249,6 @@ mod tests {
         assert!(
             !kept_a
                 .connections
-                .0
                 .values()
                 .flatten()
                 .any(|target| target == blocked),
@@ -1360,6 +1358,13 @@ pub(crate) mod phase3_merge_tests {
         crate::rodeo::convert::phase3_tests::merge_hook_guard()
     }
 
+    /// The per-test session root (known `bigtent-test-` prefix, random
+    /// name, wholly cleaned on drop): all filesystem work and assertions
+    /// stay inside it — see `phase3_tests::session_root`.
+    fn session_root() -> tempfile::TempDir {
+        crate::rodeo::convert::phase3_tests::session_root()
+    }
+
     fn map_item(identifier: &str, edge: &str, targets: &[&str]) -> Item {
         let mut t = std::collections::BTreeSet::new();
         for x in targets {
@@ -1371,7 +1376,7 @@ pub(crate) mod phase3_merge_tests {
         }
         Item {
             identifier: identifier.to_string(),
-            connections: crate::item::Connections(m),
+            connections: m,
             body_mime_type: Some(ITEM_METADATA_MIME_TYPE.to_string()),
             // a valid ItemMetaData body (the merge deserializes it when
             // duplicate groups merge)
@@ -1499,7 +1504,6 @@ pub(crate) mod phase3_merge_tests {
             .expect("the shared identifier resolves in the output");
         let targets: Vec<&String> = merged
             .connections
-            .0
             .get("contained:up")
             .map(|s| s.iter().collect())
             .unwrap();
@@ -1507,7 +1511,6 @@ pub(crate) mod phase3_merge_tests {
         assert!(
             merged
                 .connections
-                .0
                 .get("contained:up")
                 .unwrap()
                 .contains("gitoid:blob:sha256:t1")
@@ -1515,7 +1518,6 @@ pub(crate) mod phase3_merge_tests {
         assert!(
             merged
                 .connections
-                .0
                 .get("contained:up")
                 .unwrap()
                 .contains("gitoid:blob:sha256:t2")
@@ -1625,7 +1627,7 @@ pub(crate) mod phase3_merge_tests {
         let merged = cluster
             .item_for_identifier(shared)
             .expect("shared resolves");
-        let targets = merged.connections.0.get("contained:up").unwrap();
+        let targets = merged.connections.get("contained:up").unwrap();
         assert_eq!(targets.len(), 2);
         assert!(targets.contains("gitoid:blob:sha256:from_a"));
         assert!(targets.contains("gitoid:blob:sha256:from_b"));
@@ -1795,7 +1797,7 @@ pub(crate) mod phase3_merge_tests {
             .item_for_identifier("gitoid:blob:sha256:v3_keep")
             .expect("v3 kept item present");
         assert!(
-            kept.connections.0.values().flatten().all(|t| t != blocked),
+            kept.connections.values().flatten().all(|t| t != blocked),
             "blocked targets removed from kept items"
         );
         assert!(
@@ -1807,9 +1809,40 @@ pub(crate) mod phase3_merge_tests {
     }
 
     /// Tests 12/15: cleanup on success and explicit roots preserved.
+    ///
+    /// Requirement (phase 3, tests 12 & 15): a successful merge removes
+    /// its per-run directories and never deletes an explicit temp root.
+    /// Theory: the run dir under a caller-supplied root is a tempfile
+    /// TempDir, so its Drop (success AND failure) empties the root while
+    /// the root itself survives; the DEFAULT root is likewise a tempfile
+    /// TempDir whose whole-directory Drop IS the cleanup, so there is
+    /// nothing to observe outside this test's own session root. All work
+    /// and all assertions stay strictly inside this test's
+    /// `bigtent-test-` prefixed session directory: scanning the shared
+    /// top-level system temp dir (as this test once did) made the verdict
+    /// depend on global state — stale `bigtent-merge-*` dirs from a killed
+    /// earlier run, or live ones from a concurrent run or a sibling test
+    /// thread, failed the assertion with no merge defect present.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_merge_temp_dir_cleaned_on_success() {
         let _hooks = hook();
+        let session = session_root();
+        let explicit_root = session.path().join("explicit_scratch");
+        std::fs::create_dir(&explicit_root).unwrap();
+        // the explicit root must satisfy the production ownership
+        // contract (private to the effective user) regardless of the
+        // ambient umask — the merge correctly rejects group-writable
+        // roots, so the test creates its own root 0700 explicitly
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&explicit_root, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        let dest = session.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+
         let (v3_member, _d) = v3_member(
             "v3src",
             &[map_item(
@@ -1829,15 +1862,10 @@ pub(crate) mod phase3_merge_tests {
             serde_json::Value::Null,
         ));
 
-        let base = tempfile::TempDir::new().unwrap();
-        let explicit_root = base.path().join("explicit_scratch");
-        std::fs::create_dir(&explicit_root).unwrap();
-
-        let dest = tempfile::TempDir::new().unwrap();
         merge_fresh_with_options(
             vec![v3_member, v4_member],
             1_000,
-            dest.path(),
+            &dest,
             Arc::new(HashSet::new()),
             Arc::new(AtomicBool::new(true)),
             1,
@@ -1866,9 +1894,11 @@ pub(crate) mod phase3_merge_tests {
             leftovers
         );
 
-        // and with the default root: no bigtent-merge-* dirs remain at all
-        let system_temp = std::env::temp_dir();
-        let stragglers: Vec<_> = std::fs::read_dir(&system_temp)
+        // and by name: no `bigtent-merge-*` run dirs survive under the
+        // explicit root — the same cleanup contract the default root gets
+        // wholesale from its TempDir Drop, observed strictly inside the
+        // session root without ever reading the shared top-level temp dir
+        let run_stragglers: Vec<_> = std::fs::read_dir(&explicit_root)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
@@ -1879,9 +1909,9 @@ pub(crate) mod phase3_merge_tests {
             })
             .collect();
         assert!(
-            stragglers.is_empty(),
-            "no bigtent-merge-* directories survive a successful merge: {:?}",
-            stragglers
+            run_stragglers.is_empty(),
+            "no bigtent-merge-* run dirs survive a successful merge: {:?}",
+            run_stragglers
         );
     }
 
@@ -1985,8 +2015,15 @@ pub(crate) mod phase3_merge_tests {
             cluster.number_of_items() >= 200,
             "all items survive (merged duplicate groups only reduce)"
         );
+        // the fd count is PROCESS-GLOBAL and the test runs concurrently
+        // with siblings: a sibling test starting its own tokio runtime
+        // between the two samples shifts the count by that runtime's
+        // epoll/eventfd descriptors (a handful each). The LEAK signal is
+        // chunk-scale — a 100-chunk merge leaking even one descriptor per
+        // chunk adds ~100 — so the slop sits far above sibling noise
+        // while still catching any per-chunk leak.
         assert!(
-            after <= before + 8,
+            after <= before + 64,
             "the merge must not leak descriptors: before={before} after={after}"
         );
     }
@@ -2080,7 +2117,7 @@ pub(crate) mod phase3_merge_tests {
             }
             items.push(Item {
                 identifier: id,
-                connections: crate::item::Connections(connections),
+                connections: connections,
                 body_mime_type: Some(ITEM_METADATA_MIME_TYPE.to_string()),
                 body: Some(serde_cbor::Value::Map(Default::default())),
             });

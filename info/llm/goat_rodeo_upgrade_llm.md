@@ -44,7 +44,7 @@ requires data envelope 2. The `.gri` envelope version is unchanged (1).
 | readers follow the declared algorithm | `test_reader_follows_declared_algorithm` |
 | BLAKE3[0..16] derivation correct at 4 input lengths | `test_blake3_known_answer_vectors` |
 | on-disk entry stride 32 with real keys | `test_on_disk_index_entry_is_32_bytes` |
-| dual-shape reading | `test_item_legacy_pairs_cbor_deserialize`, `test_item_missing_connections_field_is_empty_map` |
+| version-scoped reading: `Item` reads only the v4 map; the v3 stream reads `ItemV3` only and upgrades | `test_item_rejects_v3_pair_shape_cbor`, `test_item_rejects_v3_pair_shape_json`, `test_item_missing_connections_field_is_empty_map` |
 | v4 round trip | `test_item_v4_cbor_round_trip` |
 | externally assembled bytes interop | `test_hand_assembled_v4_cluster_golden_bytes` |
 | checked-in v4 fixtures resolve | `test_checked_in_v4_fixtures_load` |

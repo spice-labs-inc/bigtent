@@ -250,8 +250,7 @@ async fn test_purls_and_merge() {
         .expect("Should get tags from option");
     let tagged: Vec<String> = tags
         .connections
-        .0
-        .iter()
+                .iter()
         .filter(|(edge_type, _)| edge_type.is_tag_to())
         .flat_map(|(_, targets)| targets.iter().cloned())
         .collect();

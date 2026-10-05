@@ -97,7 +97,10 @@ impl SyntheticItemGenerator {
         let gitoid = format!("gitoid:blob:sha256:{:016x}", idx);
         let file_size = rng.random_range(100..10000);
 
-        let mut connections = crate::item::Connections::default();
+        let mut connections: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<String>,
+        > = Default::default();
 
         // Add some random connections
         let num_connections = rng.random_range(0..5);
@@ -107,13 +110,11 @@ impl SyntheticItemGenerator {
                 let target = format!("gitoid:blob:sha256:{:016x}", target_idx);
                 if rng.random_bool(0.5) {
                     connections
-                        .0
                         .entry(CONTAINS.to_string())
                         .or_default()
                         .insert(target);
                 } else {
                     connections
-                        .0
                         .entry(CONTAINED_BY.to_string())
                         .or_default()
                         .insert(target);
@@ -133,7 +134,6 @@ impl SyntheticItemGenerator {
                 format!("pkg:maven/org.example{}@{}.{}", idx % 100, major, minor)
             };
             connections
-                .0
                 .entry("alias:from".to_string())
                 .or_default()
                 .insert(purl);

@@ -23,6 +23,9 @@ benches/baselines/reports/
 benches/target/
 
 # Temporary workspace for spikes and exploration (not committed)
+# The migration handoff directory (per plan: workspace/ is not checked in;
+# it holds the downstream change description, which is exempt from the
+# naming rule)
 /workspace/
 
 # Core dumps from crashed test binaries (never commit)
