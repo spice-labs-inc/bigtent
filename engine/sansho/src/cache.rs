@@ -1,4 +1,4 @@
-//! The compiled-program cache (SPEC-0001 §5.4).
+//! The compiled-program cache.
 //!
 //! Keyed by the canonicalized expression text plus the engine version;
 //! least-recently-used eviction; process-local (no disk persistence).
@@ -6,6 +6,7 @@
 //! program and a freshly compiled program must behave identically —
 //! tested by property.
 
+use crate::ast::Expr;
 use crate::error::SanshoError;
 use crate::program::{Program, compile};
 use std::collections::HashMap;
@@ -35,13 +36,11 @@ struct CacheKey {
 }
 
 impl CacheKey {
-    fn of(expression: &str) -> Result<Self, SanshoError> {
-        let parsed = crate::parser::parse(expression)?;
-        let canonical = crate::canonical(&parsed);
-        Ok(CacheKey {
-            canonical,
+    fn of_expr(expr: &Expr) -> Self {
+        CacheKey {
+            canonical: crate::canonical(expr),
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        })
+        }
     }
 }
 
@@ -64,32 +63,42 @@ impl ProgramCache {
     /// are NOT cached (a corrected expression should not pay for its
     /// predecessor's failure; the error rate would pollute the cache).
     pub fn compile_cached(&self, expression: &str) -> Result<Arc<Program>, SanshoError> {
-        let key = CacheKey::of(expression)?;
+        compile(&crate::parser::parse(expression)?, Some(self))
+    }
+
+    /// Fetch the cached program for a parsed expression, touching it as
+    /// most-recently-used; counts the hit.
+    pub(crate) fn get(&self, expr: &Expr) -> Option<Arc<Program>> {
+        let key = CacheKey::of_expr(expr);
         let mut inner = self.inner.lock().expect("cache lock");
         if inner.entries.contains_key(&key) {
             let program = inner.entries.get(&key).expect("checked").clone();
             inner.hits += 1;
-            // touch: move to the most-recently-used end
             inner.order.retain(|k| k != &key);
             inner.order.push(key);
-            return Ok(program);
+            return Some(program);
         }
+        None
+    }
+
+    /// Insert a freshly compiled program (counting the miss), evicting
+    /// least-recently-used entries while over the bound.
+    pub(crate) fn put(&self, expr: &Expr, program: Arc<Program>) {
+        let key = CacheKey::of_expr(expr);
+        let mut inner = self.inner.lock().expect("cache lock");
         inner.misses += 1;
-        let parsed = crate::parser::parse(expression)?;
-        let program = Arc::new(compile(&parsed)?);
-        // evict while over the bound (LRU first)
         while inner.entries.len() >= inner.max_entries {
-            if let Some(oldest) = inner.order.first().cloned() {
-                inner.entries.remove(&oldest);
-                inner.order.remove(0);
-                inner.evictions += 1;
-            } else {
-                break;
+            match inner.order.first().cloned() {
+                Some(oldest) => {
+                    inner.entries.remove(&oldest);
+                    inner.order.remove(0);
+                    inner.evictions += 1;
+                }
+                None => break,
             }
         }
-        inner.entries.insert(key.clone(), program.clone());
+        inner.entries.insert(key.clone(), program);
         inner.order.push(key);
-        Ok(program)
     }
 
     /// The cache's statistics: (hits, misses, evictions, entries).
@@ -108,7 +117,7 @@ impl ProgramCache {
 mod tests {
     use super::*;
 
-    // Requirement: SPEC-0001 §5.4 — a cached program and a freshly
+    // Requirement: a cached program and a freshly
     // compiled program must behave identically, INCLUDING across
     // eviction (a recompiled program after eviction behaves
     // identically). What: property test — generated expressions evaluate
@@ -120,7 +129,6 @@ mod tests {
     // evaluation through the cache matches the fresh-program evaluation.
     #[test]
     fn cache_hit_identity_including_eviction() {
-        use crate::eval::evaluate_json;
         let cache = ProgramCache::new(4);
         let expressions = [
             "a.b",
@@ -147,10 +155,12 @@ mod tests {
                 // construction and hit nothing)
                 let _ = cache.compile_cached(expression).expect("compiles");
                 let cached = cache.compile_cached(expression).expect("compiles");
-                let via_cache = evaluate_json(&cached, &document);
+                let via_cache = crate::evaluate(&cached, &document)
+                    .and_then(|value| crate::materialize(&value));
                 let parsed = crate::parser::parse(expression).unwrap();
-                let fresh = crate::program::compile(&parsed).unwrap();
-                let via_fresh = evaluate_json(&fresh, &document);
+                let fresh = crate::program::compile(&parsed, None).unwrap();
+                let via_fresh =
+                    crate::evaluate(&fresh, &document).and_then(|value| crate::materialize(&value));
                 let same = match (via_cache, via_fresh) {
                     (Ok(a), Ok(b)) => a == b,
                     (Err(a), Err(b)) => a.category() == b.category(),
@@ -167,7 +177,7 @@ mod tests {
         assert!(evictions > 0, "the tiny cache must have evicted");
     }
 
-    // Requirement: SPEC-0001 §5.4 — the key is the canonical form:
+    // Requirement: the key is the canonical form:
     // insignificant-whitespace variants SHARE a cache entry; expressions
     // of different meaning NEVER do (the negative property). What: the
     // hit/miss pattern over the pair classes. Why: false sharing returns
@@ -189,7 +199,7 @@ mod tests {
         assert_eq!(entries, 2, "distinct meanings are distinct entries");
     }
 
-    // Requirement: SPEC-0001 §5.4 — compile errors are not cached.
+    // Requirement: compile errors are not cached.
     // What: an invalid expression's error repeats on retry (and the
     // corrected expression compiles cleanly after). Why: the cache would
     // otherwise pin failures.

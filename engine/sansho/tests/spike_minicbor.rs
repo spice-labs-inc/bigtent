@@ -1,5 +1,5 @@
-//! The spike: probe minicbor's API for everything the cursor backend
-//! needs. This test is the Phase 3 spike's record — it proves the
+//! Probe minicbor's API for everything the byte source needs. This test
+//! proves the
 //! decoder supports single-pass consumption with position control,
 //! zero-copy string access, skip, container iteration, and indefinite-
 //! length detection BEFORE the backend is built on top of it.
@@ -59,8 +59,8 @@ fn minicbor_supports_the_cursor_surface() {
         enc.begin_array().unwrap();
         enc.u8(1).unwrap();
         enc.end().unwrap();
-        let buf = enc.into_writer();
-        buf
+        
+        enc.into_writer()
     };
     let mut indef_decoder = Decoder::new(&indefinite);
     assert_eq!(

@@ -1,258 +1,38 @@
-//! The CBOR-to-JSON mapping (SPEC-0001 §4, per RFC 8949 §4.2) and the
-//! item decode.
+//! The CBOR-to-JSON mapping and the item decode, over minicbor.
 //!
-//! One item = one CBOR value at a byte position. The decode is
-//! recursive over a forward-only minicbor decoder; every length and
-//! offset computation is checked (hostile headers produce input errors,
-//! never overflow); indefinite-length encodings are rejected at input;
-//! duplicate map keys resolve last-wins.
+//! One item = one CBOR value at the start of a byte slice. The decode is
+//! recursive over a forward-only minicbor decoder; indefinite-length
+//! encodings are rejected at input; duplicate map keys resolve last-wins;
+//! non-text map keys are not members (the mapping exposes text keys only).
+//!
+//! The mapping, per the trait's documented view:
+//! - byte strings (major 2) render as base64url text;
+//! - tags 2 and 3 (bignums) reduce to doubles; every other tag is an
+//!   evaluation error;
+//! - `undefined` is an evaluation error;
+//! - integers keep their full width where they fit `i64`/`u64`, and only
+//!   genuine bignums reduce to `f64`.
 
-use crate::error::SanshoError;
-use minicbor::Decoder;
-use minicbor::data::Type;
-use serde_json::Value as J;
-
-pub(crate) fn decode_document(bytes: &[u8]) -> Result<J, SanshoError> {
-    let mut decoder = Decoder::new(bytes);
-    let value = decode_item(&mut decoder, bytes)?;
-    // the input is EXACTLY one document: trailing bytes are an input
-    // error
-    if decoder.position() != bytes.len() {
-        return Err(SanshoError::Input {
-            message: format!(
-                "trailing bytes after the CBOR document: {} unexpected at position {}",
-                bytes.len() - decoder.position(),
-                decoder.position()
-            ),
-        });
-    }
-    Ok(value)
-}
-
-pub(crate) fn decode_at_position(bytes: &[u8], position: usize) -> Result<J, SanshoError> {
-    let mut decoder = Decoder::new(bytes);
-    decoder.set_position(position);
-    decode_item(&mut decoder, bytes)
-}
-
-fn input_error(position: usize, what: &str) -> SanshoError {
-    SanshoError::Input {
-        message: format!("at byte {position}: {what}"),
-    }
-}
-
-fn decode_item(decoder: &mut Decoder, bytes: &[u8]) -> Result<J, SanshoError> {
-    let position = decoder.position();
-    let kind = decoder
-        .datatype()
-        .map_err(|e| input_error(position, &format!("undecodable item: {e}")))?;
-    match kind {
-        // definite-length containers only; the indefinite forms are
-        // rejected at input per the mapping table
-        Type::Array => {
-            let len = decoder
-                .array()
-                .map_err(|e| input_error(position, &format!("array header: {e}")))?
-                .ok_or_else(|| input_error(position, "indefinite-length array"))?;
-            let mut items = Vec::new();
-            for _ in 0..len {
-                items.push(decode_item(decoder, bytes)?);
-            }
-            Ok(J::Array(items))
-        }
-        Type::Map => {
-            let len = decoder
-                .map()
-                .map_err(|e| input_error(position, &format!("map header: {e}")))?
-                .ok_or_else(|| input_error(position, "indefinite-length map"))?;
-            let mut map = serde_json::Map::new();
-            for _ in 0..len {
-                let key = decode_map_key(decoder)?;
-                let value = decode_item(decoder, bytes)?;
-                // duplicate keys resolve last-wins (the mapping table)
-                map.insert(key, value);
-            }
-            Ok(J::Object(map))
-        }
-        Type::String => {
-            let text = decoder
-                .str()
-                .map_err(|e| input_error(position, &format!("text string: {e}")))?;
-            Ok(J::String(text.to_owned()))
-        }
-        Type::Bytes => {
-            let bytes = decoder
-                .bytes()
-                .map_err(|e| input_error(position, &format!("byte string: {e}")))?;
-            Ok(J::String(base64url_encode(bytes)))
-        }
-        Type::Bool => {
-            Ok(J::Bool(decoder.bool().map_err(|e| {
-                input_error(position, &format!("boolean: {e}"))
-            })?))
-        }
-        Type::Null => {
-            decoder
-                .null()
-                .map_err(|e| input_error(position, &format!("null: {e}")))?;
-            Ok(J::Null)
-        }
-        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
-            let value = decoder
-                .u64()
-                .map_err(|e| input_error(position, &format!("unsigned: {e}")))?;
-            Ok(number_from_u64(value))
-        }
-        Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
-            let value = decoder
-                .i64()
-                .map_err(|e| input_error(position, &format!("negative integer: {e}")))?;
-            Ok(number_from_i64(value))
-        }
-        // the half-precision form: minicbor exposes no f16 accessor, so
-        // the two bytes after the 0xF9 header decode manually (IEEE 754
-        // half)
-        Type::F16 => {
-            let after_header = position + 1;
-            let raw = bytes
-                .get(after_header..after_header + 2)
-                .ok_or_else(|| input_error(position, "truncated half-float"))?;
-            let bits = u16::from_be_bytes([raw[0], raw[1]]);
-            decoder.set_position(after_header + 2);
-            Ok(number_from_f64(half_to_f64(bits)))
-        }
-        Type::F32 => {
-            let value = decoder
-                .f32()
-                .map_err(|e| input_error(position, &format!("float: {e}")))?;
-            Ok(number_from_f64(value as f64))
-        }
-        Type::F64 => {
-            let value = decoder
-                .f64()
-                .map_err(|e| input_error(position, &format!("float: {e}")))?;
-            Ok(number_from_f64(value))
-        }
-        Type::Tag => {
-            let tag = decoder
-                .tag()
-                .map_err(|e| input_error(position, &format!("tag: {e}")))?;
-            match tag.as_u64() {
-                // bignums: tags 2 (positive) and 3 (negative); the value
-                // is a big-endian byte string, reduced to a double (the
-                // documented precision loss)
-                2 | 3 => {
-                    let bytes = decoder
-                        .bytes()
-                        .map_err(|e| input_error(position, &format!("bignum: {e}")))?;
-                    bignum_to_number(bytes, tag.as_u64() == 3, position)
-                }
-                other => Err(SanshoError::Evaluation {
-                    message: format!("unsupported CBOR tag {other} at byte {position}"),
-                }),
-            }
-        }
-        // undefined has no JSON equivalent; the mapping rejects it
-        Type::Undefined => Err(SanshoError::Evaluation {
-            message: format!("CBOR undefined at byte {position} has no JSON equivalent"),
-        }),
-        // everything else (unassigned simple values, breaks, indefinite
-        // prefixes) is an input rejection
-        other => Err(input_error(
-            position,
-            &format!("unsupported CBOR type: {other:?}"),
-        )),
-    }
-}
-
-fn decode_map_key(decoder: &mut Decoder) -> Result<String, SanshoError> {
-    let position = decoder.position();
-    // keys are text strings in this mapping (the document model is JSON)
-    match decoder.datatype() {
-        Ok(Type::String) => {
-            let key = decoder
-                .str()
-                .map_err(|e| input_error(position, &format!("map key: {e}")))?;
-            Ok(key.to_owned())
-        }
-        Ok(Type::U8 | Type::U16 | Type::U32 | Type::U64) => {
-            let key = decoder
-                .u64()
-                .map_err(|e| input_error(position, &format!("map key: {e}")))?;
-            Ok(key.to_string())
-        }
-        Ok(other) => Err(input_error(
-            position,
-            &format!("map key must be a text string, found {other:?}"),
-        )),
-        Err(e) => Err(input_error(position, &format!("map key: {e}"))),
-    }
-}
-
-fn number_from_u64(value: u64) -> J {
-    // the representation stays the exact integer; the comparison-level
-    // double reduction (as_f64) is where the mapping's documented
-    // precision loss beyond the exact-double range applies (spec §4)
-    J::Number(serde_json::Number::from(value))
-}
-
-fn number_from_i64(value: i64) -> J {
-    J::Number(serde_json::Number::from(value))
-}
-
-fn number_from_f64(value: f64) -> J {
-    serde_json::Value::Number(
-        serde_json::Number::from_f64(value).unwrap_or_else(|| serde_json::Number::from(0u64)),
-    )
-}
-
-fn bignum_to_number(bytes: &[u8], negative: bool, position: usize) -> Result<J, SanshoError> {
-    if bytes.len() > 16 {
-        return Err(SanshoError::Evaluation {
-            message: format!("bignum at byte {position} exceeds 128 bits"),
-        });
-    }
-    let mut buffer = [0u8; 16];
-    buffer[16 - bytes.len()..].copy_from_slice(bytes);
-    let magnitude = u128::from_be_bytes(buffer);
-    let value = if negative {
-        magnitude
-            .checked_add(1)
-            .and_then(|m| i128::try_from(m).ok().map(|v| -v))
-            .ok_or_else(|| SanshoError::Evaluation {
-                message: format!("negative bignum at byte {position} exceeds 128 bits"),
-            })?
-    } else {
-        i128::try_from(magnitude).map_err(|_| SanshoError::Evaluation {
-            message: format!("bignum at byte {position} exceeds 128 bits"),
-        })?
-    };
-    Ok(number_from_f64(value as f64))
-}
-
-/// base64url, no padding (RFC 4648 §5, as the mapping requires).
-pub fn base64url_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[(triple >> 18) as usize & 0x3F] as char);
-        out.push(ALPHABET[(triple >> 12) as usize & 0x3F] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[(triple >> 6) as usize & 0x3F] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[triple as usize & 0x3F] as char);
-        }
-    }
-    out
-}
-
+// use crate::error::SanshoError;
+// use crate::view::SanshoNumber;
+// use minicbor::Decoder;
+// use minicbor::data::Type;
+// use serde_json::Value as J;
+//
+// fn input_error(position: usize, what: &str) -> SanshoError {
+//     SanshoError::Input {
+//         message: format!("at byte {position}: {what}"),
+//     }
+// }
+//
+// fn evaluation_error(position: usize, what: &str) -> SanshoError {
+//     SanshoError::Evaluation {
+//         message: format!("at byte {position}: {what}"),
+//     }
+// }
+//
 /// IEEE 754 half-precision to double.
-fn half_to_f64(bits: u16) -> f64 {
+pub(crate) fn half_to_f64(bits: u16) -> f64 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exponent = ((bits >> 10) & 0x1F) as i32;
     let mantissa = (bits & 0x03FF) as f64;
@@ -273,4 +53,230 @@ fn half_to_f64(bits: u16) -> f64 {
         }
         e => sign * (1.0 + mantissa / 1024.0) * (2.0f64).powi(e - 15),
     }
+}
+//
+// /// RFC 4648 §5 base64url: the URL-safe alphabet, `=`-padded to a multiple
+// /// of four. The engine's only byte-string encoder, so the byte source and
+// /// every other backend render byte strings identically.
+// pub fn base64url_encode(bytes: &[u8]) -> String {
+//     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+//     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+//     for chunk in bytes.chunks(3) {
+//         let b0 = chunk[0] as u32;
+//         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+//         let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+//         let n = (b0 << 16) | (b1 << 8) | b2;
+//         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+//         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+//         if chunk.len() > 1 {
+//             out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+//         } else {
+//             out.push('=');
+//         }
+//         if chunk.len() > 2 {
+//             out.push(ALPHABET[(n & 0x3F) as usize] as char);
+//         } else {
+//             out.push('=');
+//         }
+//     }
+//     out
+// }
+//
+// /// A full-width number as a JSON number: the exact `i64`/`u64` where it
+// /// fits, `f64` otherwise (a genuine bignum).
+// ///
+// /// The mapping's number coercion: JSON has no infinity or NaN, so a
+// /// non-finite float renders as `0`. `-0.0` is finite and survives.
+// fn number_to_json(number: SanshoNumber) -> J {
+//     let value = match number {
+//         SanshoNumber::I64(v) => Some(serde_json::Number::from(v)),
+//         SanshoNumber::U64(v) => Some(serde_json::Number::from(v)),
+//         SanshoNumber::F64(v) => {
+//             if v.is_finite() {
+//                 serde_json::Number::from_f64(v)
+//             } else {
+//                 // the coercion yields the integer zero: JSON has no
+//                 // infinity or NaN, and 0 is the pinned rendering
+//                 Some(serde_json::Number::from(0))
+//             }
+//         }
+//     };
+//     value.map(J::Number).unwrap_or(J::Null)
+// }
+//
+// /// The big-endian magnitude of a bignum's bytes as a double. Tags 2 and 3
+// /// are the bignum encodings; beyond `u64` the value necessarily reduces.
+// fn bignum_to_f64(magnitude: &[u8]) -> f64 {
+//     magnitude
+//         .iter()
+//         .fold(0.0, |acc, byte| acc * 256.0 + *byte as f64)
+// }
+//
+// /// One CBOR item at the decoder's current position, as its JSON view.
+// fn decode_item(decoder: &mut Decoder<'_>) -> Result<J, SanshoError> {
+//     let at = decoder.position();
+//     let datatype = decoder
+//         .datatype()
+//         .map_err(|error| input_error(at, &error.to_string()))?;
+//     match datatype {
+//         Type::Null => {
+//             decoder
+//                 .skip()
+//                 .map_err(|error| input_error(at, &error.to_string()))?;
+//             Ok(J::Null)
+//         }
+//         Type::Undefined => Err(evaluation_error(at, "CBOR undefined is not a value")),
+//         Type::Bool => decoder
+//             .bool()
+//             .map(J::Bool)
+//             .map_err(|error| input_error(at, &error.to_string())),
+//         Type::U8 | Type::U16 | Type::U32 | Type::U64 => decoder
+//             .u64()
+//             .map(|value| number_to_json(SanshoNumber::U64(value)))
+//             .map_err(|error| input_error(at, &error.to_string())),
+//         Type::I8 | Type::I16 | Type::I32 | Type::I64 => decoder
+//             .i64()
+//             .map(|value| number_to_json(SanshoNumber::I64(value)))
+//             .map_err(|error| input_error(at, &error.to_string())),
+//         Type::Int => decoder
+//             .int()
+//             .map(|value| number_to_json(SanshoNumber::from_i128(i128::from(value))))
+//             .map_err(|error| input_error(at, &error.to_string())),
+//         Type::F16 => {
+//             // the half-precision reader is behind minicbor's `half`
+//             // feature; the two payload bytes are read in place instead
+//             let payload = decoder
+//                 .input()
+//                 .get(at + 1..at + 3)
+//                 .ok_or_else(|| input_error(at, "truncated half-precision float"))?;
+//             let bits = u16::from_be_bytes([payload[0], payload[1]]);
+//             decoder.set_position(at + 3);
+//             Ok(number_to_json(SanshoNumber::F64(half_to_f64(bits))))
+//         }
+//         Type::F32 => decoder
+//             .f32()
+//             .map(|value| number_to_json(SanshoNumber::F64(value as f64)))
+//             .map_err(|error| input_error(at, &error.to_string())),
+//         Type::F64 => decoder
+//             .f64()
+//             .map(|value| number_to_json(SanshoNumber::F64(value)))
+//             .map_err(|error| input_error(at, &error.to_string())),
+//         Type::Bytes => decoder
+//             .bytes()
+//             .map(|bytes| J::String(base64url_encode(bytes)))
+//             .map_err(|error| input_error(at, &error.to_string())),
+//         Type::String => decoder
+//             .str()
+//             .map(|text| J::String(text.to_string()))
+//             .map_err(|error| input_error(at, &error.to_string())),
+//         Type::Array => {
+//             let count = decoder
+//                 .array()
+//                 .map_err(|error| input_error(at, &error.to_string()))?
+//                 .ok_or_else(|| input_error(at, "indefinite-length array"))?;
+//             let mut items = Vec::with_capacity(count.min(1024) as usize);
+//             for _ in 0..count {
+//                 items.push(decode_item(decoder)?);
+//             }
+//             Ok(J::Array(items))
+//         }
+//         Type::Map => {
+//             let count = decoder
+//                 .map()
+//                 .map_err(|error| input_error(at, &error.to_string()))?
+//                 .ok_or_else(|| input_error(at, "indefinite-length map"))?;
+//             let mut object = serde_json::Map::new();
+//             for _ in 0..count {
+//                 // a non-text key is not a MEMBER (navigation drops it),
+//                 // but the boundary materialization renders it as its JSON
+//                 // text: an integer key 1 becomes the key "1"
+//                 let key = match decoder.datatype() {
+//                     Ok(Type::String) => decoder
+//                         .str()
+//                         .map_err(|error| input_error(at, &error.to_string()))?
+//                         .to_string(),
+//                     _ => match decode_item(decoder)? {
+//                         J::String(text) => text,
+//                         other => other.to_string(),
+//                     },
+//                 };
+//                 let value = decode_item(decoder)?;
+//                 // duplicate keys resolve last-wins
+//                 object.insert(key, value);
+//             }
+//             Ok(J::Object(object))
+//         }
+//         Type::Tag => {
+//             let tag = decoder
+//                 .tag()
+//                 .map_err(|error| input_error(at, &error.to_string()))?;
+//             let number = tag.as_u64();
+//             match number {
+//                 2 | 3 => {
+//                     let magnitude = decoder
+//                         .bytes()
+//                         .map_err(|error| input_error(at, &error.to_string()))?;
+//                     let value = bignum_to_f64(magnitude);
+//                     let value = if number == 3 { -(value + 1.0) } else { value };
+//                     Ok(number_to_json(SanshoNumber::F64(value)))
+//                 }
+//                 other => Err(evaluation_error(at, &format!("CBOR tag {other} is not a value"))),
+//             }
+//         }
+//         Type::BytesIndef | Type::StringIndef | Type::ArrayIndef | Type::MapIndef => {
+//             Err(input_error(at, "indefinite-length encoding"))
+//         }
+//         Type::Break => Err(input_error(at, "unexpected break")),
+//         // the simple values outside the standard set, and unknown headers,
+//         // carry no JSON meaning: null, matching the kind probe
+//         Type::Simple | Type::Unknown(_) => {
+//             decoder
+//                 .skip()
+//                 .map_err(|error| input_error(at, &error.to_string()))?;
+//             Ok(J::Null)
+//         }
+//     }
+// }
+//
+// /// The JSON view of ONE CBOR document: the item at the start of `bytes`,
+// /// with the exactly-one-document contract — trailing bytes are an input
+// /// error. A member's subslice ends at its own extent, so the same rule
+// /// holds uniformly for the root and for every member.
+// pub fn cbor_to_json(bytes: &[u8]) -> Result<J, SanshoError> {
+//     let mut decoder = Decoder::new(bytes);
+//     let value = decode_item(&mut decoder)?;
+//     if decoder.position() != bytes.len() {
+//         return Err(input_error(
+//             decoder.position(),
+//             "trailing bytes after the document",
+//         ));
+//     }
+//     Ok(value)
+// }
+
+/// RFC 4648 §5 base64url: the URL-safe alphabet, `=`-padded to a multiple of
+/// four. The engine's only byte-string rendering — the one place octets
+/// become text, used by the materialization boundary and by nothing else.
+pub fn base64url_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }

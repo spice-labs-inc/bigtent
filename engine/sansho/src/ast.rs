@@ -4,7 +4,7 @@
 //! The canonical form is a deterministic re-serialization of the syntax
 //! tree: no insignificant whitespace, fixed operator spellings, minimal
 //! quoting for identifiers, and literals re-serialized from their parsed
-//! JSON values. It is the cache key's input (SPEC-0001 §5.4), so it must
+//! JSON values. It is the cache key's input, so it must
 //! be a fixed point under re-parsing and must not collide across
 //! expressions of different meaning — both are tested here.
 
@@ -124,7 +124,7 @@ pub fn canonical_literal(value: &J) -> String {
     format!("`{}`", json.replace('`', "\\`"))
 }
 
-/// The canonical form of an expression (SPEC-0001 §5.4).
+/// The canonical form of an expression.
 pub fn canonical(expr: &Expr) -> String {
     let mut out = String::new();
     render(expr, &mut out);

@@ -36,8 +36,8 @@ fn build_item(entries: usize) -> J {
     })
 }
 
-// Requirement: the comparison benchmarks' validity premise (the plan's
-// Phase 6 extension, the owner's request). What: for two sizes and four
+// Requirement: the comparison benchmarks' validity premise. What: for
+// two sizes and four
 // expressions, all three paths produce IDENTICAL results. Why: the
 // timings are only meaningful if they measure the same computation.
 //
@@ -67,10 +67,12 @@ fn path_outputs_agree() {
                 .unwrap_or_else(|e| panic!("{expression}: jmespath output: {e}"));
 
             let parsed_value: J = serde_cbor::from_slice(&bytes).unwrap();
-            let program = sansho::compile(&sansho::parse(expression).unwrap()).unwrap();
-            let via_materialized = sansho::evaluate_json(&program, &parsed_value)
+            let program = sansho::compile(&sansho::parse(expression).unwrap(), None).unwrap();
+            let via_materialized = sansho::evaluate(&program, &parsed_value)
+                .and_then(|value| sansho::materialize(&value))
                 .unwrap_or_else(|e| panic!("{expression}: sansho materialized: {e}"));
-            let via_cursor = sansho::evaluate_cbor(&program, &bytes)
+            let via_cursor = sansho::evaluate(&program, bytes.as_slice())
+                .and_then(|value| sansho::materialize(&value))
                 .unwrap_or_else(|e| panic!("{expression}: sansho cursor: {e}"));
 
             let canonical_a = canonicalize(&via_jmespath);
@@ -98,20 +100,18 @@ fn canonicalize(value: &J) -> String {
             keys.sort();
             let body: Vec<String> = keys
                 .iter()
-                .map(|k| {
-                    format!(
-                        "{}:{}",
-                        k,
-                        canonicalize(map.get(*k).unwrap())
-                    )
-                })
+                .map(|k| format!("{}:{}", k, canonicalize(map.get(*k).unwrap())))
                 .collect();
             format!("{{{}}}", body.join(","))
         }
         J::Array(items) => {
             format!(
                 "[{}]",
-                items.iter().map(canonicalize).collect::<Vec<String>>().join(",")
+                items
+                    .iter()
+                    .map(canonicalize)
+                    .collect::<Vec<String>>()
+                    .join(",")
             )
         }
         other => other.to_string(),

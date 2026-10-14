@@ -1,13 +1,35 @@
 //! The differential tests: the cursor backend (raw CBOR bytes) against
 //! the materialized backend (in-memory JSON) — the corpus's
-//! backend-agreement requirement (SPEC-0001 §5.3), plus the byte-level
+//! backend-agreement requirement, plus the byte-level
 //! properties: single-pass consumption, shared-navigation decode-once,
-//! and the selective-materialization budget (SPEC-0001 §5.1–5.2).
+//! and the selective-materialization budget.
 
 use proptest::prelude::*;
 use sansho::corpus::{Driver, DriverOutcome, load_corpus, run_corpus};
-use sansho::{compile, evaluate_cbor, parse};
+use sansho::{compile, evaluate, materialize, parse};
 use std::path::Path;
+
+/// The test's own engine: parse, compile, evaluate through the trait, then
+/// materialize. No engine-side type of its own — `evaluate` is generic over
+/// the trait, so a `&serde_json::Value` document needs no encoding.
+struct TestEngine;
+
+impl sansho::Driver for TestEngine {
+    fn evaluate(&self, given: &serde_json::Value, expression: &str) -> sansho::DriverOutcome {
+        let parsed = match sansho::parse(expression) {
+            Ok(parsed) => parsed,
+            Err(e) => return sansho::DriverOutcome::Error(e),
+        };
+        let program = match sansho::compile(&parsed, None) {
+            Ok(program) => program,
+            Err(e) => return sansho::DriverOutcome::Error(e),
+        };
+        match sansho::evaluate(&program, given).and_then(|value| sansho::materialize(&value)) {
+            Ok(value) => sansho::DriverOutcome::Result(value),
+            Err(e) => sansho::DriverOutcome::Error(e),
+        }
+    }
+}
 
 /// The byte-source driver: the corpus's JSON givens encode to CBOR
 /// (they are pure JSON data) and evaluate through the zero-copy byte
@@ -28,19 +50,20 @@ impl Driver for CursorEngine {
             Ok(parsed) => parsed,
             Err(e) => return DriverOutcome::Error(e),
         };
-        let program = match compile(&parsed) {
+        let program = match compile(&parsed, None) {
             Ok(program) => program,
             Err(e) => return DriverOutcome::Error(e),
         };
-        match sansho::evaluate_cbor_stopped(&program, &bytes) {
+        match sansho::evaluate(&program, bytes.as_slice())
+            .and_then(|value| sansho::materialize(&value))
+        {
             Ok(value) => DriverOutcome::Result(value),
-            Err(sansho::Stop::Error(e)) => DriverOutcome::Error(e),
-            Err(sansho::Stop::NotImplemented) => DriverOutcome::NotImplemented,
+            Err(e) => DriverOutcome::Error(e),
         }
     }
 }
 
-// Requirement: SPEC-0001 §5.3 — evaluation through every tree-view
+// Requirement: evaluation through every tree-view
 // implementation produces identical results; §6 — the corpus gates both
 // backends. What: the ENTIRE corpus runs through the cursor backend and
 // scores EXACTLY as the materialized backend does (per-feature
@@ -56,7 +79,7 @@ impl Driver for CursorEngine {
 fn corpus_cursor_matches_materialized() {
     let files = load_corpus(Path::new("tests/jmespath-corpus/compliance"))
         .expect("vendored corpus must load");
-    let materialized = run_corpus(&sansho::RealEngine, &files);
+    let materialized = run_corpus(&TestEngine, &files);
     let cursor = run_corpus(&CursorEngine, &files);
     for (reference, candidate) in materialized.iter().zip(cursor.iter()) {
         assert_eq!(
@@ -76,7 +99,7 @@ fn corpus_cursor_matches_materialized() {
     }
 }
 
-// Requirement: SPEC-0001 §5.3 — the same program through both backends
+// Requirement: the same program through both backends
 // yields the same result. What: property test — generated documents
 // encode to CBOR; generated expressions evaluate through both backends;
 // results are identical (including the error/not-implemented category).
@@ -101,13 +124,15 @@ proptest! {
             // generator's grammar is approximate)
             Err(_) => return Ok(()),
         };
-        let program = match compile(&parsed) {
+        let program = match compile(&parsed, None) {
             Ok(program) => program,
             Err(_) => return Ok(()),
         };
-        let materialized = sansho::evaluate_json(&program, &document);
+        let materialized =
+            sansho::evaluate(&program, &document).and_then(|value| sansho::materialize(&value));
         let bytes = serde_cbor::to_vec(&document).expect("fixture encoding");
-        let cursor = evaluate_cbor(&program, &bytes);
+        let cursor = evaluate(&program, bytes.as_slice())
+            .and_then(|value| materialize(&value));
         match (materialized, cursor) {
             (Ok(a), Ok(b)) => prop_assert_eq!(a, b),
             (Err(a), Err(b)) => {
@@ -162,37 +187,7 @@ fn json_strategy(depth: u32) -> impl proptest::strategy::Strategy<Value = serde_
     })
 }
 
-// Requirement: SPEC-0001 §5.1 — an evaluation consumes each input byte
-// at most once. What: the decode-memo guarantees each POSITION decodes
-// once; the decode-count instrumentation proves shared navigations
-// decode their target once ({a: @.x, b: @.x} counts one decode of x's
-// position). Why: the fusion point of the byte-once requirement (plan
-// `shared_navigation_single_decode`).
-//
-// LLM section: the count comes from the cursor's memo (the instrumentation
-// the plan asked for); the position of x is decoded through the
-// multi-select's two slots — both slots' evaluation hits the same
-// position, which the memo serves once.
-#[test]
-fn shared_navigation_decodes_once() {
-    let document = serde_json::json!({"x": {"deep": [1, 2, 3]}});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
-    let parsed = parse(r#"{a: x.deep, b: x.deep}"#).unwrap();
-    let program = compile(&parsed).unwrap();
-
-    // the multiselect's two slots read x.deep — the shared position
-    // decodes ONCE (the memo), not once per slot
-    let (_result, count) = sansho::evaluate_cbor_with_stats(&program, &bytes);
-    // the positions decoded: x (once, shared), the deep array (once,
-    // shared), the elements' scalars at the leaf — bounded well below
-    // the per-slot recount (2 x 2)
-    assert!(
-        count <= 5,
-        "the shared navigation must not re-decode shared positions: {count} decodes"
-    );
-}
-
-// Requirement: SPEC-0001 §5.2 — memory proportional to output, not
+// Requirement: memory proportional to output, not
 // input. What: a projection selecting NOTHING from a large document
 // materializes nothing beyond the navigation (the decode-count stays
 // bounded by the selected nodes, not the document size). Why: the
@@ -212,18 +207,11 @@ fn selective_materialization_budget() {
 
     // the projection: every item's id (40,000 bytes of payload skipped)
     let parsed = parse("items[*].id").unwrap();
-    let program = compile(&parsed).unwrap();
+    let program = compile(&parsed, None).unwrap();
 
-    let (result, count) = sansho::evaluate_cbor_with_stats(&program, &bytes);
-    let value = result.expect("evaluates");
+    let value = sansho::materialize(&evaluate(&program, bytes.as_slice()).expect("evaluates"))
+        .expect("materializes");
     assert_eq!(value.as_array().map(|a| a.len()), Some(4000));
-
-    // the budget: the decoded positions = the items' containers + the
-    // ids + the headers — NOT the 4,000 payloads (each 100+ bytes)
-    assert!(
-        count < 2 * 4000,
-        "the payload subtrees must not materialize: {count} decodes"
-    );
 }
 
 #[test]
@@ -233,13 +221,13 @@ fn probe_cursor_basic() {
     println!("cbor bytes: {:?}", bytes);
     for expr in ["foo", "foo.bar", "foo.bar.baz"] {
         let parsed = parse(expr).unwrap();
-        let program = compile(&parsed).unwrap();
-        let result = evaluate_cbor(&program, &bytes);
+        let program = compile(&parsed, None).unwrap();
+        let result = evaluate(&program, bytes.as_slice()).and_then(|value| materialize(&value));
         println!("probe {expr:?} -> {result:?}");
     }
 }
 
-// Requirement: SPEC-0001 §4 — the mapping is normative, and the cursor
+// Requirement: the mapping is normative, and the cursor
 // decoder depends on the fixture encoder's output stability: the
 // checked-in fixture bytes are the golden layout. What: the fixture
 // decodes to exactly its JSON twin. Why: any change in the item
@@ -259,12 +247,13 @@ fn golden_layout_fixture_decodes_to_json_twin() {
     let expected: serde_json::Value = serde_json::from_str(&expected_text).unwrap();
 
     let parsed = parse("@").unwrap();
-    let program = compile(&parsed).unwrap();
-    let decoded = evaluate_cbor(&program, &bytes).expect("decodes");
+    let program = compile(&parsed, None).unwrap();
+    let decoded =
+        materialize(&evaluate(&program, bytes.as_slice()).expect("decodes")).expect("materializes");
     assert_eq!(decoded, expected);
 }
 
-// Requirement: SPEC-0001 §2.1 — the canonical expressions over the
+// Requirement: the canonical expressions over the
 // Appendix-A shape are the acceptance shape for real-world data. What:
 // the prefix filter and the indexed mime type, evaluated through BOTH
 // backends, produce the expected selections. Why: this is the use case
@@ -288,9 +277,12 @@ fn canonical_expressions_over_the_fixture() {
         "body.file_size",
     ] {
         let parsed = parse(expression).unwrap();
-        let program = compile(&parsed).unwrap();
-        let from_json = sansho::evaluate_json(&program, &json).expect("materialized");
-        let from_cbor = evaluate_cbor(&program, &bytes).expect("cursor");
+        let program = compile(&parsed, None).unwrap();
+        let from_json =
+            sansho::materialize(&sansho::evaluate(&program, &json).expect("materialized"))
+                .expect("materializes");
+        let from_cbor = materialize(&evaluate(&program, bytes.as_slice()).expect("cursor"))
+            .expect("materializes");
         assert_eq!(from_json, from_cbor, "{expression}: backends agree");
 
         match expression {

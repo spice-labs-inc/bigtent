@@ -58,9 +58,9 @@ pub mod compare;
 pub mod config;
 pub mod fresh_merge;
 pub mod highwire;
+pub mod item_sansho_impl;
 pub mod main_utils;
 pub mod pid_file;
-pub mod item_sansho_impl;
 pub mod server;
 
 pub mod rodeo {

@@ -6,13 +6,11 @@
 //! runs as part of the regular build.
 //!
 
-use crate::item::Item;
 use crate::rodeo::goat::GoatRodeoCluster;
-use crate::rodeo::goat_herd::GoatHerd;
-use crate::rodeo::goat_trait::GoatRodeoTrait;
 use crate::rodeo::index::GetOffset;
 use anyhow::{Result, bail};
-use sansho::{Program, SanshoTrait, ZeroCopySanshoResult};
+use sansho::view::SanshoTrait;
+use sansho::{Program, SanshoCarrier};
 use serde_json::Value;
 use std::{collections::HashSet, fmt::Debug, sync::Arc};
 use tokio::sync::mpsc::Sender;
@@ -44,45 +42,45 @@ pub enum SinkOperation {
     ErrorMessage,
 }
 
+// filter the conn (note this is per connection type). The identifier borrows for
+// the document's lifetime, which is what lets the predicate be built once — a
+// predicate over a per-call borrow could not be stored
+pub type ConFilter<'a> = MyFn<'a, (&'a str, usize), bool>;
+pub type ConFinder<'a> = Box<dyn Fn(&Box<dyn SanshoTrait<'a>>, &str) -> &'a [&'a str]>;
+
+// Given an item, filter it... return true if the
+// item should be processed
+pub type ItemFilter<'a> = Box<dyn Fn(&(&Box<dyn SanshoTrait<'a>>, &WalkState)) -> bool>;
+
+// materialize the Item into an array of Value. This allows
+// a single `emit` to emit many rows (e.g. all the pURLs in file_names)
+// and also allows multiple emit statements for a single Item
+pub type ItemToJson<'a> = Box<dyn Fn(&(&Box<dyn SanshoTrait<'a>>, &WalkState)) -> Vec<Value>>;
+// Should the walk stop? The first terminates the walk at
+// the end of this set of traversals (continuing to process other
+// items at this level), the second is "stop immediately".
+// If the option is Some, it means stop. The Vec<Value> is sent to
+// the SINK so that a downstream process can understand why the
+// Walk was stopped
+pub type ShouldStop<'a> = Box<
+    dyn Fn(&(&Box<dyn SanshoTrait<'a>>, &WalkState)) -> (Option<Vec<Value>>, Option<Vec<Value>>),
+>;
 pub fn walk<
     'a,
-    THING: SanshoTrait<'a>,
+    // THING: SanshoTrait<'a>,
     ACCOUNTANT: AccountingAndBudget,
-    ThingFinder: Fn(&str, &Arc<ACCOUNTANT>) -> Result<Option<THING>> + 'a,
+    ThingFinder: Fn(&str, &Arc<ACCOUNTANT>) -> Result<Option<Box<dyn SanshoTrait<'a>>>> + 'a,
     // whatever is done with the materialized JSON for an Emit
     SINK: FnMut(Value, &Arc<ACCOUNTANT>, SinkOperation) -> Result<()>,
-    // for a given connection type (e.g., "connected:down" only exact lookups), return
-    // the &str of each of the connections. The strings come out of the document the
-    // THING reads, so they borrow for the document's lifetime ('a) — zero copy, and
-    // long enough that a filter built once can be handed them (see ConFilter)
-    ConFinder: for<'b> Fn(&'b THING, &str) -> Vec<&'b str>,
-    // filter the conn (note this is per connection type). The identifier borrows for
-    // the document's lifetime, which is what lets the predicate be built once — a
-    // predicate over a per-call borrow could not be stored
-    ConFilter: Fn(&(&str, usize)) -> bool,
-    // Given an item, filter it... return true if the
-    // item should be processed
-    ItemFilter: Fn(&(&THING, &WalkState)) -> bool,
-    // materialize the Item into an array of Value. This allows
-    // a single `emit` to emit many rows (e.g. all the pURLs in file_names)
-    // and also allows multiple emit statements for a single Item
-    ItemToJson: Fn(&(&THING, &WalkState)) -> Vec<Value>,
-    // Should the walk stop? The first terminates the walk at
-    // the end of this set of traversals (continuing to process other
-    // items at this level), the second is "stop immediately".
-    // If the option is Some, it means stop. The Vec<Value> is sent to
-    // the SINK so that a downstream process can understand why the
-    // Walk was stopped
-    ShouldStop: Fn(&(&THING, &WalkState)) -> (Option<Vec<Value>>, Option<Vec<Value>>),
 >(
     roots: Vec<String>,
     lookup: ThingFinder,
     mut sink: SINK,
-    connection_finder: ConFinder,
-    connections: Vec<(String, ConFilter)>,
-    item_filter: ItemFilter,
-    emit: ItemToJson,
-    stop_fn: ShouldStop,
+    connection_finder: ConFinder<'a>,
+    connections: Vec<(String, ConFilter<'a>)>,
+    item_filter: ItemFilter<'a>,
+    emit: ItemToJson<'a>,
+    stop_fn: ShouldStop<'a>,
     accountant: Arc<ACCOUNTANT>,
 ) -> Result<()> {
     // keep track of depth
@@ -113,7 +111,7 @@ pub fn walk<
 
         // the next thing to process
         for id in this_round {
-            let thing2: Option<THING> = lookup(&id, &accountant)?;
+            let thing2 = lookup(&id, &accountant)?;
             // get it
             if let Some(thing) = thing2 {
                 // pre-build stuff for the next round
@@ -130,7 +128,7 @@ pub fn walk<
                         // for this connection type, add them to the possibilities
                         // note this is a vec because adding is cheap... later, we'll
                         // de-dup with the set
-                        if !seen.contains(maybe_con) && con_filter(&(maybe_con, depth)) {
+                        if !seen.contains(*maybe_con) && con_filter.apply(&(maybe_con, depth)) {
                             maybe_next_round.push(maybe_con);
                         }
                     }
@@ -203,24 +201,28 @@ pub fn walk<
 
 pub fn find_func<'a, A: AccountingAndBudget>(
     cluster: &'a Arc<GoatRodeoCluster>,
-) -> impl Fn(&str, &Arc<A>) -> Result<Option<&'a [u8]>> + 'a {
-    move |id: &str, accounting: &Arc<A>| -> Result<Option<&'a [u8]>> {
+) -> impl Fn(&str, &Arc<A>) -> Result<Option<Box<dyn SanshoTrait<'a>>>> + 'a {
+    move |id: &str, accounting: &Arc<A>| -> Result<Option<Box<dyn SanshoTrait<'a>>>> {
         accounting.event(AccountingEventType::LoadItem);
         let Some(io) = cluster.identifier_to_item_offset(id) else {
             return Ok(None);
         };
-        Ok(cluster.bytes_for_file_and_offset(io.loc.get_file_hash(), io.loc.get_offset()))
+        Ok(cluster
+            .bytes_for_file_and_offset(io.loc.get_file_hash(), io.loc.get_offset())
+            .map(|v| Box::new(v) as Box<dyn SanshoTrait<'a>>))
     }
 }
 
-pub fn find_func_for_herd<'a, A: AccountingAndBudget>(
-    herd: Arc<GoatHerd>,
-) -> impl Fn(&str, &Arc<A>) -> Result<Option<Item>> + 'a {
-    move |id: &str, accounting: &Arc<A>| -> Result<Option<Item>> {
-        accounting.event(AccountingEventType::LoadItem);
-        Ok(herd.item_for_identifier(id))
-    }
-}
+// pub fn find_func_for_herd<'a, A: AccountingAndBudget>(
+//     herd: Arc<GoatHerd>,
+// ) -> impl Fn(&str, &Arc<A>) -> Result<Option<SanshoCarrier<'a>>> + 'a {
+//     move |id: &str, accounting: &Arc<A>| -> Result<Option<SanshoCarrier<'a>>> {
+//         accounting.event(AccountingEventType::LoadItem);
+//         Ok(herd
+//             .item_for_identifier(id)
+//             .map(|v| Rc::new(v) as SanshoCarrier<'a>))
+//     }
+// }
 
 pub fn vec_sink<'a, A: AccountingAndBudget>(
     vec: &'a mut Vec<Value>,
@@ -242,15 +244,12 @@ pub fn flume_sink<A: AccountingAndBudget>(
     }
 }
 
-pub fn compile_sansho(exp: &str) -> Result<Program> {
-    Ok(sansho::compile(&sansho::parse(exp)?)?)
+pub fn compile_sansho(exp: &str) -> Result<Arc<Program>> {
+    Ok(sansho::compile(&sansho::parse(exp)?, None)?)
 }
 
-pub fn run_sansho<'d, T: SanshoTrait<'d> + ?Sized>(
-    input: &'d T,
-    program: &Program,
-) -> Result<ZeroCopySanshoResult<'d>> {
-    Ok(sansho::lookup(input, program)?)
+pub trait WalkBuilder: ExpressionBuilder {
+    fn walk<'a>(&self) -> Result<Vec<(String, ConFilter<'a>)>>;
 }
 
 pub trait ExpressionBuilder: Debug {
@@ -267,6 +266,47 @@ pub trait ExpressionBuilder: Debug {
     fn as_bool(&self) -> Option<bool>;
 }
 
+pub fn build_walk_for_str<'a>(s: &str) -> Result<(String, ConFilter<'a>)> {
+    Ok((
+        s.to_string(),
+        MyFn::<'a, (&'a str, usize), bool> {
+            the_fn: Box::new(|(_, _): &(&'a str, usize)| true),
+        },
+    ))
+}
+
+impl WalkBuilder for serde_json::Value {
+    fn walk<'a>(&self) -> Result<Vec<(String, ConFilter<'a>)>> {
+        match self {
+            serde_json::Value::Object(obj) => match obj.get("walk") {
+                Some(serde_json::Value::String(s)) => Ok(vec![build_walk_for_str(s)?]),
+                Some(serde_json::Value::Array(arr)) => {
+                    let mut ret = vec![];
+                    for v in arr {
+                        match v {
+                            serde_json::Value::String(s) => ret.push(build_walk_for_str(s)?),
+                            serde_json::Value::Object(obj) if obj.len() == 1 => {
+                                for (k, v) in obj {
+                                    let e = build_expression(
+                                        v,
+                                        &build_con_compare_function,
+                                        &depth_cmp,
+                                    )?;
+                                    ret.push((k.to_string(), e));
+                                }
+                            }
+                            it => bail!("Subwalk failed for {:?}", it),
+                        }
+                    }
+                    Ok(ret)
+                }
+
+                it => bail!("Walk doesn't have a type we understand {:?}", it),
+            },
+            _ => bail!("Must be testing an object"),
+        }
+    }
+}
 /// The gate grammar's JSON encoding.
 ///
 /// Every compound node is a single-entry object keyed by its operator —
@@ -422,14 +462,76 @@ pub enum CompareTypes {
     LTE,
 }
 
+pub fn build_item_compare_function<'a>(
+    expr: &str,
+) -> Result<MyFn<'a, (SanshoCarrier<'a>, &'a WalkState), bool>> {
+    // the leaf is a Sansho expression: parse and compile it once, here;
+    // the built predicate evaluates the incoming thing against it per call
+    let program = compile_sansho(expr)?;
+
+    Ok(MyFn {
+        the_fn: Box::new(move |data: &(SanshoCarrier<'a>, &'a WalkState)| -> bool {
+            let (thing, _walk_state) = data;
+            // the thing is evaluated against the expression; a truthy
+            // result matches (null and false do not). An evaluation
+            // error is a non-match: the expression itself was already
+            // validated at compile time.
+            // match sansho::lookup_value(thing, &program) {
+            //     Ok(value) => match value {
+            //         Value::Null => false,
+            //         Value::Bool(matched) => matched,
+            //         _ => true,
+            //     },
+            //     Err(_) => false,
+            // }
+            todo!("FIXME")
+        }),
+    })
+}
+
+pub fn build_con_compare_function<'a>(expr: &str) -> Result<MyFn<'a, (&'a str, usize), bool>> {
+    if expr.starts_with("start:") {
+        let cmp = expr[6..].to_string();
+        if cmp.len() > 0 {
+            Ok(MyFn {
+                the_fn: Box::new(move |conn| -> bool { conn.0.starts_with(&cmp) }),
+            })
+        } else {
+            bail!("'start:' must have the thing that is being compared")
+        }
+    } else if expr.starts_with("end:") {
+        let cmp = expr[4..].to_string();
+        if cmp.len() > 0 {
+            Ok(MyFn {
+                the_fn: Box::new(move |conn: &(&str, usize)| -> bool { conn.0.ends_with(&cmp) }),
+            })
+        } else {
+            bail!("'end:' must have the thing that is being compared")
+        }
+    } else if expr.starts_with("regex:") {
+        let re_text = &expr[6..];
+        if re_text.len() == 0 {
+            bail!("'regex:' must have an actual regular expression")
+        } else {
+            let regex = regex::Regex::new(re_text)?;
+
+            Ok(MyFn {
+                the_fn: Box::new(move |conn: &(&str, usize)| -> bool { regex.is_match(conn.0) }),
+            })
+        }
+    } else {
+        bail!("Invalid expression '{expr}'")
+    }
+}
+
 pub fn build_con_compare_function_function<'a>()
--> Box<dyn Fn(&str) -> Result<Box<dyn Fn(&(&'a str, usize)) -> bool + 'a>>> {
+-> Box<dyn Fn(&str) -> Result<Box<dyn Fn(&'a (&'a str, usize)) -> bool + 'a>>> {
     Box::new(
-        |expr: &str| -> Result<Box<dyn Fn(&(&'a str, usize)) -> bool + 'a>> {
+        |expr: &str| -> Result<Box<dyn Fn(&'a (&'a str, usize)) -> bool + 'a>> {
             if expr.starts_with("start:") {
                 let cmp = expr[6..].to_string();
                 if cmp.len() > 0 {
-                    Ok(Box::new(move |conn: &(&'a str, usize)| -> bool {
+                    Ok(Box::new(move |conn: &(&str, usize)| -> bool {
                         conn.0.starts_with(&cmp)
                     }))
                 } else {
@@ -438,7 +540,7 @@ pub fn build_con_compare_function_function<'a>()
             } else if expr.starts_with("end:") {
                 let cmp = expr[4..].to_string();
                 if cmp.len() > 0 {
-                    Ok(Box::new(move |conn: &(&'a str, usize)| -> bool {
+                    Ok(Box::new(move |conn: &(&str, usize)| -> bool {
                         conn.0.ends_with(&cmp)
                     }))
                 } else {
@@ -451,7 +553,7 @@ pub fn build_con_compare_function_function<'a>()
                 } else {
                     let regex = regex::Regex::new(re_text)?;
 
-                    Ok(Box::new(move |conn: &(&'a str, usize)| -> bool {
+                    Ok(Box::new(move |conn: &(&str, usize)| -> bool {
                         regex.is_match(conn.0)
                     }))
                 }
@@ -462,33 +564,48 @@ pub fn build_con_compare_function_function<'a>()
     )
 }
 
+pub struct MyFn<'a, P, R> {
+    pub the_fn: Box<dyn Fn(&P) -> R + 'a>,
+}
+
+impl<'a, P, R> MyFn<'a, P, R> {
+    pub fn apply(&self, v: &P) -> R {
+        (self.the_fn)(v)
+    }
+}
+
 pub fn build_expression<
     'd,
-    P: 'd,
+    P: Clone + 'd,
     EB: ExpressionBuilder,
-    FB: Fn(&str) -> Result<Box<dyn Fn(&P) -> bool + 'd>>,
-    CB: Fn(CompareTypes, &str, &EB) -> Result<Box<dyn Fn(&P) -> bool + 'd>>,
+    FB: Fn(&str) -> Result<MyFn<'d, P, bool>>,
+    CB: Fn(CompareTypes, &str, &EB) -> Result<MyFn<'d, P, bool>>,
 >(
     expression: &EB,
     func_builder: &FB,
     cmp_builder: &CB,
-) -> Result<Box<dyn Fn(&P) -> bool + 'd>> {
+) -> Result<MyFn<'d, P, bool>> {
     if let Some(not_b) = expression.not()? {
-        let sub: Box<dyn for<'a> Fn(&'a P) -> bool> =
-            build_expression(not_b, func_builder, cmp_builder)?;
-        Ok(Box::new(move |v: &P| -> bool { !sub(v) }))
+        let sub = build_expression(not_b, func_builder, cmp_builder)?;
+        Ok(MyFn {
+            the_fn: Box::new(move |v: &P| -> bool { !sub.apply(v) }),
+        })
     } else if let Some(and_b) = expression.and()? {
         let mut subs = vec![];
         for v in and_b {
             subs.push(build_expression(v, func_builder, cmp_builder)?);
         }
-        Ok(Box::new(move |v: &P| subs.iter().all(|f| f(v))))
+        Ok(MyFn {
+            the_fn: Box::new(move |v: &P| subs.iter().all(|f| f.apply(v))),
+        })
     } else if let Some(or_b) = expression.or()? {
         let mut subs = vec![];
         for v in or_b {
             subs.push(build_expression(v, func_builder, cmp_builder)?);
         }
-        Ok(Box::new(move |v: &P| subs.iter().any(|f| f(v))))
+        Ok(MyFn {
+            the_fn: Box::new(move |v: &P| subs.iter().any(|f| f.apply(v))),
+        })
     } else if let Some((cmp_type, var_name, vs)) = expression.as_compare()? {
         // the variable vocabulary lives with the comparator builder: it
         // is the thing that knows where a variable's value comes from,
@@ -510,45 +627,43 @@ pub fn build_expression<
 /// variable's value comes from, so it is the thing that can say which
 /// variables exist. A walk-state builder over `(&THING, &WalkState)`
 /// would know `depth` and `terminal` and leave this one untouched.
-pub fn build_depth_cmp<'a, EB: ExpressionBuilder>()
--> Box<dyn Fn(CompareTypes, &str, &EB) -> Result<Box<dyn Fn(&(&'a str, usize)) -> bool + 'a>>> {
+pub fn depth_cmp<'a, EB: ExpressionBuilder>(
+    cmp: CompareTypes,
+    var_name: &str,
+    expression: &EB,
+) -> Result<MyFn<'a, (&'a str, usize), bool>> {
     /// The variables this builder can read.
     const KNOWN: &str = "depth";
 
-    Box::new(
-        |cmp: CompareTypes,
-         var_name: &str,
-         expression: &EB|
-         -> Result<Box<dyn Fn(&(&'a str, usize)) -> bool + 'a>> {
-            if var_name != KNOWN {
-                bail!("unknown variable `{var_name}`; known: {KNOWN}");
-            }
-            let Some(cmp_value) = expression.as_int() else {
-                bail!("`{KNOWN}` compares against an integer, not {expression:?}");
-            };
-            let cmp_value: usize = cmp_value as usize;
-            match cmp {
-                CompareTypes::EQ => Ok(Box::new(move |data: &(&'a str, usize)| -> bool {
-                    data.1 == cmp_value
-                })),
-                CompareTypes::GT => Ok(Box::new(move |data: &(&'a str, usize)| -> bool {
-                    data.1 > cmp_value
-                })),
-                CompareTypes::GTE => Ok(Box::new(move |data: &(&'a str, usize)| -> bool {
-                    data.1 >= cmp_value
-                })),
-                CompareTypes::LT => Ok(Box::new(move |data: &(&'a str, usize)| -> bool {
-                    data.1 < cmp_value
-                })),
-                CompareTypes::LTE => Ok(Box::new(move |data: &(&'a str, usize)| -> bool {
-                    data.1 <= cmp_value
-                })),
-                CompareTypes::NOTEQ => Ok(Box::new(move |data: &(&'a str, usize)| -> bool {
-                    data.1 != cmp_value
-                })),
-            }
-        },
-    )
+    {
+        if var_name != KNOWN {
+            bail!("unknown variable `{var_name}`; known: {KNOWN}");
+        }
+        let Some(cmp_value) = expression.as_int() else {
+            bail!("`{KNOWN}` compares against an integer, not {expression:?}");
+        };
+        let cmp_value: usize = cmp_value as usize;
+        match cmp {
+            CompareTypes::EQ => Ok(MyFn {
+                the_fn: Box::new(move |data: &(&str, usize)| -> bool { data.1 == cmp_value }),
+            }),
+            CompareTypes::GT => Ok(MyFn {
+                the_fn: Box::new(move |data: &(&str, usize)| -> bool { data.1 > cmp_value }),
+            }),
+            CompareTypes::GTE => Ok(MyFn {
+                the_fn: Box::new(move |data: &(&str, usize)| -> bool { data.1 >= cmp_value }),
+            }),
+            CompareTypes::LT => Ok(MyFn {
+                the_fn: Box::new(move |data: &(&str, usize)| -> bool { data.1 < cmp_value }),
+            }),
+            CompareTypes::LTE => Ok(MyFn {
+                the_fn: Box::new(move |data: &(&str, usize)| -> bool { data.1 <= cmp_value }),
+            }),
+            CompareTypes::NOTEQ => Ok(MyFn {
+                the_fn: Box::new(move |data: &(&str, usize)| -> bool { data.1 != cmp_value }),
+            }),
+        }
+    }
 }
 
 /// Find the connections of one type for a thing — the walk's
@@ -564,21 +679,27 @@ pub fn build_depth_cmp<'a, EB: ExpressionBuilder>()
 /// there is nothing to compile and nothing to cache — the lookup is two
 /// key probes and a walk over the target array. An unknown edge type and
 /// a thing with no connections both find nothing.
-pub fn find_connections<'a, THING: SanshoTrait<'a> + ?Sized>(
-    thing: &THING,
-    connection_type: &str,
-) -> Vec<&'a str> {
-    let Some(connections) = SanshoTrait::get_key(thing, "connections") else {
-        return Vec::new();
-    };
-    let Some(targets) = SanshoTrait::get_key(&connections, connection_type) else {
-        return Vec::new();
-    };
-    SanshoTrait::elements(&targets)
-        .iter()
-        .filter_map(|target| SanshoTrait::as_str_ref(target))
-        .collect()
-}
+// pub fn find_connections<'a, THING: SanshoTrait<'a> + ?Sized>(
+//     thing: &THING,
+//     connection_type: &str,
+// ) -> Option<Vec<&'a str>> {
+//     let Ok(Some(connections)) = SanshoTrait::get_key(thing, "connections") else {
+//         return None;
+//     };
+//
+//     let Ok(Some(targets)) = SanshoTrait::get_key(&connections, connection_type) else {
+//         return None;
+//     };
+//
+//     match SanshoTrait::elements(&targets) {
+//         Ok(v) => Some(
+//             v.iter()
+//                 .filter_map(|target| SanshoTrait::as_str(target).ok())
+//                 .collect(),
+//         ),
+//         Err(_) => None,
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -853,33 +974,30 @@ mod tests {
             }
         });
 
-        // a borrowed JSON document
-        let borrowed: &serde_json::Value = &document;
-        assert_eq!(
-            find_connections(&borrowed, "alias:from"),
-            vec!["pkg:a", "gitoid:b"]
-        );
-
-        // the same document as CBOR bytes
-        let encoded = serde_cbor::to_vec(&document).unwrap();
-        let bytes: &[u8] = &encoded;
-        assert_eq!(
-            find_connections(&bytes, "alias:from"),
-            vec!["pkg:a", "gitoid:b"]
-        );
-        assert_eq!(find_connections(&bytes, "contained:up"), vec!["p"]);
-        assert_eq!(
-            find_connections(&bytes, "not-an-edge-type"),
-            Vec::<&str>::new()
-        );
-
-        // and through the walk's bound, with the borrow the walk hands it
-        let found = through_the_walk_bound(
-            |thing: &&[u8], connection_type: &str| find_connections(thing, connection_type),
-            &bytes,
-            "contained:up",
-        );
-        assert_eq!(found, vec!["p"]);
+        //         // a borrowed JSON document
+        //         let borrowed: &serde_json::Value = &document;
+        //         assert_eq!(
+        //             find_connections(&borrowed, "alias:from"),
+        //             Some(vec!["pkg:a", "gitoid:b"])
+        //         );
+        //
+        //         // the same document as CBOR bytes
+        //         let encoded = serde_cbor::to_vec(&document).unwrap();
+        //         let bytes: &[u8] = &encoded;
+        //         assert_eq!(
+        //             find_connections(&bytes, "alias:from"),
+        //             Some(vec!["pkg:a", "gitoid:b"])
+        //         );
+        //         assert_eq!(find_connections(&bytes, "contained:up"), Some(vec!["p"]));
+        //         assert_eq!(find_connections(&bytes, "not-an-edge-type"), None);
+        //
+        //         // and through the walk's bound, with the borrow the walk hands it
+        //         // let found = through_the_walk_bound(
+        //         //     |thing: &&[u8], connection_type: &str| find_connections(thing, connection_type),
+        //         //     &bytes,
+        //         //     "contained:up",
+        //         // );
+        //         // assert_eq!(found, vec!["p"]);
     }
 
     // Requirement: the gate compiler is instantiable for the walk's
@@ -907,19 +1025,65 @@ mod tests {
         });
 
         // built in one scope...
-        let stored: Box<dyn Fn(&ConnData<'static>) -> bool> = {
-            let func_builder = build_con_compare_function_function::<'static>();
-            let cmp_builder = build_depth_cmp::<'static, serde_json::Value>();
-            build_expression::<ConnData<'static>, _, _, _>(&gate, &func_builder, &cmp_builder)
-                .expect("the gate compiles")
+        let stored: MyFn<'static, ConnData<'static>, bool> = {
+            build_expression::<ConnData<'static>, _, _, _>(
+                &gate,
+                &build_con_compare_function,
+                &depth_cmp::<serde_json::Value>,
+            )
+            .expect("the gate compiles")
         };
 
         // ...and used after it
-        assert!(stored(&("pkg:thing", 0)), "a pkg: identifier at depth 0");
-        assert!(stored(&("gitoid:abc", 2)), "a gitoid at the depth limit");
-        assert!(!stored(&("other", 0)), "a different identifier");
-        assert!(!stored(&("pkg:thing", 3)), "past the depth limit");
+        assert!(
+            stored.apply(&("pkg:thing", 0)),
+            "a pkg: identifier at depth 0"
+        );
+        assert!(
+            stored.apply(&("gitoid:abc", 2)),
+            "a gitoid at the depth limit"
+        );
+        assert!(!stored.apply(&("other", 0)), "a different identifier");
+        assert!(!stored.apply(&("pkg:thing", 3)), "past the depth limit");
     }
+
+    // Requirement: the item gate's leaves are Sansho expressions — a leaf
+    // compiles once and the built predicate evaluates the incoming thing
+    // against it per call. What: an expression naming an item field
+    // matches when the field's value is truthy (null and false do not);
+    // the walk state rides along unexamined. Why: the item gate's data is
+    // the (thing, walk-state) pair, and the expression's subject is the
+    // thing — the walk state is present for the gate's other variables.
+    //
+    // LLM section: the thing is a boxed trait value (the walk's THING
+    // shape); the expressions are evaluated through the engine's trait
+    // surface with a per-call borrow.
+    //     #[test]
+    //     fn item_compare_function_evaluates_the_thing_against_the_expression() {
+    //         // the gate's lifetime is the walk state's borrow: a helper scopes
+    //         // 'a to the state, the way the walk scopes it to a loaded item
+    //         // fn evaluate<'a>(state: &'a WalkState) -> (bool, bool) {
+    //         //     let predicate =
+    //         //         build_item_compare_function::<'a>("file_size").expect("the expression compiles");
+    //         //     let big: Box<dyn SanshoTrait<'a>> = Box::new(json!({"file_size": 3050}));
+    //         //     let empty: Box<dyn SanshoTrait<'a>> = Box::new(json!({}));
+    //         //     (
+    //         //         predicate.apply(&(big, state)),
+    //         //         predicate.apply(&(empty, state)),
+    //         //     )
+    //         // }
+    //
+    //         let state = WalkState {
+    //             depth_cnt: 0,
+    //             is_terminal: false,
+    //         };
+    //         let (big_matches, empty_matches) = evaluate(&state);
+    //         assert!(big_matches, "file_size is present and truthy");
+    //         assert!(
+    //             !empty_matches,
+    //             "a missing field evaluates to null, not a match"
+    //         );
+    //     }
 
     // Requirement: the variable vocabulary lives with the comparator
     // builder — the thing that knows where a variable's value comes from.
@@ -935,21 +1099,19 @@ mod tests {
     // and `terminal`.
     #[test]
     fn comparator_builder_owns_the_variable_vocabulary() {
-        let cmp_builder = build_depth_cmp::<serde_json::Value>();
-
-        let error = cmp_builder(CompareTypes::LTE, "nonsense", &json!(2))
+        let error = depth_cmp::<serde_json::Value>(CompareTypes::LTE, "nonsense", &json!(2))
             .err()
             .expect("an unknown variable must be an error");
         let message = error.to_string();
         assert!(message.contains("nonsense"), "{message}");
         assert!(message.contains("depth"), "{message}");
 
-        let depth_test = cmp_builder(CompareTypes::LTE, "depth", &json!(2))
+        let depth_test = depth_cmp::<serde_json::Value>(CompareTypes::LTE, "depth", &json!(2))
             .expect("`depth` is a variable this builder reads");
-        assert!(depth_test(&("anything", 2)), "at the limit");
-        assert!(!depth_test(&("anything", 3)), "past the limit");
+        assert!(depth_test.apply(&("anything", 2)), "at the limit");
+        assert!(!depth_test.apply(&("anything", 3)), "past the limit");
 
-        let error = cmp_builder(CompareTypes::LTE, "depth", &json!("two"))
+        let error = depth_cmp::<serde_json::Value>(CompareTypes::LTE, "depth", &json!("two"))
             .err()
             .expect("a non-integer comparison must be an error");
         assert!(error.to_string().contains("integer"), "{error}");

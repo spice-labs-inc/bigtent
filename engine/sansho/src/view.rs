@@ -22,23 +22,25 @@
 //! (`Option`, `Vec`, slices, `BTreeSet`, `HashSet`, `BTreeMap`,
 //! `HashMap` — standard-library types, their impls in this crate).
 
-use std::fmt;
-
 use crate::error::SanshoError;
-use serde_json::Value as J;
+use std::fmt::{self};
+use std::rc::Rc;
 
-/// The JSON-shaped kind of a value, as the evaluator sees it.
+/// The kind of a value, as the evaluator sees it.
 ///
-/// The underlying CBOR may be richer than JSON; the mapping in
-/// SPEC-0001 §4 reduces it before it reaches this type: byte strings
-/// arrive as [`Kind::String`] (base64url), bignums as [`Kind::Number`].
-/// Anything the mapping rejects (unknown tags, `undefined`) never
-/// becomes a value — it is an evaluation error at access time.
+/// The underlying format may be richer than JSON. A CBOR byte string
+/// (major type 2) is its own kind — [`Kind::Bytes`] — because it is not
+/// text: it carries octets whose encoding the format does not specify,
+/// and it is never validated as UTF-8. A bignum (tags 2/3) is
+/// [`Kind::Number`]. Anything the mapping rejects (unknown tags,
+/// `undefined`) never becomes a value — it is an evaluation error at
+/// access time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Object,
     Array,
     String,
+    Bytes,
     Number,
     Bool,
     Null,
@@ -50,6 +52,7 @@ impl fmt::Display for Kind {
             Kind::Object => "object",
             Kind::Array => "array",
             Kind::String => "string",
+            Kind::Bytes => "bytes",
             Kind::Number => "number",
             Kind::Bool => "bool",
             Kind::Null => "null",
@@ -72,7 +75,7 @@ pub enum SanshoNumber {
 
 impl SanshoNumber {
     /// The spec-level view: JMESPath numbers are IEEE-754 doubles
-    /// (SPEC-0001 §4 reduces comparison semantics to f64).
+    /// (comparison semantics reduce to f64).
     pub fn to_f64(self) -> f64 {
         match self {
             SanshoNumber::I64(v) => v as f64,
@@ -89,14 +92,102 @@ impl SanshoNumber {
         if let Ok(v) = i64::try_from(n) {
             return SanshoNumber::I64(v);
         }
-        if n >= 0 {
-            if let Ok(v) = u64::try_from(n) {
+        if n >= 0
+            && let Ok(v) = u64::try_from(n) {
                 return SanshoNumber::U64(v);
             }
-        }
         SanshoNumber::F64(n as f64)
     }
 }
+
+pub type SanshoCarrier<'a> = Rc<dyn SanshoTrait<'a> + 'a>;
+
+/// The member view a container hands out.
+///
+/// `Member` is implemented per **concrete** member type — never for a
+/// parameter, and never as a blanket over references. That is the point: a
+/// container impl may require `&'a V: Member<'a>` for its own parameter `V`,
+/// and because every `Member` impl names a concrete type, the trait solver
+/// has exactly one step to unfold per member type. It can never re-enter the
+/// container impl (which would unify `V` with a container of `V` and grow the
+/// type forever), so a generic container impl cannot overflow the solver.
+///
+/// The hand-out itself is a refcount around the borrow for a
+/// document-backed member, and the value itself for one that is already a
+/// carrier — no member is ever copied.
+pub trait Member<'a>: SanshoTrait<'a> {
+    /// The member as a refcounted trait value.
+    fn carrier(self) -> SanshoCarrier<'a>;
+}
+
+// pub struct OwnedCarrier<'a, T>
+// where
+//     &'a T: SanshoTrait<'a>,
+// {
+//     val: T,
+//     reference: &'a T,
+// }
+//
+// impl<'a, T> OwnedCarrier<'a, T>
+// where
+//     &'a T: SanshoTrait<'a>,
+// {
+//     pub fn new(v: T) -> OwnedCarrier<'a, T> {
+//         OwnedCarrier {
+//             val: v,
+//             reference: &v,
+//         }
+//     }
+// }
+//
+// impl<'a, T> SanshoTrait<'a> for OwnedCarrier<'a, T>
+// where
+//     &'a T: SanshoTrait<'a>,
+// {
+//     fn kind(&self) -> Kind {
+//         self.reference.kind()
+//     }
+//
+//     fn as_str(&self) -> Result<&str, SanshoError> {
+//         self.reference.as_str()
+//     }
+//
+//     fn as_bytes(&self) -> Result<&[u8], SanshoError> {
+//         self.reference.as_bytes()
+//     }
+//
+//     fn as_sansho_number(&self) -> Result<SanshoNumber, SanshoError> {
+//         self.reference.as_sansho_number()
+//     }
+//
+//     fn as_bool(&self) -> Result<bool, SanshoError> {
+//         self.reference.as_bool()
+//     }
+//
+//     fn get_key(&self, name: &str) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+//         self.reference.get_key(name)
+//     }
+//
+//     fn get_index(&self, index: usize) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+//         self.reference.get_index(index)
+//     }
+//
+//     fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
+//         self.reference.entries()
+//     }
+//
+//     fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+//         self.reference.elements()
+//     }
+//
+//     fn container_len(&self) -> Result<usize, SanshoError> {
+//         self.reference.container_len()
+//     }
+//
+//     fn to_string_sansho(&self) -> String {
+//         self.reference.to_string_sansho()
+//     }
+// }
 
 /// The Sansho data-access trait — the only thing an evaluation needs.
 ///
@@ -121,30 +212,25 @@ pub trait SanshoTrait<'a>: 'a {
     /// The JSON-shaped kind of this value.
     fn kind(&self) -> Kind;
 
-    /// The string content of this value, if it is a string. Borrowed
-    /// from the document when the format stores text (the mmap'd CBOR
-    /// text, the in-memory strings); computed (and owned) when the
-    /// mapping transforms it — a CBOR byte string renders as base64url.
-    fn as_str(&self) -> Option<std::borrow::Cow<'_, str>>;
+    /// The string content of this value, if this is a TEXT string.
+    /// Borrowed from the document when the format stores text (the
+    /// mmap'd CBOR text, the in-memory strings); owned for a value form,
+    /// which has no borrowable storage. A byte string is not text: it is
+    /// [`Kind::Bytes`] and answers `None` here — see [`Self::as_bytes`].
+    fn as_str(&self) -> Result<&str, SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: "Not a String type".to_string(),
+        })
+    }
 
-    /// The string content of this value borrowed from the DOCUMENT — the
-    /// borrow a traversal needs in order to carry a string OUT of itself.
-    ///
-    /// [`Self::as_str`] lends for as long as the receiver is borrowed:
-    /// enough to read a value in place, not to return one, because a
-    /// member arrives as a value (a local) and its borrow cannot escape
-    /// the traversal that obtained it. This borrow belongs to the
-    /// document instead, so it outlives the member value carrying it.
-    ///
-    /// The default is `None`. The value forms (an owned `Value`, an
-    /// `Item`, a `String`) hold their text in themselves rather than in
-    /// the document and cannot lend it for `'a`; the borrowed forms (the
-    /// byte source's node and its `&[u8]` root, `&serde_json::Value`,
-    /// `&serde_cbor::Value`, `Cow<'a, str>`) can. A CBOR byte string
-    /// (major 2) renders as base64url — computed, never borrowed — so it
-    /// answers `None` here and keeps the [`Self::as_str`] path.
-    fn as_str_ref(&self) -> Option<&'a str> {
-        None
+    /// The octets of this value, if this is a BYTE string
+    /// ([`Kind::Bytes`]) — borrowed from the document, so nothing is
+    /// copied and no encoding is applied. The default is `None`: a value
+    /// that is not a byte string has no octets of its own.
+    fn as_bytes(&self) -> Result<&[u8], SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: "Not a byte carrier".to_string(),
+        })
     }
 
     /// The full-width number probe: the exact integer or float value,
@@ -152,70 +238,124 @@ pub trait SanshoTrait<'a>: 'a {
     /// byte header decode, the materialized JSON number, the in-memory
     /// CBOR integer) report the `I64`/`U64` arms — numbers are
     /// full-width, never narrowed.
-    fn as_sansho_number(&self) -> Option<SanshoNumber> {
-        self.as_f64().map(SanshoNumber::F64)
+    fn as_sansho_number(&self) -> Result<SanshoNumber, SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: "Not a number".to_string(),
+        })
     }
 
     /// The numeric content as a double, if this is a number: the
-    /// spec-level reduction (SPEC-0001 §4) of the full-width probe.
-    fn as_f64(&self) -> Option<f64> {
+    /// spec-level reduction of the full-width probe.
+    fn as_f64(&self) -> Result<f64, SanshoError> {
         self.as_sansho_number().map(SanshoNumber::to_f64)
     }
 
     /// The boolean content, if this is a boolean value.
-    fn as_bool(&self) -> Option<bool>;
+    fn as_bool(&self) -> Result<bool, SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: "Not a bool type".to_string(),
+        })
+    }
 
     /// Whether this is the null value.
-    fn is_null(&self) -> bool;
+    fn is_null(&self) -> bool {
+        matches!(self.kind(), Kind::Null)
+    }
 
     /// The member named `name`, if this is an object value that has
     /// one: a value bounded by the trait — the very thing the
     /// evaluator carries.
-    fn get_key(&self, name: &str) -> Option<impl SanshoTrait<'a> + use<'a, Self>>;
+    fn get_key(&self, _name: &str) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: "Not an object type".to_string(),
+        })
+    }
 
     /// The `index`-th array element, if this is an array value that
     /// has one: a value bounded by the trait.
-    fn get_index(&self, index: usize) -> Option<impl SanshoTrait<'a> + use<'a, Self>>;
+    fn get_index(&self, _index: usize) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: "Not an array type".to_string(),
+        })
+    }
 
-    /// All object members as `(key, member)` pairs, ordered by key —
-    /// iteration is deterministic and backends agree.
-    fn entries(&self) -> Vec<(String, impl SanshoTrait<'a> + use<'a, Self>)>;
+    /// All object members as `(key, member)` pairs, in the container's
+    /// own order.
+    fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: format!("entries requires an object, found {}", self.kind()),
+        })
+    }
 
     /// All array elements, in document order.
-    fn elements(&self) -> Vec<impl SanshoTrait<'a> + use<'a, Self>>;
+    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: format!("elements requires an array, found {}", self.kind()),
+        })
+    }
 
     /// The number of members or elements, if this is an object or
     /// array; `None` for scalars.
-    fn container_len(&self) -> Option<usize>;
-
-    /// Whether this value's materializations count against the
-    /// evaluation's aggregation ledger. The byte source DECODES (each
-    /// materialization is memory the ENGINE creates — the aggregation
-    /// cap's subject); the materialized sources' clones are the
-    /// CALLER's pre-existing data (already fully materialized by
-    /// definition).
-    fn counts_toward_aggregation() -> bool;
-
-    /// This value's full JSON view — the materialization boundary: the
-    /// row boundary for an emit. For the byte source it is the
-    /// memoized decode of the position (every byte decoded at most
-    /// once per evaluation, SPEC-0001 §5.1).
-    fn materialize(&self) -> Result<J, SanshoError>;
-
-    /// The output-boundary materialization: decode without storing in
-    /// the memo. For positions consumed EXACTLY ONCE by the output,
-    /// the memo's dedup is never hit; the default is the memoized
-    /// form.
-    fn materialize_unmemoized(&self) -> Result<J, SanshoError> {
-        self.materialize()
+    fn container_len(&self) -> Result<usize, SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: "Not an Array or Object".to_string(),
+        })
     }
 
-    /// The raw bytes of a text string, WITHOUT the UTF-8 validation —
-    /// the filter-predicate fast path's comparison input. The default
-    /// is None (only the byte source and borrowed-string forms
-    /// implement it); byte strings (major 2) also return None and keep
-    /// the base64url path.
-    fn raw_text_bytes(&self) -> Option<&[u8]> {
-        None
+    /// Convert the Sansho Trait to a human friendly string. This operation may
+    /// be expensive and it's okay to implement it using cloning and other copying
+    /// operations. The method should be used sparingly... mostly for debugging
+    /// not in the normal course of operations (i.e., during `eval`)
+    fn to_string_sansho(&self) -> String;
+}
+
+// The boxed trait object IS a Sansho value: navigation hands members over
+// as refcounted values, and the evaluator carries trait values, so a
+// wrapper must answer the trait itself — by delegating to the value
+// inside. `Box` and `Rc` are standard-library types, so these
+// implementations live here with the others.
+impl<'a> SanshoTrait<'a> for SanshoCarrier<'a> {
+    fn kind(&self) -> Kind {
+        (**self).kind()
+    }
+
+    fn as_str(&self) -> Result<&str, SanshoError> {
+        (**self).as_str()
+    }
+
+    fn as_bytes(&self) -> Result<&[u8], SanshoError> {
+        (**self).as_bytes()
+    }
+
+    fn as_sansho_number(&self) -> Result<SanshoNumber, SanshoError> {
+        (**self).as_sansho_number()
+    }
+
+    fn as_bool(&self) -> Result<bool, SanshoError> {
+        (**self).as_bool()
+    }
+
+    fn get_key(&self, name: &str) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        (**self).get_key(name)
+    }
+
+    fn get_index(&self, index: usize) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        (**self).get_index(index)
+    }
+
+    fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
+        (**self).entries()
+    }
+
+    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+        (**self).elements()
+    }
+
+    fn container_len(&self) -> Result<usize, SanshoError> {
+        (**self).container_len()
+    }
+
+    fn to_string_sansho(&self) -> String {
+        (**self).to_string_sansho()
     }
 }

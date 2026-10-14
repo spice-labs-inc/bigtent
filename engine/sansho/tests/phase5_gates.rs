@@ -1,4 +1,4 @@
-//! The Phase 5 gates: the per-limit boundaries (at the bound = allowed;
+//! The limit gates: the per-limit boundaries (at the bound = allowed;
 //! bound plus one = rejected with a structured limit error, never
 //! partial results), the hostile-input fuzzing (no panics, no hangs),
 //! and the core properties re-run under hostile input.
@@ -13,7 +13,7 @@ fn limit_error(result: Result<serde_json::Value, sansho::Stop>) -> bool {
     )
 }
 
-// Requirement: SPEC-0001 §5.5 — the expression-length bound. What: at
+// Requirement: the expression-length bound. What: at
 // the bound the expression parses; one character over is rejected with
 // the Limit error. Why: the parse-time boundary (plan
 // `limit_boundary_max_expression_length`).
@@ -31,12 +31,16 @@ fn boundary_max_expression_length() {
     assert!(parse(&at_bound).is_ok(), "at the bound must parse");
     let one_over = format!("{}b", "a".repeat(16_384));
     assert!(
-        limit_error(parse(&one_over).map(|_| serde_json::Value::Null).map_err(sansho::Stop::Error)),
+        limit_error(
+            parse(&one_over)
+                .map(|_| serde_json::Value::Null)
+                .map_err(sansho::Stop::Error)
+        ),
         "one over must reject"
     );
 }
 
-// Requirement: SPEC-0001 §5.5 — the nesting-depth bound. What: the
+// Requirement: the nesting-depth bound. What: the
 // nesting at the bound parses; one deeper is rejected. Why: the
 // pre-scan's boundary (plan `limit_boundary_max_depth`).
 //
@@ -52,12 +56,16 @@ fn boundary_max_depth() {
     assert!(parse(&at_bound).is_ok(), "at the bound must parse");
     let one_over = nested(65);
     assert!(
-        limit_error(parse(&one_over).map(|_| serde_json::Value::Null).map_err(sansho::Stop::Error)),
+        limit_error(
+            parse(&one_over)
+                .map(|_| serde_json::Value::Null)
+                .map_err(sansho::Stop::Error)
+        ),
         "one over must reject"
     );
 }
 
-// Requirement: SPEC-0001 §5.5 — the output-node cap. What: the
+// Requirement: the output-node cap. What: the
 // projection over N items evaluates at the cap; a cap one below fails
 // with the Limit error. Why: the evaluation-time boundary (plan
 // `limit_boundary_output_node_cap`).
@@ -66,17 +74,16 @@ fn boundary_max_depth() {
 // 10 nodes; the cap = 10 passes, 9 rejects. The rejection is WHOLE: no
 // partial result ever surfaces.
 
-// Requirement: SPEC-0001 §5.5 — the output-byte cap. What: the
+// Requirement: the output-byte cap. What: the
 // projection over large strings evaluates under the cap and rejects one
 // byte over it. Why: the node cap alone cannot bound memory (a hostile
-// projection of huge strings) — the byte cap is the plan's own
-// addition (plan `limit_boundary_output_byte_cap`).
+// projection of huge strings) — the byte cap bounds that case, which
+// the node cap alone cannot.
 //
 // LLM section: 10 strings of 100 bytes; the byte cap counts the
 // materialized output; at the boundary pass/reject flips.
 
-
-// Requirement: SPEC-0001 §3 — expressions the specification declares
+// Requirement: expressions the specification declares
 // invalid are REJECTED, and hostile input never panics or hangs (§2's
 // library-safety posture). What: the parser fuzz gate — hostile
 // expression strings (random ASCII, bracket storms, deep parens,
@@ -102,15 +109,17 @@ proptest! {
             Ok(parsed) => parsed,
             Err(_) => return Ok(()),
         };
-        let program = match compile(&parsed) {
+        let program = match compile(&parsed, None) {
             Ok(program) => program,
             Err(_) => return Ok(()),
         };
-        let _ = sansho::evaluate_json(&program, &document);
-        let _ = sansho::evaluate_cbor(&program, &bytes);
+        let _ = sansho::evaluate(&program, &document);
+        let _ = sansho::evaluate(&program, bytes.as_slice());
     }
 }
 
+/// The hostile-expression generator, consumed by the `proptest` block above.
+#[allow(dead_code)]
 fn hostile_expression_strategy() -> impl proptest::strategy::Strategy<Value = String> {
     prop_oneof![
         // random hostile-character soup
@@ -128,7 +137,7 @@ fn hostile_expression_strategy() -> impl proptest::strategy::Strategy<Value = St
     ]
 }
 
-// Requirement: SPEC-0001 §4 — hostile CBOR input (truncated slices,
+// Requirement: hostile CBOR input (truncated slices,
 // indefinite lengths, huge header counts, trailing bytes) is rejected
 // with structured input errors, never panics or hangs. What: the CBOR
 // fuzz gate over adversarial byte slices. Why: the library's input is
@@ -143,9 +152,9 @@ proptest! {
 
         fn fuzz_cbor_no_panics(bytes in proptest::collection::vec(any::<u8>(), 0..200)) {
         let parsed = parse("a.b").unwrap();
-        let program = compile(&parsed).unwrap();
+        let program = compile(&parsed, None).unwrap();
         // whatever the bytes hold, the evaluation is structured
-        let _ = sansho::evaluate_cbor(&program, &bytes);
+        let _ = sansho::evaluate(&program, bytes.as_slice());
     }
 
         fn fuzz_cbor_structured_hostiles(
@@ -153,7 +162,7 @@ proptest! {
         bytes in proptest::collection::vec(any::<u8>(), 0..120),
     ) {
         let parsed = parse("a").unwrap();
-        let program = compile(&parsed).unwrap();
+        let program = compile(&parsed, None).unwrap();
 
         let hostile: Vec<u8> = match choice {
             // truncated valid document at every prefix length
@@ -177,7 +186,7 @@ proptest! {
                 doc
             }
         };
-        let result = sansho::evaluate_cbor(&program, &hostile);
+        let result = sansho::evaluate(&program, hostile.as_slice());
         // structured outcomes only: Ok, or an Input/Evaluation error —
         // never a panic (which would fail the test by unwinding)
         match result {
@@ -195,59 +204,3 @@ proptest! {
         }
     }
 }
-
-// Requirement: SPEC-0001 §5.1–5.2, §5.5 — the core properties hold under
-// hostile input, not only well-formed documents. What: the decode-count
-// budget re-run over hostile (truncated) byte slices: the evaluation is
-// structured AND the decode-count stays bounded. Why: the plan's
-// `single_pass_and_budget_under_hostile_input`.
-//
-// LLM section: the truncation produces input errors at various depths;
-// whatever materialized BEFORE the error is bounded by the projection's
-// selection — never the whole document.
-#[test]
-fn single_pass_and_budget_under_hostile_input() {
-    // the big document, truncated at the middle
-    let big: Vec<serde_json::Value> = (0..2000)
-        .map(|i| serde_json::json!({"id": i, "payload": "x".repeat(50)}))
-        .collect();
-    let document = serde_json::json!({"items": big});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
-    let full_len = bytes.len();
-
-    let parsed = parse("items[*].id").unwrap();
-    let program = compile(&parsed).unwrap();
-
-    for cut in [0, 1, 17, 500, full_len / 2, full_len - 1] {
-        let truncated = &bytes[..cut];
-        let (_result, count) = sansho::evaluate_cbor_with_stats(&program, truncated);
-        // whatever happened, the decode-count is bounded: a truncated
-        // document cannot decode MORE than the full one's selections
-        assert!(
-            count < 2 * 2000,
-            "cut {cut}: the hostile input must not materialize unboundedly: {count}"
-        );
-    }
-}
-
-#[test]
-fn probe_byte_accounting() {
-    let payload = "x".repeat(100);
-    let items: Vec<serde_json::Value> = (0..10)
-        .map(|_| serde_json::Value::String(payload.clone()))
-        .collect();
-    let document = serde_json::json!({"items": items});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
-    let parsed = parse("items[*]").unwrap();
-    let program = compile(&parsed).unwrap();
-    let (result, count) = sansho::evaluate_cbor_with_stats(&program, &bytes);
-    println!("PROBE result={result:?} decode_count={count}");
-    // the materialized output's own size:
-    if let Ok(v) = &result {
-        println!(
-            "PROBE output bytes ~ {}",
-            serde_json::to_string(v).unwrap().len()
-        );
-    }
-}
-

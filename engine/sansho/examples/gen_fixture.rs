@@ -1,5 +1,5 @@
 //! One-time fixture generator: writes the golden CBOR bytes of a
-//! representative item (the SPEC-0001 Appendix-A shape: file_names with
+//! representative item (the fixture shape: file_names with
 //! merge-disambiguated gitoid entries, an array-valued mime_type,
 //! file_size, extra, connections). Run once:
 //! `cargo run -p sansho --example gen_fixture`

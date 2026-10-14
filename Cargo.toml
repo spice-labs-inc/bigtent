@@ -109,4 +109,7 @@ vergen-git2 = {version = "9", features = ["build", "cargo", "rustc", "si"]}
 
 [workspace]
 members = ["engine/sansho", "engine/sansho-derive"]
+# a bare `cargo test` / `cargo build` covers the root package AND the engine
+# crates; `cargo test --workspace` still covers every member
+default-members = [".", "engine/sansho"]
 

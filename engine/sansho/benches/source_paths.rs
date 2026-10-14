@@ -1,4 +1,4 @@
-//! The four-path benchmark suite (the plan's Phase 0 baseline): the
+//! The four-path benchmark suite: the
 //! data paths for the scan, full-item, and seek shapes across item
 //! sizes. The `cursor_original` numbers are the recorded baseline the
 //! later phases' ratio gates compare against.
@@ -13,10 +13,20 @@
 //!   backend (the "values at the front" approach; the timed region
 //!   includes the conversion).
 //! - `view_direct`: the reference-view walk over the in-memory value —
-//!   **scratch**: runs the mini evaluator from the spike until the
-//!   production view lands (Phase 3 of the plan).
+//!   **scratch**: runs the mini evaluator until the
+//!   production view lands.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+
+/// The whole public path: evaluate the program, then materialize the result at
+/// the boundary. This is what a consumer pays for one query, so it is what
+/// these benchmarks measure.
+fn run<'a, T: sansho::SanshoTrait<'a>>(
+    program: &sansho::Program,
+    document: T,
+) -> Result<serde_json::Value, sansho::SanshoError> {
+    sansho::evaluate(program, document).and_then(|value| sansho::materialize(&value))
+}
 
 
 /// The shared fixture builder (tests/common/mod.rs, included via
@@ -29,25 +39,25 @@ use common::appendix_a;
 /// The scan shape: the north_purls emit —
 /// `connections."alias:from"[?starts_with(@, 'pkg:')]` (one row per
 /// matched PURL under the flatten form).
-fn scan_program() -> sansho::Program {
+fn scan_program() -> std::sync::Arc<sansho::Program> {
     let parsed = sansho::parse("connections.\"alias:from\"[?starts_with(@, 'pkg:')]")
         .expect("parses");
-    sansho::compile(&parsed).expect("compiles")
+    sansho::compile(&parsed, None).expect("compiles")
 }
 
 /// The seek shape: single-field access — `body.file_size`.
-fn seek_program() -> sansho::Program {
+fn seek_program() -> std::sync::Arc<sansho::Program> {
     let parsed = sansho::parse("body.file_size").expect("parses");
-    sansho::compile(&parsed).expect("compiles")
+    sansho::compile(&parsed, None).expect("compiles")
 }
 
 /// The full-item shape: `@` (the whole document materialized).
-fn full_item_program() -> sansho::Program {
+fn full_item_program() -> std::sync::Arc<sansho::Program> {
     let parsed = sansho::parse("@").expect("parses");
-    sansho::compile(&parsed).expect("compiles")
+    sansho::compile(&parsed, None).expect("compiles")
 }
 
-/// The spike's mini view-walker (scratch until Phase 3): evaluates the
+/// The mini view-walker (scratch): evaluates the
 /// scan and seek shapes over the in-memory value tree by reference.
 mod mini {
     use serde_json::Value as J;
@@ -81,7 +91,7 @@ mod mini {
 }
 
 fn bench_paths(c: &mut Criterion) {
-    // the log4shell-scale shape (owner decision 2026-09-23): the
+    // the log4shell-scale shape: the
     // 500k-connection item — the size the High Wire spike promised
     // and no plan committed
     let sizes: [usize; 5] = [10, 1_000, 25_000, 100_000, 500_000];
@@ -99,7 +109,7 @@ fn bench_paths(c: &mut Criterion) {
             |b, bytes| {
                 b.iter(|| {
                     black_box(
-                        sansho::evaluate_cbor(black_box(&program), black_box(bytes))
+                        run(black_box(&program), black_box(bytes.as_slice()))
                             .expect("evaluates"),
                     )
                 })
@@ -112,7 +122,7 @@ fn bench_paths(c: &mut Criterion) {
                 b.iter(|| {
                     let bytes = serde_cbor::to_vec(black_box(item)).expect("serializes");
                     black_box(
-                        sansho::evaluate_cbor(black_box(&program), black_box(&bytes))
+                        run(black_box(&program), black_box(bytes.as_slice()))
                             .expect("evaluates"),
                     )
                 })
@@ -124,7 +134,7 @@ fn bench_paths(c: &mut Criterion) {
             |b, item| {
                 b.iter(|| {
                     black_box(
-                        sansho::evaluate_json(black_box(&program), black_box(item))
+                        run(black_box(&program), black_box(item))
                             .expect("evaluates"),
                     )
                 })
@@ -137,7 +147,7 @@ fn bench_paths(c: &mut Criterion) {
                 b.iter(|| black_box(mini::scan_count(black_box(item))))
             },
         );
-        // the zero-copy byte source (Phase 1's CborNode): the scan via
+        // the zero-copy byte source: the scan via
         // the new source — the T1.10 gate arm (≤ 50% of the recorded
         // scan/cursor_original median)
         group.bench_with_input(
@@ -145,8 +155,8 @@ fn bench_paths(c: &mut Criterion) {
             &original_bytes,
             |b, bytes| {
                 let prog = scan_program();
-                let slice: &[u8] = &bytes;
-                b.iter(|| black_box(sansho::lookup_value(black_box(&slice), black_box(&prog))))
+                let slice: &[u8] = bytes;
+                b.iter(|| black_box(sansho::evaluate(black_box(&prog), black_box(slice))))
             },
         );
 
@@ -159,7 +169,7 @@ fn bench_paths(c: &mut Criterion) {
             |b, bytes| {
                 b.iter(|| {
                     black_box(
-                        sansho::evaluate_cbor(black_box(program_ref), black_box(bytes))
+                        run(black_box(program_ref), black_box(bytes.as_slice()))
                             .expect("evaluates"),
                     )
                 })
@@ -172,7 +182,7 @@ fn bench_paths(c: &mut Criterion) {
                 b.iter(|| {
                     let bytes = serde_cbor::to_vec(black_box(item)).expect("serializes");
                     black_box(
-                        sansho::evaluate_cbor(black_box(&program), black_box(&bytes))
+                        run(black_box(&program), black_box(bytes.as_slice()))
                             .expect("evaluates"),
                     )
                 })
@@ -184,7 +194,7 @@ fn bench_paths(c: &mut Criterion) {
             |b, item| {
                 b.iter(|| {
                     black_box(
-                        sansho::evaluate_json(black_box(&program), black_box(item))
+                        run(black_box(&program), black_box(item))
                             .expect("evaluates"),
                     )
                 })
@@ -200,8 +210,8 @@ fn bench_paths(c: &mut Criterion) {
             &original_bytes,
             |b, bytes| {
                 let prog = seek_program();
-                let slice: &[u8] = &bytes;
-                b.iter(|| black_box(sansho::lookup_value(black_box(&slice), black_box(&prog))))
+                let slice: &[u8] = bytes;
+                b.iter(|| black_box(sansho::evaluate(black_box(&prog), black_box(slice))))
             },
         );
 
@@ -218,7 +228,7 @@ fn bench_paths(c: &mut Criterion) {
                 |b, bytes| {
                     b.iter(|| {
                         black_box(
-                            sansho::evaluate_cbor(black_box(&program), black_box(bytes))
+                            run(black_box(&program), black_box(bytes.as_slice()))
                                 .expect("evaluates"),
                         )
                     })
@@ -230,7 +240,7 @@ fn bench_paths(c: &mut Criterion) {
                 |b, item| {
                     b.iter(|| {
                         black_box(
-                            sansho::evaluate_json(black_box(&program), black_box(item))
+                            run(black_box(&program), black_box(item))
                                 .expect("evaluates"),
                         )
                     })

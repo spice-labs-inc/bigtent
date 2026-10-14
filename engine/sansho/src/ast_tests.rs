@@ -1,4 +1,4 @@
-//! Tests for the canonical form (SPEC-0001 §5.4), the determinism
+//! Tests for the canonical form, the determinism
 //! guarantee (§2), and the null/missing-value semantics (§3).
 
 #[cfg(test)]
@@ -8,7 +8,29 @@ mod tests {
     use crate::parser::parse;
     use std::path::Path;
 
-    // Requirement: SPEC-0001 §5.4 — the canonical form is a fixed point
+    /// The test's own engine: parse, compile, evaluate through the trait,
+    /// then materialize — the same shape every consumer uses, with no
+    /// engine-side type of its own.
+    pub(crate) struct TestEngine;
+
+    impl Driver for TestEngine {
+        fn evaluate(&self, given: &serde_json::Value, expression: &str) -> crate::DriverOutcome {
+            let parsed = match parse(expression) {
+                Ok(parsed) => parsed,
+                Err(e) => return crate::DriverOutcome::Error(e),
+            };
+            let program = match crate::compile(&parsed, None) {
+                Ok(program) => program,
+                Err(e) => return crate::DriverOutcome::Error(e),
+            };
+            match crate::evaluate(&program, given).and_then(|value| crate::materialize(&value)) {
+                Ok(value) => crate::DriverOutcome::Result(value),
+                Err(e) => crate::DriverOutcome::Error(e),
+            }
+        }
+    }
+
+    // Requirement: the canonical form is a fixed point
     // (re-parsing the canonical form yields the same canonical form).
     // What: a sweep over every VALID corpus expression: each must parse,
     // canonicalize, re-parse, and re-canonicalize to the same string.
@@ -58,7 +80,7 @@ mod tests {
         );
     }
 
-    // Requirement: SPEC-0001 §5.4 — expressions of different meaning never
+    // Requirement: expressions of different meaning never
     // share a canonical form (the negative cache-key property).
     // What: hand-picked distinct-meaning pairs must render differently.
     // Why: a collision would return wrong cached results, which is worse
@@ -94,7 +116,7 @@ mod tests {
         }
     }
 
-    // Requirement: SPEC-0001 §5.4 — insignificant whitespace collapses.
+    // Requirement: insignificant whitespace collapses.
     // What: whitespace variants share one canonical form. Why: the
     // cache-key stability property (plan `canonical_form_stability`).
     //
@@ -108,7 +130,7 @@ mod tests {
         }
     }
 
-    // Requirement: SPEC-0001 §2 — evaluation is deterministic: identical
+    // Requirement: evaluation is deterministic: identical
     // bytes and an identical expression always produce identical results.
     // What: the same corpus case evaluated repeatedly yields byte-
     // identical serialized results. Why: unordered container iteration
@@ -139,14 +161,14 @@ mod tests {
     }
 
     fn run_once(given: &serde_json::Value, expression: &str) -> String {
-        match crate::eval::RealEngine.evaluate(given, expression) {
+        match TestEngine.evaluate(given, expression) {
             crate::corpus::DriverOutcome::Result(value) => value.to_string(),
             crate::corpus::DriverOutcome::Error(error) => format!("error:{error}"),
             crate::corpus::DriverOutcome::NotImplemented => "not-implemented".to_string(),
         }
     }
 
-    // Requirement: SPEC-0001 §3 — null and missing-value semantics are
+    // Requirement: null and missing-value semantics are
     // exactly the specification's: missing paths evaluate to null; there
     // are no omission or defaulting rules. What: direct probes of the
     // miss chains (missing key, index out of range, navigation through a
@@ -170,7 +192,7 @@ mod tests {
             ("list[1]", serde_json::json!(20)),
         ];
         for (expression, expected) in cases {
-            let actual = match crate::eval::RealEngine.evaluate(&document, expression) {
+            let actual = match TestEngine.evaluate(&document, expression) {
                 crate::corpus::DriverOutcome::Result(value) => value,
                 other => panic!("{expression}: expected a result, got {other:?}"),
             };
@@ -178,7 +200,7 @@ mod tests {
         }
     }
 
-    // Requirement: SPEC-0001 §4 — the CBOR-to-JSON mapping is normative;
+    // Requirement: the CBOR-to-JSON mapping is normative;
     // the corpus's escape tests must round-trip through canonicalization
     // (this is the case that caught Rust-Debug escaping being used where
     // JSON escaping was required). What: the corpus's backslash-literal
@@ -202,10 +224,11 @@ mod tests {
 
 #[cfg(test)]
 mod slice_tests {
+    use super::tests::TestEngine;
 
     use crate::corpus::{Driver, DriverOutcome, load_corpus};
     use std::path::Path;
-    // Requirement: SPEC-0001 §3, §6 — the first language slice turns the
+    // Requirement: the first language slice turns the
     // corpus green on the materialized backend. What: per-feature roll-ups:
     // the slice's features fully green; later-phase features red-or-not-
     // implemented but never silently wrong (this test prints the full report
@@ -219,7 +242,7 @@ mod slice_tests {
     #[test]
     fn corpus_slice1_materialized() {
         let files = load_corpus(Path::new("tests/jmespath-corpus/compliance")).expect("loads");
-        let reports = crate::corpus::run_corpus(&crate::eval::RealEngine, &files);
+        let reports = crate::corpus::run_corpus(&TestEngine, &files);
         for report in &reports {
             println!(
                 "{:12} total {:4} passed {:4} failed {:4} not-implemented {:4}",
@@ -231,7 +254,7 @@ mod slice_tests {
         for file in &files {
             for group in &file.groups {
                 for case in &group.cases {
-                    let outcome = crate::eval::RealEngine.evaluate(&group.given, &case.expression);
+                    let outcome = TestEngine.evaluate(&group.given, &case.expression);
                     let declared = case.error.clone().unwrap_or_else(|| "ok".to_string());
                     let matches = match (&outcome, &case.error) {
                         (DriverOutcome::Result(value), None) => match &case.result {
@@ -254,11 +277,10 @@ mod slice_tests {
                             declared = declared,
                         );
                     }
-                    if let DriverOutcome::NotImplemented = outcome {
-                        if case.error.is_none() {
+                    if let DriverOutcome::NotImplemented = outcome
+                        && case.error.is_none() {
                             println!("NOTIMPL[{}] expr={:?}", file.feature, case.expression);
                         }
-                    }
                 }
             }
         }
@@ -282,7 +304,7 @@ mod slice_tests {
         // these features are fully implemented for their slice except where
         // the flatten operator (a later phase) appears: zero failures, with
         // the remainder honestly not-implemented
-        // the function library is complete (phase 4): functions is fully
+        // the function library is complete: functions is fully
         // green, like the other implemented features
         for feature in ["functions", "unicode"] {
             let report = reports

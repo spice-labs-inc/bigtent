@@ -303,7 +303,7 @@ mod tests {
     use super::*;
     use crate::error::SanshoError;
 
-    // Requirement: SPEC-0001 §6 — conformance is defined by the vendored
+    // Requirement: conformance is defined by the vendored
     // corpus; the harness must load the real files as data (Hard Stop 4)
     // and the red baseline must be honest (nothing green, nothing
     // falsely rejected-green).
@@ -312,8 +312,8 @@ mod tests {
     // unimplemented driver marks every case NotImplemented; the report
     // shows passed == 0 everywhere with substantial case totals.
     //
-    // LLM section: this is the "red baseline" test from the plan's
-    // Phase 1. It fails if the corpus directory is missing or malformed
+    // LLM section: the corpus-missing gate. It fails if the corpus
+    // directory is missing or malformed
     // (harness input errors are real errors), and it fails if any case
     // is green under the do-nothing driver — which would mean the
     // harness lies about conformance.
@@ -349,7 +349,7 @@ mod tests {
         }
     }
 
-    // Requirement: SPEC-0001 §3 — expressions the specification declares
+    // Requirement: expressions the specification declares
     // invalid are rejected; §6 — the corpus's invalid cases are part of
     // conformance. What: the harness classifies every corpus error case
     // into an engine error category — no declared error string may be
@@ -391,7 +391,7 @@ mod tests {
         }
     }
 
-    // Requirement: SPEC-0001 §3 — numeric equality follows the
+    // Requirement: numeric equality follows the
     // specification (numbers are doubles). What: `json_equal` treats
     // integer and float renderings of the same value as equal, and
     // structure-aware elsewhere. Why: corpus result comparison would
@@ -411,7 +411,7 @@ mod tests {
         assert!(!json_equal(&serde_json::json!(1), &serde_json::json!(2)));
     }
 
-    // Requirement: SPEC-0001 §6 — a conforming engine rejects the
+    // Requirement: a conforming engine rejects the
     // corpus's invalid cases; the harness must not credit a driver that
     // answers errors where results are expected (and vice versa).
     // What: a driver that errors on everything scores zero passes on
@@ -452,7 +452,7 @@ mod tests {
         }
     }
 
-    // Requirement: SPEC-0001 §6 — a conforming engine rejects invalid
+    // Requirement: a conforming engine rejects invalid
     // expressions; the harness must not credit a driver that answers
     // results where rejections are declared. What: a driver that returns
     // a result for every case must score zero passes on every error-

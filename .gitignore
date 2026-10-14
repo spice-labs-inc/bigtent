@@ -41,3 +41,10 @@ core.*
 
 # Alternate bigtent copy (large; kept out of the repository)
 /other_bigtent/
+
+/execution_state/
+/plans/
+/discussions/
+AGENTS.md
+CLAUDE.md
+

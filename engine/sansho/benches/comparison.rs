@@ -8,7 +8,17 @@
 //! (the `path_outputs_agree` test). The interest is the relative timing.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use sansho::{compile, evaluate_cbor, evaluate_json, parse};
+use sansho::{compile, parse};
+
+/// The whole public path: evaluate the program, then materialize the result at
+/// the boundary. This is what a consumer pays for one query, so it is what
+/// these benchmarks measure.
+fn run<'a, T: sansho::SanshoTrait<'a>>(
+    program: &sansho::Program,
+    document: T,
+) -> Result<serde_json::Value, sansho::SanshoError> {
+    sansho::evaluate(program, document).and_then(|value| sansho::materialize(&value))
+}
 use serde_json::Value as J;
 
 /// The document shape: the Appendix-A-like item (file_names-heavy, the
@@ -16,7 +26,6 @@ use serde_json::Value as J;
 /// paths), scaled to a TARGET SERIALIZED-CBOR size.
 // NOTE: the equality-test lives in tests/comparison_equality.rs (the
 // bench-targets do not run #[test]s); the generator is duplicated there.
-
 fn scaled_item_to_size(target_bytes: usize) -> (J, Vec<u8>, usize) {
     // the approximate per-entry contribution (~130 bytes of CBOR per
     // entry at this shape) — the entry-count that lands near the target
@@ -74,8 +83,6 @@ fn build_item(entries: usize) -> J {
 ///   representation → Sansho's materialized backend;
 /// - `sansho_cursor`: the CBOR byte slice → Sansho's cursor directly
 ///   (no intermediate representation).
-
-
 fn bench_comparison(criterion: &mut Criterion) {
     for target in [10_000, 100_000, 1_000_000, 10_000_000] {
         let (document, bytes, entries) = scaled_item_to_size(target);
@@ -91,7 +98,7 @@ fn bench_comparison(criterion: &mut Criterion) {
             ("identifier", "identifier"),
         ] {
             let jmespath_expression = jmespath::compile(expression).unwrap();
-            let program = compile(&parse(expression).unwrap()).unwrap();
+            let program = compile(&parse(expression).unwrap(), None).unwrap();
 
             group.bench_with_input(
                 BenchmarkId::new(
@@ -123,7 +130,7 @@ fn bench_comparison(criterion: &mut Criterion) {
                     bench.iter(|| {
                         let parsed =
                             serde_cbor::from_slice::<J>(black_box(bytes)).unwrap();
-                        black_box(evaluate_json(program, &parsed).expect("evaluates"))
+                        black_box(run(program, &parsed).expect("evaluates"))
                     });
                 },
             );
@@ -133,7 +140,7 @@ fn bench_comparison(criterion: &mut Criterion) {
                 &(bytes.as_slice(), &program),
                 |bench, (bytes, program)| {
                     bench.iter(|| {
-                        black_box(evaluate_cbor(program, black_box(bytes)).expect("evaluates"))
+                        black_box(run(program, black_box(*bytes)).expect("evaluates"))
                     });
                 },
             );

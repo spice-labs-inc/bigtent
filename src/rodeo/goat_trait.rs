@@ -125,7 +125,7 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
                 if let Some(item) = the_self.item_for_identifier(&identifier) {
                     // deal with anti-aliasing
                     item.connections
-                                                .iter()
+                        .iter()
                         .filter(|(edge_type, _)| edge_type.is_alias_to())
                         .flat_map(|(_, targets)| targets.iter())
                         .for_each(|target| {
@@ -137,7 +137,7 @@ pub async fn impl_stream_flattened_items<GRT: GoatRodeoTrait + 'static>(
                     // process
                     for s in item
                         .connections
-                                                .iter()
+                        .iter()
                         .filter(|(edge_type, _)| {
                             edge_type.is_contains_down() || (source && edge_type.is_built_from())
                         })

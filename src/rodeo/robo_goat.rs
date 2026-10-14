@@ -221,7 +221,7 @@ async fn test_synthetic() {
 
     let tagged: Vec<String> = tags
         .connections
-                .iter()
+        .iter()
         .filter(|(edge_type, _)| edge_type.is_tag_to())
         .flat_map(|(_, targets)| targets.iter().cloned())
         .collect();

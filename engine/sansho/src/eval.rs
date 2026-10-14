@@ -1,42 +1,44 @@
 //! The evaluator: runs a compiled walk program against a document,
-//! performing EVERY data access through the [`SanshoTrait`] (SPEC-0001
-//! §5). The trait is the thing carried through program execution — the
-//! evaluator's functions take `&impl SanshoTrait<'a>` and navigation
-//! returns trait-bounded values; no other value carrier exists.
+//! performing EVERY data access through the [`SanshoTrait`]. The trait is
+//! the ONLY thing carried through program execution: the evaluator's
+//! functions take a trait value (a `&(dyn SanshoTrait<'a> + 'a)`) and
+//! return one (`Box<dyn SanshoTrait<'a> + 'a>`); navigation returns
+//! trait-bounded values, so no other value carrier exists.
 //!
-//! Evaluation state is internal bookkeeping: the FLOW holds only owned
-//! values (computed scalars and the materialized row boundary — the
-//! emit); references into the document live only as trait-bounded
-//! values being walked, per element, inside the evaluation. A
-//! single-position spine materializes at its end (the row boundary);
-//! projection output elements materialize per element at their spine's
-//! end.
+//! Evaluation state is internal bookkeeping: the values being walked are
+//! trait values (a member is a trait value, borrowed from the document
+//! where the format stores it), and a projection is a collection of them
+//! (`Vec<Box<dyn SanshoTrait<'a> + 'a>>` — itself a trait value). The
+//! document's bytes are decoded only at the materialization boundary.
 //!
 //! - a value navigates lazily (key, index) or projects (wildcards,
-//!   slice, filter, flatten) — nothing materializes until the spine
-//!   end;
+//!   slice, filter, flatten) — the traversal itself never decodes;
 //! - every edge after a projection applies per element: the REMAINING
 //!   spine is evaluated per kept element, preserving shape (nested
 //!   projections stay nested);
-//! - an element whose result is null drops out of the projection;
+//! - an element whose result is null drops out of the projection (an
+//!   empty projection stays: a wildcard on a scalar is a valid empty row);
 //! - the flatten edge alone dissolves arrays one level into the parent
 //!   projection;
 //! - navigation misses evaluate to null (the specification's null
 //!   semantics: no omission, no defaulting);
-//! - value-level constructs (functions, comparators, logic, literals)
-//!   materialize their inputs through the value's boundary decode —
-//!   the fusion point that keeps every byte decoded at most once.
+//! - the value-level constructs (functions, comparators, logic, literals)
+//!   read their inputs through the trait's probes — a computed scalar is a
+//!   new value, never a decode of the document.
 //!
-//! The public entry is [`lookup`], generic over the trait: pass any
-//! Sansho source (`&[u8]`, `&serde_json::Value`, `&serde_cbor::Value`,
-//! `&Item`, a scalar), and get the reference-shaped result.
+//! The public entry is generic over the trait: pass any Sansho source
+//! (`&[u8]`, `&serde_json::Value`, `&serde_cbor::Value`, `&Item`, a
+//! scalar) boxed as a trait value, and get the materialized result.
+
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::ast::CmpOp;
-use crate::corpus::{Driver, DriverOutcome};
+
 use crate::error::SanshoError;
-use crate::program::{Edge, FnArgP, Program, compile as to_program};
-use crate::view::{Kind, SanshoTrait};
-use serde_json::Value as J;
+use crate::program::{Edge, FnArgP, Program};
+use crate::view::{Kind, SanshoCarrier, SanshoTrait};
+use serde_json::Value as SerdeJson;
 
 /// Why evaluation stopped: either a structured error, or a construct the
 /// current language phase does not implement (scored by the corpus
@@ -54,7 +56,7 @@ impl From<SanshoError> for Stop {
 }
 
 impl Stop {
-    pub(crate) fn into_error(self) -> SanshoError {
+    pub fn into_error(self) -> SanshoError {
         match self {
             Stop::Error(e) => e,
             Stop::NotImplemented => SanshoError::Compile {
@@ -63,183 +65,76 @@ impl Stop {
         }
     }
 }
-
-/// The evaluation's internal result shape: owned values only — the
-/// reference-shaped values live as trait-bounded values being walked,
-/// never stored here (internal bookkeeping; not part of the public
-/// surface).
-#[derive(Debug)]
-pub(crate) enum Flow {
-    /// A computed scalar or aggregate (functions, comparators,
-    /// literals, multi-selects) or a materialized row (the emit
-    /// boundary).
-    Value(J),
-    /// A projection's collection.
-    Proj(Vec<Flow>),
+/// The evaluation's internal flow: a value at this level, or a grouping of
+/// flows at this level.
+///
+/// This is bookkeeping for the evaluation — never part of the trait, never
+/// returned by the public entry — and it holds only trait values, so nothing
+/// is copied and no `serde_json` value appears inside an evaluation. The two
+/// shapes are what the projection semantics turn on: a grouping takes an edge
+/// per item and its items stay at their own level, while a value takes the
+/// edge directly.
+pub(crate) enum Flow<'a> {
+    /// One value at this level.
+    Value(SanshoCarrier<'a>),
+    /// A grouping at this level: the per-item results.
+    Items(Vec<Flow<'a>>),
 }
 
-impl Flow {
-    /// Materialize the flow (the emit boundary: rows of owned JSON).
-    pub fn as_value(&self) -> Result<J, SanshoError> {
-        match self {
-            Flow::Value(value) => Ok(value.clone()),
-            Flow::Proj(items) => {
-                let mut array = Vec::with_capacity(items.len());
-                for item in items {
-                    array.push(item.as_value()?);
-                }
-                Ok(J::Array(array))
-            }
-        }
+/// The emit: a flow as a trait value. A grouping becomes a collection value —
+/// a refcount around the vector of its items — so no data is copied.
+pub(crate) fn flow_value<'a>(flow: Flow<'a>) -> SanshoCarrier<'a> {
+    match flow {
+        Flow::Value(value) => value,
+        Flow::Items(items) => Rc::new(
+            items
+                .into_iter()
+                .map(flow_value)
+                .collect::<Vec<SanshoCarrier<'a>>>(),
+        ),
     }
 }
 
-/// The corpus-facing driver: the real engine, through the JSON source.
-/// Unimplemented constructs surface as not-implemented outcomes so the
-/// corpus report distinguishes "not built yet" from "built and wrong".
-pub struct RealEngine;
-
-impl Driver for RealEngine {
-    fn evaluate(&self, given: &serde_json::Value, expression: &str) -> DriverOutcome {
-        match crate::parser::parse(expression) {
-            Err(e) => DriverOutcome::Error(e),
-            Ok(parsed) => match to_program(&parsed) {
-                Err(e) => DriverOutcome::Error(e),
-                Ok(program) => match eval_program(&program, given) {
-                    Ok(value) => DriverOutcome::Result(value),
-                    Err(Stop::Error(e)) => DriverOutcome::Error(e),
-                    Err(Stop::NotImplemented) => DriverOutcome::NotImplemented,
-                },
-            },
-        }
-    }
-}
-
-/// The reference-shaped result of [`lookup`]: the rows produced at the
-/// spine ends (the emit boundary). Materialize with [`Self::as_value`].
-pub struct ZeroCopySanshoResult<'d> {
-    flow: Flow,
-    _lifetime: std::marker::PhantomData<&'d ()>,
-}
-
-impl<'d> ZeroCopySanshoResult<'d> {
-    /// Materialize the result (the emit boundary: rows of owned JSON).
-    pub fn as_value(&self) -> Result<J, SanshoError> {
-        self.flow.as_value()
-    }
-}
-
-/// The generic lookup entry — the source-trait surface: evaluate a
-/// compiled program against ANY [`SanshoTrait`] source — a `&[u8]`
-/// CBOR document, a `serde_json::Value`, a `serde_cbor::Value`, an
-/// `Item` (in the embedding crate), or a scalar — passing the raw
-/// type. The trait is the only data-access surface an evaluation
-/// touches; the source value ITSELF is the trait value the evaluator
-/// walks.
-pub fn lookup<'a, T: SanshoTrait<'a> + ?Sized>(
-    data: &'a T,
-    program: &Program,
-) -> Result<ZeroCopySanshoResult<'a>, SanshoError> {
-    let flow = eval(program, data).map_err(|stop| stop.into_error())?;
-    Ok(ZeroCopySanshoResult {
-        flow,
-        _lifetime: std::marker::PhantomData,
-    })
-}
-
-/// The materialized convenience form of [`lookup`]: the result
-/// collapsed at the emit boundary (the row boundary for a walk's
-/// emit).
-pub fn lookup_value<'a, T: SanshoTrait<'a> + ?Sized>(
-    data: &'a T,
-    program: &Program,
-) -> Result<J, SanshoError> {
-    lookup(data, program).and_then(|result| result.as_value())
-}
-
-/// Evaluate a program against an in-memory JSON document. The
-/// document is a BORROW — the evaluation routes through the borrowed
-/// `&J` trait surface, whose members are references into the tree (no
-/// per-member clones); the owned value form stays available to callers
-/// passing an owned value directly to [`lookup_value`].
-pub fn evaluate_json(program: &Program, document: &J) -> Result<J, SanshoError> {
-    lookup_value(&document, program)
-}
-
-/// Evaluate a program against one CBOR document (the byte-slice input of
-/// SPEC-0001 §2): the byte source, with every position decoded at
-/// most once per evaluation.
-pub fn evaluate_cbor(program: &Program, document: &[u8]) -> Result<J, SanshoError> {
-    lookup_value(&document, program)
-}
-
-/// The instrumented form: the result plus the number of DISTINCT
-/// positions decoded (the byte-once property's observable). The decode
-/// memo is internal bookkeeping; the count is read from the root
-/// position the evaluator walked.
-pub fn evaluate_cbor_with_stats(
-    program: &Program,
-    document: &[u8],
-) -> (Result<J, SanshoError>, usize) {
-    let root = crate::source::CborNode::root(document);
-    let result = lookup_value(&document, program);
-    (result, root.decode_count())
-}
-
-/// The phase-visible form of the CBOR entry: the not-implemented
-/// constructs surface as [`Stop::NotImplemented`] (the corpus harness
-/// scores those as not-built-yet, never as failures). Interim during the
-/// phased construction.
-pub fn evaluate_cbor_stopped(program: &Program, document: &[u8]) -> Result<J, Stop> {
-    eval(program, &document).and_then(|flow| flow.as_value().map_err(Stop::from))
-}
-
-/// The corpus harness's JSON entry: the outcome-visible form.
-pub(crate) fn eval_program(program: &Program, document: &J) -> Result<J, Stop> {
-    eval(program, document).and_then(|flow| flow.as_value().map_err(Stop::from))
-}
-
-/// The program evaluation: the ONLY data carrier is the trait value
-/// being walked.
-
-fn eval<'a, T: SanshoTrait<'a> + ?Sized>(program: &Program, node: &T) -> Result<Flow, Stop> {
+/// The program evaluation: the ONLY data carrier is the trait value being
+/// walked; a spine's result may be a grouping.
+pub(crate) fn eval<'a>(program: &Program, node: SanshoCarrier<'a>) -> Result<Flow<'a>, Stop> {
     match program {
-        Program::Literal(value) => Ok(Flow::Value(value.clone())),
-        Program::Spine(spine) => eval_spine(node, &spine.edges),
+        Program::Literal(value) => Ok(Flow::Value(Rc::new(value.clone()))),
+        Program::Spine(edges) => eval_spine(node, &edges.edges),
         Program::MultiList(slots) => {
             if node.is_null() {
-                return Ok(Flow::Value(J::Null));
+                return Ok(Flow::Value(null_value()));
             }
-            let mut items = Vec::with_capacity(slots.len());
+            let mut items: Vec<SanshoCarrier<'a>> = Vec::with_capacity(slots.len());
             for slot in slots {
-                let value = eval(slot, node)?.as_value()?;
-                items.push(value);
+                let found = eval(slot, node.clone())?;
+                items.push(flow_value(found));
             }
-            Ok(Flow::Value(J::Array(items)))
+            Ok(Flow::Value(Rc::new(items)))
         }
         Program::MultiHash(entries) => {
             if node.is_null() {
-                return Ok(Flow::Value(J::Null));
+                return Ok(Flow::Value(null_value()));
             }
-            let mut object = serde_json::Map::new();
+            let mut object = HashMap::<String, SanshoCarrier<'a>>::new();
             for (key, slot) in entries {
-                let value = eval(slot, node)?.as_value()?;
-                object.insert(key.clone(), value);
+                let value = eval(slot, node.clone())?;
+                object.insert(key.clone(), flow_value(value));
             }
-            Ok(Flow::Value(J::Object(object)))
+            Ok(Flow::Value(Rc::new(object) as SanshoCarrier<'a>))
         }
         Program::Pipe(left, right) => {
-            let left_value = eval(left, node)?.as_value()?;
-            eval(right, &left_value)
+            let left_value = flow_value(eval(left, node)?);
+            eval(right, left_value)
         }
-        Program::Function(name, args) => eval_function(name, args, node),
+        Program::Function(name, args) => eval_function(name, args, node).map(Flow::Value),
         Program::Compare(op, left, right) => {
-            let left_value = eval(left, node)?.as_value()?;
-            let right_value = eval(right, node)?.as_value()?;
+            let left_value = flow_value(eval(left, node.clone())?);
+            let right_value = flow_value(eval(right, node)?);
             compare(*op, &left_value, &right_value).map(Flow::Value)
         }
         Program::And(left, right) => {
-            let left_value = eval(left, node)?.as_value()?;
+            let left_value = flow_value(eval(left, node.clone())?);
             if truthy(&left_value) {
                 eval(right, node)
             } else {
@@ -247,7 +142,7 @@ fn eval<'a, T: SanshoTrait<'a> + ?Sized>(program: &Program, node: &T) -> Result<
             }
         }
         Program::Or(left, right) => {
-            let left_value = eval(left, node)?.as_value()?;
+            let left_value = flow_value(eval(left, node.clone())?);
             if truthy(&left_value) {
                 Ok(Flow::Value(left_value))
             } else {
@@ -255,558 +150,380 @@ fn eval<'a, T: SanshoTrait<'a> + ?Sized>(program: &Program, node: &T) -> Result<
             }
         }
         Program::Not(inner) => {
-            let value = eval(inner, node)?.as_value()?;
-            Ok(Flow::Value(J::Bool(!truthy(&value))))
+            let value = !truthy(&flow_value(eval(inner, node)?));
+            Ok(Flow::Value(Rc::new(value)))
         }
     }
 }
 
-/// Walk a spine over a trait value. The FIRST edge applies to the
-/// value; if it produces a projection, the REMAINING edges apply PER
-/// KEPT ELEMENT (the projection semantics); otherwise the chain walks
-/// the single position, materializing at the spine end (the row
-/// boundary).
-fn eval_spine<'a, T: SanshoTrait<'a> + ?Sized>(node: &T, edges: &[Edge]) -> Result<Flow, Stop> {
+/// Walk a spine over a trait value. The FIRST edge applies to the value; a
+/// projecting edge collects its elements into a grouping and the REMAINING
+/// edges then apply at that collection's level; otherwise the chain walks the
+/// single position.
+fn eval_spine<'a>(node: SanshoCarrier<'a>, edges: &[Edge]) -> Result<Flow<'a>, Stop> {
     match edges {
-        [] => node.materialize().map(Flow::Value).map_err(Stop::from),
+        [] => Ok(Flow::Value(node)),
         [edge, rest @ ..] => eval_edge(node, edge, rest),
     }
 }
 
-/// Apply ONE edge to a trait value, then the remaining edges: for a
-/// projection-producing edge, per element; for a position-producing
-/// edge, on the member.
-fn eval_edge<'a, T: SanshoTrait<'a> + ?Sized>(
-    node: &T,
-    edge: &Edge,
-    rest: &[Edge],
-) -> Result<Flow, Stop> {
+/// Apply ONE edge to a trait value, then the remaining edges.
+fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
     match edge {
         Edge::Compute(program) => {
-            // a value-construct spliced into the chain: the program
-            // evaluates over the current value; if the spine continues,
-            // the result continues as a VALUE (a computed value has no
-            // backing position)
+            // a value-construct spliced into the chain: the program evaluates
+            // over the current value and the result continues as a VALUE (a
+            // computed value has no backing position)
             let flow = eval(program, node)?;
             continue_flow(flow, rest)
         }
-        Edge::Key(name) => match node.get_key(name) {
-            Some(child) => continue_single(&child, rest),
-            None => Ok(Flow::Value(J::Null)),
+        Edge::Key(name) => match node.kind() {
+            // the specification's null semantics: a miss on a value that is
+            // not an object is null, never an error
+            Kind::Object => match node.get_key(name).map_err(Stop::from)? {
+                Some(child) => continue_single(child, rest),
+                None => Ok(Flow::Value(null_value())),
+            },
+            _ => Ok(Flow::Value(null_value())),
         },
-        Edge::Index(index) => {
-            let resolved = match node.kind() {
-                Kind::Array => {
-                    let len = node.container_len().unwrap_or(0) as i64;
-                    let effective = if *index < 0 { len + index } else { *index };
-                    if effective >= 0 && effective < len {
-                        node.get_index(effective as usize)
-                    } else {
-                        None
-                    }
+        Edge::Index(index) => match node.kind() {
+            // a miss on a value that is not an array is null
+            Kind::Array => {
+                let len = node.container_len().unwrap_or(0) as i64;
+                let effective = if *index < 0 { len + index } else { *index };
+                let resolved = if effective >= 0 && effective < len {
+                    node.get_index(effective as usize).map_err(Stop::from)?
+                } else {
+                    None
+                };
+                match resolved {
+                    Some(child) => continue_single(child, rest),
+                    None => Ok(Flow::Value(null_value())),
                 }
-                _ => None,
-            };
-            match resolved {
-                Some(child) => continue_single(&child, rest),
-                None => Ok(Flow::Value(J::Null)),
             }
-        }
+            _ => Ok(Flow::Value(null_value())),
+        },
         // the dot form reads object values only
         Edge::WildcardDot => match node.kind() {
             Kind::Object => {
-                let members: Vec<_> = node.entries().into_iter().map(|(_, v)| v).collect();
-                let flow = eval_projection(members, &[])?;
-                continue_flow(flow, rest)
+                let mut elements: Vec<SanshoCarrier<'a>> = Vec::new();
+                for (_, member) in node.entries().map_err(Stop::from)? {
+                    elements.push(member);
+                }
+                project(elements, rest)
             }
-            _ => Ok(Flow::Value(J::Null)),
+            _ => Ok(Flow::Value(null_value())),
         },
         // the bracket form reads array elements only
         Edge::WildcardBracket => match node.kind() {
-            Kind::Array => {
-                let elements = node.elements();
-                let flow = eval_projection(elements, &[])?;
-                continue_flow(flow, rest)
-            }
-            _ => Ok(Flow::Value(J::Null)),
+            Kind::Array => project(node.elements().map_err(Stop::from)?, rest),
+            _ => Ok(Flow::Value(null_value())),
         },
         Edge::Filter(predicate) => match node.kind() {
-            Kind::Array => {
-                let mut kept = Vec::new();
-                // the hoisted leaf-predicate fast path (Phase 2): the
-                // dominant filter shape `[?starts_with(@, 'prefix')]`
-                // is evaluated per element WITHOUT the program-eval
-                // recursion — a borrowed leaf read + a boolean. Non-
-                // string elements and as_str-None elements fall
-                // through to the general path (semantics preserved).
-                let leaf = leaf_predicate_shape(predicate);
-                for element in node.elements() {
-                    let keep = match &leaf {
-                        Some((name, prefix)) if element.kind() == Kind::String => {
-                            // the RAW-BYTES fast path (owner decision
-                            // 2026-09-23): the string-predicate
-                            // comparison runs on the unvalidated text
-                            // bytes — no UTF-8 validation per element.
-                            // An invalid-UTF-8 element in a filter
-                            // predicate is DROPPED (not errored — the
-                            // relaxed contract, pinned in the escape
-                            // matrix). Byte strings (major 2) return
-                            // None here and keep the base64url general
-                            // path.
-                            match element.raw_text_bytes() {
-                                Some(bytes) => match name.as_str() {
-                                    "starts_with" => bytes.starts_with(prefix.as_bytes()),
-                                    "ends_with" => bytes.ends_with(prefix.as_bytes()),
-                                    _ => bytes
-                                        .windows(prefix.len())
-                                        .any(|w| w == prefix.as_bytes()),
-                                },
-                                None => truthy(
-                                    &eval(predicate, &element)?
-                                        .as_value()
-                                        .map_err(Stop::from)?,
-                                ),
-                            }
-                        }
-                        _ => truthy(
-                            &eval(predicate, &element)?
-                                .as_value()
-                                .map_err(Stop::from)?,
-                        ),
-                    };
-                    if keep {
-                        kept.push(element);
-                    }
-                }
-                let flow = eval_projection(kept, &[])?;
-                continue_flow(flow, rest)
-            }
-            _ => Ok(Flow::Value(J::Null)),
+            Kind::Array => project(filter_elements(node, predicate)?, rest),
+            _ => Ok(Flow::Value(null_value())),
         },
-        // the slice is a projection over the selected range (arrays), or
-        // the sliced string (strings)
+        // the slice is a projection over the selected range (arrays), or the
+        // sliced string (strings)
         Edge::Slice(spec) => match node.kind() {
             Kind::Array => {
                 let len = node.container_len().unwrap_or(0) as i64;
                 let selected = slice_indices(len, spec)?;
-                let mut elements = Vec::with_capacity(selected.len());
+                let mut elements: Vec<SanshoCarrier<'a>> = Vec::with_capacity(selected.len());
                 for index in selected {
-                    if let Some(element) = node.get_index(index as usize) {
+                    if let Some(element) = node.get_index(index as usize).map_err(Stop::from)? {
                         elements.push(element);
                     }
                 }
-                let flow = eval_projection(elements, &[])?;
-                continue_flow(flow, rest)
+                project(elements, rest)
             }
             Kind::String => {
-                let text = node.as_str().map(|s| s.into_owned()).unwrap_or_default();
+                let text = node.as_str().map(|s| s.to_string()).unwrap_or_default();
                 let chars: Vec<char> = text.chars().collect();
                 let selected = slice_indices(chars.len() as i64, spec)?;
                 let sliced: String = selected
                     .into_iter()
                     .filter_map(|i| chars.get(i as usize))
                     .collect();
-                Ok(Flow::Value(J::String(sliced)))
+                Ok(Flow::Value(Rc::new(sliced)))
             }
-            _ => Ok(Flow::Value(J::Null)),
+            _ => Ok(Flow::Value(null_value())),
         },
         Edge::Flatten => {
-            // the flatten of the current value: dissolve array-valued
-            // results one level
-            let flow = flatten_value(node).map_err(Stop::from)?;
+            // the flatten of the current value: dissolve array-valued results
+            // one level
+            let flow = flatten_value(node)?;
             continue_flow(flow, rest)
         }
     }
 }
 
-/// Continue the spine on a SINGLE member position (a key/index hit):
-/// the remaining edges walk the member; an empty remainder materializes
-/// the member at the row boundary.
-fn continue_single<'a, T: SanshoTrait<'a> + ?Sized>(child: &T, rest: &[Edge]) -> Result<Flow, Stop> {
+/// Collect the elements into a grouping at their own level, then apply the
+/// REMAINING edges at that collection's level — the two-step split that keeps
+/// a projection from adding a level per edge.
+fn project<'a>(elements: Vec<SanshoCarrier<'a>>, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
+    let flow = Flow::Items(elements.into_iter().map(Flow::Value).collect());
+    continue_flow(flow, rest)
+}
+
+/// Continue the spine on a SINGLE member position (a key/index hit): the
+/// remaining edges walk the member; an empty remainder is the member itself.
+fn continue_single<'a>(child: SanshoCarrier<'a>, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
     match rest {
-        [] => child.materialize().map(Flow::Value).map_err(Stop::from),
+        [] => Ok(Flow::Value(child)),
         [edge, more @ ..] => eval_edge(child, edge, more),
     }
 }
 
-/// Continue the spine on a FLOW (a computed value or a flatten): the
-/// remaining edges apply; an empty remainder passes the flow through.
-fn continue_flow(flow: Flow, rest: &[Edge]) -> Result<Flow, Stop> {
+/// Continue the spine on a FLOW: the remaining edges apply; an empty remainder
+/// passes the flow through.
+fn continue_flow<'a>(flow: Flow<'a>, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
     match rest {
         [] => Ok(flow),
         [edge, more @ ..] => eval_flow(flow, edge, more),
     }
 }
 
-/// Apply an edge to an owned-value flow (computed values have no
-/// backing position): the edge applies PER ELEMENT through the JSON
-/// value's own trait surface (`J` implements [`SanshoTrait`]) — a
-/// projection continues per element, and the nested-projection shape
-/// is preserved.
-/// Apply ONE edge to a collection (the projection semantics): the
-/// edge applies PER ITEM, at its own depth — a value item yields its
-/// edge result, a nested projection item yields the edge applied to
-/// each of ITS items (the per-item nesting is preserved: a
-/// `[*]`/`.*`-chain stays nested per source item, `foo[*].bar[*].kind`
-/// → `[[kinds],[kinds]]`). A null value result drops out of the
-/// collection; an empty projection item stays (a wildcard-on-scalar
-/// yields a valid empty row, `foo.*.*.*` → `[[],[],[]]`). The FLATTEN
-/// edge is handled at the collection level: it dissolves array-valued
-/// items one level INTO the collection (the `...[][]` → flat rule, and
-/// the reason a flatten after a projection flattens the whole row
-/// shape).
-fn eval_flow(flow: Flow, edge: &Edge, rest: &[Edge]) -> Result<Flow, Stop> {
+/// Apply an edge to a flow. A VALUE takes the edge directly. A GROUPING takes
+/// it per item, at each item's own depth (a nested grouping keeps its shape),
+/// and the results stay at this level — so the level count does not grow with
+/// the number of projecting edges. A null value item drops; an empty grouping
+/// item stays (a wildcard on a scalar inside a projection is a valid empty
+/// row). The flatten dissolves array-valued items one level INTO this
+/// collection.
+fn eval_flow<'a>(flow: Flow<'a>, edge: &Edge, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
     match edge {
         Edge::Flatten => {
-            // a computed flatten: dissolve arrays one level
+            // a computed flatten: dissolve arrays one level into this collection
             let mut flows = Vec::new();
             flatten_into(flow, &mut flows)?;
-            continue_flow(Flow::Proj(flows), rest)
+            continue_flow(Flow::Items(flows), rest)
         }
         _ => match flow {
-            Flow::Value(value) => eval_edge(&value, edge, rest),
-            Flow::Proj(items) => {
+            Flow::Value(value) => eval_edge(value, edge, rest),
+            Flow::Items(items) => {
                 let mut results = Vec::new();
                 for item in items {
                     collect_projected(item, edge, &mut results)?;
                 }
-                continue_flow(Flow::Proj(results), rest)
+                continue_flow(Flow::Items(results), rest)
             }
         },
     }
 }
 
-/// Apply the edge to one flow item, collecting the results at the
-/// collection's level: a value item's edge result joins the collection
-/// (a null result drops); a nested projection item keeps its shape —
-/// the edge applies to each of its items and the results stay one item
-/// (the per-source-item nesting).
-fn collect_projected(item: Flow, edge: &Edge, results: &mut Vec<Flow>) -> Result<(), Stop> {
+/// Apply the edge to ONE flow item, collecting the result at the collection's
+/// level: a value item's edge result joins the collection (a null result
+/// drops); a nested grouping keeps its shape — the edge applies to each of its
+/// items and the results stay one item.
+fn collect_projected<'a>(
+    item: Flow<'a>,
+    edge: &Edge,
+    results: &mut Vec<Flow<'a>>,
+) -> Result<(), Stop> {
     match item {
-        Flow::Value(value) => match eval_edge(&value, edge, &[])? {
-            Flow::Value(J::Null) => Ok(()),
+        Flow::Value(value) => match eval_edge(value, edge, &[])? {
+            Flow::Value(result) if result.is_null() => Ok(()),
             flow => {
                 results.push(flow);
                 Ok(())
             }
         },
-        Flow::Proj(items) => {
+        Flow::Items(items) => {
             let mut nested = Vec::new();
             for item in items {
                 collect_projected(item, edge, &mut nested)?;
             }
-            results.push(Flow::Proj(nested));
+            results.push(Flow::Items(nested));
             Ok(())
         }
     }
 }
 
-/// The projection continuation — the collection semantics over
-/// per-item GROUPS. Each projecting edge produces, for every source
-/// value, the group of its results (an object's members, an array's
-/// elements, a filter's kept elements, a key hit); the next edge
-/// applies per group member, preserving the projection's per-item
-/// nesting (`foo[*].bar[*].kind` → `[[kinds],[kinds]]`). The flatten
-/// edge dissolves arrays one level INTO the collection and collapses
-/// the grouping (`...[][]` → flat).
-fn eval_projection<'a, I: IntoIterator<Item = impl SanshoTrait<'a>>>(
-    elements: I,
-    edges: &[Edge],
-) -> Result<Flow, Stop> {
-    match edges {
-        // the collected end: each element materializes at the row
-        // boundary; null elements drop
-        [] => {
-            let mut flows = Vec::new();
-            for element in elements {
-                match element.materialize().map_err(Stop::from)? {
-                    J::Null => {}
-                    value => flows.push(Flow::Value(value)),
-                }
-            }
-            Ok(Flow::Proj(flows))
-        }
-        [Edge::Flatten, rest @ ..] => {
-            // a leading/early flatten dissolves the elements into the
-            // collection and collapses the grouping
-            let mut dissolved = Vec::new();
-            for element in elements {
-                match element.materialize().map_err(Stop::from)? {
-                    J::Null => {}
-                    J::Array(items) => dissolved.extend(items),
-                    value => dissolved.push(value),
-                }
-            }
-            finish_projection(vec![dissolved], rest, true)
-        }
-        [edge, rest @ ..] => {
-            let groups = apply_edge_batch(elements, edge)?;
-            finish_projection(groups, rest, false)
-        }
-    }
-}
-
-/// The first edge, applied once per element (the elements enter as one
-/// group); the per-element results become the initial groups.
-fn apply_edge_batch<'a, I: IntoIterator<Item = impl SanshoTrait<'a>>>(
-    elements: I,
-    edge: &Edge,
-) -> Result<Vec<Vec<J>>, Stop> {
-    let mut groups = Vec::new();
-    for element in elements {
-        groups.push(apply_single_projection_edge(&element, edge)?);
-    }
-    Ok(groups)
-}
-
-/// One projecting edge on ONE value: the group of its results.
-fn apply_single_projection_edge<'a, T: SanshoTrait<'a> + ?Sized>(
-    element: &T,
-    edge: &Edge,
-) -> Result<Vec<J>, Stop> {
-    match edge {
-        // the dissolve: array values one level, scalars pass through
-        // (this grouping collapses at the finish level)
-        Edge::Flatten => {
-            let mut group = Vec::new();
-            match element.materialize().map_err(Stop::from)? {
-                J::Null => {}
-                J::Array(items) => group.extend(items),
-                value => group.push(value),
-            }
-            Ok(group)
-        }
-        Edge::Key(name) => Ok(match element.get_key(name) {
-            Some(child) => vec![child.materialize().map_err(Stop::from)?],
-            None => Vec::new(),
-        }),
-        Edge::Index(index) => {
-            let resolved = match element.kind() {
-                Kind::Array => {
-                    let len = element.container_len().unwrap_or(0) as i64;
-                    let effective = if *index < 0 { len + index } else { *index };
-                    if effective >= 0 && effective < len {
-                        element.get_index(effective as usize)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            Ok(match resolved {
-                Some(child) => vec![child.materialize().map_err(Stop::from)?],
-                None => Vec::new(),
-            })
-        }
-        Edge::WildcardDot => Ok(match element.kind() {
-            Kind::Object => element
-                .entries()
-                .into_iter()
-                .map(|(_, v)| v.materialize().map_err(Stop::from))
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => Vec::new(),
-        }),
-        Edge::WildcardBracket => Ok(match element.kind() {
-            Kind::Array => element
-                .elements()
-                .into_iter()
-                .map(|v| v.materialize().map_err(Stop::from))
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => Vec::new(),
-        }),
-        Edge::Filter(predicate) => {
-            let mut group = Vec::new();
-            if element.kind() == Kind::Array {
-                // the hoisted leaf-predicate fast path (the raw-bytes
-                // comparison, no program recursion) where it applies
-                let leaf = leaf_predicate_shape(predicate);
-                for member in element.elements() {
-                    let keep = match &leaf {
-                        Some((name, prefix)) if member.kind() == Kind::String => {
-                            match member.raw_text_bytes() {
-                                Some(bytes) => match name.as_str() {
-                                    "starts_with" => bytes.starts_with(prefix.as_bytes()),
-                                    "ends_with" => bytes.ends_with(prefix.as_bytes()),
-                                    _ => bytes.windows(prefix.len()).any(|w| w == prefix.as_bytes()),
-                                },
-                                None => truthy(
-                                    &eval(predicate, &member)?.as_value().map_err(Stop::from)?,
-                                ),
-                            }
-                        }
-                        _ => truthy(
-                            &eval(predicate, &member)?.as_value().map_err(Stop::from)?,
-                        ),
-                    };
-                    if keep {
-                        group.push(member.materialize().map_err(Stop::from)?);
-                    }
-                }
-            }
-            Ok(group)
-        }
-        Edge::Slice(spec) => Ok(match element.kind() {
-            Kind::Array => {
-                let len = element.container_len().unwrap_or(0) as i64;
-                let selected = slice_indices(len, spec)?;
-                let mut group = Vec::new();
-                for index in selected {
-                    if let Some(child) = element.get_index(index as usize) {
-                        group.push(child.materialize().map_err(Stop::from)?);
-                    }
-                }
-                group
-            }
-            _ => Vec::new(),
-        }),
-        Edge::Compute(program) => {
-            Ok(vec![eval(program, element)?.as_value().map_err(Stop::from)?])
-        }
-    }
-}
-
-/// Continue the groups along the remaining edges; the flatten
-/// dissolves arrays one level into the COLLECTION and collapses the
-/// grouping; every other edge applies per group member, the per-member
-/// results becoming the next groups; the empty tail emits the groups
-/// as the projection's arrays.
-fn finish_projection(groups: Vec<Vec<J>>, edges: &[Edge], collapsed: bool) -> Result<Flow, Stop> {
-    match edges {
-        // the projection's end: an uncollapsed collection emits each
-        // group as its array (the per-item nesting); a collapsed
-        // collection (after a flatten) emits the values flat
-        [] => {
-            if collapsed {
-                let mut flows = Vec::new();
-                for group in groups {
-                    for value in group {
-                        if !value.is_null() {
-                            flows.push(Flow::Value(value));
-                        }
-                    }
-                }
-                Ok(Flow::Proj(flows))
-            } else {
-                let flows = groups
-                    .into_iter()
-                    .map(|g| Flow::Value(J::Array(g)))
-                    .collect();
-                Ok(Flow::Proj(flows))
-            }
-        }
-        [Edge::Flatten, rest @ ..] => {
-            // the dissolve: arrays one level into the collection, the
-            // grouping collapses
-            let mut dissolved = Vec::new();
-            for group in groups {
-                for value in group {
-                    match value {
-                        J::Null => {}
-                        J::Array(items) => dissolved.extend(items),
-                        value => dissolved.push(value),
-                    }
-                }
-            }
-            finish_projection(vec![dissolved], rest, true)
-        }
-        [edge, rest @ ..] => {
-            // each source group survives the edge: its values' results
-            // aggregate back into the group, preserving the per-item
-            // nesting (a reservation's instances stay one group)
-            let mut next = Vec::new();
-            for group in groups {
-                let mut aggregated = Vec::new();
-                for value in group {
-                    if value.is_null() {
-                        continue;
-                    }
-                    aggregated.extend(apply_single_projection_edge(&value, edge)?);
-                }
-                next.push(aggregated);
-            }
-            finish_projection(next, rest, collapsed)
-        }
-    }
-}
-
-/// The `[]` operator on a single value: dissolve array-valued results
-/// one level into the projection; a plain non-array flattens to null.
-fn flatten_value<'a, T: SanshoTrait<'a> + ?Sized>(node: &T) -> Result<Flow, SanshoError> {
+/// The `[]` operator on a single value: dissolve array-valued elements ONE
+/// level into the collection; null elements drop; a plain element passes
+/// through; a plain non-array flattens to null.
+fn flatten_value<'a>(node: SanshoCarrier<'a>) -> Result<Flow<'a>, Stop> {
     let mut flows = Vec::new();
     match node.kind() {
         Kind::Array => {
-            for element in node.elements() {
-                match element.materialize()? {
-                    J::Null => {}
-                    J::Array(inner) => flows.extend(inner.into_iter().map(Flow::Value)),
-                    plain => flows.push(Flow::Value(plain)),
+            for element in node.elements().map_err(Stop::from)? {
+                if element.is_null() {
+                    continue;
+                }
+                if element.kind() == Kind::Array {
+                    for inner in element.elements().map_err(Stop::from)? {
+                        flows.push(Flow::Value(inner));
+                    }
+                } else {
+                    flows.push(Flow::Value(element));
                 }
             }
         }
-        // the flatten of a plain non-array is null
-        _ => return Ok(Flow::Value(J::Null)),
+        _ => return Ok(Flow::Value(null_value())),
     }
-    Ok(Flow::Proj(flows))
+    Ok(Flow::Items(flows))
 }
 
-fn flatten_into(flow: Flow, flows: &mut Vec<Flow>) -> Result<(), Stop> {
+/// The flatten of a flow: array-valued items dissolve ONE level into the
+/// collection, and a grouping dissolves its items so the collection stays flat
+/// (the double-bracket to flat rule).
+fn flatten_into<'a>(flow: Flow<'a>, flows: &mut Vec<Flow<'a>>) -> Result<(), Stop> {
     match flow {
-        Flow::Value(J::Null) => {}
-        Flow::Value(J::Array(elements)) => {
-            for element in elements {
-                match element {
-                    J::Null => {}
-                    J::Array(inner) => flows.extend(inner.into_iter().map(Flow::Value)),
-                    plain => flows.push(Flow::Value(plain)),
+        Flow::Value(value) => {
+            if value.is_null() {
+                return Ok(());
+            }
+            if value.kind() == Kind::Array {
+                for element in value.elements().map_err(Stop::from)? {
+                    if element.is_null() {
+                        continue;
+                    }
+                    if element.kind() == Kind::Array {
+                        for inner in element.elements().map_err(Stop::from)? {
+                            flows.push(Flow::Value(inner));
+                        }
+                    } else {
+                        flows.push(Flow::Value(element));
+                    }
                 }
+            } else {
+                flows.push(Flow::Value(value));
             }
         }
-        Flow::Value(plain) => flows.push(Flow::Value(plain)),
-        Flow::Proj(items) => {
+        Flow::Items(items) => {
             for item in items {
                 flatten_into(item, flows)?;
             }
         }
-    };
+    }
     Ok(())
 }
 
-fn truthy(value: &J) -> bool {
-    match value {
-        J::Null | J::Bool(false) => false,
-        J::String(s) => !s.is_empty(),
-        J::Array(items) => !items.is_empty(),
-        J::Object(map) => !map.is_empty(),
-        // numbers are always true, zero included
-        J::Number(_) => true,
-        J::Bool(_) => true,
+/// The filter's kept elements. The hoisted leaf-predicate fast path
+/// compares the borrowed text directly — the relaxed contract: an
+/// element whose text the format cannot validate, and a byte string,
+/// fall through to the general path and are dropped, never errored.
+fn filter_elements<'a>(
+    node: SanshoCarrier<'a>,
+    predicate: &Program,
+) -> Result<Vec<SanshoCarrier<'a>>, Stop> {
+    let leaf = leaf_predicate_shape(predicate);
+    let mut kept: Vec<SanshoCarrier<'a>> = Vec::new();
+    for element in node.elements().map_err(Stop::from)? {
+        let keep = match &leaf {
+            Some((name, prefix)) if element.kind() == Kind::String => match element.as_str() {
+                Ok(text) => match name.as_str() {
+                    "starts_with" => text.starts_with(prefix.as_str()),
+                    "ends_with" => text.ends_with(prefix.as_str()),
+                    _ => text.contains(prefix.as_str()),
+                },
+                Err(_) => truthy(&flow_value(eval(predicate, element.clone())?)),
+            },
+            _ => truthy(&flow_value(eval(predicate, element.clone())?)),
+        };
+        if keep {
+            kept.push(element);
+        }
+    }
+    Ok(kept)
+}
+
+/// The null value: a navigation miss, or an edge that does not apply.
+fn null_value<'a>() -> SanshoCarrier<'a> {
+    Rc::new(SerdeJson::Null)
+}
+
+/// The specification's truthiness: false for null and false, an empty
+/// string, an empty array, an empty object; true for numbers (zero
+/// included) and true.
+pub fn truthy<'a>(value: &(dyn SanshoTrait<'a> + 'a)) -> bool {
+    match value.kind() {
+        Kind::Null => false,
+        Kind::Bool => value.as_bool().unwrap_or(false),
+        Kind::String => value.as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        Kind::Array | Kind::Object => value.container_len().map(|len| len > 0).unwrap_or(false),
+        Kind::Number => true,
+        Kind::Bytes => true,
     }
 }
 
-fn compare(op: CmpOp, left: &J, right: &J) -> Result<J, Stop> {
+/// Value equality over the trait: the same kind and the same content,
+/// recursively for containers. Numbers compare as doubles (the
+/// specification's reduction); objects compare by key and member.
+fn trait_equal<'a>(left: &SanshoCarrier<'a>, right: &SanshoCarrier<'a>) -> bool {
+    if left.kind() != right.kind() {
+        return false;
+    }
+    match left.kind() {
+        Kind::Null => true,
+        Kind::Bool => left.as_bool() == right.as_bool(),
+        Kind::Number => match (left.as_f64(), right.as_f64()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        },
+        Kind::String => left.as_str() == right.as_str(),
+        Kind::Array => {
+            let a = left.elements().unwrap_or(vec![]);
+            let b = right.elements().unwrap_or(vec![]);
+            a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| trait_equal(x, y))
+        }
+        Kind::Object => {
+            let a = left.entries().unwrap_or(vec![]);
+            let b = right.entries().unwrap_or(vec![]);
+            a.len() == b.len()
+                && a.iter()
+                    .zip(&b)
+                    .all(|((ka, va), (kb, vb))| ka == kb && trait_equal(va, vb))
+        }
+        Kind::Bytes => {
+            let Ok(a) = left.as_bytes() else {
+                return false;
+            };
+            let Ok(b) = right.as_bytes() else {
+                return false;
+            };
+
+            a == b
+        }
+    }
+}
+
+pub fn compare<'a>(
+    op: CmpOp,
+    left: &SanshoCarrier<'a>,
+    right: &SanshoCarrier<'a>,
+) -> Result<SanshoCarrier<'a>, Stop> {
     let result = match op {
-        CmpOp::Eq => crate::corpus::json_equal(left, right),
-        CmpOp::Ne => !crate::corpus::json_equal(left, right),
+        CmpOp::Eq => trait_equal(left, right),
+        CmpOp::Ne => !trait_equal(left, right),
         CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
             // ordering across different kinds (or NaN) is null
-            match (left, right) {
-                (J::Number(_), J::Number(_)) | (J::String(_), J::String(_)) => {
+            match (left.kind(), right.kind()) {
+                (Kind::Number, Kind::Number) | (Kind::String, Kind::String) => {
                     order_compare(op, left, right)?
                 }
-                _ => return Ok(J::Null),
+                _ => return Ok(null_value()),
             }
         }
     };
-    Ok(J::Bool(result))
+    Ok(Rc::new(result))
 }
 
-fn order_compare(op: CmpOp, left: &J, right: &J) -> Result<bool, Stop> {
-    let ordering = match (left, right) {
-        (J::Number(a), J::Number(b)) => match (a.as_f64(), b.as_f64()) {
-            (Some(a), Some(b)) => a.partial_cmp(&b),
+pub fn order_compare<'a>(
+    op: CmpOp,
+    left: &SanshoCarrier<'a>,
+    right: &SanshoCarrier<'a>,
+) -> Result<bool, Stop> {
+    let ordering = match (left.kind(), right.kind()) {
+        (Kind::Number, Kind::Number) => match (left.as_f64(), right.as_f64()) {
+            (Ok(a), Ok(b)) => a.partial_cmp(&b),
             _ => None,
         },
-        (J::String(a), J::String(b)) => Some(a.cmp(b)),
+        (Kind::String, Kind::String) => match (left.as_str(), right.as_str()) {
+            (Ok(a), Ok(b)) => Some(a.cmp(b)),
+            _ => None,
+        },
         _ => None,
     };
     use std::cmp::Ordering;
@@ -818,18 +535,25 @@ fn order_compare(op: CmpOp, left: &J, right: &J) -> Result<bool, Stop> {
     })
 }
 
-fn kind_name(value: &J) -> &'static str {
-    match value {
-        J::Null => "null",
-        J::Bool(_) => "boolean",
-        J::Number(_) => "number",
-        J::String(_) => "string",
-        J::Array(_) => "array",
-        J::Object(_) => "object",
+/// The kind's name as the language spells it (`type(@)` and the
+/// invalid-type errors).
+pub fn kind_name<'a>(value: SanshoCarrier<'a>) -> &'static str {
+    match value.kind() {
+        Kind::Null => "null",
+        Kind::Bool => "boolean",
+        Kind::Number => "number",
+        Kind::String => "string",
+        Kind::Array => "array",
+        Kind::Object => "object",
+        Kind::Bytes => "bytes",
     }
 }
 
-fn eval_function<'a, T: SanshoTrait<'a> + ?Sized>(name: &str, args: &[FnArgP], node: &T) -> Result<Flow, Stop> {
+fn eval_function<'a>(
+    name: &str,
+    args: &[FnArgP],
+    node: SanshoCarrier<'a>,
+) -> Result<SanshoCarrier<'a>, Stop> {
     if !crate::program::function_implemented(name) {
         return Err(Stop::NotImplemented);
     }
@@ -851,32 +575,29 @@ fn eval_function<'a, T: SanshoTrait<'a> + ?Sized>(name: &str, args: &[FnArgP], n
                 }));
             }
         };
-        let array = eval(array_arg, node)?.as_value()?;
-        let items = match array {
-            J::Array(items) => items,
-            other => return Err(type_error(name, kind_name(&other))),
-        };
+        let array = flow_value(eval(array_arg, node.clone())?);
+        if array.kind() != Kind::Array {
+            return Err(type_error(name, kind_name(array)));
+        }
+        let items = array.elements().map_err(Stop::from)?;
         return match name {
             "map" => {
                 let mut mapped = Vec::with_capacity(items.len());
-                for item in &items {
-                    let flow = eval(ref_program, item)?;
-                    mapped.push(flow.as_value().map_err(Stop::from)?);
+                for item in items {
+                    mapped.push(flow_value(eval(ref_program, item)?));
                 }
-                Ok(Flow::Value(J::Array(mapped)))
+                Ok(Rc::new(mapped))
             }
             "max_by" | "min_by" => {
                 let want_max = name == "max_by";
-                let mut best_item: Option<&J> = None;
-                let mut best_key: Option<J> = None;
-                for item in &items {
-                    let flow = eval(ref_program, item)?;
-                    let key = flow.as_value().map_err(Stop::from)?;
-                    check_by_key(&key)?;
-                    let take = match &best_key {
+                let mut best: Option<(SanshoCarrier<'a>, SanshoCarrier<'a>)> = None;
+                for item in items {
+                    let key = flow_value(eval(ref_program, item.clone())?);
+                    check_by_key(key.clone())?;
+                    let take = match &best {
                         None => true,
-                        Some(current) => {
-                            let ordering = order_values(current, &key)?;
+                        Some((_, current)) => {
+                            let ordering = order_values(current.clone(), key.clone())?;
                             if want_max {
                                 ordering == std::cmp::Ordering::Less
                             } else {
@@ -885,31 +606,32 @@ fn eval_function<'a, T: SanshoTrait<'a> + ?Sized>(name: &str, args: &[FnArgP], n
                         }
                     };
                     if take {
-                        best_item = Some(item);
-                        best_key = Some(key);
+                        best = Some((item, key));
                     }
                 }
-                Ok(Flow::Value(best_item.cloned().unwrap_or(J::Null)))
+                Ok(best.map(|(item, _)| item).unwrap_or_else(|| null_value()))
             }
             "sort_by" => {
-                let mut keyed: Vec<(J, &J)> = Vec::with_capacity(items.len());
-                for item in &items {
-                    let flow = eval(ref_program, item)?;
-                    let key = flow.as_value().map_err(Stop::from)?;
-                    check_by_key(&key)?;
+                let mut keyed: Vec<(SanshoCarrier<'a>, SanshoCarrier<'a>)> =
+                    Vec::with_capacity(items.len());
+                for item in items {
+                    let key = flow_value(eval(ref_program, item.clone())?);
+                    check_by_key(key.clone())?;
                     keyed.push((key, item));
                 }
                 // the keys must be UNIFORMLY typed (the same contract as
                 // sort): mixed numbers and strings is invalid-type
-                let any_number = keyed.iter().any(|(k, _)| matches!(k, J::Number(_)));
-                let any_string = keyed.iter().any(|(k, _)| matches!(k, J::String(_)));
+                let any_number = keyed.iter().any(|(k, _)| k.kind() == Kind::Number);
+                let any_string = keyed.iter().any(|(k, _)| k.kind() == Kind::String);
                 if any_number && any_string {
                     return Err(type_error(name, "mixed-type keys"));
                 }
-                keyed.sort_by(|a, b| order_values(&a.0, &b.0).unwrap_or(std::cmp::Ordering::Equal));
-                Ok(Flow::Value(J::Array(
-                    keyed.into_iter().map(|(_, item)| item.clone()).collect(),
-                )))
+                keyed.sort_by(|a, b| {
+                    order_values(a.0.clone(), b.0.clone()).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                Ok(Rc::new(
+                    keyed.into_iter().map(|(_, item)| item).collect::<Vec<_>>(),
+                ))
             }
             _ => unreachable!("function_takes_expression gates this match"),
         };
@@ -917,41 +639,26 @@ fn eval_function<'a, T: SanshoTrait<'a> + ?Sized>(name: &str, args: &[FnArgP], n
 
     // the length-over-container fast path: an array or object node's
     // element count is a HEADER read — the whole subtree must NOT
-    // materialize to count its elements. Returns the count directly
-    // (bypassing the general `length` arm, which expects the container
-    // value).
-    if name == "length" {
-        if let [FnArgP::Value(single)] = args {
-            if let Flow::Value(value) = eval(single, node)? {
-                if let Some(len) = match &value {
-                    J::Array(items) => Some(items.len()),
-                    J::Object(map) => Some(map.len()),
-                    _ => None,
-                } {
-                    return Ok(Flow::Value(J::Number((len as u64).into())));
-                }
+    // materialize to count its elements.
+    if name == "length"
+        && let [FnArgP::Value(single)] = args {
+            let value = flow_value(eval(single, node.clone())?);
+            // a string's length is its character count, not a container's
+            // member count: only the containers take the header fast path
+            if matches!(value.kind(), Kind::Array | Kind::Object) {
+                return value
+                    .container_len()
+                    .map_err(Stop::from)
+                    .map(|v| Rc::new(v as i64) as SanshoCarrier<'a>);
             }
         }
-    }
 
-    // the value-argument functions: every argument evaluates eagerly;
-    // an expression reference here is an invalid type
-    let mut values = Vec::with_capacity(args.len());
+    // the value-argument functions: every argument evaluates eagerly; an
+    // expression reference here is an invalid type
+    let mut values: Vec<SanshoCarrier<'a>> = Vec::with_capacity(args.len());
     for arg in args {
         match arg {
-            FnArgP::Value(program) => {
-                let flow = eval(program, node)?;
-                let value = match flow {
-                    Flow::Value(v) => v,
-                    Flow::Proj(items) => J::Array(
-                        items
-                            .iter()
-                            .map(|f| f.as_value())
-                            .collect::<Result<_, SanshoError>>()?,
-                    ),
-                };
-                values.push(value)
-            }
+            FnArgP::Value(program) => values.push(flow_value(eval(program, node.clone())?)),
             FnArgP::Ref(_) => {
                 return Err(Stop::Error(SanshoError::Evaluation {
                     message: format!("function {name} does not accept expression references"),
@@ -959,86 +666,143 @@ fn eval_function<'a, T: SanshoTrait<'a> + ?Sized>(name: &str, args: &[FnArgP], n
             }
         }
     }
-    let values = values;
-    match (name, values.as_slice()) {
-        ("length", [one]) => match one {
-            J::String(s) => Ok(Flow::Value(J::Number((s.chars().count() as u64).into()))),
-            J::Array(items) => Ok(Flow::Value(J::Number((items.len() as u64).into()))),
-            J::Object(map) => Ok(Flow::Value(J::Number((map.len() as u64).into()))),
-            other => Err(type_error("length", kind_name(other))),
-        },
-        ("type", [one]) => Ok(Flow::Value(J::String(kind_name(one).to_string()))),
-        ("keys", [one]) => match one {
-            J::Object(map) => Ok(Flow::Value(J::Array(
-                map.keys().map(|k| J::String(k.clone())).collect(),
-            ))),
-            other => Err(type_error("keys", kind_name(other))),
-        },
-        ("values", [one]) => match one {
-            J::Object(map) => Ok(Flow::Value(J::Array(map.values().cloned().collect()))),
-            other => Err(type_error("values", kind_name(other))),
-        },
-        ("starts_with", [subject, prefix]) => {
-            string_predicate("starts_with", subject, prefix, |s, p| s.starts_with(p))
+
+    // the argument-passing functions hand an argument through unchanged:
+    // no copy of the document's data
+    if name == "to_array" && values.len() == 1 {
+        let one = values.into_iter().next().expect("one argument");
+        return Ok(match one.kind() {
+            Kind::Array => one,
+            _ => Rc::new(vec![one]),
+        });
+    }
+    if name == "not_null" {
+        for value in values {
+            if !value.is_null() {
+                return Ok(value);
+            }
         }
-        ("ends_with", [subject, suffix]) => {
-            string_predicate("ends_with", subject, suffix, |s, p| s.ends_with(p))
+        return Ok(null_value());
+    }
+    if name == "merge" {
+        let mut merged = HashMap::<String, SanshoCarrier<'a>>::new();
+        for value in values.iter() {
+            if value.kind() != Kind::Object {
+                return Err(type_error("merge", kind_name(value.clone())));
+            }
+            let entries = value.entries().map_err(Stop::from)?;
+            for (key, member) in entries {
+                // later arguments win
+                merged.insert(key.to_string(), Rc::new(member));
+            }
         }
-        ("contains", [subject, needle]) => match (subject, needle) {
-            (J::String(s), J::String(n)) => Ok(Flow::Value(J::Bool(s.contains(n.as_str())))),
-            (J::Array(items), needle) => Ok(Flow::Value(J::Bool(
-                items
+        return Ok(Rc::new(merged));
+    }
+
+    match (name, (values.first().cloned(), values.get(1))) {
+        ("length", (Some(one), _)) => match one.kind() {
+            Kind::String => Ok(Rc::new(string_length(one.clone()) as u64)),
+            Kind::Array | Kind::Object => one
+                .container_len()
+                .map_err(Stop::from)
+                .map(|v| Rc::new(v as u64) as SanshoCarrier<'a>),
+            _ => Err(type_error("length", kind_name(one.clone()))),
+        },
+        ("type", (Some(one), _)) => Ok(Rc::new(kind_name(one.clone()).to_string())),
+        ("keys", (Some(one), _)) => match one.kind() {
+            Kind::Object => {
+                // the key text borrows the document: no key string is built
+
+                let keys: HashSet<String> = one
+                    .entries()
+                    .map_err(Stop::from)?
+                    .into_iter()
+                    .map(|(key, _)| key.to_string())
+                    .collect();
+                Ok(Rc::new(keys))
+            }
+            _ => Err(type_error("keys", kind_name(one.clone()))),
+        },
+        ("values", (Some(one), _)) => match one.kind() {
+            Kind::Object => {
+                let members: Vec<SanshoCarrier<'a>> = one
+                    .entries()
+                    .map_err(Stop::from)?
+                    .into_iter()
+                    .map(|(_, member)| Rc::new(member) as SanshoCarrier<'a>)
+                    .collect();
+                Ok(Rc::new(members))
+            }
+            _ => Err(type_error("values", kind_name(one.clone()))),
+        },
+        ("starts_with", (Some(subject), Some(prefix))) => {
+            string_predicate("starts_with", subject.clone(), prefix.clone(), |s, p| {
+                s.starts_with(p)
+            })
+        }
+        ("ends_with", (Some(subject), Some(suffix))) => {
+            string_predicate("ends_with", subject.clone(), suffix.clone(), |s, p| {
+                s.ends_with(p)
+            })
+        }
+        ("contains", (Some(subject), Some(needle))) => match subject.kind() {
+            Kind::String => match (subject.as_str(), needle.as_str()) {
+                (Ok(s), Ok(n)) => Ok(Rc::new(s.contains(n)) as SanshoCarrier<'a>),
+                _ => Err(type_error("contains", kind_name(subject.clone()))),
+            },
+            Kind::Array => {
+                let found = subject
+                    .elements()
+                    .map_err(Stop::from)?
                     .iter()
-                    .any(|item| crate::corpus::json_equal(item, needle)),
-            ))),
-            (other, _) => Err(type_error("contains", kind_name(other))),
+                    .any(|item| trait_equal(item, needle));
+                Ok(Rc::new(found) as SanshoCarrier<'a>)
+            }
+            _ => Err(type_error("contains", kind_name(subject.clone()))),
         },
         // numeric single-array functions
-        ("abs", [one]) => numeric("abs", one, f64::abs),
-        ("ceil", [one]) => numeric("ceil", one, f64::ceil),
-        ("floor", [one]) => numeric("floor", one, f64::floor),
-        ("avg" | "mean", [one]) => match one {
-            J::Array(items) => {
+        ("abs", (Some(one), None)) => numeric("abs", one.clone(), f64::abs),
+        ("ceil", (Some(one), None)) => numeric("ceil", one.clone(), f64::ceil),
+        ("floor", (Some(one), None)) => numeric("floor", one.clone(), f64::floor),
+        ("avg" | "mean", (Some(one), None)) => match one.kind() {
+            Kind::Array => {
+                let items = one.elements().map_err(Stop::from)?;
                 if items.is_empty() {
-                    return Ok(Flow::Value(J::Null));
+                    return Ok(null_value());
                 }
                 let mut sum = 0.0;
-                for item in items {
-                    sum += number_of(item, "avg")?;
+                for item in &items {
+                    sum += number_of(item.clone(), "avg")?;
                 }
-                Ok(Flow::Value(J::Number(
-                    serde_json::Number::from_f64(sum / items.len() as f64)
-                        .unwrap_or_else(|| serde_json::Number::from(0u64)),
-                )))
+                Ok(number_value(sum / items.len() as f64))
             }
-            other => Err(type_error("avg", kind_name(other))),
+            _ => Err(type_error("avg", kind_name(Rc::new(one)))),
         },
-        ("sum", [one]) => match one {
-            J::Array(items) => {
+        ("sum", (Some(one), None)) => match one.kind() {
+            Kind::Array => {
                 let mut sum = 0.0;
-                for item in items {
+                for item in one.elements().map_err(Stop::from)? {
                     sum += number_of(item, "sum")?;
                 }
-                Ok(Flow::Value(J::Number(
-                    serde_json::Number::from_f64(sum)
-                        .unwrap_or_else(|| serde_json::Number::from(0u64)),
-                )))
+                Ok(number_value(sum))
             }
-            other => Err(type_error("sum", kind_name(other))),
+            _ => Err(type_error("sum", kind_name(one.clone()))),
         },
-        ("max" | "min", [one]) => {
+        ("max" | "min", (Some(one), None)) => {
             let want_max = name == "max";
-            match one {
-                J::Array(items) => {
+            match one.kind() {
+                Kind::Array => {
+                    let items = one.elements().map_err(Stop::from)?;
+
                     if items.is_empty() {
-                        return Ok(Flow::Value(J::Null));
+                        return Ok(null_value());
                     }
-                    let mut best: Option<&J> = None;
+                    let mut best: Option<SanshoCarrier<'a>> = None;
                     for item in items {
-                        let take = match best {
+                        let take = match &best {
                             None => true,
                             Some(current) => {
-                                let ordering = order_values(current, item)?;
+                                let ordering = order_values(current.clone(), item.clone())?;
                                 if want_max {
                                     ordering == std::cmp::Ordering::Less
                                 } else {
@@ -1050,93 +814,68 @@ fn eval_function<'a, T: SanshoTrait<'a> + ?Sized>(name: &str, args: &[FnArgP], n
                             best = Some(item);
                         }
                     }
-                    Ok(Flow::Value(best.cloned().unwrap_or(J::Null)))
+                    Ok(best.unwrap_or_else(|| null_value()))
                 }
-                other => Err(type_error(name, kind_name(other))),
+                _ => Err(type_error(name, kind_name(one.clone()))),
             }
         }
-        ("sort", [one]) => match one {
-            J::Array(items) => {
-                let all_numbers = items.iter().all(|i| matches!(i, J::Number(_)));
-                let all_strings = items.iter().all(|i| matches!(i, J::String(_)));
+        ("sort", (Some(one), None)) => match one.kind() {
+            Kind::Array => {
+                let mut items = one.elements().map_err(Stop::from)?;
+                let all_numbers = items.iter().all(|item| item.kind() == Kind::Number);
+                let all_strings = items.iter().all(|item| item.kind() == Kind::String);
                 if !all_numbers && !all_strings {
                     return Err(type_error("sort", "mixed-type array"));
                 }
-                let mut sorted = items.clone();
-                sorted.sort_by(|a, b| order_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
-                Ok(Flow::Value(J::Array(sorted)))
+                items.sort_by(|a, b| {
+                    order_values(a.clone(), b.clone()).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                Ok(Rc::new(items))
             }
-            other => Err(type_error("sort", kind_name(other))),
+            _ => Err(type_error("sort", kind_name(one.clone()))),
         },
-        ("reverse", [one]) => match one {
-            J::Array(items) => {
-                let mut reversed = items.clone();
-                reversed.reverse();
-                Ok(Flow::Value(J::Array(reversed)))
+        ("reverse", (Some(one), None)) => match one.kind() {
+            Kind::Array => {
+                let mut items = one.elements().map_err(Stop::from)?;
+                items.reverse();
+                Ok(Rc::new(items))
             }
-            J::String(text) => Ok(Flow::Value(J::String(text.chars().rev().collect()))),
-            other => Err(type_error("reverse", kind_name(other))),
+            Kind::String => match one.as_str() {
+                Ok(text) => Ok(Rc::new(text.chars().rev().collect::<String>())),
+                _ => Err(type_error("reverse", kind_name(one.clone()))),
+            },
+            _ => Err(type_error("reverse", kind_name(one.clone()))),
         },
         // string/number conversions
-        ("to_string", [one]) => Ok(Flow::Value(match one {
-            J::String(s) => J::String(s.clone()),
-            J::Null => J::String(String::new()),
-            other => J::String(other.to_string()),
-        })),
-        ("to_number", [one]) => Ok(Flow::Value(match one {
-            J::Number(n) => J::Number(n.clone()),
-            J::String(s) => {
-                let trimmed = s.trim();
-                match trimmed.parse::<f64>() {
-                    Ok(value) => serde_json::Number::from_f64(value)
-                        .map(J::Number)
-                        .unwrap_or(J::Null),
-                    Err(_) => J::Null,
-                }
-            }
-            _ => J::Null,
-        })),
-        ("to_array", [one]) => Ok(Flow::Value(match one {
-            J::Array(_) => one.clone(),
-            other => J::Array(vec![other.clone()]),
-        })),
-        // the variadic object merge: later arguments win
-        ("merge", many) => {
-            let mut object = serde_json::Map::new();
-            for argument in many {
-                match argument {
-                    J::Object(map) => {
-                        for (key, value) in map {
-                            object.insert(key.clone(), value.clone());
-                        }
-                    }
-                    other => return Err(type_error("merge", kind_name(other))),
-                }
-            }
-            Ok(Flow::Value(J::Object(object)))
+        ("to_string", (Some(one), None)) => {
+            Ok(Rc::new(string_for(&one, false)?) as SanshoCarrier<'a>)
         }
-        // the first non-null argument; all-null yields null
-        ("not_null", many) => {
-            for argument in many {
-                if !matches!(argument, J::Null) {
-                    return Ok(Flow::Value(argument.clone()));
-                }
-            }
-            Ok(Flow::Value(J::Null))
-        }
+        ("to_number", (Some(one), None)) => match one.kind() {
+            Kind::Number => Ok(number_value(one.as_f64().unwrap_or(0.0))),
+            Kind::String => Ok(match one.as_str() {
+                Ok(s) => match s.trim().parse::<f64>().ok() {
+                    Some(value) => number_value(value),
+                    _ => null_value(),
+                },
+                _ => null_value(),
+            }),
+            _ => Ok(null_value()),
+        },
         // string join over an array of strings
-        ("join", [separator, items]) => match (separator, items) {
-            (J::String(sep), J::Array(items)) => {
-                let mut parts = Vec::with_capacity(items.len());
-                for item in items {
-                    match item {
-                        J::String(text) => parts.push(text.clone()),
-                        other => return Err(type_error("join", kind_name(other))),
+        ("join", (Some(separator), Some(items))) => match separator.as_str() {
+            Ok(sep) if items.kind() == Kind::Array => {
+                let mut parts = Vec::with_capacity(items.container_len().unwrap_or(0));
+
+                let elements = items.elements().map_err(Stop::from)?;
+                for item in elements {
+                    match item.as_str() {
+                        Ok(text) => parts.push(text.to_string()),
+                        _ => return Err(type_error("join", kind_name(Rc::new(item)))),
                     }
                 }
-                Ok(Flow::Value(J::String(parts.join(sep))))
+                Ok(Rc::new(parts.join(sep.as_ref())))
             }
-            (other, _) => Err(type_error("join", kind_name(other))),
+            _ => Err(type_error("join", kind_name(separator.clone()))),
         },
         _ => Err(Stop::NotImplemented),
     }
@@ -1145,34 +884,133 @@ fn eval_function<'a, T: SanshoTrait<'a> + ?Sized>(name: &str, args: &[FnArgP], n
 /// The `_by` functions' key contract: numbers or strings only; null
 /// (a missing by-value), booleans, and containers are invalid-type (the
 /// corpus's referee; mixed key types fail the ordering).
-fn check_by_key(key: &J) -> Result<(), Stop> {
-    match key {
-        J::Number(_) | J::String(_) => Ok(()),
-        other => Err(type_error("sort_by/max_by/min_by", kind_name(other))),
+fn check_by_key<'a>(key: SanshoCarrier<'a>) -> Result<(), Stop> {
+    match key.kind() {
+        Kind::Number | Kind::String => Ok(()),
+        _ => Err(type_error("sort_by/max_by/min_by", kind_name(key))),
     }
 }
 
-fn numeric(name: &str, value: &J, function: fn(f64) -> f64) -> Result<Flow, Stop> {
+/// A computed number as a value.
+fn number_value<'a>(value: f64) -> SanshoCarrier<'a> {
+    Rc::new(value)
+}
+
+/// Escape a text for embedding in a JSON string.
+///
+/// JSON forbids three things raw inside a string: the quotation
+/// mark, the reverse solidus, and the whole control range
+/// (U+0000 through U+001F). The five control characters with a
+/// short form take it; the rest take `\u00XX`. Everything above
+/// the control range, including all non-ASCII text, is legal raw
+/// and is passed through unchanged.
+///
+/// The surrounding quotes are the CALLER's job, so that one
+/// function serves both a member value and a member key.
+fn escape_string(the_str: &str) -> String {
+    let mut escaped = String::with_capacity(the_str.len());
+    for c in the_str.chars() {
+        match c {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{8}' => escaped.push_str("\\b"),
+            '\u{c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                escaped.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+/// The `to_string` rendering: a value as its JSON text.
+///
+/// A string converts to itself — unquoted at the top level, where the
+/// specification returns a string argument as it is, and quoted with its
+/// escapes as a member of a container, where it is part of that container's
+/// JSON text. Null renders as `null`, a boolean as `true` or `false`, a
+/// number as its JSON number text, and an array or object as its members
+/// rendered recursively and compactly. A non-finite number has no JSON text
+/// and renders as `null`; a byte string has no JSON representation at all and
+/// renders as a placeholder.
+fn string_for<'b>(one: &SanshoCarrier<'b>, quote_string: bool) -> Result<String, Stop> {
+    match one.kind() {
+        Kind::String => Ok({
+            let the_str = one.as_str()?;
+            if quote_string {
+                format!("\"{}\"", escape_string(the_str))
+            } else {
+                the_str.to_string()
+            }
+        }),
+        Kind::Null => Ok("null".to_string()),
+        Kind::Number => Ok(one.as_sansho_number().map(|n| match n {
+            crate::view::SanshoNumber::I64(v) => v.to_string(),
+            crate::view::SanshoNumber::U64(v) => v.to_string(),
+            crate::view::SanshoNumber::F64(v) if v.is_finite() => format!("{v:?}"),
+            crate::view::SanshoNumber::F64(_) => "null".to_string(),
+        })?),
+        Kind::Bool => Ok(one.as_bool().map(|b| b.to_string())?),
+        Kind::Array => Ok({
+            let arr = one.elements()?;
+
+            let mut out = vec![];
+            for v in arr {
+                out.push(string_for(&v, true)?);
+            }
+
+            format!("[{}]", out.join(","))
+        }),
+
+        Kind::Object => Ok({
+            let arr = one.entries()?;
+
+            let mut out = vec![];
+            for (k, v) in arr {
+                out.push(format!(
+                    "\"{}\":{}",
+                    escape_string(k),
+                    string_for(&v, true)?
+                ));
+            }
+
+            format!("{{{}}}", out.join(","))
+        }),
+
+        _ => Ok("\"Binary_data\"".to_string()),
+    }
+}
+
+/// A string's character count, for `length`.
+fn string_length<'a>(value: SanshoCarrier<'a>) -> usize {
+    value.as_str().map(|s| s.chars().count()).unwrap_or(0)
+}
+
+/// The numeric coercion for the numeric functions: a number (never NaN),
+/// or an invalid-type error naming the function.
+fn numeric<'a>(
+    name: &str,
+    value: SanshoCarrier<'a>,
+    function: fn(f64) -> f64,
+) -> Result<SanshoCarrier<'a>, Stop> {
     let input = number_of(value, name)?;
-    let result = function(input);
-    Ok(Flow::Value(
-        serde_json::Number::from_f64(result)
-            .map(J::Number)
-            .unwrap_or(J::Null),
-    ))
+    Ok(number_value(function(input)))
 }
 
-fn number_of(value: &J, name: &str) -> Result<f64, Stop> {
-    value
-        .as_f64()
-        .filter(|v| !v.is_nan())
-        .ok_or_else(|| type_error(name, kind_name(value)))
+fn number_of<'a>(value: SanshoCarrier<'a>, _name: &str) -> Result<f64, Stop> {
+    value.as_f64().map_err(Stop::from)
 }
 
-fn order_values(left: &J, right: &J) -> Result<std::cmp::Ordering, Stop> {
-    match (left, right) {
-        (J::Number(a), J::Number(b)) => match (a.as_f64(), b.as_f64()) {
-            (Some(a), Some(b)) => a.partial_cmp(&b).ok_or_else(|| {
+fn order_values<'a>(
+    left: SanshoCarrier<'a>,
+    right: SanshoCarrier<'a>,
+) -> Result<std::cmp::Ordering, Stop> {
+    match (left.kind(), right.kind()) {
+        (Kind::Number, Kind::Number) => match (left.as_f64(), right.as_f64()) {
+            (Ok(a), Ok(b)) => a.partial_cmp(&b).ok_or_else(|| {
                 Stop::Error(SanshoError::Evaluation {
                     message: "cannot order NaN".to_string(),
                 })
@@ -1181,22 +1019,27 @@ fn order_values(left: &J, right: &J) -> Result<std::cmp::Ordering, Stop> {
                 message: "cannot order numbers".to_string(),
             })),
         },
-        (J::String(a), J::String(b)) => Ok(a.cmp(b)),
+        (Kind::String, Kind::String) => match (left.as_str(), right.as_str()) {
+            (Ok(a), Ok(b)) => Ok(a.cmp(b)),
+            _ => Err(Stop::Error(SanshoError::Evaluation {
+                message: "cannot order strings".to_string(),
+            })),
+        },
         _ => Err(Stop::Error(SanshoError::Evaluation {
             message: format!("cannot order {} and {}", kind_name(left), kind_name(right)),
         })),
     }
 }
 
-fn string_predicate(
+fn string_predicate<'a>(
     name: &str,
-    subject: &J,
-    argument: &J,
+    subject: SanshoCarrier<'a>,
+    argument: SanshoCarrier<'a>,
     predicate: fn(&str, &str) -> bool,
-) -> Result<Flow, Stop> {
-    match (subject, argument) {
-        (J::String(s), J::String(p)) => Ok(Flow::Value(J::Bool(predicate(s, p)))),
-        (other, _) => Err(type_error(name, kind_name(other))),
+) -> Result<SanshoCarrier<'a>, Stop> {
+    match (subject.as_str(), argument.as_str()) {
+        (Ok(s), Ok(p)) => Ok(Rc::new(predicate(s, p))),
+        _ => Err(type_error(name, kind_name(subject.clone()))),
     }
 }
 
@@ -1204,19 +1047,49 @@ fn string_predicate(
 /// (verified against the compiler's output): the predicate is
 /// `Spine[Compute(Function(name, [Value(Spine{[]}), Value(Spine{edges:[Compute(Literal(prefix))]})]))]`.
 fn leaf_predicate_shape(predicate: &Program) -> Option<(String, String)> {
-    let Program::Spine(pred_spine) = predicate else { return None };
-    if pred_spine.edges.len() != 1 { return None }
-    let Edge::Compute(inner) = &pred_spine.edges[0] else { return None };
-    let Program::Function(name, args) = &**inner else { return None };
-    if !matches!(name.as_str(), "starts_with" | "ends_with" | "contains") { return None }
-    let [FnArgP::Value(Program::Spine(subject)), FnArgP::Value(Program::Spine(prefix_spine))] = args.as_slice() else { return None };
+    let Program::Spine(pred_spine) = predicate else {
+        return None;
+    };
+    if pred_spine.edges.len() != 1 {
+        return None;
+    }
+    let Edge::Compute(inner) = &pred_spine.edges[0] else {
+        return None;
+    };
+    let Program::Function(name, args) = &**inner else {
+        return None;
+    };
+    if !matches!(name.as_str(), "starts_with" | "ends_with" | "contains") {
+        return None;
+    }
+    let [
+        FnArgP::Value(Program::Spine(subject)),
+        FnArgP::Value(Program::Spine(prefix_spine)),
+    ] = args.as_slice()
+    else {
+        return None;
+    };
     // the subject must be the empty spine (`@` — the current node)
-    if !subject.edges.is_empty() { return None }
+    if !subject.edges.is_empty() {
+        return None;
+    }
     // the prefix must be Spine[Compute(Literal(string))]
-    if prefix_spine.edges.len() != 1 { return None }
-    let Edge::Compute(prefix_inner) = &prefix_spine.edges[0] else { return None };
-    let Program::Literal(J::String(prefix)) = &**prefix_inner else { return None };
-    Some((name.clone(), prefix.clone()))
+    if prefix_spine.edges.len() != 1 {
+        return None;
+    }
+    let Edge::Compute(prefix_inner) = &prefix_spine.edges[0] else {
+        return None;
+    };
+    let Program::Literal(prefix) = &**prefix_inner else {
+        return None;
+    };
+    // the prefix is the literal's own text: a string literal must be
+    // unwrapped, not rendered as JSON (which would carry its quotes)
+    let text = match prefix {
+        serde_json::Value::String(text) => text.clone(),
+        _ => return None,
+    };
+    Some((name.clone(), text))
 }
 
 fn type_error(function: &str, found: &str) -> Stop {
@@ -1267,3 +1140,7 @@ fn slice_indices(len: i64, spec: &crate::ast::SliceSpec) -> Result<Vec<i64>, Sto
     }
     Ok(indices)
 }
+
+#[cfg(test)]
+#[path = "eval_tests.rs"]
+mod tests;

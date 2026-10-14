@@ -1,4 +1,4 @@
-//! Phase 0, T0.2: the fixture builder generates the parameterized
+//! The fixture builder generates the parameterized
 //! shapes exactly (the benches and the escape-case matrix rest on it).
 
 #[path = "../src/tests_common.rs"]
@@ -26,9 +26,12 @@ fn fixture_builder_generates_shapes() {
     // the scan shape's contract: the north_purls emit over this item
     // yields exactly the pkg: entries, in order
     let parsed = sansho::parse("connections.\"alias:from\"[?starts_with(@, 'pkg:')]").unwrap();
-    let program = sansho::compile(&parsed).unwrap();
-    let result = sansho::evaluate_json(&program, &item).unwrap();
+    let program = sansho::compile(&parsed, None).unwrap();
+    let result = sansho::materialize(&sansho::evaluate(&program, &item).unwrap()).unwrap();
     let rows = result.as_array().unwrap();
     assert_eq!(rows.len(), 12_500, "one row per pkg: entry");
-    assert!(rows[0].as_str().unwrap().starts_with("pkg:"), "rows are pkg: entries");
+    assert!(
+        rows[0].as_str().unwrap().starts_with("pkg:"),
+        "rows are pkg: entries"
+    );
 }

@@ -1,18 +1,25 @@
-//! The source-trait surface benchmarks: the new [`SanshoTrait`] entry
-//! (`lookup`/`lookup_value` over the raw types) measured against the
-//! pre-existing cell entries (`evaluate_cbor`/`evaluate_json`) on the
-//! same documents and programs.
+//! The source-trait surface benchmarks: the bare [`SanshoTrait`] entry
+//! (`sansho::evaluate` alone, over each raw source type) measured
+//! against the whole public path (`run`: evaluate, then materialize at
+//! the boundary) on the same documents and programs.
 //!
 //! The point of the delta: the trait surface must not cost anything —
-//! same evaluator, monomorphized through the same cells; the new
-//! wrapper is the caller's raw type, and normalization is a single
-//! `root_cell` call. If the trait entry shows up in these numbers, the
-//! abstraction has a cost and the design is wrong.
+//! one evaluator, monomorphized per source. If the bare entry shows up
+//! in these numbers, the abstraction has a cost and the design is wrong.
 //!
 //! Run: `cargo bench -p sansho --bench trait_surface`.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use sansho::{evaluate_cbor, evaluate_json, lookup_value};
+
+/// The whole public path: evaluate the program, then materialize the result at
+/// the boundary. This is what a consumer pays for one query, so it is what
+/// these benchmarks measure.
+fn run<'a, T: sansho::SanshoTrait<'a>>(
+    program: &sansho::Program,
+    document: T,
+) -> Result<serde_json::Value, sansho::SanshoError> {
+    sansho::evaluate(program, document).and_then(|value| sansho::materialize(&value))
+}
 
 /// The Appendix-A-shaped document (the scan shape's subject), served
 /// three ways: raw CBOR bytes, an in-memory JSON value, and an
@@ -44,15 +51,15 @@ fn fixtures() -> (Vec<u8>, serde_json::Value, serde_cbor::Value) {
 
 /// The scan shape: the prefix-filter over file_names (the measure of
 /// selective materialization; a thousand entries).
-fn scan_program() -> sansho::Program {
+fn scan_program() -> std::sync::Arc<sansho::Program> {
     let parsed = sansho::parse("body.file_names[?starts_with(@, 'gitoid:')]").expect("parses");
-    sansho::compile(&parsed).expect("compiles")
+    sansho::compile(&parsed, None).expect("compiles")
 }
 
 /// The seek shape: single-field access.
-fn seek_program() -> sansho::Program {
+fn seek_program() -> std::sync::Arc<sansho::Program> {
     let parsed = sansho::parse("body.file_size").expect("parses");
-    sansho::compile(&parsed).expect("compiles")
+    sansho::compile(&parsed, None).expect("compiles")
 }
 
 fn trait_surface_benchmarks(c: &mut Criterion) {
@@ -63,33 +70,33 @@ fn trait_surface_benchmarks(c: &mut Criterion) {
     // the byte source: the pre-existing entry vs the trait entry
     let mut group = c.benchmark_group("byte_source_entry");
     group.throughput(criterion::Throughput::Elements(1));
-    group.bench_function("evaluate_cbor_scan", |b| {
-        b.iter(|| evaluate_cbor(black_box(&scan), black_box(&bytes)).unwrap())
+    group.bench_function("materialized_scan", |b| {
+        b.iter(|| run(black_box(&scan), black_box(bytes.as_slice())).unwrap())
     });
     group.bench_function("lookup_scan", |b| {
         let slice: &[u8] = &bytes;
-        b.iter(|| lookup_value(black_box(&slice), black_box(&scan)).unwrap())
+        b.iter(|| sansho::evaluate(black_box(&scan), black_box(slice)).unwrap())
     });
-    group.bench_function("evaluate_cbor_seek", |b| {
-        b.iter(|| evaluate_cbor(black_box(&seek), black_box(&bytes)).unwrap())
+    group.bench_function("materialized_seek", |b| {
+        b.iter(|| run(black_box(&seek), black_box(bytes.as_slice())).unwrap())
     });
     group.bench_function("lookup_seek", |b| {
         let slice: &[u8] = &bytes;
-        b.iter(|| lookup_value(black_box(&slice), black_box(&seek)).unwrap())
+        b.iter(|| sansho::evaluate(black_box(&seek), black_box(slice)).unwrap())
     });
     group.finish();
 
     // the JSON source: the pre-existing entry vs the trait entry
     let mut group = c.benchmark_group("json_source_entry");
     group.throughput(criterion::Throughput::Elements(1));
-    group.bench_function("evaluate_json_scan", |b| {
-        b.iter(|| evaluate_json(black_box(&scan), black_box(&json)).unwrap())
+    group.bench_function("materialized_scan", |b| {
+        b.iter(|| run(black_box(&scan), black_box(&json)).unwrap())
     });
     group.bench_function("lookup_scan", |b| {
-        b.iter(|| lookup_value(black_box(&json), black_box(&scan)).unwrap())
+        b.iter(|| sansho::evaluate(black_box(&scan), black_box(&json)).unwrap())
     });
     group.bench_function("lookup_seek", |b| {
-        b.iter(|| lookup_value(black_box(&json), black_box(&seek)).unwrap())
+        b.iter(|| sansho::evaluate(black_box(&seek), black_box(&json)).unwrap())
     });
     group.finish();
 
@@ -97,14 +104,17 @@ fn trait_surface_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("cbor_value_source_entry");
     group.throughput(criterion::Throughput::Elements(1));
     group.bench_function("lookup_scan", |b| {
-        b.iter(|| lookup_value(black_box(&cbor_value), black_box(&scan)).unwrap())
+        b.iter(|| sansho::evaluate(black_box(&scan), black_box(&cbor_value)).unwrap())
     });
     group.bench_function("lookup_seek", |b| {
-        b.iter(|| lookup_value(black_box(&cbor_value), black_box(&seek)).unwrap())
+        b.iter(|| sansho::evaluate(black_box(&seek), black_box(&cbor_value)).unwrap())
     });
     group.bench_function("root_probe_kind", |b| {
+        // the trait is implemented for `&serde_cbor::Value`, so the receiver
+        // is a reference to the reference
+        let reference: &serde_cbor::Value = &cbor_value;
         b.iter(|| {
-            black_box(sansho::view::SanshoTrait::kind(&cbor_value));
+            black_box(sansho::view::SanshoTrait::kind(&reference));
         })
     });
     group.finish();

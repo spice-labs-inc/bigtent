@@ -26,12 +26,14 @@
 //! jmespath.org; conformance is defined by the vendored JMESPath
 //! compliance corpus.
 //!
-//! ## Phase status
+//! ## Entry points
 //!
-//! The parser, canonical form, walk program, and the evaluator over the
-//! materialized backend are live: see [`compile`] and [`evaluate_json`].
-//! The cursor backend over raw CBOR bytes — and with it the public
-//! [`evaluate`] byte-slice entry point — arrives with the cursor phase.
+//! [`parse`] and [`compile`] produce a [`Program`]; [`evaluate`] runs it
+//! against any source that implements [`SanshoTrait`] — a CBOR byte slice or
+//! an in-memory `serde_json::Value`; [`materialize`] converts the result to a
+//! `serde_json::Value` at the boundary, after the evaluation has finished.
+//! [`ProgramCache`] amortizes the parse and compile over repeated
+//! expressions.
 
 pub mod ast;
 pub mod cache;
@@ -51,29 +53,83 @@ pub mod view;
 #[cfg(test)]
 mod ast_tests;
 
+use std::rc::Rc;
+
 pub use ast::canonical;
 pub use cache::ProgramCache;
 pub use corpus::{Driver, DriverOutcome, Unimplemented};
 pub use error::SanshoError;
 pub use eval::Stop;
-pub use eval::{
-    RealEngine, ZeroCopySanshoResult, evaluate_cbor, evaluate_cbor_stopped, evaluate_cbor_with_stats,
-    evaluate_json, lookup, lookup_value,
-};
 pub use parser::parse;
 pub use program::{Program, compile};
-pub use view::{Kind, SanshoNumber, SanshoTrait};
 
-/// Evaluate a [Program] against one CBOR document.
+pub use crate::view::{SanshoCarrier, SanshoTrait};
+
+use crate::view::{Kind, SanshoNumber};
+
+/// Evaluate a [Program] against a document.
 ///
-/// The `document` byte slice must contain exactly one CBOR document;
-/// trailing bytes are an input error. Returns the projection result as a
-/// JSON value.
+/// Generic over [`SanshoTrait`], so any Sansho source evaluates: a CBOR byte
+/// slice, an in-memory `serde_json::Value`, a scalar, a container. The result
+/// is a trait value rather than a JSON value — [`materialize`] converts it at
+/// the boundary, after the evaluation has finished.
 ///
-/// The cursor backend decodes selectively: only the positions the
-/// expression consumes materialize, each at most once per evaluation
-/// (the memoized decode). [`evaluate_json`] evaluates against in-memory
-/// documents.
-pub fn evaluate(program: &Program, document: &[u8]) -> Result<serde_json::Value, SanshoError> {
-    eval::evaluate_cbor(program, document)
+/// The byte source reads selectively: only the positions the expression
+/// consumes are decoded, so an unselected payload is never visited. Bytes
+/// after the document are not read.
+pub fn evaluate<'a, T: SanshoTrait<'a>>(
+    program: &Program,
+    document: T,
+) -> Result<SanshoCarrier<'a>, SanshoError> {
+    eval::eval(program, Rc::new(document) as SanshoCarrier<'a>)
+        .map(eval::flow_value)
+        .map_err(|e| match e {
+            Stop::Error(e) => e,
+            Stop::NotImplemented => SanshoError::Evaluation {
+                message: "Not implemented".to_string(),
+            },
+        })
+}
+
+/// The materialization boundary: the JSON view of a finished evaluation.
+///
+/// Generic over the trait, so any Sansho source materializes — a carrier, a
+/// borrowed document, a scalar, a container. This is a SEPARATE operation
+/// from evaluation: it runs after the evaluation completes and never inside
+/// it. Octets become text only here, through the byte-string rendering.
+pub fn materialize<'a, T: SanshoTrait<'a> + ?Sized>(
+    value: &T,
+) -> Result<serde_json::Value, SanshoError> {
+    match value.kind() {
+        Kind::Null => Ok(serde_json::Value::Null),
+        Kind::Bool => Ok(serde_json::Value::Bool(value.as_bool()?)),
+        Kind::Number => {
+            let number = match value.as_sansho_number()? {
+                SanshoNumber::I64(v) => serde_json::Number::from(v),
+                SanshoNumber::U64(v) => serde_json::Number::from(v),
+                SanshoNumber::F64(v) => {
+                    serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0))
+                }
+            };
+            Ok(serde_json::Value::Number(number))
+        }
+        Kind::String => Ok(serde_json::Value::String(value.as_str()?.to_string())),
+        Kind::Bytes => Ok(serde_json::Value::String(cbor::base64url_encode(
+            value.as_bytes()?,
+        ))),
+        Kind::Array => {
+            let mut items = Vec::new();
+            for element in value.elements()? {
+                items.push(materialize(&element)?);
+            }
+            Ok(serde_json::Value::Array(items))
+        }
+        Kind::Object => {
+            let mut object = serde_json::Map::new();
+            for (key, member) in value.entries()? {
+                object.insert(key.to_string(), materialize(&member)?);
+            }
+            Ok(serde_json::Value::Object(object))
+        }
+    }
 }

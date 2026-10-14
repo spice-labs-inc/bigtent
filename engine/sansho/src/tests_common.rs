@@ -1,9 +1,8 @@
 //! The shared test-support fixture builder: the Appendix-A-shaped item
-//! with parameterized connection and file-name counts (the plan's
-//! Phase 0 — the machinery the benchmarks and the escape-case matrix
-//! rest on; the spike's `SpikeItem::appendix_a` promoted into the
-//! engine). Included via `#[path]` by the benches and the integration
-//! tests; not part of the library's public surface.
+//! with parameterized connection and file-name counts — the machinery
+//! the benchmarks and the escape-case matrix rest on. Included via
+//! `#[path]` by the benches and the integration tests; not part of the
+//! library's public surface.
 
 use serde_json::Value as J;
 use std::collections::BTreeMap;
@@ -64,9 +63,15 @@ pub fn appendix_a(n_connections: usize, n_file_names: usize) -> J {
                 "body".to_string(),
                 J::Object(
                     [
-                        ("file_names".to_string(), J::Array(file_names.into_iter().map(J::String).collect())),
+                        (
+                            "file_names".to_string(),
+                            J::Array(file_names.into_iter().map(J::String).collect()),
+                        ),
                         ("file_size".to_string(), J::Number(3050.into())),
-                        ("mime_type".to_string(), J::Array(vec![J::String("text/x-java-source".to_string())])),
+                        (
+                            "mime_type".to_string(),
+                            J::Array(vec![J::String("text/x-java-source".to_string())]),
+                        ),
                         ("extra".to_string(), J::Object(Default::default())),
                     ]
                     .into_iter()
@@ -80,11 +85,24 @@ pub fn appendix_a(n_connections: usize, n_file_names: usize) -> J {
 }
 
 /// The connection count of an Appendix-A item (for assertions).
+///
+/// This file is included by several targets through `#[path]`, and each uses
+/// a subset of it, so an item that is unused in one includer is not dead.
+#[allow(dead_code)]
 pub fn connection_count(item: &J) -> usize {
-    item["connections"]["alias:from"].as_array().map(|a| a.len()).unwrap_or(0)
+    item["connections"]["alias:from"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0)
 }
 
 /// The file-name count of an Appendix-A item (for assertions).
+///
+/// See `connection_count`: the shared inclusion is why this needs the allow.
+#[allow(dead_code)]
 pub fn file_name_count(item: &J) -> usize {
-    item["body"]["file_names"].as_array().map(|a| a.len()).unwrap_or(0)
+    item["body"]["file_names"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0)
 }

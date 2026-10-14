@@ -4,7 +4,7 @@
 //! even where evaluation lags (later phases turn more of the corpus
 //! green). The nesting-depth limit is enforced during parsing, so
 //! hostile nesting is rejected before recursion can run away
-//! (SPEC-0001 §5.5).
+//! The expression bounds.
 
 use crate::ast::*;
 use crate::error::SanshoError;
@@ -16,7 +16,7 @@ use nom::combinator::{cut, eof, opt, recognize, value};
 use nom::multi::separated_list1;
 use nom::sequence::{delimited, preceded, terminated, tuple};
 
-/// The parse-time expression bounds (SPEC-0001 §5.5, kept as module
+/// The parse-time expression bounds (kept as module
 /// constants — one-time parse checks; not traversal accounting).
 const MAX_EXPRESSION_LENGTH: usize = 16_384;
 const MAX_NESTING_DEPTH: usize = 64;
@@ -164,13 +164,12 @@ fn tag2<'a>(
     input: &'a str,
     pattern: &'a str,
 ) -> IResult<&'a str, &'a str, nom::error::Error<&'a str>> {
-    if input.starts_with(pattern) {
-        Ok((&input[pattern.len()..], pattern))
-    } else {
-        Err(nom::Err::Error(nom::error::Error::new(
+    match input.strip_prefix(pattern) {
+        Some(rest) => Ok((rest, pattern)),
+        None => Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Tag,
-        )))
+        ))),
     }
 }
 

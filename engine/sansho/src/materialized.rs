@@ -1,104 +1,20 @@
-//! The JSON value source: `serde_json::Value` and `&serde_json::Value`
-//! implemented directly on the trait surface.
+//! The JSON value source: `&serde_json::Value` implemented directly on the
+//! trait surface — references only.
 //!
-//! Two forms, both on the trait:
-//! - `J` (the value form): the natural call shape —
-//!   `lookup(&value, …)`; members are OWNED values (clones) — a value
-//!   form has no borrowable storage, its members are computed values.
-//! - `&'a J` (the borrowed form): members are BORROWED values — an
-//!   `&'a J`'s members are `&'a J` (zero-copy; the item/body
-//!   navigations that hold an in-memory JSON tree use this form).
+//! Members are BORROWED values (zero-copy): an `&'a serde_json::Value`'s
+//! members are `&'a serde_json::Value`, handed out as a refcount around the
+//! borrow, and an object's keys are the document's own `&'a str`.
+//!
+//! The owned form (`impl SanshoTrait for serde_json::Value`) is commented
+//! out below: a value that owns its content cannot lend it for `'a` from a
+//! `&self` receiver, so every member and every string would have to be
+//! copied. Reference forms only.
+
+use std::rc::Rc;
 
 use crate::error::SanshoError;
-use crate::view::{Kind, SanshoNumber, SanshoTrait};
+use crate::view::{Kind, SanshoCarrier, SanshoNumber, SanshoTrait};
 use serde_json::Value as J;
-
-/// The value form: members are owned computed values.
-impl<'a> SanshoTrait<'a> for J {
-    fn kind(&self) -> Kind {
-        match self {
-            J::Object(_) => Kind::Object,
-            J::Array(_) => Kind::Array,
-            J::String(_) => Kind::String,
-            J::Number(_) => Kind::Number,
-            J::Bool(_) => Kind::Bool,
-            J::Null => Kind::Null,
-        }
-    }
-
-    fn as_str(&self) -> Option<std::borrow::Cow<'_, str>> {
-        match self {
-            J::String(s) => Some(std::borrow::Cow::Borrowed(s)),
-            _ => None,
-        }
-    }
-
-    fn as_sansho_number(&self) -> Option<SanshoNumber> {
-        let number = self.as_number()?;
-        // exact first: serde_json preserves i64/u64 exactly — report
-        // them full-width, never narrowed through f64
-        if let Some(v) = number.as_i64() {
-            return Some(SanshoNumber::I64(v));
-        }
-        if let Some(v) = number.as_u64() {
-            return Some(SanshoNumber::U64(v));
-        }
-        number.as_f64().map(SanshoNumber::F64)
-    }
-
-    fn as_bool(&self) -> Option<bool> {
-        match self {
-            J::Bool(value) => Some(*value),
-            _ => None,
-        }
-    }
-
-    fn is_null(&self) -> bool {
-        matches!(self, J::Null)
-    }
-
-    fn get_key(&self, name: &str) -> Option<impl SanshoTrait<'a> + use<'a>> {
-        self.get(name).cloned()
-    }
-
-    fn get_index(&self, index: usize) -> Option<impl SanshoTrait<'a> + use<'a>> {
-        self.get(index).cloned()
-    }
-
-    fn entries(&self) -> Vec<(String, impl SanshoTrait<'a> + use<'a>)> {
-        self.as_object()
-            .map(|map| {
-                map.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn elements(&self) -> Vec<impl SanshoTrait<'a> + use<'a>> {
-        self.as_array()
-            .map(|items| items.to_vec())
-            .unwrap_or_default()
-    }
-
-    fn container_len(&self) -> Option<usize> {
-        match self {
-            J::Object(map) => Some(map.len()),
-            J::Array(items) => Some(items.len()),
-            _ => None,
-        }
-    }
-
-    fn counts_toward_aggregation() -> bool {
-        // the value is the CALLER's pre-existing data — nothing is
-        // engine-created
-        false
-    }
-
-    fn materialize(&self) -> Result<J, SanshoError> {
-        Ok(self.clone())
-    }
-}
 
 /// The borrowed form: members are BORROWED values (zero-copy).
 impl<'a> SanshoTrait<'a> for &'a J {
@@ -113,35 +29,45 @@ impl<'a> SanshoTrait<'a> for &'a J {
         }
     }
 
-    fn as_str(&self) -> Option<std::borrow::Cow<'_, str>> {
-        match self {
-            J::String(s) => Some(std::borrow::Cow::Borrowed(s)),
-            _ => None,
+    fn as_str(&self) -> Result<&'a str, SanshoError> {
+        let value: &'a J = self;
+        match value {
+            // the text borrows the document
+            J::String(text) => Ok(text.as_str()),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not a String type".to_string(),
+            }),
         }
     }
 
-    fn as_str_ref(&self) -> Option<&'a str> {
-        match **self {
-            J::String(ref text) => Some(text.as_str()),
-            _ => None,
-        }
-    }
-
-    fn as_sansho_number(&self) -> Option<SanshoNumber> {
-        let number = self.as_number()?;
+    fn as_sansho_number(&self) -> Result<SanshoNumber, SanshoError> {
+        let number = (**self)
+            .as_number()
+            .ok_or_else(|| SanshoError::Evaluation {
+                message: "Not a Number type".to_string(),
+            })?;
+        // exact first: serde_json preserves i64/u64 exactly — report them
+        // full-width, never narrowed through f64
         if let Some(v) = number.as_i64() {
-            return Some(SanshoNumber::I64(v));
+            return Ok(SanshoNumber::I64(v));
         }
         if let Some(v) = number.as_u64() {
-            return Some(SanshoNumber::U64(v));
+            return Ok(SanshoNumber::U64(v));
         }
-        number.as_f64().map(SanshoNumber::F64)
+        number
+            .as_f64()
+            .map(SanshoNumber::F64)
+            .ok_or_else(|| SanshoError::Evaluation {
+                message: "Not a Number type".to_string(),
+            })
     }
 
-    fn as_bool(&self) -> Option<bool> {
+    fn as_bool(&self) -> Result<bool, SanshoError> {
         match **self {
-            J::Bool(value) => Some(value),
-            _ => None,
+            J::Bool(value) => Ok(value),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not a bool type".to_string(),
+            }),
         }
     }
 
@@ -149,42 +75,188 @@ impl<'a> SanshoTrait<'a> for &'a J {
         matches!(**self, J::Null)
     }
 
-    fn get_key(&self, name: &str) -> Option<impl SanshoTrait<'a> + use<'a>> {
-        // the receiver is a &'a J; the member is the borrowed sub-value
-        (**self).get(name)
-    }
-
-    fn get_index(&self, index: usize) -> Option<impl SanshoTrait<'a> + use<'a>> {
-        (**self).get(index)
-    }
-
-    fn entries(&self) -> Vec<(String, impl SanshoTrait<'a> + use<'a>)> {
-        (**self)
-            .as_object()
-            .map(|map| map.iter().map(|(k, v)| (k.clone(), v)).collect())
-            .unwrap_or_default()
-    }
-
-    fn elements(&self) -> Vec<impl SanshoTrait<'a> + use<'a>> {
-        (**self)
-            .as_array()
-            .map(|items| items.iter().map(|v| v).collect())
-            .unwrap_or_default()
-    }
-
-    fn container_len(&self) -> Option<usize> {
-        match *self {
-            &J::Object(ref map) => Some(map.len()),
-            &J::Array(ref items) => Some(items.len()),
-            _ => None,
+    fn get_key(&self, name: &str) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        let value: &'a J = self;
+        match value {
+            J::Object(_) => Ok(value
+                .get(name)
+                .map(|member| Rc::new(member) as SanshoCarrier<'a>)),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not an object type".to_string(),
+            }),
         }
     }
 
-    fn counts_toward_aggregation() -> bool {
-        false
+    fn get_index(&self, index: usize) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        let value: &'a J = self;
+        match value {
+            J::Array(_) => Ok(value
+                .get(index)
+                .map(|member| Rc::new(member) as SanshoCarrier<'a>)),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not an array type".to_string(),
+            }),
+        }
     }
 
-    fn materialize(&self) -> Result<J, SanshoError> {
-        Ok((**self).clone())
+    fn entries(&self) -> Result<Vec<(&'a str, SanshoCarrier<'a>)>, SanshoError> {
+        let value: &'a J = self;
+        match value.as_object() {
+            // the keys borrow the document: no key string is built
+            Some(object) => Ok(object
+                .iter()
+                .map(|(key, member)| (key.as_str(), Rc::new(member) as SanshoCarrier<'a>))
+                .collect()),
+            None => Err(SanshoError::Evaluation {
+                message: format!("entries requires an object, found {}", self.kind()),
+            }),
+        }
+    }
+
+    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+        let value: &'a J = self;
+        match value.as_array() {
+            Some(items) => Ok(items
+                .iter()
+                .map(|member| Rc::new(member) as SanshoCarrier<'a>)
+                .collect()),
+            None => Err(SanshoError::Evaluation {
+                message: format!("elements requires an array, found {}", self.kind()),
+            }),
+        }
+    }
+
+    fn container_len(&self) -> Result<usize, SanshoError> {
+        match **self {
+            J::Object(ref map) => Ok(map.len()),
+            J::Array(ref items) => Ok(items.len()),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not an Array or Object".to_string(),
+            }),
+        }
+    }
+
+    /// The value is already materialized: print its JSON text.
+    fn to_string_sansho(&self) -> String {
+        (**self).to_string()
+    }
+}
+
+/// The borrowed form: members are BORROWED values (zero-copy).
+impl<'a> SanshoTrait<'a> for J {
+    fn kind(&self) -> Kind {
+        match *self {
+            J::Object(_) => Kind::Object,
+            J::Array(_) => Kind::Array,
+            J::String(_) => Kind::String,
+            J::Number(_) => Kind::Number,
+            J::Bool(_) => Kind::Bool,
+            J::Null => Kind::Null,
+        }
+    }
+
+    fn as_str(&self) -> Result<&str, SanshoError> {
+        match self {
+            // the text borrows the document
+            J::String(text) => Ok(text.as_str()),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not a String type".to_string(),
+            }),
+        }
+    }
+
+    fn as_sansho_number(&self) -> Result<SanshoNumber, SanshoError> {
+        let number = (*self).as_number().ok_or_else(|| SanshoError::Evaluation {
+            message: "Not a Number type".to_string(),
+        })?;
+        // exact first: serde_json preserves i64/u64 exactly — report them
+        // full-width, never narrowed through f64
+        if let Some(v) = number.as_i64() {
+            return Ok(SanshoNumber::I64(v));
+        }
+        if let Some(v) = number.as_u64() {
+            return Ok(SanshoNumber::U64(v));
+        }
+        number
+            .as_f64()
+            .map(SanshoNumber::F64)
+            .ok_or_else(|| SanshoError::Evaluation {
+                message: "Not a Number type".to_string(),
+            })
+    }
+
+    fn as_bool(&self) -> Result<bool, SanshoError> {
+        match *self {
+            J::Bool(value) => Ok(value),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not a bool type".to_string(),
+            }),
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        matches!(*self, J::Null)
+    }
+
+    fn get_key(&self, name: &str) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        match self {
+            J::Object(obj) => Ok(obj
+                .get(name)
+                .map(|member| Rc::new(member.clone()) as SanshoCarrier<'a>)),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not an object type".to_string(),
+            }),
+        }
+    }
+
+    fn get_index(&self, index: usize) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        match self {
+            J::Array(value) => Ok(value
+                .get(index)
+                .map(|member| Rc::new(member.clone()) as SanshoCarrier<'a>)),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not an array type".to_string(),
+            }),
+        }
+    }
+
+    fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
+        match self.as_object() {
+            // the keys borrow the document: no key string is built
+            Some(object) => Ok(object
+                .iter()
+                .map(|(key, member)| (key.as_str(), Rc::new(member.clone()) as SanshoCarrier<'a>))
+                .collect()),
+            None => Err(SanshoError::Evaluation {
+                message: format!("entries requires an object, found {}", self.kind()),
+            }),
+        }
+    }
+
+    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+        match self.as_array() {
+            Some(items) => Ok(items
+                .iter()
+                .map(|member| Rc::new(member.clone()) as SanshoCarrier<'a>)
+                .collect()),
+            None => Err(SanshoError::Evaluation {
+                message: format!("elements requires an array, found {}", self.kind()),
+            }),
+        }
+    }
+
+    fn container_len(&self) -> Result<usize, SanshoError> {
+        match self {
+            J::Object(map) => Ok(map.len()),
+            J::Array(items) => Ok(items.len()),
+            _ => Err(SanshoError::Evaluation {
+                message: "Not an Array or Object".to_string(),
+            }),
+        }
+    }
+
+    /// The value is already materialized: print its JSON text.
+    fn to_string_sansho(&self) -> String {
+        (*self).to_string()
     }
 }

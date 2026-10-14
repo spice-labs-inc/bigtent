@@ -5,8 +5,8 @@
 //! The tests live in the derive crate (dev-depending on sansho — the
 //! allowed direction per ADR-0001: sansho never depends on this crate).
 
-use sansho_derive::SanshoNode;
 use sansho::view::Node;
+use sansho_derive::SanshoNode;
 
 /// The item-shaped struct under test.
 #[derive(SanshoNode)]
@@ -95,7 +95,10 @@ fn derive_matches_hand_written() {
 
     // the string field's content via the generated Str variant
     let id_node = derived.get_key("identifier").unwrap();
-    assert_eq!(id_node.as_str().map(|s| s.into_owned()), Some("gitoid:blob:sha1:x".to_string()));
+    assert_eq!(
+        id_node.as_str().map(|s| s.into_owned()),
+        Some("gitoid:blob:sha1:x".to_string())
+    );
     assert_eq!(id_node.kind(), sansho::view::Kind::String);
 
     // the body value's navigation through the generated Value variant
@@ -136,10 +139,15 @@ pub struct OneField {
 
 #[test]
 fn derive_compiles_for_single_shape_struct() {
-    let item = OneField { identifier: "x".to_string() };
+    let item = OneField {
+        identifier: "x".to_string(),
+    };
     let node = OneFieldNode::wrap(&item);
     assert_eq!(
-        node.get_key("identifier").unwrap().as_str().map(|s| s.into_owned()),
+        node.get_key("identifier")
+            .unwrap()
+            .as_str()
+            .map(|s| s.into_owned()),
         Some("x".to_string())
     );
     assert!(node.get_key("nope").is_none());
@@ -158,7 +166,10 @@ fn leaf_nodes_answer_no_navigation() {
     let derived = TestItemNode::wrap(&item);
     let id = derived.get_key("identifier").unwrap();
     // JMESPath: navigation on a string is null
-    assert!(id.get_key("identifier").is_none(), "leaf navigation is null");
+    assert!(
+        id.get_key("identifier").is_none(),
+        "leaf navigation is null"
+    );
     let mime = derived.get_key("body_mime_type").unwrap();
     assert!(mime.get_key("body_mime_type").is_none());
 }

@@ -1,17 +1,27 @@
-//! The projection benchmarks (SPEC-0001 §2's motivation made measured):
+//! The projection benchmarks (the projection motivation, measured):
 //! selective evaluation over the CBOR byte slice versus the
 //! full-materialization baseline, on the Appendix-A-shaped item class
 //! scaled up to real sizes (thousands of file_names entries).
 //!
 //! Run: `cargo bench -p sansho` (criterion; the results land under
 //! target/criterion/). The GATE lives in the test-suite
-//! (`tests/phase5_gates.rs`'s benchmark gate) — the thresholds:
-//! the prefix-filter expression materializes at most one tenth of the
-//! nodes the full path materializes, and is never slower by more than
-//! fifteen percent than the baseline on trivial projections.
+//! (`tests/benchmark_gate.rs`) — the thresholds: the prefix-filter
+//! expression materializes a fraction of the nodes the full path
+//! materializes, and a single-key selection is far slower than the
+//! current-node identity.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use sansho::{compile, evaluate_cbor, evaluate_json, parse};
+use sansho::{compile, parse};
+
+/// The whole public path: evaluate the program, then materialize the result at
+/// the boundary. This is what a consumer pays for one query, so it is what
+/// these benchmarks measure.
+fn run<'a, T: sansho::SanshoTrait<'a>>(
+    program: &sansho::Program,
+    document: T,
+) -> Result<serde_json::Value, sansho::SanshoError> {
+    sansho::evaluate(program, document).and_then(|value| sansho::materialize(&value))
+}
 
 /// The Appendix-A-shaped item, scaled: `file_names` entries with the
 /// gitoid-prefixed merge-disambiguation form mixed among plain paths.
@@ -46,10 +56,10 @@ fn bench_projection(criterion: &mut Criterion) {
         let document = scaled_item(entries);
         let bytes = serde_cbor::to_vec(&document).unwrap();
 
-        let prefix = compile(&parse("body.file_names[?starts_with(@, 'gitoid:')]").unwrap())
+        let prefix = compile(&parse("body.file_names[?starts_with(@, 'gitoid:')]").unwrap(), None)
             .expect("compiles");
-        let full = compile(&parse("@").unwrap()).expect("compiles");
-        let none = compile(&parse("body.extra").unwrap()).expect("compiles");
+        let full = compile(&parse("@").unwrap(), None).expect("compiles");
+        let none = compile(&parse("body.extra").unwrap(), None).expect("compiles");
 
         let mut group = criterion.benchmark_group("projection");
         group.throughput(criterion::Throughput::Bytes(bytes.len() as u64));
@@ -57,22 +67,22 @@ fn bench_projection(criterion: &mut Criterion) {
         group.bench_with_input(
             format!("prefix_filter/cursor/{entries}_entries"),
             &bytes,
-            |bench, bytes| bench.iter(|| evaluate_cbor(black_box(&prefix), black_box(bytes))),
+            |bench, bytes| bench.iter(|| run(black_box(&prefix), black_box(bytes.as_slice()))),
         );
         group.bench_with_input(
             format!("prefix_filter/materialized/{entries}_entries"),
             &document,
-            |bench, doc| bench.iter(|| evaluate_json(black_box(&prefix), black_box(doc))),
+            |bench, doc| bench.iter(|| run(black_box(&prefix), black_box(doc))),
         );
         group.bench_with_input(
             format!("full_item/cursor/{entries}_entries"),
             &bytes,
-            |bench, bytes| bench.iter(|| evaluate_cbor(black_box(&full), black_box(bytes))),
+            |bench, bytes| bench.iter(|| run(black_box(&full), black_box(bytes.as_slice()))),
         );
         group.bench_with_input(
             format!("no_selection/cursor/{entries}_entries"),
             &bytes,
-            |bench, bytes| bench.iter(|| evaluate_cbor(black_box(&none), black_box(bytes))),
+            |bench, bytes| bench.iter(|| run(black_box(&none), black_box(bytes.as_slice()))),
         );
         group.finish();
     }

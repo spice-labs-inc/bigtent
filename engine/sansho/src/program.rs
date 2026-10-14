@@ -1,5 +1,5 @@
 //! The walk program: the compiled form of a JMESPath expression
-//! (SPEC-0001 §5).
+//! The compiled form.
 //!
 //! A spine is a linear instruction list — one edge per selector, in
 //! source order. The evaluator threads a FLOW through the edges: plain
@@ -14,6 +14,7 @@
 use crate::ast::{CmpOp, Expr, FnArg, Postfix, Primary, SliceSpec};
 use crate::error::SanshoError;
 use serde_json::Value as J;
+use std::sync::Arc;
 
 /// The compiled program.
 #[derive(Clone, Debug)]
@@ -143,25 +144,49 @@ pub fn function_takes_expression(name: &str) -> bool {
 // ---------- compilation ----------
 
 /// Lower a parsed expression into a walk program.
-pub fn compile(expr: &Expr) -> Result<Program, SanshoError> {
+/// Compile a parsed expression into its program: the lowered tree the
+/// evaluator walks.
+///
+/// The optional cache is the caller's — instantiated, passed, and managed
+/// entirely by them — and is keyed by the canonical form of the
+/// expression, so repeated expressions compile once. `None` compiles
+/// fresh. Sub-compilation (the expression's own nested programs) is
+/// uncached: only whole expressions are cached.
+pub fn compile(
+    expr: &Expr,
+    cache: Option<&crate::cache::ProgramCache>,
+) -> Result<Arc<Program>, SanshoError> {
+    if let Some(cache) = cache {
+        if let Some(program) = cache.get(expr) {
+            return Ok(program);
+        }
+        let program = Arc::new(compile_program(expr)?);
+        cache.put(expr, program.clone());
+        Ok(program)
+    } else {
+        Ok(Arc::new(compile_program(expr)?))
+    }
+}
+
+fn compile_program(expr: &Expr) -> Result<Program, SanshoError> {
     match expr {
         Expr::Pipe(left, right) => Ok(Program::Pipe(
-            Box::new(compile(left)?),
-            Box::new(compile(right)?),
+            Box::new(compile_program(left)?),
+            Box::new(compile_program(right)?),
         )),
         Expr::Or(left, right) => Ok(Program::Or(
-            Box::new(compile(left)?),
-            Box::new(compile(right)?),
+            Box::new(compile_program(left)?),
+            Box::new(compile_program(right)?),
         )),
         Expr::And(left, right) => Ok(Program::And(
-            Box::new(compile(left)?),
-            Box::new(compile(right)?),
+            Box::new(compile_program(left)?),
+            Box::new(compile_program(right)?),
         )),
-        Expr::Not(inner) => Ok(Program::Not(Box::new(compile(inner)?))),
+        Expr::Not(inner) => Ok(Program::Not(Box::new(compile_program(inner)?))),
         Expr::Compare(op, left, right) => Ok(Program::Compare(
             *op,
-            Box::new(compile(left)?),
-            Box::new(compile(right)?),
+            Box::new(compile_program(left)?),
+            Box::new(compile_program(right)?),
         )),
         Expr::Chain(primary, postfixes) => {
             let mut edges = Vec::with_capacity(postfixes.len() + 1);
@@ -182,14 +207,14 @@ pub fn compile(expr: &Expr) -> Result<Program, SanshoError> {
                 Primary::MultiList(items) => {
                     let slots = items
                         .iter()
-                        .map(compile)
+                        .map(compile_program)
                         .collect::<Result<Vec<_>, SanshoError>>()?;
                     edges.push(Edge::Compute(Box::new(Program::MultiList(slots))));
                 }
                 Primary::MultiHash(entries) => {
                     let slots = entries
                         .iter()
-                        .map(|(k, v)| compile(v).map(|p| (k.clone(), p)))
+                        .map(|(k, v)| compile_program(v).map(|p| (k.clone(), p)))
                         .collect::<Result<Vec<_>, SanshoError>>()?;
                     edges.push(Edge::Compute(Box::new(Program::MultiHash(slots))));
                 }
@@ -207,18 +232,20 @@ pub fn compile(expr: &Expr) -> Result<Program, SanshoError> {
                         }
                     }
                     Postfix::Flatten => edges.push(Edge::Flatten),
-                    Postfix::Filter(pred) => edges.push(Edge::Filter(Box::new(compile(pred)?))),
+                    Postfix::Filter(pred) => {
+                        edges.push(Edge::Filter(Box::new(compile_program(pred)?)))
+                    }
                     Postfix::MultiList(items) => {
                         let slots = items
                             .iter()
-                            .map(compile)
+                            .map(compile_program)
                             .collect::<Result<Vec<_>, SanshoError>>()?;
                         edges.push(Edge::Compute(Box::new(Program::MultiList(slots))));
                     }
                     Postfix::MultiHash(entries) => {
                         let slots = entries
                             .iter()
-                            .map(|(k, v)| compile(v).map(|p| (k.clone(), p)))
+                            .map(|(k, v)| compile_program(v).map(|p| (k.clone(), p)))
                             .collect::<Result<Vec<_>, SanshoError>>()?;
                         edges.push(Edge::Compute(Box::new(Program::MultiHash(slots))));
                     }
@@ -236,8 +263,8 @@ fn compile_function(name: &str, args: &[FnArg]) -> Result<Program, SanshoError> 
     let program_args = args
         .iter()
         .map(|arg| match arg {
-            FnArg::Value(e) => compile(e).map(FnArgP::Value),
-            FnArg::Ref(e) => compile(e).map(|p| FnArgP::Ref(Box::new(p))),
+            FnArg::Value(e) => compile_program(e).map(FnArgP::Value),
+            FnArg::Ref(e) => compile_program(e).map(|p| FnArgP::Ref(Box::new(p))),
         })
         .collect::<Result<Vec<_>, SanshoError>>()?;
     check_arity(name, &program_args)?;

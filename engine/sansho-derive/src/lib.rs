@@ -321,7 +321,10 @@ fn field_shape(ty: &syn::Type) -> Shape {
             // Option<String> only
             let args = &tp.path.segments[0].arguments;
             if let syn::PathArguments::AngleBracketed(ab) = args {
-                let inner = ab.args.first().map(|a| quote::ToTokens::to_token_stream(a).to_string());
+                let inner = ab
+                    .args
+                    .first()
+                    .map(|a| quote::ToTokens::to_token_stream(a).to_string());
                 if inner.as_deref() == Some("String") {
                     return Shape::OptString;
                 }
