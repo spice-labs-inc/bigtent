@@ -9,9 +9,9 @@
 //! the trait (`Option<impl SanshoTrait<'a>>`, `Vec<impl SanshoTrait<'a>>`).
 //! There is no other value carrier — no reference enum, no position
 //! wrapper: a member IS a value implementing the trait, and the
-//! evaluation's internal bookkeeping (a byte position's machinery,
-//! the memos) lives inside the implementations' hidden types, visible
-//! nowhere in the public surface.
+//! evaluation's internal bookkeeping (a byte position's machinery)
+//! lives inside the implementations' hidden types, visible nowhere in
+//! the public surface.
 //!
 //! The trait is implemented directly on the Sansho types — the
 //! "turtles all the way down" contract: the sources (`&[u8]` CBOR
@@ -23,6 +23,7 @@
 //! `HashMap` — standard-library types, their impls in this crate).
 
 use crate::error::SanshoError;
+use std::collections::HashMap;
 use std::fmt::{self};
 use std::rc::Rc;
 
@@ -93,9 +94,10 @@ impl SanshoNumber {
             return SanshoNumber::I64(v);
         }
         if n >= 0
-            && let Ok(v) = u64::try_from(n) {
-                return SanshoNumber::U64(v);
-            }
+            && let Ok(v) = u64::try_from(n)
+        {
+            return SanshoNumber::U64(v);
+        }
         SanshoNumber::F64(n as f64)
     }
 }
@@ -172,12 +174,12 @@ pub trait Member<'a>: SanshoTrait<'a> {
 //         self.reference.get_index(index)
 //     }
 //
-//     fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
-//         self.reference.entries()
+//     fn as_object(&self) -> Result<HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
+//         self.reference.as_object()
 //     }
 //
-//     fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
-//         self.reference.elements()
+//     fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+//         self.reference.as_elements()
 //     }
 //
 //     fn container_len(&self) -> Result<usize, SanshoError> {
@@ -198,13 +200,14 @@ pub trait Member<'a>: SanshoTrait<'a> {
 /// where the mapping transforms it.
 ///
 /// Navigation returns trait-bounded values: `get_key`/`get_index`
-/// give `Option<impl SanshoTrait<'a>>`, `entries`/`elements` give
-/// `Vec` of them. The hidden member type is per-implementation (a
+/// give `Option<impl SanshoTrait<'a>>`; `as_object` gives the object's
+/// members keyed by name, and `as_elements` gives the array's elements
+/// in document order. The hidden member type is per-implementation (a
 /// byte position for the byte source — its machinery crate-private —
 /// a borrowed value for the borrowed source forms, a computed value
 /// for the value forms); the walk never names it, only the trait.
 ///
-/// Evaluation state (the flow, a byte position's parsing and memo)
+/// Evaluation state (the flow, a byte position's parsing)
 /// is internal bookkeeping: it lives in this crate's private modules
 /// and in the hidden types of the implementations — nowhere in the
 /// public surface.
@@ -279,18 +282,44 @@ pub trait SanshoTrait<'a>: 'a {
         })
     }
 
-    /// All object members as `(key, member)` pairs, in the container's
-    /// own order.
-    fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
+    /// The object's members, keyed by name.
+    ///
+    /// Member order is not part of a value: a JSON object is an unordered
+    /// collection of name/value pairs, so the iteration order of the
+    /// returned map is not a contract and no caller may depend on it.
+    fn as_object(&self) -> Result<HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
         Err(SanshoError::Evaluation {
-            message: format!("entries requires an object, found {}", self.kind()),
+            message: format!("requires an object, found {}", self.kind()),
         })
     }
 
     /// All array elements, in document order.
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Err(SanshoError::Evaluation {
             message: format!("elements requires an array, found {}", self.kind()),
+        })
+    }
+
+    /// The array's TEXT elements, in document order, skipping every element
+    /// of any other kind — including byte strings, which are octets and are
+    /// never text.
+    ///
+    /// Nothing is refcounted and nothing is allocated: each string borrows the
+    /// source. This is the LENIENT read of an array — an element whose text is
+    /// not valid UTF-8 is skipped rather than reported. The strict read is
+    /// [`Self::as_elements`] followed by [`Self::as_str`], which answers an
+    /// input error instead. The two exist deliberately: scanning for a prefix
+    /// wants to pass over what it cannot read, while producing a value must
+    /// not silently drop data.
+    ///
+    /// The default answers an error. A general-path default is not possible —
+    /// it would have to borrow `&str` out of carriers that it owns — so each
+    /// source whose storage holds the text itself supplies its own walk.
+    fn as_array_str<'s>(
+        &'s self,
+    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        Err(SanshoError::Evaluation {
+            message: format!("as_array_str requires an array, found {}", self.kind()),
         })
     }
 
@@ -343,12 +372,18 @@ impl<'a> SanshoTrait<'a> for SanshoCarrier<'a> {
         (**self).get_index(index)
     }
 
-    fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
-        (**self).entries()
+    fn as_object(&self) -> Result<HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
+        (**self).as_object()
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
-        (**self).elements()
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+        (**self).as_elements()
+    }
+
+    fn as_array_str<'s>(
+        &'s self,
+    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        (**self).as_array_str()
     }
 
     fn container_len(&self) -> Result<usize, SanshoError> {

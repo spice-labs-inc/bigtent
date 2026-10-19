@@ -16,6 +16,7 @@
 //! (a map is not a string, an array has no members, a scalar is not a
 //! container) comes from the trait's defaults, which are the errors.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -77,8 +78,14 @@ impl<'a> SanshoTrait<'a> for Vec<SanshoCarrier<'a>> {
         Ok(self.get(index).map(Rc::clone))
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Ok((*self).clone())
+    }
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        // the elements may be any kind; the text-bearing ones are yielded
+        Ok(Box::new(
+            self.iter().filter_map(|element| element.as_str().ok()),
+        ))
     }
 
     fn container_len(&self) -> Result<usize, SanshoError> {
@@ -107,8 +114,14 @@ impl<'a> SanshoTrait<'a> for &'a Vec<SanshoCarrier<'a>> {
         Ok(self.get(index).map(Rc::clone))
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Ok((*self).clone())
+    }
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        // the elements may be any kind; the text-bearing ones are yielded
+        Ok(Box::new(
+            self.iter().filter_map(|element| element.as_str().ok()),
+        ))
     }
 
     fn container_len(&self) -> Result<usize, SanshoError> {
@@ -140,8 +153,12 @@ impl<'a> SanshoTrait<'a> for &'a BTreeSet<String> {
         Ok(self.iter().nth(index).map(Member::carrier))
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Ok(self.iter().map(Member::carrier).collect())
+    }
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        // every element is text
+        Ok(Box::new(self.iter().map(|text| text.as_str())))
     }
 
     fn container_len(&self) -> Result<usize, SanshoError> {
@@ -171,8 +188,12 @@ impl<'a> SanshoTrait<'a> for &'a HashSet<String> {
         Ok(self.iter().nth(index).map(Member::carrier))
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Ok(self.iter().map(Member::carrier).collect())
+    }
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        // every element is text
+        Ok(Box::new(self.iter().map(|text| text.as_str())))
     }
 
     fn container_len(&self) -> Result<usize, SanshoError> {
@@ -205,11 +226,15 @@ impl<'a> SanshoTrait<'a> for HashSet<String> {
             .map(|v| Rc::new(v.to_string()) as SanshoCarrier<'a>))
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Ok(self
             .iter()
             .map(|v| Rc::new(v.to_string()) as SanshoCarrier<'a>)
             .collect())
+    }
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        // every element is text
+        Ok(Box::new(self.iter().map(|text| text.as_str())))
     }
 
     fn container_len(&self) -> Result<usize, SanshoError> {
@@ -255,7 +280,7 @@ where
         Ok(self.get(name).map(Member::carrier))
     }
 
-    fn entries(&self) -> Result<Vec<(&'a str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<HashMap<&'a str, SanshoCarrier<'a>>, SanshoError> {
         Ok(self
             .iter()
             .map(|(key, member)| (key.as_str(), member.carrier()))
@@ -295,7 +320,7 @@ where
         Ok(self.get(name).map(Member::carrier))
     }
 
-    fn entries(&self) -> Result<Vec<(&'a str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<HashMap<&'a str, SanshoCarrier<'a>>, SanshoError> {
         Ok(self
             .iter()
             .map(|(key, member)| (key.as_str(), member.carrier()))
@@ -332,7 +357,7 @@ impl<'a> SanshoTrait<'a> for HashMap<String, SanshoCarrier<'a>> {
         Ok(self.get(name).cloned())
     }
 
-    fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
         Ok(self
             .iter()
             .map(|(key, member)| (key.as_str(), member.clone()))
@@ -427,18 +452,18 @@ impl<'a> SanshoTrait<'a> for &'a Option<SanshoCarrier<'a>> {
         }
     }
 
-    fn entries(&self) -> Result<Vec<(&'a str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<HashMap<&'a str, SanshoCarrier<'a>>, SanshoError> {
         match self {
-            Some(member) => member.entries(),
+            Some(member) => member.as_object(),
             None => Err(SanshoError::Evaluation {
-                message: "entries requires an object, found null".to_string(),
+                message: "requires an object, found null".to_string(),
             }),
         }
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         match self {
-            Some(member) => member.elements(),
+            Some(member) => member.as_elements(),
             None => Err(SanshoError::Evaluation {
                 message: "elements requires an array, found null".to_string(),
             }),
@@ -540,7 +565,7 @@ impl<'a> SanshoTrait<'a> for &'a Option<serde_cbor::Value> {
 
     /// The keys borrow the document and each member is a refcount around a
     /// borrow: matched here for the same reason as `as_str`.
-    fn entries(&self) -> Result<Vec<(&'a str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<HashMap<&'a str, SanshoCarrier<'a>>, SanshoError> {
         match self {
             Some(serde_cbor::Value::Map(members)) => Ok(members
                 .iter()
@@ -557,9 +582,9 @@ impl<'a> SanshoTrait<'a> for &'a Option<serde_cbor::Value> {
         }
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         match self {
-            Some(value) => value.elements(),
+            Some(value) => value.as_elements(),
             None => Err(SanshoError::Evaluation {
                 message: "elements requires an array, found null".to_string(),
             }),
@@ -579,6 +604,125 @@ impl<'a> SanshoTrait<'a> for &'a Option<serde_cbor::Value> {
         match self {
             Some(value) => value.to_string_sansho(),
             None => "null".to_string(),
+        }
+    }
+}
+
+/// A borrowed-or-owned value is a value: every read delegates to whatever the
+/// `Cow` carries, so a `Cow` and the value inside it answer identically.
+///
+/// The two bounds name the two implementations it delegates to. The borrowed
+/// form carries a reference, and the trait is implemented on references for the
+/// document-backed types, so that bound is on the reference and is
+/// higher-ranked — a reborrow of any lifetime answers. The owned form carries
+/// the value itself, so its bound is on `T::Owned`, the type the `Cow` holds.
+///
+/// Both arms are written out rather than going through `as_ref()`: that hands
+/// back a temporary reference, and a value derived from a temporary cannot be
+/// returned from a method.
+impl<'a, T> SanshoTrait<'a> for Cow<'a, T>
+where
+    T: ToOwned,
+    T::Owned: SanshoTrait<'a>,
+    for<'x> &'x T: SanshoTrait<'x>,
+{
+    fn kind(&self) -> Kind {
+        match self {
+            Cow::Borrowed(reference) => reference.kind(),
+            Cow::Owned(value) => value.kind(),
+        }
+    }
+
+    fn as_str(&self) -> Result<&str, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.as_str(),
+            Cow::Owned(value) => value.as_str(),
+        }
+    }
+
+    fn as_bytes(&self) -> Result<&[u8], SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.as_bytes(),
+            Cow::Owned(value) => value.as_bytes(),
+        }
+    }
+
+    fn as_sansho_number(&self) -> Result<SanshoNumber, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.as_sansho_number(),
+            Cow::Owned(value) => value.as_sansho_number(),
+        }
+    }
+
+    fn as_f64(&self) -> Result<f64, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.as_f64(),
+            Cow::Owned(value) => value.as_f64(),
+        }
+    }
+
+    fn as_bool(&self) -> Result<bool, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.as_bool(),
+            Cow::Owned(value) => value.as_bool(),
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        match self {
+            Cow::Borrowed(reference) => reference.is_null(),
+            Cow::Owned(value) => value.is_null(),
+        }
+    }
+
+    fn get_key(&self, name: &str) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.get_key(name),
+            Cow::Owned(value) => value.get_key(name),
+        }
+    }
+
+    fn get_index(&self, index: usize) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.get_index(index),
+            Cow::Owned(value) => value.get_index(index),
+        }
+    }
+
+    fn as_object(&self) -> Result<HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.as_object(),
+            Cow::Owned(value) => value.as_object(),
+        }
+    }
+
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.as_elements(),
+            Cow::Owned(value) => value.as_elements(),
+        }
+    }
+
+    fn container_len(&self) -> Result<usize, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.container_len(),
+            Cow::Owned(value) => value.container_len(),
+        }
+    }
+
+    fn to_string_sansho(&self) -> String {
+        match self {
+            Cow::Borrowed(reference) => reference.to_string_sansho(),
+            Cow::Owned(value) => value.to_string_sansho(),
+        }
+    }
+
+    fn as_array_str<'s>(
+        &'s self,
+    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        match self {
+            Cow::Borrowed(reference) => reference.as_array_str(),
+            Cow::Owned(value) => value.as_array_str(),
         }
     }
 }
@@ -650,18 +794,18 @@ where
         }
     }
 
-    fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
         match self {
-            Some(member) => member.entries(),
+            Some(member) => member.as_object(),
             None => Err(SanshoError::Evaluation {
-                message: "entries requires an object, found null".to_string(),
+                message: "requires an object, found null".to_string(),
             }),
         }
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         match self {
-            Some(member) => member.carrier().elements(),
+            Some(member) => member.carrier().as_elements(),
             None => Err(SanshoError::Evaluation {
                 message: "elements requires an array, found null".to_string(),
             }),

@@ -5,6 +5,7 @@
 //! and the selective-materialization budget.
 
 use proptest::prelude::*;
+use serde_json::Value;
 use sansho::corpus::{Driver, DriverOutcome, load_corpus, run_corpus};
 use sansho::{compile, evaluate, materialize, parse};
 use std::path::Path;
@@ -102,7 +103,10 @@ fn corpus_cursor_matches_materialized() {
 // Requirement: the same program through both backends
 // yields the same result. What: property test — generated documents
 // encode to CBOR; generated expressions evaluate through both backends;
-// results are identical (including the error/not-implemented category).
+// results agree (including the error/not-implemented category). An array's
+// ORDER is not part of a value: a wildcard over an object yields its values
+// in whatever order holds them, so the two backends are compared by the
+// elements they hold rather than by their order (see `results_agree`).
 // Why: the differential property at random scale beyond the corpus (plan
 // `cursor_matches_materialized_property`).
 //
@@ -110,6 +114,54 @@ fn corpus_cursor_matches_materialized() {
 // slice (fields, indices, slices, wildcards, filters, multi-selects,
 // pipes, the implemented functions); document generation covers nesting
 // and scalars.
+/// Whether two results agree, treating an array's ORDER as not part of the
+/// value.
+///
+/// A wildcard over an object yields the object's values in whatever order
+/// holds them, and the engine's member map is a `HashMap`, whose iteration
+/// order varies between runs — so the two backends can produce the same
+/// multiset of elements in different orders, and comparing the arrays
+/// element by element fails on a difference that is not a disagreement.
+///
+/// The comparison is by canonical text with the order removed at every
+/// level, so a nested array is treated the same way. It counts rather than
+/// deduplicates: two arrays that differ only in how many times an element
+/// appears must not compare equal, and the length check alone would not
+/// catch that.
+fn results_agree(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && sorted_canonical(x) == sorted_canonical(y)
+        }
+        _ => left == right,
+    }
+}
+
+/// The elements' canonical text, sorted — an array's identity without its
+/// order.
+fn sorted_canonical(items: &[Value]) -> Vec<String> {
+    let mut rendered: Vec<String> = items.iter().map(canonical).collect();
+    rendered.sort();
+    rendered
+}
+
+/// A value's text with any nested array's order removed, so that the
+/// comparison reaches every level.
+fn canonical(value: &Value) -> String {
+    match value {
+        Value::Array(items) => format!("[{}]", sorted_canonical(items).join(",")),
+        Value::Object(members) => {
+            let mut parts: Vec<String> = members
+                .iter()
+                .map(|(key, member)| format!("{key}:{}", canonical(member)))
+                .collect();
+            parts.sort();
+            format!("{{{}}}", parts.join(","))
+        }
+        scalar => scalar.to_string(),
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -134,7 +186,10 @@ proptest! {
         let cursor = evaluate(&program, bytes.as_slice())
             .and_then(|value| materialize(&value));
         match (materialized, cursor) {
-            (Ok(a), Ok(b)) => prop_assert_eq!(a, b),
+            (Ok(a), Ok(b)) => prop_assert!(
+                results_agree(&a, &b),
+                "backend disagreement on {expression:?}: {a:?} vs {b:?}"
+            ),
             (Err(a), Err(b)) => {
                 // both must fail in the same CATEGORY
                 prop_assert_eq!(

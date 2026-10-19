@@ -207,7 +207,7 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
         Edge::WildcardDot => match node.kind() {
             Kind::Object => {
                 let mut elements: Vec<SanshoCarrier<'a>> = Vec::new();
-                for (_, member) in node.entries().map_err(Stop::from)? {
+                for (_, member) in node.as_object().map_err(Stop::from)? {
                     elements.push(member);
                 }
                 project(elements, rest)
@@ -216,7 +216,7 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
         },
         // the bracket form reads array elements only
         Edge::WildcardBracket => match node.kind() {
-            Kind::Array => project(node.elements().map_err(Stop::from)?, rest),
+            Kind::Array => project(node.as_elements().map_err(Stop::from)?, rest),
             _ => Ok(Flow::Value(null_value())),
         },
         Edge::Filter(predicate) => match node.kind() {
@@ -347,12 +347,12 @@ fn flatten_value<'a>(node: SanshoCarrier<'a>) -> Result<Flow<'a>, Stop> {
     let mut flows = Vec::new();
     match node.kind() {
         Kind::Array => {
-            for element in node.elements().map_err(Stop::from)? {
+            for element in node.as_elements().map_err(Stop::from)? {
                 if element.is_null() {
                     continue;
                 }
                 if element.kind() == Kind::Array {
-                    for inner in element.elements().map_err(Stop::from)? {
+                    for inner in element.as_elements().map_err(Stop::from)? {
                         flows.push(Flow::Value(inner));
                     }
                 } else {
@@ -375,12 +375,12 @@ fn flatten_into<'a>(flow: Flow<'a>, flows: &mut Vec<Flow<'a>>) -> Result<(), Sto
                 return Ok(());
             }
             if value.kind() == Kind::Array {
-                for element in value.elements().map_err(Stop::from)? {
+                for element in value.as_elements().map_err(Stop::from)? {
                     if element.is_null() {
                         continue;
                     }
                     if element.kind() == Kind::Array {
-                        for inner in element.elements().map_err(Stop::from)? {
+                        for inner in element.as_elements().map_err(Stop::from)? {
                             flows.push(Flow::Value(inner));
                         }
                     } else {
@@ -410,7 +410,7 @@ fn filter_elements<'a>(
 ) -> Result<Vec<SanshoCarrier<'a>>, Stop> {
     let leaf = leaf_predicate_shape(predicate);
     let mut kept: Vec<SanshoCarrier<'a>> = Vec::new();
-    for element in node.elements().map_err(Stop::from)? {
+    for element in node.as_elements().map_err(Stop::from)? {
         let keep = match &leaf {
             Some((name, prefix)) if element.kind() == Kind::String => match element.as_str() {
                 Ok(text) => match name.as_str() {
@@ -451,40 +451,65 @@ pub fn truthy<'a>(value: &(dyn SanshoTrait<'a> + 'a)) -> bool {
 /// Value equality over the trait: the same kind and the same content,
 /// recursively for containers. Numbers compare as doubles (the
 /// specification's reduction); objects compare by key and member.
-fn trait_equal<'a>(left: &SanshoCarrier<'a>, right: &SanshoCarrier<'a>) -> bool {
+fn trait_equal<'a>(left: &SanshoCarrier<'a>, right: &SanshoCarrier<'a>) -> Result<bool, Stop> {
     if left.kind() != right.kind() {
-        return false;
+        return Ok(false);
     }
     match left.kind() {
-        Kind::Null => true,
-        Kind::Bool => left.as_bool() == right.as_bool(),
+        Kind::Null => Ok(true),
+        Kind::Bool => Ok(left.as_bool() == right.as_bool()),
         Kind::Number => match (left.as_f64(), right.as_f64()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
+            (Ok(a), Ok(b)) => Ok(a == b),
+            _ => Ok(false),
         },
-        Kind::String => left.as_str() == right.as_str(),
+        Kind::String => Ok(left.as_str() == right.as_str()),
         Kind::Array => {
-            let a = left.elements().unwrap_or(vec![]);
-            let b = right.elements().unwrap_or(vec![]);
-            a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| trait_equal(x, y))
+            let a = left.as_elements()?;
+            let Ok(b) = right.as_elements() else {
+                return Ok(false);
+            };
+            Ok(a.len() == b.len() && {
+                for (va, vb) in a.iter().zip(&b) {
+                    if !trait_equal(va, vb)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            })
         }
         Kind::Object => {
-            let a = left.entries().unwrap_or(vec![]);
-            let b = right.entries().unwrap_or(vec![]);
-            a.len() == b.len()
-                && a.iter()
-                    .zip(&b)
-                    .all(|((ka, va), (kb, vb))| ka == kb && trait_equal(va, vb))
+            // a JSON object is an UNORDERED collection of name/value pairs, so
+            // the comparison cannot depend on either side's member order: the
+            // sources each iterate in their own order (a sorted map, a
+            // document's own order, a CBOR map's order), and a positional
+            // comparison calls two equal objects different whenever those
+            // orders differ
+
+            let a = left.as_object()?;
+            let Ok(b) = right.as_object() else {
+                return Ok(false);
+            };
+            Ok(a.len() == b.len() && {
+                for (k, v) in a {
+                    let Some(vb) = b.get(k) else {
+                        return Ok(false);
+                    };
+                    if !trait_equal(&v, vb)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            })
         }
         Kind::Bytes => {
             let Ok(a) = left.as_bytes() else {
-                return false;
+                return Ok(false);
             };
             let Ok(b) = right.as_bytes() else {
-                return false;
+                return Ok(false);
             };
 
-            a == b
+            Ok(a == b)
         }
     }
 }
@@ -495,8 +520,8 @@ pub fn compare<'a>(
     right: &SanshoCarrier<'a>,
 ) -> Result<SanshoCarrier<'a>, Stop> {
     let result = match op {
-        CmpOp::Eq => trait_equal(left, right),
-        CmpOp::Ne => !trait_equal(left, right),
+        CmpOp::Eq => trait_equal(left, right)?,
+        CmpOp::Ne => !trait_equal(left, right)?,
         CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
             // ordering across different kinds (or NaN) is null
             match (left.kind(), right.kind()) {
@@ -579,7 +604,7 @@ fn eval_function<'a>(
         if array.kind() != Kind::Array {
             return Err(type_error(name, kind_name(array)));
         }
-        let items = array.elements().map_err(Stop::from)?;
+        let items = array.as_elements()?;
         return match name {
             "map" => {
                 let mut mapped = Vec::with_capacity(items.len());
@@ -641,17 +666,18 @@ fn eval_function<'a>(
     // element count is a HEADER read — the whole subtree must NOT
     // materialize to count its elements.
     if name == "length"
-        && let [FnArgP::Value(single)] = args {
-            let value = flow_value(eval(single, node.clone())?);
-            // a string's length is its character count, not a container's
-            // member count: only the containers take the header fast path
-            if matches!(value.kind(), Kind::Array | Kind::Object) {
-                return value
-                    .container_len()
-                    .map_err(Stop::from)
-                    .map(|v| Rc::new(v as i64) as SanshoCarrier<'a>);
-            }
+        && let [FnArgP::Value(single)] = args
+    {
+        let value = flow_value(eval(single, node.clone())?);
+        // a string's length is its character count, not a container's
+        // member count: only the containers take the header fast path
+        if matches!(value.kind(), Kind::Array | Kind::Object) {
+            return value
+                .container_len()
+                .map_err(Stop::from)
+                .map(|v| Rc::new(v as i64) as SanshoCarrier<'a>);
         }
+    }
 
     // the value-argument functions: every argument evaluates eagerly; an
     // expression reference here is an invalid type
@@ -690,10 +716,10 @@ fn eval_function<'a>(
             if value.kind() != Kind::Object {
                 return Err(type_error("merge", kind_name(value.clone())));
             }
-            let entries = value.entries().map_err(Stop::from)?;
+            let entries = value.as_object()?;
             for (key, member) in entries {
                 // later arguments win
-                merged.insert(key.to_string(), Rc::new(member));
+                merged.insert(key.to_string(), member.clone());
             }
         }
         return Ok(Rc::new(merged));
@@ -713,24 +739,16 @@ fn eval_function<'a>(
             Kind::Object => {
                 // the key text borrows the document: no key string is built
 
-                let keys: HashSet<String> = one
-                    .entries()
-                    .map_err(Stop::from)?
-                    .into_iter()
-                    .map(|(key, _)| key.to_string())
-                    .collect();
+                let keys: HashSet<String> =
+                    one.as_object()?.keys().map(|key| key.to_string()).collect();
                 Ok(Rc::new(keys))
             }
             _ => Err(type_error("keys", kind_name(one.clone()))),
         },
         ("values", (Some(one), _)) => match one.kind() {
             Kind::Object => {
-                let members: Vec<SanshoCarrier<'a>> = one
-                    .entries()
-                    .map_err(Stop::from)?
-                    .into_iter()
-                    .map(|(_, member)| Rc::new(member) as SanshoCarrier<'a>)
-                    .collect();
+                let members: Vec<SanshoCarrier<'a>> =
+                    one.as_object()?.values().cloned().collect();
                 Ok(Rc::new(members))
             }
             _ => Err(type_error("values", kind_name(one.clone()))),
@@ -751,11 +769,16 @@ fn eval_function<'a>(
                 _ => Err(type_error("contains", kind_name(subject.clone()))),
             },
             Kind::Array => {
-                let found = subject
-                    .elements()
-                    .map_err(Stop::from)?
-                    .iter()
-                    .any(|item| trait_equal(item, needle));
+                let found = {
+                    let mut f = false;
+                    for v in subject.as_elements()? {
+                        if trait_equal(&v, needle)? {
+                            f = true;
+                            break;
+                        }
+                    }
+                    f
+                };
                 Ok(Rc::new(found) as SanshoCarrier<'a>)
             }
             _ => Err(type_error("contains", kind_name(subject.clone()))),
@@ -766,7 +789,7 @@ fn eval_function<'a>(
         ("floor", (Some(one), None)) => numeric("floor", one.clone(), f64::floor),
         ("avg" | "mean", (Some(one), None)) => match one.kind() {
             Kind::Array => {
-                let items = one.elements().map_err(Stop::from)?;
+                let items = one.as_elements()?;
                 if items.is_empty() {
                     return Ok(null_value());
                 }
@@ -781,7 +804,7 @@ fn eval_function<'a>(
         ("sum", (Some(one), None)) => match one.kind() {
             Kind::Array => {
                 let mut sum = 0.0;
-                for item in one.elements().map_err(Stop::from)? {
+                for item in one.as_elements()? {
                     sum += number_of(item, "sum")?;
                 }
                 Ok(number_value(sum))
@@ -792,7 +815,7 @@ fn eval_function<'a>(
             let want_max = name == "max";
             match one.kind() {
                 Kind::Array => {
-                    let items = one.elements().map_err(Stop::from)?;
+                    let items = one.as_elements()?;
 
                     if items.is_empty() {
                         return Ok(null_value());
@@ -821,7 +844,7 @@ fn eval_function<'a>(
         }
         ("sort", (Some(one), None)) => match one.kind() {
             Kind::Array => {
-                let mut items = one.elements().map_err(Stop::from)?;
+                let mut items = one.as_elements()?;
                 let all_numbers = items.iter().all(|item| item.kind() == Kind::Number);
                 let all_strings = items.iter().all(|item| item.kind() == Kind::String);
                 if !all_numbers && !all_strings {
@@ -836,7 +859,7 @@ fn eval_function<'a>(
         },
         ("reverse", (Some(one), None)) => match one.kind() {
             Kind::Array => {
-                let mut items = one.elements().map_err(Stop::from)?;
+                let mut items = one.as_elements()?;
                 items.reverse();
                 Ok(Rc::new(items))
             }
@@ -866,7 +889,7 @@ fn eval_function<'a>(
             Ok(sep) if items.kind() == Kind::Array => {
                 let mut parts = Vec::with_capacity(items.container_len().unwrap_or(0));
 
-                let elements = items.elements().map_err(Stop::from)?;
+                let elements = items.as_elements()?;
                 for item in elements {
                     match item.as_str() {
                         Ok(text) => parts.push(text.to_string()),
@@ -955,7 +978,7 @@ fn string_for<'b>(one: &SanshoCarrier<'b>, quote_string: bool) -> Result<String,
         })?),
         Kind::Bool => Ok(one.as_bool().map(|b| b.to_string())?),
         Kind::Array => Ok({
-            let arr = one.elements()?;
+            let arr = one.as_elements()?;
 
             let mut out = vec![];
             for v in arr {
@@ -966,7 +989,7 @@ fn string_for<'b>(one: &SanshoCarrier<'b>, quote_string: bool) -> Result<String,
         }),
 
         Kind::Object => Ok({
-            let arr = one.entries()?;
+            let arr = one.as_object()?;
 
             let mut out = vec![];
             for (k, v) in arr {

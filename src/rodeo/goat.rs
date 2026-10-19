@@ -860,11 +860,11 @@ impl GoatRodeoCluster {
     }
 
     /// given a hash, find an item
-    pub fn bytes_for_file_and_offset<'a>(
-        &'a self,
+    pub fn bytes_for_file_and_offset(
+        &self,
         file_hash: u64,
         offset: usize,
-    ) -> Option<&'a [u8]> {
+    ) -> Option<&[u8]> {
         let data_files = &self.data_files;
         let data_file = data_files.get(&file_hash);
         match data_file {

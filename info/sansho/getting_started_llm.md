@@ -23,9 +23,9 @@ LLM-readable counterpart of `getting_started.md`.
   nothing panics (the fuzz gates: `fuzz_expressions_no_panics`,
   `fuzz_cbor_no_panics`, `fuzz_cbor_structured_hostiles`).
 - Guarantees: complete JMESPath conformance (the corpus:
-  `corpus_slice1_materialized`); determinism
-  (`evaluation_is_deterministic`); byte-once
-  (`shared_navigation_decodes_once`); selective materialization
+  `corpus_slice1_materialized`); determinism as VALUE equality rather
+  than byte equality (`evaluation_is_deterministic`); navigation reads
+  only the positions the program visits; selective materialization
   (`selective_materialization_budget`); backend agreement
   (`corpus_cursor_matches_materialized`); the evaluation path performs
   no I/O of its own (the corpus-driver module reads the vendored

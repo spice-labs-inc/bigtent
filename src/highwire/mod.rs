@@ -3,4 +3,7 @@
 //! Prototype under active design discussion; see the phase plans under
 //! `plans/2026_09_23_highwire/`.
 
+pub mod compiler;
+pub mod grammar;
+mod grammar_impl_serde;
 pub mod walk;

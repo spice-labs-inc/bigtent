@@ -467,6 +467,107 @@ async fn run_lookup(path_vec: &[PathBuf], args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// The accountant for a query: it never stops the walk and counts nothing.
+///
+/// The walk takes an [`AccountingAndBudget`] so that a caller can bound its
+/// work. A query run from the command line has no such bound: the query's own
+/// `stop` rules are what end it.
+struct NoBudget;
+
+impl bigtent::highwire::walk::AccountingAndBudget for NoBudget {
+    fn should_stop(&self) -> Option<Vec<serde_json::Value>> {
+        None
+    }
+
+    fn can_sink_normal(&self) -> bool {
+        true
+    }
+
+    fn event(&self, _event_type: bigtent::highwire::walk::AccountingEventType) {}
+}
+
+/// The sink a query run uses: every row as one JSON line, and a stop's report
+/// marked so it cannot be mistaken for a row the walk emitted.
+///
+/// It is a FUNCTION rather than a closure because a closure's type cannot be
+/// written down, and the compiler has to be told which sink type it compiles
+/// for.
+fn print_row(
+    row: serde_json::Value,
+    _accountant: &Arc<NoBudget>,
+    operation: bigtent::highwire::walk::SinkOperation,
+) -> Result<()> {
+    use bigtent::highwire::walk::SinkOperation;
+    match operation {
+        SinkOperation::NormalMessage => println!("{row}"),
+        SinkOperation::ErrorMessage => println!("{{\"stop\": {row}}}"),
+    }
+    Ok(())
+}
+
+/// The sink type a compiled query is asked for.
+type PrintSink = fn(
+    serde_json::Value,
+    &Arc<NoBudget>,
+    bigtent::highwire::walk::SinkOperation,
+) -> Result<()>;
+
+/// Run a query against the clusters in `path_vec`, printing every row the run
+/// emits.
+///
+/// The document is handed over as a QUERY and nothing here picks it apart: the
+/// grammar's traits are what read it, and the compiler is what turns what they
+/// answer into a run. A document that names phases runs as a chain; one that
+/// does not is a single walk, and the compiler cannot tell the difference —
+/// which is the point of the query level existing at all.
+async fn run_query(path_vec: &[PathBuf], args: &Args) -> Result<()> {
+    use bigtent::highwire::compiler::compile;
+    use bigtent::highwire::grammar::Query;
+    use bigtent::highwire::walk::HerdOrCluster;
+    use sansho::cache::ProgramCache;
+    use std::rc::Rc;
+
+    let query_path = match &args.query {
+        Some(p) => p.clone(),
+        None => bail!("A `--query` path must be supplied"),
+    };
+    if !query_path.exists() || !query_path.is_file() {
+        bail!("Query file does not exist or is not a file: {query_path:?}");
+    }
+    let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&query_path)?)?;
+
+    let query: Rc<dyn Query> = Rc::new(document);
+    let cache = ProgramCache::new(4096);
+    let mut run = compile::<NoBudget, PrintSink>(query, &cache)?;
+
+    // load the clusters, the same way the lookup mode does
+    let mut cluster = None;
+    for path in path_vec.iter() {
+        if !path.exists() {
+            bail!("Path to `.grc` does not point to a file: {path:?}");
+        }
+        for b in
+            GoatRodeoCluster::cluster_files_in_dir(path.clone(), args.pre_cache_index(), vec![])
+                .await?
+        {
+            info!("Loaded cluster {}", b.name());
+            cluster = Some(b);
+        }
+    }
+    let Some(cluster) = cluster else {
+        bail!("No cluster loaded from {path_vec:?}");
+    };
+
+    let started = std::time::Instant::now();
+    run(
+        Arc::new(NoBudget),
+        print_row,
+        HerdOrCluster::Cluster(cluster),
+    )?;
+    info!("Query complete in {:?}", started.elapsed());
+    Ok(())
+}
+
 /// Validate cluster files and exit.
 ///
 /// Loads clusters from the given source and reports any errors.
@@ -612,6 +713,15 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         _ => {}
+    }
+
+    // Query mode: --rodeo + --query (run a query and print the rows)
+    if let Some(_query) = &args.query {
+        let Some(ClusterSource::Rodeo(rodeo)) = &cluster_source else {
+            bail!("`--query` needs `--rodeo` to say which cluster to run against");
+        };
+        run_query(rodeo, &args).await?;
+        return Ok(());
     }
 
     match (&cluster_source, &args.fresh_merge, &args.lookup, args.check) {

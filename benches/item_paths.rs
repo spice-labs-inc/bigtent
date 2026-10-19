@@ -1,7 +1,7 @@
 //! The real-Item benchmark: how fast evaluation works against the
 //! three input shapes — raw CBOR binary, a real `Item`, and a
 //! `serde_json::Value` in Item shape — through the trait surface
-//! (`sansho::lookup_value` over the raw types: `&[u8]`, `&Item`,
+//! (`sansho::evaluate` over the raw types: `&[u8]`, `&Item`,
 //! `&Value`).
 //!
 //! The timed region is the full evaluation INCLUDING the emit-boundary
@@ -21,7 +21,7 @@
 
 use bigtent::item::Item;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 /// The row count of a materialized result (a projection's elements, or
 /// a single value).
@@ -60,7 +60,9 @@ fn real_item(n_connections: usize, n_file_names: usize) -> Item {
             map.insert("alias:from".to_string(), alias_from);
             map.insert(
                 "contained:up".to_string(),
-                ["gitoid:blob:sha1:parent".to_string()].into_iter().collect(),
+                ["gitoid:blob:sha1:parent".to_string()]
+                    .into_iter()
+                    .collect(),
             );
             map
         },
@@ -77,18 +79,18 @@ fn real_item(n_connections: usize, n_file_names: usize) -> Item {
     }
 }
 
-fn scan_program() -> sansho::Program {
-    let parsed = sansho::parse("connections.\"alias:from\"[?starts_with(@, 'pkg:')]")
-        .expect("parses");
+fn scan_program() -> Arc<sansho::Program> {
+    let parsed =
+        sansho::parse("connections.\"alias:from\"[?starts_with(@, 'pkg:')]").expect("parses");
     sansho::compile(&parsed, None).expect("compiles")
 }
 
-fn seek_program() -> sansho::Program {
+fn seek_program() -> Arc<sansho::Program> {
     let parsed = sansho::parse("body.file_size").expect("parses");
     sansho::compile(&parsed, None).expect("compiles")
 }
 
-fn full_item_program() -> sansho::Program {
+fn full_item_program() -> Arc<sansho::Program> {
     let parsed = sansho::parse("@").expect("parses");
     sansho::compile(&parsed, None).expect("compiles")
 }
@@ -104,554 +106,115 @@ fn bench_item_paths(c: &mut Criterion) {
 
         // ---- scan shape ----
         let program = scan_program();
-        group.bench_with_input(
-            BenchmarkId::new("scan/raw_cbor", n),
-            &bytes,
-            |b, bytes| {
-                let slice: &[u8] = &bytes;
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(&slice), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("scan/item", n),
-            &item,
-            |b, item| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(item), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("scan/json_shape", n),
-            &json,
-            |b, json| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(json), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("scan/raw_cbor", n), &bytes, |b, bytes| {
+            let slice: &[u8] = bytes;
+            b.iter(|| {
+                let value =
+                    sansho::materialize(
+                    &sansho::evaluate(black_box(&program), black_box(slice))
+                        .expect("evaluates"),
+                )
+                .expect("materializes");
+                black_box(row_count(&value))
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("scan/item", n), &item, |b, item| {
+            b.iter(|| {
+                let value =
+                    sansho::materialize(
+                    &sansho::evaluate(black_box(&program), black_box(item))
+                        .expect("evaluates"),
+                )
+                .expect("materializes");
+                black_box(row_count(&value))
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("scan/json_shape", n), &json, |b, json| {
+            b.iter(|| {
+                let value =
+                    sansho::materialize(
+                    &sansho::evaluate(black_box(&program), black_box(json))
+                        .expect("evaluates"),
+                )
+                .expect("materializes");
+                black_box(row_count(&value))
+            })
+        });
 
         // ---- seek shape ----
         let program = seek_program();
-        group.bench_with_input(
-            BenchmarkId::new("seek/raw_cbor", n),
-            &bytes,
-            |b, bytes| {
-                let slice: &[u8] = &bytes;
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(&slice), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("seek/item", n),
-            &item,
-            |b, item| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(item), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("seek/json_shape", n),
-            &json,
-            |b, json| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(json), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("seek/raw_cbor", n), &bytes, |b, bytes| {
+            let slice: &[u8] = bytes;
+            b.iter(|| {
+                let value = sansho::materialize(
+                    &sansho::evaluate(black_box(&program), black_box(slice))
+                        .expect("evaluates"),
+                )
+                .expect("materializes");
+                black_box(row_count(&value))
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("seek/item", n), &item, |b, item| {
+            b.iter(|| {
+                let value =
+                    sansho::materialize(
+                    &sansho::evaluate(black_box(&program), black_box(item))
+                        .expect("evaluates"),
+                )
+                .expect("materializes");
+                black_box(row_count(&value))
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("seek/json_shape", n), &json, |b, json| {
+            b.iter(|| {
+                let value =
+                    sansho::materialize(
+                    &sansho::evaluate(black_box(&program), black_box(json))
+                        .expect("evaluates"),
+                )
+                .expect("materializes");
+                black_box(row_count(&value))
+            })
+        });
 
         // ---- full-item shape ---- (at the three smaller sizes, where
         // the result stays within the bench's practical bounds)
         if n <= 25_000 {
             let program = full_item_program();
-            group.bench_with_input(
-                BenchmarkId::new("full/raw_cbor", n),
-                &bytes,
-                |b, bytes| {
-                    let slice: &[u8] = &bytes;
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(&slice), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("full/item", n),
-                &item,
-                |b, item| {
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(item), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("full/json_shape", n),
-                &json,
-                |b, json| {
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(json), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("full/raw_cbor", n), &bytes, |b, bytes| {
+                let slice: &[u8] = bytes;
+                b.iter(|| {
+                    let value = sansho::materialize(
+                    &sansho::evaluate(black_box(&program), black_box(slice))
+                        .expect("evaluates"),
+                )
+                .expect("materializes");
+                    black_box(row_count(&value))
+                })
+            });
+            group.bench_with_input(BenchmarkId::new("full/item", n), &item, |b, item| {
+                b.iter(|| {
+                    let value = sansho::materialize(
+                    &sansho::evaluate(black_box(&program), black_box(item))
+                        .expect("evaluates"),
+                )
+                .expect("materializes");
+                    black_box(row_count(&value))
+                })
+            });
+            group.bench_with_input(BenchmarkId::new("full/json_shape", n), &json, |b, json| {
+                b.iter(|| {
+                    let value = sansho::materialize(
+                    &sansho::evaluate(black_box(&program), black_box(json))
+                        .expect("evaluates"),
+                )
+                .expect("materializes");
+                    black_box(row_count(&value))
+                })
+            });
         }
     }
 }
 
 criterion_group!(benches, bench_item_paths);
-criterion_main!(benches);).expect("compiles")
-}
-
-fn seek_program() -> sansho::Program {
-    let parsed = sansho::parse("body.file_size").expect("parses");
-    sansho::compile(&parsed, None).expect("compiles")
-}
-
-fn full_item_program() -> sansho::Program {
-    let parsed = sansho::parse("@").expect("parses");
-    sansho::compile(&parsed, None).expect("compiles")
-}
-
-fn bench_item_paths(c: &mut Criterion) {
-    let sizes: [usize; 5] = [10, 1_000, 25_000, 100_000, 500_000];
-    for n in sizes {
-        let item = real_item(n, n / 2);
-        let bytes = serde_cbor::to_vec(&item).expect("the real item serializes");
-        let json = serde_json::to_value(&item).expect("the real item converts to JSON");
-        let mut group = c.benchmark_group("item_paths");
-        group.throughput(criterion::Throughput::Bytes(bytes.len() as u64));
-
-        // ---- scan shape ----
-        let program = scan_program();
-        group.bench_with_input(
-            BenchmarkId::new("scan/raw_cbor", n),
-            &bytes,
-            |b, bytes| {
-                let slice: &[u8] = &bytes;
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(&slice), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("scan/item", n),
-            &item,
-            |b, item| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(item), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("scan/json_shape", n),
-            &json,
-            |b, json| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(json), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-
-        // ---- seek shape ----
-        let program = seek_program();
-        group.bench_with_input(
-            BenchmarkId::new("seek/raw_cbor", n),
-            &bytes,
-            |b, bytes| {
-                let slice: &[u8] = &bytes;
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(&slice), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("seek/item", n),
-            &item,
-            |b, item| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(item), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("seek/json_shape", n),
-            &json,
-            |b, json| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(json), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-
-        // ---- full-item shape ---- (at the three smaller sizes, where
-        // the result stays within the bench's practical bounds)
-        if n <= 25_000 {
-            let program = full_item_program();
-            group.bench_with_input(
-                BenchmarkId::new("full/raw_cbor", n),
-                &bytes,
-                |b, bytes| {
-                    let slice: &[u8] = &bytes;
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(&slice), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("full/item", n),
-                &item,
-                |b, item| {
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(item), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("full/json_shape", n),
-                &json,
-                |b, json| {
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(json), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-        }
-    }
-}
-
-criterion_group!(benches, bench_item_paths);
-criterion_main!(benches);).expect("compiles")
-}
-
-fn full_item_program() -> sansho::Program {
-    let parsed = sansho::parse("@").expect("parses");
-    sansho::compile(&parsed, None).expect("compiles")
-}
-
-fn bench_item_paths(c: &mut Criterion) {
-    let sizes: [usize; 5] = [10, 1_000, 25_000, 100_000, 500_000];
-    for n in sizes {
-        let item = real_item(n, n / 2);
-        let bytes = serde_cbor::to_vec(&item).expect("the real item serializes");
-        let json = serde_json::to_value(&item).expect("the real item converts to JSON");
-        let mut group = c.benchmark_group("item_paths");
-        group.throughput(criterion::Throughput::Bytes(bytes.len() as u64));
-
-        // ---- scan shape ----
-        let program = scan_program();
-        group.bench_with_input(
-            BenchmarkId::new("scan/raw_cbor", n),
-            &bytes,
-            |b, bytes| {
-                let slice: &[u8] = &bytes;
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(&slice), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("scan/item", n),
-            &item,
-            |b, item| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(item), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("scan/json_shape", n),
-            &json,
-            |b, json| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(json), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-
-        // ---- seek shape ----
-        let program = seek_program();
-        group.bench_with_input(
-            BenchmarkId::new("seek/raw_cbor", n),
-            &bytes,
-            |b, bytes| {
-                let slice: &[u8] = &bytes;
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(&slice), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("seek/item", n),
-            &item,
-            |b, item| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(item), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("seek/json_shape", n),
-            &json,
-            |b, json| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(json), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-
-        // ---- full-item shape ---- (at the three smaller sizes, where
-        // the result stays within the bench's practical bounds)
-        if n <= 25_000 {
-            let program = full_item_program();
-            group.bench_with_input(
-                BenchmarkId::new("full/raw_cbor", n),
-                &bytes,
-                |b, bytes| {
-                    let slice: &[u8] = &bytes;
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(&slice), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("full/item", n),
-                &item,
-                |b, item| {
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(item), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("full/json_shape", n),
-                &json,
-                |b, json| {
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(json), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-        }
-    }
-}
-
-criterion_group!(benches, bench_item_paths);
-criterion_main!(benches);).expect("compiles")
-}
-
-fn bench_item_paths(c: &mut Criterion) {
-    let sizes: [usize; 5] = [10, 1_000, 25_000, 100_000, 500_000];
-    for n in sizes {
-        let item = real_item(n, n / 2);
-        let bytes = serde_cbor::to_vec(&item).expect("the real item serializes");
-        let json = serde_json::to_value(&item).expect("the real item converts to JSON");
-        let mut group = c.benchmark_group("item_paths");
-        group.throughput(criterion::Throughput::Bytes(bytes.len() as u64));
-
-        // ---- scan shape ----
-        let program = scan_program();
-        group.bench_with_input(
-            BenchmarkId::new("scan/raw_cbor", n),
-            &bytes,
-            |b, bytes| {
-                let slice: &[u8] = &bytes;
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(&slice), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("scan/item", n),
-            &item,
-            |b, item| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(item), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("scan/json_shape", n),
-            &json,
-            |b, json| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(json), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-
-        // ---- seek shape ----
-        let program = seek_program();
-        group.bench_with_input(
-            BenchmarkId::new("seek/raw_cbor", n),
-            &bytes,
-            |b, bytes| {
-                let slice: &[u8] = &bytes;
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(&slice), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("seek/item", n),
-            &item,
-            |b, item| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(item), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("seek/json_shape", n),
-            &json,
-            |b, json| {
-                b.iter(|| {
-                    let value =
-                        sansho::lookup_value(black_box(json), black_box(&program))
-                            .expect("evaluates");
-                    black_box(row_count(&value))
-                })
-            },
-        );
-
-        // ---- full-item shape ---- (at the three smaller sizes, where
-        // the result stays within the bench's practical bounds)
-        if n <= 25_000 {
-            let program = full_item_program();
-            group.bench_with_input(
-                BenchmarkId::new("full/raw_cbor", n),
-                &bytes,
-                |b, bytes| {
-                    let slice: &[u8] = &bytes;
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(&slice), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("full/item", n),
-                &item,
-                |b, item| {
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(item), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("full/json_shape", n),
-                &json,
-                |b, json| {
-                    b.iter(|| {
-                        let value =
-                            sansho::lookup_value(black_box(json), black_box(&program))
-                                .expect("evaluates");
-                        black_box(row_count(&value))
-                    })
-                },
-            );
-        }
-    }
-}
+criterion_main!(benches);

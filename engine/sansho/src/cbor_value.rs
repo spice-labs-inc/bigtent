@@ -11,6 +11,7 @@
 //! evaluation errors (reported by the probes that meet them, never silently
 //! as a value).
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::error::SanshoError;
@@ -101,7 +102,7 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
         }
     }
 
-    fn entries(&self) -> Result<Vec<(&'a str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<HashMap<&'a str, SanshoCarrier<'a>>, SanshoError> {
         let value: &'a serde_cbor::Value = self;
         match value {
             // a non-text key is not a member: it is not exposed. The map's
@@ -121,7 +122,7 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
         }
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         let value: &'a serde_cbor::Value = self;
         match value {
             serde_cbor::Value::Array(items) => Ok(items
@@ -134,6 +135,22 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
         }
     }
 
+    fn as_array_str<'s>(
+        &'s self,
+    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        let value: &'s serde_cbor::Value = self;
+        match value {
+            serde_cbor::Value::Array(items) => Ok(Box::new(items.iter().filter_map(|item| {
+                match item {
+                    serde_cbor::Value::Text(text) => Some(text.as_str()),
+                    _ => None,
+                }
+            }))),
+            _ => Err(SanshoError::Evaluation {
+                message: format!("as_array_str requires an array, found {}", value.kind()),
+            }),
+        }
+    }
     fn container_len(&self) -> Result<usize, SanshoError> {
         match **self {
             serde_cbor::Value::Array(ref items) => Ok(items.len()),

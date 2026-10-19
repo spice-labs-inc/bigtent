@@ -13,6 +13,7 @@
 
 use minicbor::Decoder;
 use minicbor::data::Type;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::error::SanshoError;
@@ -41,6 +42,13 @@ fn decoder_error(error: minicbor::decode::Error) -> SanshoError {
 
 impl<'a> SanshoTrait<'a> for &'a [u8] {
     fn kind(&self) -> Kind {
+        // Every minicbor type is named explicitly, with no wildcard: a
+        // minicbor upgrade that adds a variant fails this build rather than
+        // silently becoming a kind it is not. The three variants that are
+        // not values — a break byte outside a container, a simple value with
+        // no JMESPath type, and a byte minicbor cannot classify — answer
+        // null, and every read of them answers an error, so the kind is the
+        // least-wrong answer rather than a claim about the document.
         match item_type(self) {
             Some(Type::Map) | Some(Type::MapIndef) => Kind::Object,
             Some(Type::Array) | Some(Type::ArrayIndef) => Kind::Array,
@@ -48,18 +56,34 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
             Some(Type::Bytes) | Some(Type::BytesIndef) => Kind::Bytes,
             Some(Type::Bool) => Kind::Bool,
             Some(Type::Null) | Some(Type::Undefined) => Kind::Null,
-            Some(Type::U8) | Some(Type::U16) | Some(Type::U32) | Some(Type::U64)
-            | Some(Type::I8) | Some(Type::I16) | Some(Type::I32) | Some(Type::I64)
-            | Some(Type::Int) | Some(Type::F16) | Some(Type::F32) | Some(Type::F64)
+            Some(Type::U8)
+            | Some(Type::U16)
+            | Some(Type::U32)
+            | Some(Type::U64)
+            | Some(Type::I8)
+            | Some(Type::I16)
+            | Some(Type::I32)
+            | Some(Type::I64)
+            | Some(Type::Int)
+            | Some(Type::F16)
+            | Some(Type::F32)
+            | Some(Type::F64)
             | Some(Type::Tag) => Kind::Number,
-            _ => Kind::Null,
+            Some(Type::Simple) | Some(Type::Break) | Some(Type::Unknown(_)) => Kind::Null,
+            // a document with no decodable first item at all
+            None => Kind::Null,
         }
     }
 
     fn as_str(&self) -> Result<&'a str, SanshoError> {
-        match item_type(self) {
+        match self.kind() {
+            // a chunked text item has no single `&str` to lend: it is named
+            // rather than reported as a type error
+            Kind::String if item_type(self) == Some(Type::StringIndef) => Err(SanshoError::Input {
+                message: "indefinite-length text".to_string(),
+            }),
             // the text borrows the document
-            Some(Type::String) => Decoder::new(self).str().map_err(decoder_error),
+            Kind::String => Decoder::new(self).str().map_err(decoder_error),
             _ => Err(SanshoError::Evaluation {
                 message: "Not a String type".to_string(),
             }),
@@ -67,9 +91,13 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
     }
 
     fn as_bytes(&self) -> Result<&'a [u8], SanshoError> {
-        match item_type(self) {
+        match self.kind() {
+            // a chunked byte string has no single slice to lend
+            Kind::Bytes if item_type(self) == Some(Type::BytesIndef) => Err(SanshoError::Input {
+                message: "indefinite-length byte string".to_string(),
+            }),
             // the octets are the document's own bytes: no copy, no encoding
-            Some(Type::Bytes) => Decoder::new(self).bytes().map_err(decoder_error),
+            Kind::Bytes => Decoder::new(self).bytes().map_err(decoder_error),
             _ => Err(SanshoError::Evaluation {
                 message: "Not a byte carrier".to_string(),
             }),
@@ -132,8 +160,8 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
     fn get_key(&self, name: &str) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
         let bytes: &'a [u8] = self;
         let mut decoder = Decoder::new(bytes);
-        let count = match decoder.datatype().map_err(decoder_error)? {
-            Type::Map => {
+        let count = match self.kind() {
+            Kind::Object => {
                 decoder
                     .map()
                     .map_err(decoder_error)?
@@ -170,8 +198,8 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
     fn get_index(&self, index: usize) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
         let bytes: &'a [u8] = self;
         let mut decoder = Decoder::new(bytes);
-        let count = match decoder.datatype().map_err(decoder_error)? {
-            Type::Array => {
+        let count = match self.kind() {
+            Kind::Array => {
                 decoder
                     .array()
                     .map_err(decoder_error)?
@@ -196,11 +224,11 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
         Ok(None)
     }
 
-    fn entries(&self) -> Result<Vec<(&'a str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<std::collections::HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
         let bytes: &'a [u8] = self;
         let mut decoder = Decoder::new(bytes);
-        let count = match decoder.datatype().map_err(decoder_error)? {
-            Type::Map => {
+        let count = match self.kind() {
+            Kind::Object => {
                 decoder
                     .map()
                     .map_err(decoder_error)?
@@ -214,7 +242,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
                 });
             }
         };
-        let mut members = Vec::with_capacity(count.min(1024) as usize);
+        let mut members = HashMap::new();
         for _ in 0..count {
             // the key borrows the document: no key string is built
             let key = match decoder.datatype() {
@@ -229,16 +257,16 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
             let start = decoder.position();
             decoder.skip().map_err(decoder_error)?;
             let end = decoder.position();
-            members.push((key, member(bytes, start, end)));
+            members.insert(key, member(bytes, start, end));
         }
         Ok(members)
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         let bytes: &'a [u8] = self;
         let mut decoder = Decoder::new(bytes);
-        let count = match decoder.datatype().map_err(decoder_error)? {
-            Type::Array => {
+        let count = match self.kind() {
+            Kind::Array => {
                 decoder
                     .array()
                     .map_err(decoder_error)?
@@ -262,17 +290,61 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
         Ok(members)
     }
 
+    fn as_array_str<'s>(
+        &'s self,
+    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        match self.kind() {
+            Kind::Array => {
+                let slice: &'s [u8] = self;
+                let mut decoder = Decoder::new(slice);
+                // a definite array gives its element count; an indefinite one
+                // gives None and ends at its break byte
+                let mut remaining = decoder.array().map_err(decoder_error)?;
+                Ok(Box::new(std::iter::from_fn(move || loop {
+                    if let Some(left) = remaining {
+                        if left == 0 {
+                            return None;
+                        }
+                        remaining = Some(left - 1);
+                    }
+                    let kind = decoder.datatype().ok()?;
+                    if kind == Type::Break {
+                        remaining = Some(0);
+                        return None;
+                    }
+                    if kind == Type::String {
+                        // an element whose text is not valid UTF-8 is
+                        // skipped, not reported: this is the lenient read
+                        if let Ok(text) = decoder.str() {
+                            return Some(text);
+                        }
+                    } else if kind == Type::StringIndef {
+                        // a chunked text item has no single `&str`: the
+                        // lenient read passes over it
+                    } else if decoder.skip().is_err() {
+                        // a malformed element: there is nothing to resynchronize
+                        // to, so the iteration ends
+                        return None;
+                    }
+                })))
+            }
+            _ => Err(SanshoError::Evaluation {
+                message: format!("as_array_str requires an array, found {}", self.kind()),
+            }),
+        }
+    }
+
     fn container_len(&self) -> Result<usize, SanshoError> {
         let mut decoder = Decoder::new(self);
-        match decoder.datatype().map_err(decoder_error)? {
-            Type::Map => decoder
+        match self.kind() {
+            Kind::Object => decoder
                 .map()
                 .map_err(decoder_error)?
                 .map(|count| count as usize)
                 .ok_or_else(|| SanshoError::Input {
                     message: "indefinite-length map".to_string(),
                 }),
-            Type::Array => decoder
+            Kind::Array => decoder
                 .array()
                 .map_err(decoder_error)?
                 .map(|count| count as usize)

@@ -1,336 +1,242 @@
-//! `#[derive(SanshoNode)]` — the field-walking `Node` implementation
-//! for item-shaped structs (the research spike, Phase 3).
+//! `#[derive(SanshoObject)]` — the field-walking `SanshoTrait`
+//! implementation for an item-shaped struct.
 //!
-//! Generates an enum node wrapping the struct's walkable fields and
-//! implements `sansho::view::Node` over it:
-//! - `String` / `&str` fields → the `Str` variant;
-//! - `Option<String>` fields → the `OptStr` variant;
-//! - `serde_json::Value` fields → the `Value` variant (navigation
-//!   over the value tree implemented directly in the generated code);
-//! - any other field type → the `Skip` variant (not walked; evaluates
-//!   as null).
+//! The derive implements `SanshoTrait` for `&'a MyStruct`, so the struct
+//! is itself a Sansho source: `sansho::evaluate(&program, &my_struct)`
+//! walks its fields. Nothing but the implementation is generated — no
+//! wrapper type, no constructor to call.
 //!
-//! `#[serde(rename)]` / `#[serde(rename_all)]` are compile errors —
-//! the derive cannot honor them, and silently wrong evaluation
-//! results are the alternative.
+//! Each named field becomes a member carried by reference
+//! (`Rc::new(&value.field)`), so the field's type needs a `SanshoTrait`
+//! implementation for its *reference*: the engine provides those for
+//! `String`, `&str`, `&[u8]`, `BTreeSet<String>`, `HashSet<String>`,
+//! `BTreeMap<String, _>`, `HashMap<String, _>`, `serde_json::Value`,
+//! `serde_cbor::Value`, and `Option<T>` of any of them. A `Copy` scalar
+//! (`bool`, `u64`, `i64`, `f64`) or a reference field is copied into its
+//! carrier instead, because the engine implements the trait for those
+//! types in their owned form and copying a scalar is cheap.
 //!
-//! The generated enum is constructed from the wrapped struct via the
-//! generated `wrap` constructor: `ItemNode::wrap(&item)`.
+//! Attributes:
+//! - `#[serde(rename = "name")]` is honored: the member takes that name.
+//! - `#[serde(skip)]` is honored: the field is not a member.
+//! - `#[serde(rename_all = "...")]` is a compile error: the derive does
+//!   not implement serde's case conversions, so it cannot honor it.
+//! - Any other serde attribute is ignored.
 //!
-//! The serde-rename guard (a compile error — the derive cannot honor
-//! renamed fields, and silently wrong evaluation results are the
-//! alternative):
+//! ```ignore
+//! use sansho_derive::SanshoObject;
 //!
-//! ```compile_fail
-//! use sansho_derive::SanshoNode;
-//! #[derive(SanshoNode)]
-//! pub struct Renamed {
-//!     #[serde(rename = "other")]
-//!     pub identifier: String,
+//! #[derive(SanshoObject)]
+//! struct Item {
+//!     identifier: String,
+//!     #[serde(rename = "bodyMimeType")]
+//!     body_mime_type: String,
+//!     #[serde(skip)]
+//!     scratch: Vec<u8>,
 //! }
+//!
+//! let program = sansho::compile(&sansho::parse("bodyMimeType")?, None)?;
+//! let value = sansho::evaluate(&program, &item)?;
 //! ```
 
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, Meta};
+use syn::{Data, DeriveInput, Fields, LitStr, Meta, Type};
 
-#[proc_macro_derive(SanshoNode)]
-pub fn sansho_node(input: TokenStream) -> TokenStream {
+/// One field's contribution to the generated implementation.
+struct Member {
+    /// The member name as JMESPath sees it: the serde rename when there
+    /// is one, otherwise the field's own name.
+    name: String,
+    /// The field's Rust identifier, for the accessor expressions.
+    ident: syn::Ident,
+    /// Whether the carrier copies the field rather than borrowing it.
+    copied: bool,
+}
+
+/// Whether the field is carried by copy rather than by reference.
+///
+/// The engine implements the trait for `bool`, `u64`, `i64` and `f64` in
+/// their owned form, and a reference field (`&str`, `&[u8]`) is itself
+/// the value — copying either is cheap. Every other field is carried as a
+/// reference to it, whatever its type, as long as that reference
+/// implements the trait.
+fn is_copied(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(_) => true,
+        Type::Path(path) => match path.path.segments.last() {
+            Some(segment) => matches!(
+                segment.ident.to_string().as_str(),
+                "bool" | "u64" | "i64" | "f64"
+            ),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+#[proc_macro_derive(SanshoObject, attributes(serde))]
+pub fn sansho_object(input: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(input).expect("the derive parses the input type");
     let name = &ast.ident;
-    let node_name = syn::Ident::new(&format!("{name}Node"), name.span());
 
     let Data::Struct(data) = &ast.data else {
-        return syn::Error::new_spanned(name, "SanshoNode derives structs only")
+        return syn::Error::new_spanned(name, "SanshoObject derives structs only")
             .to_compile_error()
             .into();
     };
     let Fields::Named(fields) = &data.fields else {
-        return syn::Error::new_spanned(name, "SanshoNode derives named-field structs only")
+        return syn::Error::new_spanned(name, "SanshoObject derives named-field structs only")
             .to_compile_error()
             .into();
     };
+    if !ast.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &ast.generics,
+            "SanshoObject cannot derive a generic struct — hand-write the SanshoTrait implementation",
+        )
+        .to_compile_error()
+        .into();
+    }
 
-    let mut errors = Vec::new();
-    let mut wrap_arms = Vec::new();
-    let mut entries_items: Vec<String> = Vec::new();
+    let mut errors: Vec<syn::Error> = Vec::new();
 
-    // the struct-level serde-rename guard
+    // The struct-level guard: the derive does not implement serde's case
+    // conversions, so it cannot honor a rename_all.
     for attr in &ast.attrs {
-        if attr.path().is_ident("serde") {
-            if let Meta::List(list) = attr.meta.clone() {
-                if list.tokens.to_string().contains("rename_all") {
-                    errors.push(syn::Error::new_spanned(
-                        attr,
-                        "SanshoNode cannot honor #[serde(rename_all)] — remove it or hand-write the Node impl",
-                    ));
-                }
-            }
+        if attr.path().is_ident("serde")
+            && let Meta::List(list) = attr.meta.clone()
+            && list.tokens.to_string().contains("rename_all")
+        {
+            errors.push(syn::Error::new_spanned(
+                attr,
+                "SanshoObject cannot honor #[serde(rename_all)] — name the fields \
+                 explicitly or hand-write the SanshoTrait implementation",
+            ));
         }
     }
 
+    let mut members: Vec<Member> = Vec::new();
     for field in &fields.named {
-        let field_name = field.ident.as_ref().expect("named fields");
-        let field_str = field_name.to_string();
+        let ident = field.ident.clone().expect("named fields");
+        let mut name = ident.to_string();
+        let mut skipped = false;
 
         for attr in &field.attrs {
-            if attr.path().is_ident("serde") {
-                if let Meta::List(list) = attr.meta.clone() {
-                    if list.tokens.to_string().contains("rename") {
-                        errors.push(syn::Error::new_spanned(
-                            attr,
-                            "SanshoNode cannot honor #[serde(rename(...))] — remove it or hand-write the Node impl",
-                        ));
+            if !attr.path().is_ident("serde") {
+                continue;
+            }
+            // A serde knob the derive does not use is ignored rather than
+            // rejected: the struct keeps whatever serde configuration it
+            // already had.
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("rename") {
+                    if let Ok(value) = meta.value()
+                        && let Ok(literal) = value.parse::<LitStr>()
+                    {
+                        name = literal.value();
                     }
+                    return Ok(());
                 }
-            }
+                if meta.path.is_ident("skip") {
+                    skipped = true;
+                    return Ok(());
+                }
+                if meta.input.peek(syn::Token![=]) {
+                    let _ = meta.value().and_then(|value| value.parse::<syn::Expr>());
+                }
+                Ok(())
+            });
         }
 
-        entries_items.push(field_str.clone());
-
-        // classify the field's shape
-        let variant = field_shape(&field.ty);
-        match variant {
-            Shape::String => {
-                // the field is String or &str: `as_str()` works for
-                // both (String::as_str and str::as_str)
-                wrap_arms.push(quote! {
-                    #field_str => Some(Self::Str(item.#field_name.as_str())),
-                });
-            }
-            Shape::OptString => {
-                wrap_arms.push(quote! {
-                    #field_str => Some(Self::OptStr(item.#field_name.as_deref())),
-                });
-            }
-            Shape::Value => {
-                wrap_arms.push(quote! {
-                    #field_str => Some(Self::Value(&item.#field_name)),
-                });
-            }
-            Shape::Skip => {
-                wrap_arms.push(quote! {
-                    #field_str => Some(Self::Skip),
-                });
-            }
+        if skipped {
+            continue;
         }
+        members.push(Member {
+            name,
+            ident,
+            copied: is_copied(&field.ty),
+        });
     }
 
     if !errors.is_empty() {
-        let errors = errors.into_iter().map(|e| e.to_compile_error());
+        let errors = errors.into_iter().map(|error| error.to_compile_error());
         return quote!(#(#errors)*).into();
     }
 
+    let names: Vec<&str> = members.iter().map(|member| member.name.as_str()).collect();
+    let carriers: Vec<TokenStream2> = members
+        .iter()
+        .map(|member| {
+            let ident = &member.ident;
+            if member.copied {
+                quote!((::std::rc::Rc::new(value.#ident) as ::sansho::view::SanshoCarrier<'a>))
+            } else {
+                quote!((::std::rc::Rc::new(&value.#ident) as ::sansho::view::SanshoCarrier<'a>))
+            }
+        })
+        .collect();
+    let count = members.len();
+
     let expanded = quote! {
-        /// The value-node wrapper generated for `#name`.
-        #[derive(Clone)]
-        #[allow(dead_code)]
-        pub enum #node_name<'a> {
-            Struct(&'a #name),
-            Str(&'a str),
-            OptStr(Option<&'a str>),
-            Value(&'a serde_json::Value),
-            Skip,
-        }
-
-        impl<'a> #node_name<'a> {
-            /// Wrap a reference to the struct into its node.
-            pub fn wrap(value: &'a #name) -> Self {
-                Self::Struct(value)
-            }
-
-
-
-            /// The field node for a named field of the struct.
-            fn node_for(item: &'a #name, name: &str) -> Option<Self> {
-                match name {
-                    #(#wrap_arms)*
-                    _ => None,
-                }
-            }
-        }
-
-        impl<'a> ::sansho::view::Node<'a> for #node_name<'a> {
+        impl<'a> ::sansho::view::SanshoTrait<'a> for &'a #name {
             fn kind(&self) -> ::sansho::view::Kind {
-                match self {
-                    Self::Struct(_) => ::sansho::view::Kind::Object,
-                    Self::Str(_) | Self::OptStr(_) => ::sansho::view::Kind::String,
-                    Self::Value(v) => match v {
-                        ::serde_json::Value::Object(_) => ::sansho::view::Kind::Object,
-                        ::serde_json::Value::Array(_) => ::sansho::view::Kind::Array,
-                        ::serde_json::Value::String(_) => ::sansho::view::Kind::String,
-                        ::serde_json::Value::Number(_) => ::sansho::view::Kind::Number,
-                        ::serde_json::Value::Bool(_) => ::sansho::view::Kind::Bool,
-                        ::serde_json::Value::Null => ::sansho::view::Kind::Null,
-                    },
-                    Self::Skip => ::sansho::view::Kind::Null,
+                ::sansho::view::Kind::Object
+            }
+
+            fn get_key(
+                &self,
+                name: &str,
+            ) -> ::core::result::Result<
+                ::core::option::Option<::sansho::view::SanshoCarrier<'a>>,
+                ::sansho::SanshoError,
+            > {
+                let value: &'a #name = *self;
+                match name {
+                    #(
+                        #names => ::core::result::Result::Ok(
+                            ::core::option::Option::Some(#carriers)
+                        ),
+                    )*
+                    _ => ::core::result::Result::Ok(::core::option::Option::None),
                 }
             }
-            fn as_str(&self) -> Option<std::borrow::Cow<'a, str>> {
-                match self {
-                    Self::Str(s) => Some(std::borrow::Cow::Borrowed(s)),
-                    Self::OptStr(Some(s)) => Some(std::borrow::Cow::Borrowed(s)),
-                    Self::Value(::serde_json::Value::String(s)) => {
-                        Some(std::borrow::Cow::Borrowed(s.as_str()))
+
+            fn as_object(
+                &self,
+            ) -> ::core::result::Result<
+                ::std::collections::HashMap<&str, ::sansho::view::SanshoCarrier<'a>>,
+                ::sansho::SanshoError,
+            > {
+                let value: &'a #name = *self;
+                let mut members: ::std::collections::HashMap<
+                    &str,
+                    ::sansho::view::SanshoCarrier<'a>,
+                > = ::std::collections::HashMap::with_capacity(#count);
+                #(members.insert(#names, #carriers);)*
+                ::core::result::Result::Ok(members)
+            }
+
+            fn container_len(&self) -> ::core::result::Result<usize, ::sansho::SanshoError> {
+                ::core::result::Result::Ok(#count)
+            }
+
+            fn to_string_sansho(&self) -> ::std::string::String {
+                let value: &'a #name = *self;
+                let mut out = ::std::string::String::from("{");
+                #(
+                    if out.len() > 1 {
+                        out.push_str(", ");
                     }
-                    _ => None,
-                }
-            }
-            fn as_f64(&self) -> Option<f64> {
-                match self {
-                    Self::Value(::serde_json::Value::Number(n)) => n.as_f64(),
-                    _ => None,
-                }
-            }
-            fn as_bool(&self) -> Option<bool> {
-                match self {
-                    Self::Value(::serde_json::Value::Bool(b)) => Some(*b),
-                    _ => None,
-                }
-            }
-            fn is_null(&self) -> bool {
-                matches!(self, Self::Skip | Self::OptStr(None))
-                    || matches!(self, Self::Value(::serde_json::Value::Null))
-            }
-            fn get_key(&self, name: &str) -> Option<Self> {
-                match self {
-                    Self::Struct(item) => Self::node_for(item, name),
-                    Self::Value(::serde_json::Value::Object(map)) => {
-                        map.get(name).map(|v| Self::Value(v))
-                    }
-                    // leaf nodes (Str/OptStr/Skip) answer NO
-                    // navigation — JMESPath says null for navigation
-                    // on a string
-                    Self::Str(_) | Self::OptStr(_) | Self::Skip => None,
-                    _ => None,
-                }
-            }
-            fn get_index(&self, index: usize) -> Option<Self> {
-                match self {
-                    Self::Value(::serde_json::Value::Array(items)) => {
-                        items.get(index).map(|v| Self::Value(v))
-                    }
-                    _ => None,
-                }
-            }
-            fn entries(&self) -> Vec<(String, Self)> {
-                match self {
-                    Self::Struct(item) => {
-                        // the walkable fields, in declaration order,
-                        // keyed by field name
-                        let mut pairs: Vec<(String, Self)> = Vec::new();
-                        for field in [#(#entries_items),*] {
-                            pairs.push((
-                                field.to_string(),
-                                Self::node_for(item, field).unwrap_or(Self::Skip),
-                            ));
-                        }
-                        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                        pairs
-                    }
-                    Self::Value(::serde_json::Value::Object(map)) => {
-                        let mut pairs: Vec<(String, Self)> = map
-                            .iter()
-                            .map(|(k, v)| (k.clone(), Self::Value(v)))
-                            .collect();
-                        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                        pairs
-                    }
-                    _ => Vec::new(),
-                }
-            }
-            fn elements(&self) -> Vec<Self> {
-                match self {
-                    Self::Value(::serde_json::Value::Array(items)) => {
-                        items.iter().map(|v| Self::Value(v)).collect()
-                    }
-                    _ => Vec::new(),
-                }
-            }
-            fn container_len(&self) -> Option<usize> {
-                match self {
-                    Self::Value(::serde_json::Value::Array(items)) => Some(items.len()),
-                    Self::Value(::serde_json::Value::Object(map)) => Some(map.len()),
-                    _ => None,
-                }
-            }
-            fn counts_toward_aggregation() -> bool {
-                false
-            }
-            fn materialize(&self) -> Result<::serde_json::Value, ::sansho::SanshoError> {
-                match self {
-                    Self::Struct(item) => {
-                        // the struct's JSON: the walkable fields
-                        let mut object = ::serde_json::Map::new();
-                        for field in [#(#entries_items),*] {
-                            if let Some(node) = Self::node_for(item, field) {
-                                let value = node.materialize()?;
-                                object.insert(field.to_string(), value);
-                            }
-                        }
-                        Ok(::serde_json::Value::Object(object))
-                    }
-                    Self::Str(s) => Ok(::serde_json::Value::String(s.to_string())),
-                    Self::OptStr(Some(s)) => Ok(::serde_json::Value::String(s.to_string())),
-                    Self::OptStr(None) => Ok(::serde_json::Value::Null),
-                    Self::Value(v) => Ok((*v).clone()),
-                    Self::Skip => Ok(::serde_json::Value::Null),
-                }
+                    out.push_str(#names);
+                    out.push_str(": ");
+                    out.push_str(&::sansho::view::SanshoTrait::to_string_sansho(&#carriers));
+                )*
+                out.push('}');
+                out
             }
         }
     };
     expanded.into()
-}
-
-#[cfg(test)]
-mod dump {
-    #[test]
-    fn dump_generated() {
-        let input = r#"
-        struct T { identifier: String, body: serde_json::Value }
-        "#;
-        let _ = input;
-    }
-}
-
-/// The recognized field shapes.
-enum Shape {
-    String,
-    OptString,
-    Value,
-    Skip,
-}
-
-fn field_shape(ty: &syn::Type) -> Shape {
-    // &str / &'a str reference fields classify as String
-    if let syn::Type::Reference(r) = ty {
-        if let syn::Type::Path(inner) = r.elem.as_ref() {
-            if inner.path.is_ident("str") {
-                return Shape::String;
-            }
-        }
-    }
-    let syn::Type::Path(tp) = ty else {
-        return Shape::Skip;
-    };
-    let last = tp.path.segments.last().map(|s| s.ident.to_string());
-    match last.as_deref() {
-        Some("String") | Some("str") => Shape::String,
-        Some("Value") => Shape::Value,
-        Some("Option") => {
-            // Option<String> only
-            let args = &tp.path.segments[0].arguments;
-            if let syn::PathArguments::AngleBracketed(ab) = args {
-                let inner = ab
-                    .args
-                    .first()
-                    .map(|a| quote::ToTokens::to_token_stream(a).to_string());
-                if inner.as_deref() == Some("String") {
-                    return Shape::OptString;
-                }
-            }
-            Shape::Skip
-        }
-        _ => Shape::Skip,
-    }
 }

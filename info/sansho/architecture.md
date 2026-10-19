@@ -53,11 +53,11 @@ iteration) without decoding the unselected values; the minicbor spike
 
 Evaluation threads a FLOW through the program's edges:
 
-- `One(node)` — a backend position (lazy; materialization is the
-  backend's memoized decode);
-- `Value(json)` — a computed scalar or aggregate (functions,
-  comparators, logic, literals, multi-selects);
-- `Proj(items)` — a projection's collection.
+- `Value(carrier)` — one value at this level: a scalar, an aggregate, a
+  container, or a computed value (functions, comparators, logic,
+  literals, multi-selects);
+- `Items(flows)` — a grouping at this level: a projection's per-item
+  results, each still at its own level.
 
 The rules, all corpus-refereed:
 
@@ -79,15 +79,14 @@ The rules, all corpus-refereed:
    true.
 7. **Comparators across kinds yield null** (never an error).
 
-## The memo is the fusion
+## Navigation and the boundary
 
-The byte source's decode memo guarantees each boundary position materializes at most
-once per evaluation. When a filter predicate and an emission both
-consume the same subtree, they share the one decode — the fusion that
-makes the byte-once requirement (SPEC-0001 §5.1) true without any
-deferred-emission buffering (as demonstrated by
-`shared_navigation_decodes_once`; the decode-count is the
-instrumentation).
+Navigation parses container headers and does position arithmetic: it
+never decodes a value, so a field lookup is a raw-key-bytes scan and a
+member is a subslice of the document. Decoding happens where a value is
+read — at a leaf for a string or a number, and at the boundary for the
+result. There is no decode memo and no decode-count instrumentation, so a
+navigation that is repeated walks again rather than sharing a decode.
 
 ## The limits
 

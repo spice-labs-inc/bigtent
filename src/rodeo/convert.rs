@@ -136,7 +136,7 @@ static TEST_HOOK_OWNER: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 thread_local! {
     /// This thread's latest hook token (0 = never took a guard).
-    static TEST_HOOK_TOKEN: AtomicUsize = AtomicUsize::new(0);
+    static TEST_HOOK_TOKEN: AtomicUsize = const { AtomicUsize::new(0) };
 }
 
 #[cfg(test)]

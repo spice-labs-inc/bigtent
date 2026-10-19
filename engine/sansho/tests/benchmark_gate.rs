@@ -289,27 +289,3 @@ fn benchmark_gate_worst_case_legal_expression() {
         "the worst-case legal expression must evaluate promptly: {elapsed:?}"
     );
 }
-
-#[test]
-fn probe_trivial_costs() {
-    let document = scaled_item(4_000);
-    let bytes = serde_cbor::to_vec(&document).unwrap();
-    println!("PROBE item bytes: {}", bytes.len());
-
-    for expr in [
-        "body.mime_type",
-        "body.extra",
-        "body.file_names",
-        "body.file_size",
-    ] {
-        let parsed = parse(expr).unwrap();
-        let program = compile(&parsed, None).unwrap();
-        let start = Instant::now();
-        let result = evaluate(&program, bytes.as_slice()).and_then(|value| materialize(&value));
-        let elapsed = start.elapsed();
-        println!(
-            "PROBE {expr:?} -> {elapsed:?} result_size={:?}",
-            result.map(|v| v.to_string().len())
-        );
-    }
-}

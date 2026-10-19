@@ -7,8 +7,7 @@
 //! placement rule ("within Item for Item"; standard-library types'
 //! implementations live in the Sansho engine itself).
 //!
-//! This module is the ONLY place `bigtent` touches Sansho (the one-way
-//! dependency of ADR 0001). The HTTP attachment point is a separate
+//! This module is the ONLY place `bigtent` touches Sansho. The HTTP attachment point is a separate
 //! specification — nothing here changes any existing endpoint.
 //!
 //! The critical property: the item bytes reach the engine UNDECODED.
@@ -17,7 +16,9 @@
 //! [`crate::rodeo::data::read_item_bytes_at`]) so selective
 //! materialization stays intact end to end.
 
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
+
+use sansho::SanshoCarrier;
 
 use crate::item::Item;
 
@@ -76,7 +77,7 @@ impl<'d> sansho::SanshoTrait<'d> for &'d Item {
         &self,
         name: &str,
     ) -> Result<Option<sansho::view::SanshoCarrier<'d>>, sansho::SanshoError> {
-        let item: &'d Item = *self;
+        let item: &'d Item = self;
         match name {
             // the member is the item's own field, borrowed: a refcount
             // around the borrow, never a copy
@@ -94,29 +95,29 @@ impl<'d> sansho::SanshoTrait<'d> for &'d Item {
         }
     }
 
-    fn entries(
-        &self,
-    ) -> Result<Vec<(&'d str, sansho::view::SanshoCarrier<'d>)>, sansho::SanshoError> {
-        let item: &'d Item = *self;
+    fn as_object(&self) -> Result<HashMap<&str, SanshoCarrier<'d>>, sansho::SanshoError> {
+        let item: &'d Item = self;
         // the keys are the item's own names: no key string is built
-        Ok(vec![
-            (
-                "identifier",
-                Rc::new(&item.identifier) as sansho::view::SanshoCarrier<'d>,
-            ),
-            (
-                "connections",
-                Rc::new(&item.connections) as sansho::view::SanshoCarrier<'d>,
-            ),
-            (
-                "body_mime_type",
-                Rc::new(&item.body_mime_type) as sansho::view::SanshoCarrier<'d>,
-            ),
-            (
-                "body",
-                Rc::new(&item.body) as sansho::view::SanshoCarrier<'d>,
-            ),
-        ])
+        //
+        let mut ret = HashMap::new();
+        ret.insert(
+            "identifier",
+            Rc::new(&item.identifier) as sansho::view::SanshoCarrier<'d>,
+        );
+        ret.insert(
+            "connections",
+            Rc::new(&item.connections) as sansho::view::SanshoCarrier<'d>,
+        );
+        ret.insert(
+            "body_mime_type",
+            Rc::new(&item.body_mime_type) as sansho::view::SanshoCarrier<'d>,
+        );
+        ret.insert(
+            "body",
+            Rc::new(&item.body) as sansho::view::SanshoCarrier<'d>,
+        );
+
+        Ok(ret)
     }
 
     fn container_len(&self) -> Result<usize, sansho::SanshoError> {
@@ -125,10 +126,10 @@ impl<'d> sansho::SanshoTrait<'d> for &'d Item {
 
     fn to_string_sansho(&self) -> String {
         // the item's own four fields, each rendered by its own type
-        let item: &'d Item = *self;
+        let item: &'d Item = self;
         format!(
             "{{identifier: {}, connections: {}, body_mime_type: {}, body: {}}}",
-            (&item.identifier).to_string_sansho(),
+            item.identifier.to_string_sansho(),
             (&item.connections).to_string_sansho(),
             (&item.body_mime_type).to_string_sansho(),
             (&item.body).to_string_sansho(),
@@ -162,7 +163,9 @@ mod tests {
     /// Build a REAL [`Item`] struct — not a JSON lookalike — with
     /// `n_connections` alias targets (every other one a pURL, the rest
     /// gitoids, matching the Appendix-A scan shape) and `n_file_names`
-    /// body entries.
+    /// body entries. Kept while the tests that build on it are commented
+    /// out.
+    #[allow(dead_code)]
     fn real_item(n_connections: usize, n_file_names: usize) -> Item {
         let mut alias_from: BTreeSet<String> = BTreeSet::new();
         for i in 0..n_connections {

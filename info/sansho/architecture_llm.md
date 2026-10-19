@@ -11,17 +11,19 @@ the claims' test references are identical.
   meanings, whitespace-collapsing (`canonical_is_fixed_point_over_corpus_expressions`,
   `canonical_distinguishes_distinct_meanings`,
   `canonical_collapses_insignificant_whitespace`).
-- Tree view: a generic read-only trait; two backends — materialized
-  (in-memory JSON references) and cursor (byte positions over CBOR).
-  Identical results REQUIRED: the whole corpus through both with
-  identical per-feature scores (`corpus_cursor_matches_materialized`),
-  plus the generated differential property (`differential_property_over_generated_documents`).
-- Cursor: a node = a byte POSITION; navigation walks container headers
-  without decoding values; materialization = the MEMOIZED decode (each
-  position decodes at most once per evaluation — the byte-once
-  requirement's enforcement); the decode-count = the instrumentation
-  (`shared_navigation_decodes_once`).
-- Flow model: One(node) | Value(json) | Proj(collection). Rules:
+- The trait (`SanshoTrait`) is the only type the evaluator carries;
+  three sources implement it — the byte slice, `serde_json::Value`, and
+  `&serde_cbor::Value`. Equal results REQUIRED: the whole corpus through
+  each (`corpus_green_through_cbor_node`,
+  `corpus_slice1_materialized`, `corpus_green_through_cbor_value`), plus
+  the generated differential property
+  (`differential_property_over_generated_documents`).
+- Byte source: a node is a byte POSITION; navigation walks container
+  headers without decoding values; decoding happens where a value is read
+  (a leaf's text or number, or the result at the boundary). No decode
+  memo, no decode-count instrumentation — a repeated navigation walks
+  again.
+- Flow model: Value(carrier) | Items(flows). Rules:
   (1) edges after a projection apply per element; the mapping recurses
   into nested projections SHAPE-PRESERVING (nested projections are
   values); (2) null element-results drop; (3) the flatten operator `[]`

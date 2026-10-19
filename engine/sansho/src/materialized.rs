@@ -99,7 +99,7 @@ impl<'a> SanshoTrait<'a> for &'a J {
         }
     }
 
-    fn entries(&self) -> Result<Vec<(&'a str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<std::collections::HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
         let value: &'a J = self;
         match value.as_object() {
             // the keys borrow the document: no key string is built
@@ -113,7 +113,7 @@ impl<'a> SanshoTrait<'a> for &'a J {
         }
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         let value: &'a J = self;
         match value.as_array() {
             Some(items) => Ok(items
@@ -126,6 +126,20 @@ impl<'a> SanshoTrait<'a> for &'a J {
         }
     }
 
+    fn as_array_str<'s>(
+        &'s self,
+    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        let value: &'s J = self;
+        match value.as_array() {
+            Some(items) => Ok(Box::new(items.iter().filter_map(|item| match item {
+                J::String(text) => Some(text.as_str()),
+                _ => None,
+            }))),
+            None => Err(SanshoError::Evaluation {
+                message: format!("as_array_str requires an array, found {}", value.kind()),
+            }),
+        }
+    }
     fn container_len(&self) -> Result<usize, SanshoError> {
         match **self {
             J::Object(ref map) => Ok(map.len()),
@@ -220,7 +234,7 @@ impl<'a> SanshoTrait<'a> for J {
         }
     }
 
-    fn entries(&self) -> Result<Vec<(&str, SanshoCarrier<'a>)>, SanshoError> {
+    fn as_object(&self) -> Result<std::collections::HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
         match self.as_object() {
             // the keys borrow the document: no key string is built
             Some(object) => Ok(object
@@ -233,7 +247,7 @@ impl<'a> SanshoTrait<'a> for J {
         }
     }
 
-    fn elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
+    fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         match self.as_array() {
             Some(items) => Ok(items
                 .iter()
@@ -245,6 +259,20 @@ impl<'a> SanshoTrait<'a> for J {
         }
     }
 
+    fn as_array_str<'s>(
+        &'s self,
+    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+        let value: &'s J = self;
+        match value.as_array() {
+            Some(items) => Ok(Box::new(items.iter().filter_map(|item| match item {
+                J::String(text) => Some(text.as_str()),
+                _ => None,
+            }))),
+            None => Err(SanshoError::Evaluation {
+                message: format!("as_array_str requires an array, found {}", value.kind()),
+            }),
+        }
+    }
     fn container_len(&self) -> Result<usize, SanshoError> {
         match self {
             J::Object(map) => Ok(map.len()),

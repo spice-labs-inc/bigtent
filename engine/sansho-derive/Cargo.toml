@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
-description = "The derive macro for Sansho's value-node source implementations"
+description = "The SanshoObject derive: a field-walking SanshoTrait implementation for item-shaped structs"
 
 [lib]
 proc-macro = true

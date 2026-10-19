@@ -2117,7 +2117,7 @@ pub(crate) mod phase3_merge_tests {
             }
             items.push(Item {
                 identifier: id,
-                connections: connections,
+                connections,
                 body_mime_type: Some(ITEM_METADATA_MIME_TYPE.to_string()),
                 body: Some(serde_cbor::Value::Map(Default::default())),
             });

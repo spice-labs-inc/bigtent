@@ -37,6 +37,36 @@ impl Driver for CborNodeEngine {
     }
 }
 
+/// The in-memory CBOR value driver: the corpus's JSON givens convert to a
+/// `serde_cbor::Value` and evaluate through that source. The third source
+/// must answer exactly as the other two do.
+struct CborValueEngine;
+
+impl Driver for CborValueEngine {
+    fn evaluate(&self, given: &serde_json::Value, expression: &str) -> DriverOutcome {
+        let value = match serde_cbor::value::to_value(given) {
+            Ok(value) => value,
+            Err(e) => {
+                return DriverOutcome::Error(sansho::SanshoError::Input {
+                    message: format!("fixture conversion: {e}"),
+                });
+            }
+        };
+        let parsed = match sansho::parse(expression) {
+            Ok(parsed) => parsed,
+            Err(e) => return DriverOutcome::Error(e),
+        };
+        let program = match sansho::compile(&parsed, None) {
+            Ok(p) => p,
+            Err(e) => return DriverOutcome::Error(e),
+        };
+        match sansho::evaluate(&program, &value).and_then(|value| sansho::materialize(&value)) {
+            Ok(value) => DriverOutcome::Result(value),
+            Err(e) => DriverOutcome::Error(e),
+        }
+    }
+}
+
 /// Every corpus case runs green through CborNode (the corpus is the
 /// referee; a single failure names the expression).
 #[test]
@@ -76,6 +106,60 @@ fn corpus_green_through_cbor_node() {
     }
     println!("not-implemented: {not_impl}");
     assert_eq!(failures, 0, "corpus failures through CborNode: {failures}");
+}
+
+// Requirement: the JMESPath compliance corpus is the conformance referee, and
+// the sources are required to agree on it. What: every corpus case runs through
+// the in-memory `serde_cbor::Value` source and is compared against the case's
+// declared result or error category, exactly as the byte source and the
+// `serde_json::Value` source are. Why: that source has no test of its own — the
+// corpus runs through the other two — so a defect in it would be invisible
+// until a consumer happened to use it.
+//
+// LLM section: the driver converts each corpus `given` with
+// `serde_cbor::value::to_value` and evaluates through the borrowed
+// `&serde_cbor::Value` implementation. A failure prints the feature, the
+// expression, the document, and the outcome, so a regression names itself.
+#[test]
+fn corpus_green_through_cbor_value() {
+    let files = load_corpus(Path::new("tests/jmespath-corpus/compliance")).expect("loads");
+    let mut failures = 0usize;
+    let mut not_impl = 0usize;
+    for file in &files {
+        for group in &file.groups {
+            for case in &group.cases {
+                let outcome = CborValueEngine.evaluate(&group.given, &case.expression);
+                let declared = case.error.clone().unwrap_or_else(|| "ok".to_string());
+                let matches = match (&outcome, &case.error) {
+                    (DriverOutcome::Result(value), None) => case
+                        .result
+                        .as_ref()
+                        .map(|e| sansho::corpus::json_equal(value, e))
+                        .unwrap_or(false),
+                    (DriverOutcome::Error(error), Some(_)) => {
+                        sansho::corpus::expected_category(&declared) == Some(error.category())
+                    }
+                    (DriverOutcome::NotImplemented, _) => {
+                        not_impl += 1;
+                        true
+                    }
+                    _ => false,
+                };
+                if !matches {
+                    failures += 1;
+                    println!(
+                        "FAIL[{}] expr={:?}\n  given={}\n  declared={declared} outcome={outcome:?}",
+                        file.feature, case.expression, group.given,
+                    );
+                }
+            }
+        }
+    }
+    println!("not-implemented: {not_impl}");
+    assert_eq!(
+        failures, 0,
+        "corpus failures through the in-memory CBOR value source: {failures}"
+    );
 }
 
 /// Generated documents: the byte source and the in-memory source must
@@ -254,7 +338,7 @@ fn escape_case_matrix_pins_the_mapping() {
         "navigation does not find a non-text key"
     );
     assert!(
-        SanshoTrait::entries(&slice5).unwrap().is_empty(),
+        SanshoTrait::as_object(&slice5).unwrap().is_empty(),
         "entries do not report a non-text key"
     );
 }
@@ -279,7 +363,7 @@ fn fuzz_truncated_slices_never_panic() {
         let _ = SanshoTrait::kind(&slice);
         let _ = SanshoTrait::get_key(&slice, "connections");
         let _ = SanshoTrait::get_key(&slice, "body");
-        let _ = SanshoTrait::elements(&slice);
+        let _ = SanshoTrait::as_object(&slice);
         let _ = SanshoTrait::container_len(&slice);
     }
 }

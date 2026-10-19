@@ -142,7 +142,7 @@ impl DataFile {
     /// multi-gigabyte allocation per lookup), is an `Err` naming the file
     /// and offset (H3). The lookup boundary logs the error and reports
     /// the item as absent.
-    pub fn read_bytes_at<'a>(&'a self, pos: usize) -> Result<&'a [u8]> {
+    pub fn read_bytes_at(&self, pos: usize) -> Result<&[u8]> {
         let file_len = self.file.len();
         if pos >= file_len || file_len - pos < 4 {
             bail!(
@@ -474,7 +474,7 @@ mod tests {
 
         // a missing connections member is tolerated in both versions
         let no_conn = item_bytes_without_connections("gitoid:blob:sha256:noconn");
-        let hash = write_grd(dir.path(), 2, &[no_conn.clone()]).unwrap();
+        let hash = write_grd(dir.path(), 2, std::slice::from_ref(&no_conn)).unwrap();
         let df = open(dir.path(), hash, 2);
         assert!(df.read_item_at(df.data_offset).is_ok());
         let hash = write_grd(dir.path(), 1, &[no_conn]).unwrap();

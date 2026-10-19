@@ -1,175 +1,199 @@
-//! The derive's integration tests (the plan's T3.3, T3.5): the
-//! generated node equals the hand-written baseline, and the
-//! serde-rename guard is a compile error.
+//! The derive's integration test: a derived struct used as a Sansho
+//! source, through the public entry points.
 //!
-//! The tests live in the derive crate (dev-depending on sansho — the
-//! allowed direction per ADR-0001: sansho never depends on this crate).
+//! The test is about navigation results, not generated code: a struct's
+//! fields ARE the document's members, so what it asserts is what a
+//! JMESPath expression answers over that struct.
 
-use sansho::view::Node;
-use sansho_derive::SanshoNode;
+use sansho::view::SanshoTrait;
+use sansho_derive::SanshoObject;
+use std::collections::BTreeSet;
 
-/// The item-shaped struct under test.
-#[derive(SanshoNode)]
-pub struct TestItem {
-    pub identifier: String,
-    pub body_mime_type: Option<String>,
-    pub body: serde_json::Value,
-    pub not_walkable: std::collections::BTreeMap<String, String>,
+/// A nested object. Its own derived implementation makes `&Inner` a
+/// source, so an `Inner` field of another struct is a member like any
+/// other.
+#[derive(SanshoObject)]
+struct Inner {
+    label: String,
+    count: u64,
 }
 
-/// The hand-written baseline (what the derive must match).
-#[derive(Clone)]
-pub struct BaselineNode<'a>(&'a TestItem);
+/// One field of every shape the derive maps: a borrowed string, a
+/// renamed field, an optional string, the Copy scalars, a nested derived
+/// struct, an in-memory JSON value, a container, and a skipped field.
+#[derive(SanshoObject)]
+struct Outer {
+    identifier: String,
+    #[serde(rename = "bodyMimeType")]
+    body_mime_type: String,
+    optional: Option<String>,
+    count: u64,
+    flag: bool,
+    inner: Inner,
+    payload: serde_json::Value,
+    tags: BTreeSet<String>,
+    #[serde(skip)]
+    scratch: Vec<u8>,
+}
 
-impl<'a> Node<'a> for BaselineNode<'a> {
-    fn kind(&self) -> sansho::view::Kind {
-        sansho::view::Kind::Object
-    }
-    fn as_str(&self) -> Option<std::borrow::Cow<'a, str>> {
-        None
-    }
-    fn as_f64(&self) -> Option<f64> {
-        None
-    }
-    fn as_bool(&self) -> Option<bool> {
-        None
-    }
-    fn is_null(&self) -> bool {
-        false
-    }
-    fn get_key(&self, name: &str) -> Option<Self> {
-        match name {
-            "identifier" => Some(BaselineNode(self.0)),
-            "body_mime_type" => Some(BaselineNode(self.0)),
-            "body" => Some(BaselineNode(self.0)),
-            _ => None,
-        }
-    }
-    fn get_index(&self, _index: usize) -> Option<Self> {
-        None
-    }
-    fn entries(&self) -> Vec<(String, Self)> {
-        Vec::new()
-    }
-    fn elements(&self) -> Vec<Self> {
-        Vec::new()
-    }
-    fn container_len(&self) -> Option<usize> {
-        None
-    }
-    fn counts_toward_aggregation() -> bool {
-        false
-    }
-    fn materialize(&self) -> Result<serde_json::Value, sansho::SanshoError> {
-        Ok(serde_json::json!({"identifier": self.0.identifier, "body": self.0.body}))
+/// The document under test.
+fn fixture() -> Outer {
+    let mut tags = BTreeSet::new();
+    tags.insert("alpha".to_string());
+    tags.insert("beta".to_string());
+    Outer {
+        identifier: "gitoid:blob:sha1:abc".to_string(),
+        body_mime_type: "application/vnd.cc.goatrodeo".to_string(),
+        optional: Some("present".to_string()),
+        count: 7,
+        flag: true,
+        inner: Inner {
+            label: "nested".to_string(),
+            count: 2,
+        },
+        payload: serde_json::json!({"x": [1, 2, 3]}),
+        tags,
+        scratch: vec![0xff, 0xfe],
     }
 }
 
-/// T3.3: the derive-generated node and the hand-written baseline
-/// agree on the walkable shapes (field lookup + materialization).
+/// Evaluate one expression over the fixture through the derived source
+/// and materialize the result — the same shape a consumer uses.
+fn query(expression: &str) -> serde_json::Value {
+    let program = sansho::compile(&sansho::parse(expression).unwrap(), None).unwrap();
+    let document = fixture();
+    sansho::evaluate(&program, &document)
+        .and_then(|value| sansho::materialize(&value))
+        .expect("the derived source evaluates")
+}
+
+// Requirement: the derive is the generic path from a Rust struct to a
+// JMESPath source — Sansho is not tied to any one consumer's item type.
+// What: a derived struct queried through the public entry points, one
+// expression per field shape. Why: the derive's contract is that the
+// struct's fields are the document's members, so each shape has to answer
+// as its JMESPath type: a `String` as a string, a `u64` as a number, a
+// nested derived struct as an object to descend into, and so on.
+//
+// LLM section: the shapes covered, in order — borrowed `String`,
+// `#[serde(rename)]`, `Option<String>`, a Copy `u64`, a Copy `bool`, a
+// nested derived struct (two levels of navigation), a
+// `serde_json::Value` (its own tree), a `BTreeSet<String>` (a
+// container), a missing name (a miss, not an error), and a
+// `#[serde(skip)]` field (not a member).
 #[test]
-fn derive_matches_hand_written() {
-    let item = TestItem {
-        identifier: "gitoid:blob:sha1:x".to_string(),
-        body_mime_type: Some("application/vnd.cc.goatrodeo".to_string()),
-        body: serde_json::json!({"file_size": 3050, "file_names": ["a.java"]}),
-        not_walkable: Default::default(),
-    };
-
-    let derived = TestItemNode::wrap(&item);
-    let baseline = BaselineNode(&item);
-
-    // the walkable fields resolve identically
-    for key in ["identifier", "body_mime_type", "body"] {
-        let d = derived.get_key(key);
-        let b = baseline.get_key(key);
-        assert!(d.is_some(), "derive resolves {key}");
-        assert!(b.is_some(), "baseline resolves {key}");
-    }
-
-    // materialization agrees
-    let dv = derived.materialize().unwrap();
-    let bv = baseline.materialize().unwrap();
-    assert_eq!(dv["identifier"], bv["identifier"]);
-    assert_eq!(dv["body"], bv["body"]);
-
-    // the string field's content via the generated Str variant
-    let id_node = derived.get_key("identifier").unwrap();
+fn derived_struct_is_a_jmespath_source() {
     assert_eq!(
-        id_node.as_str().map(|s| s.into_owned()),
-        Some("gitoid:blob:sha1:x".to_string())
+        query("identifier"),
+        serde_json::json!("gitoid:blob:sha1:abc")
     );
-    assert_eq!(id_node.kind(), sansho::view::Kind::String);
-
-    // the body value's navigation through the generated Value variant
-    let body_node = derived.get_key("body").unwrap();
-    assert_eq!(body_node.kind(), sansho::view::Kind::Object);
-    let size = body_node.get_key("file_size").unwrap();
-    assert_eq!(size.as_f64(), Some(3050.0));
-    let names = body_node.get_key("file_names").unwrap();
-    assert_eq!(names.elements().len(), 1);
-}
-
-/// T3.5's behavioral half: the Skip field evaluates as null and does
-/// not navigate.
-#[test]
-fn skip_field_is_null() {
-    let item = TestItem {
-        identifier: "x".to_string(),
-        body_mime_type: None,
-        body: serde_json::Value::Null,
-        not_walkable: Default::default(),
-    };
-    let derived = TestItemNode::wrap(&item);
-    let skip = derived.get_key("not_walkable").unwrap();
-    assert!(skip.is_null(), "the Skip field is null");
-    assert_eq!(skip.kind(), sansho::view::Kind::Null);
-    assert!(skip.get_key("anything").is_none(), "Skip does not navigate");
-}
-
-/// T3.5's compile-fail half is pinned in the crate's lib.rs module
-/// documentation (a `compile_fail` doc-test — integration-test doc
-/// comments never run as doc-tests).
-/// Finding 1's regression: the derive compiles for a struct with only
-/// ONE walkable field shape (the enum always emits all variants).
-#[derive(SanshoNode)]
-pub struct OneField {
-    pub identifier: String,
-}
-
-#[test]
-fn derive_compiles_for_single_shape_struct() {
-    let item = OneField {
-        identifier: "x".to_string(),
-    };
-    let node = OneFieldNode::wrap(&item);
+    // the serde rename is the member name
     assert_eq!(
-        node.get_key("identifier")
-            .unwrap()
-            .as_str()
-            .map(|s| s.into_owned()),
-        Some("x".to_string())
+        query("bodyMimeType"),
+        serde_json::json!("application/vnd.cc.goatrodeo")
     );
-    assert!(node.get_key("nope").is_none());
+    assert_eq!(query("optional"), serde_json::json!("present"));
+    assert_eq!(query("count"), serde_json::json!(7));
+    assert_eq!(query("flag"), serde_json::json!(true));
+    // a nested derived struct: navigation descends into it
+    assert_eq!(query("inner.label"), serde_json::json!("nested"));
+    assert_eq!(query("inner.count"), serde_json::json!(2));
+    // an in-memory JSON value walks its own tree
+    assert_eq!(query("payload.x[1]"), serde_json::json!(2));
+    // a container field answers as a container
+    assert_eq!(query("length(tags)"), serde_json::json!(2));
+    assert_eq!(query("contains(tags, 'alpha')"), serde_json::json!(true));
+    // a name the struct does not have is a miss, not an error
+    assert_eq!(query("no_such_field"), serde_json::Value::Null);
+    // a skipped field is not a member — and it HAS content, so what
+    // keeps it out of the document is the skip rather than emptiness
+    assert!(!fixture().scratch.is_empty());
+    assert_eq!(query("scratch"), serde_json::Value::Null);
 }
 
-/// Finding 3's regression: navigation past a leaf answers null (the
-/// leaf does NOT return itself for its own field name).
+// Requirement: the member set is the field set — a rename renames the
+// member, a skip removes it, and the object's length is the member count.
+// What: the object's own length and its key set, queried over the
+// derived struct. Why: `as_object` and `container_len` are what the
+// evaluator's object paths read, and a field that is present in the
+// struct but absent from the document (or the reverse) is a silent
+// wrong answer rather than an error.
+//
+// LLM section: eight fields are members (the nine declared fields less
+// the skipped one). The key set is asserted through `contains` rather
+// than by position, because the engine's object iteration order is not
+// part of a value.
 #[test]
-fn leaf_nodes_answer_no_navigation() {
-    let item = TestItem {
-        identifier: "gitoid:blob:sha1:x".to_string(),
-        body_mime_type: None,
-        body: serde_json::Value::Null,
-        not_walkable: Default::default(),
-    };
-    let derived = TestItemNode::wrap(&item);
-    let id = derived.get_key("identifier").unwrap();
-    // JMESPath: navigation on a string is null
+fn the_member_set_is_the_field_set() {
+    assert_eq!(query("length(@)"), serde_json::json!(8));
+    assert_eq!(query("contains(keys(@), 'bodyMimeType')"), serde_json::json!(true));
+    assert_eq!(query("contains(keys(@), 'body_mime_type')"), serde_json::json!(false));
+    assert_eq!(query("contains(keys(@), 'scratch')"), serde_json::json!(false));
+    assert_eq!(query("contains(keys(@), 'inner')"), serde_json::json!(true));
+    assert_eq!(query("contains(keys(@), 'tags')"), serde_json::json!(true));
+}
+
+// Requirement: a derived struct renders as its members. What: the
+// `to_string` rendering of the derived document. Why: `to_string_sansho`
+// is the trait method the `to_string` function reads, and the derive has
+// to supply it — the trait declares it without a default, so a wrong
+// rendering is a wrong `to_string` result rather than a missing method.
+//
+// LLM section: the rendering names each member; the skipped field is
+// absent from it. The assertions read the rendered text, which is a
+// runtime value produced by the source — not the source code.
+#[test]
+fn the_rendering_names_the_members() {
+    let rendered = query("to_string(@)");
+    let text = rendered.as_str().expect("the rendering is a string");
+    for member in ["identifier", "bodyMimeType", "optional", "count", "inner", "tags"] {
+        assert!(
+            text.contains(member),
+            "the rendering must name the member {member}: {text}"
+        );
+    }
     assert!(
-        id.get_key("identifier").is_none(),
-        "leaf navigation is null"
+        !text.contains("scratch"),
+        "a skipped field must not render: {text}"
     );
-    let mime = derived.get_key("body_mime_type").unwrap();
-    assert!(mime.get_key("body_mime_type").is_none());
+}
+
+// Requirement: navigation and iteration answer the same document. What:
+// a member reached by name (`get_key`) and the same member reached
+// through the member map (`as_object`) are equal, for every member.
+// Why: the two paths are generated separately — `get_key`'s match arms
+// and `as_object`'s inserts — so a field added to one and not the other
+// would make the document answer differently depending on how it was
+// read.
+//
+// LLM section: the comparison is by value over each member name, so the
+// test is independent of the map's iteration order. The member names are
+// the ones the derive produced (the rename, not the Rust field name).
+#[test]
+fn navigation_and_iteration_agree() {
+    let document = fixture();
+    let object: &Outer = &document;
+
+    let members = SanshoTrait::as_object(&object).expect("the derived object iterates");
+    assert_eq!(members.len(), 8, "the member map holds every non-skipped field");
+
+    for (name, member) in &members {
+        let found = SanshoTrait::get_key(&object, name)
+            .expect("the lookup answers")
+            .expect("every iterated member is also reachable by name");
+        let iterated = sansho::materialize(member).expect("the member materializes");
+        let looked_up = sansho::materialize(&found).expect("the member materializes");
+        assert_eq!(
+            looked_up, iterated,
+            "the member {name} must be the same value on both paths"
+        );
+    }
+
+    // and a name that is not a member answers a miss
+    assert!(
+        SanshoTrait::get_key(&object, "scratch")
+            .expect("the lookup answers")
+            .is_none(),
+        "a skipped field is not reachable by name"
+    );
 }

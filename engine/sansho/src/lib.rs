@@ -13,12 +13,20 @@
 //!
 //! ## Guarantees
 //!
-//! - Evaluation is a single forward pass: each input byte is consumed at
-//!   most once.
+//! - Navigation touches only the positions the program reads: the
+//!   document is never decoded as a whole, and a leaf is decoded where it
+//!   is read. (The decode-count instrumentation that used to demonstrate a
+//!   byte-once walk was removed with the decode memo; navigation parses
+//!   headers and does position arithmetic, so a repeated navigation walks
+//!   again rather than sharing a decode.)
 //! - Parts of the document the expression does not select are never
 //!   materialized; memory use tracks the output, not the input.
 //! - Evaluation is deterministic: identical bytes and an identical
-//!   expression always produce identical results.
+//!   expression always produce the same VALUE — results that compare
+//!   equal as JSON. This is value equality, not byte equality: an
+//!   object's member order is not part of its value, so a result carried
+//!   in a hash-backed container may serialize its members in a different
+//!   order on the next call and still be the same result.
 //! - Sansho performs no input/output of its own — no network, no
 //!   filesystem, no clock. It is a pure library.
 //!
@@ -119,14 +127,14 @@ pub fn materialize<'a, T: SanshoTrait<'a> + ?Sized>(
         ))),
         Kind::Array => {
             let mut items = Vec::new();
-            for element in value.elements()? {
+            for element in value.as_elements()? {
                 items.push(materialize(&element)?);
             }
             Ok(serde_json::Value::Array(items))
         }
         Kind::Object => {
             let mut object = serde_json::Map::new();
-            for (key, member) in value.entries()? {
+            for (key, member) in value.as_object()? {
                 object.insert(key.to_string(), materialize(&member)?);
             }
             Ok(serde_json::Value::Object(object))

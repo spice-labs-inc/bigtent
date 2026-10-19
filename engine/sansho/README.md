@@ -39,16 +39,22 @@ never materializes the unselected payloads (as demonstrated by
   invalid-expression cases (as demonstrated by
   `corpus_slice1_materialized` and `corpus_cursor_matches_materialized`).
 - **Deterministic evaluation** — identical bytes and an identical
-  expression always produce identical results (as demonstrated by
-  `evaluation_is_deterministic`).
-- **Single-pass input** — each input byte is consumed at most once per
-  evaluation; identical navigations share one decode (as demonstrated
-  by `shared_navigation_decodes_once`).
+  expression always produce the same value: results that compare equal
+  as JSON (as demonstrated by `evaluation_is_deterministic`). This is
+  value equality, not byte equality — member order is not part of an
+  object's value, so a result carried in a hash-backed container may
+  serialize its members in a different order and still be the same
+  result.
+- **Navigation reads only what the program visits** — the document is
+  never decoded as a whole, and a leaf is decoded where it is read. The
+  decode-count instrumentation that used to demonstrate a byte-once walk
+  was removed with the decode memo, so a repeated navigation walks again
+  rather than sharing a decode.
 - **Selective materialization** — memory tracks the output, not the
   input: the byte source reads string leaves by reference (zero-copy;
-  as demonstrated by `text_string_borrows_bytes`), the seek shape
-  scans raw key bytes without materializing keys (as demonstrated by
-  `raw_key_scan_finds_keys`), and the scan shape's per-element cost is
+  as demonstrated by `consumer_byte_source_borrows_in_place`), the seek
+  shape scans raw key bytes without materializing keys, and the scan
+  shape's per-element cost is
   a borrowed read + a boolean (as demonstrated by the `scan/cbor_node`
   benchmark arm: 103.6 ms → 23.4 ms at 100k connections against the
   recorded baseline).
@@ -64,7 +70,7 @@ never materializes the unselected payloads (as demonstrated by
 
 ## Where to read next
 
-- Getting started: `docs/sansho/getting_started.md`
+- Getting started: `info/sansho/getting_started.md`
 - Architecture (the walk program, the tree view, the cache):
   `docs/sansho/architecture.md`
 - Interpreting benchmark results: `docs/sansho/benchmarks.md`
