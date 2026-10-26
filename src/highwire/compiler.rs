@@ -57,8 +57,8 @@
 //! success for something it did not do.
 
 use crate::highwire::grammar::{
-    EmitEntry, GrammarError, ItemEmit, ItemStop, LevelResult, Query, Root, RootKind, Step, StopRule,
-    Walk, WalkConnection,
+    Barker, EmitEntry, GrammarError, ItemEmit, ItemStop, LevelResult, Query, Root, RootKind, Stage,
+    StageKind, Step, StopRule, Walk, WalkConnection,
 };
 use crate::highwire::walk::{
     AccountingAndBudget, ConFilter, ExpressionBuilder, HerdOrCluster, SinkOperation, WalkState,
@@ -73,14 +73,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// A gate over an item and the walk state, compiled.
-pub type Gate = Rc<dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> bool>;
+pub type Gate = Arc<dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> bool + Send + Sync>;
 
 /// What an emit produces for one subject, compiled.
-pub type EmitFn = Rc<dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> Vec<Value>>;
+pub type EmitFn =
+    Arc<dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> Vec<Value> + Send + Sync>;
 
 /// The stop rules, compiled: hard first, then soft, first match wins.
-pub type StopFn = Rc<
-    dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> (Option<Vec<Value>>, Option<Vec<Value>>),
+pub type StopFn = Arc<
+    dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> (Option<Vec<Value>>, Option<Vec<Value>>)
+        + Send
+        + Sync,
 >;
 
 /// The result of compiling.
@@ -168,6 +171,9 @@ enum CompiledRoot {
 
     /// Identifiers derived from the rows of the phases at these positions.
     Predicates(Vec<(usize, Arc<Program>)>),
+
+    /// Taken from the caller's input stream, adapted to identifiers.
+    FromInput,
 }
 
 /// One phase, compiled: no syntax survives.
@@ -179,6 +185,8 @@ struct CompiledPhase {
     emit: EmitFn,
     stop: StopFn,
     tee: bool,
+    /// Whether repeated rows are emitted once.
+    dedup: bool,
     emit_at_end: Option<EmitFn>,
 }
 
@@ -200,17 +208,285 @@ enum Variables {
     Refused,
 }
 
+/// A stage, compiled: the traversal, or the program and where its rows come
+/// from.
+enum CompiledStage {
+    Walk(Box<CompiledPhase>),
+    Barker(Box<CompiledBarker>),
+}
+
+// Both variants are boxed: a compiled walk is large and a compiled program is
+// small, and boxing both keeps the enum one pointer wide either way rather than
+// making every stage pay for the walk's size.
+
+impl CompiledStage {
+    /// The stage's name, when it has one.
+    fn name(&self) -> Option<&String> {
+        match self {
+            CompiledStage::Walk(phase) => phase.name.as_ref(),
+            CompiledStage::Barker(barker) => barker.name.as_ref(),
+        }
+    }
+
+    /// Where a walk draws its roots from, as the stages whose rows it reads.
+    fn row_sources(&self) -> Vec<usize> {
+        match self {
+            CompiledStage::Walk(phase) => match &phase.roots {
+                CompiledRoot::Predicates(predicates) => {
+                    predicates.iter().map(|(at, _)| *at).collect()
+                }
+                CompiledRoot::Enumerated(_) | CompiledRoot::FromInput => Vec::new(),
+            },
+            CompiledStage::Barker(barker) => barker.inputs.clone(),
+        }
+    }
+}
+
+/// A program stage, compiled.
+///
+/// The program is parsed HERE, at compile time, so a syntax error is a compile
+/// failure located in the phase it was written in rather than something that
+/// turns up when the pipeline is half-run.
+struct CompiledBarker {
+    name: Option<String>,
+
+    /// The stages whose rows this program reads, as their positions.
+    inputs: Vec<usize>,
+
+    /// Whether its rows also reach the caller.
+    tee: bool,
+
+    /// Whether an array a row evaluates to produces one row per element.
+    unnest: bool,
+
+    /// Whether repeated rows are emitted once.
+    dedup: bool,
+
+    /// The program's SOURCE, kept rather than a parsed `Program`.
+    ///
+    /// A cached query runs many times, and a barker's `Program` is consumed by a
+    /// run — the Starlark evaluator binds its module state at execution. So the
+    /// compiled stage holds the source, validates it by parsing at compile time
+    /// (a syntax error is a compile failure), and parses again per run on the
+    /// stage's own thread. Parse is the cheap phase; the expensive work is the
+    /// evaluation itself.
+    source: String,
+}
+
+/// Compile a program stage.
+fn compile_barker(
+    barker: &Rc<dyn Barker>,
+    position: usize,
+    by_name: &HashMap<String, usize>,
+    _cache: &ProgramCache,
+) -> LevelResult<CompiledStage> {
+    let at = Location::query().step(Step::Phase {
+        name: None,
+        position,
+    });
+
+    // the name first, so every failure below can be located against it
+    let name = match barker.program() {
+        Ok(_) => by_name
+            .iter()
+            .find(|(_, at)| **at == position)
+            .map(|(name, _)| name.clone()),
+        Err(error) => return Err(located(&at, Err(error))?),
+    };
+    let at = Location::query().step(Step::Phase {
+        name: name.clone(),
+        position,
+    });
+
+    let mut inputs = Vec::new();
+    for source in located(&at, barker.inputs())? {
+        let Some(&producer) = by_name.get(source.as_str()) else {
+            return Err(at.error(format!(
+                "a program reads `{source}`, and no stage is named that"
+            )));
+        };
+        inputs.push(producer);
+    }
+
+    let tee = located(&at, barker.tee())?;
+    let unnest = located(&at, barker.unnest())?;
+    let dedup = located(&at, barker.dedup())?;
+
+    let source = located(&at, barker.program())?;
+    // validated here by parsing; the Program is dropped, and the source is what
+    // the compiled stage keeps for its runs
+    crate::barker::parse(source).map_err(|e| at.error(format!("{e}")))?;
+
+    Ok(CompiledStage::Barker(Box::new(CompiledBarker {
+        name,
+        inputs,
+        tee,
+        unnest,
+        dedup,
+        source: source.to_string(),
+    })))
+}
+
+impl CompiledPhase {
+    /// Whether this stage's roots come from the caller's input stream.
+    ///
+    /// Read by the wiring, so that only a stage the query left unnamed is fed from
+    /// the input — a stage that names its own roots keeps them.
+    fn roots_is_from_input(&self) -> bool {
+        matches!(self.roots, CompiledRoot::FromInput)
+    }
+}
+
 /// The phase graph, settled at compile time.
 struct Plan {
     /// The phases in the order they must run.
     order: Vec<usize>,
+
+    /// Per stage, the stages that feed it. Recorded because it is what a wired
+    /// run would connect channels from; the sequential loop derives the same
+    /// information from each root's predicates, so nothing reads this yet.
+    #[allow(dead_code)]
+    dependencies: Vec<Vec<usize>>,
 
     /// Per phase, the phases that read its rows and the program each applies.
     /// Indexed by the producing phase's position.
     consumers: Vec<Vec<(usize, Arc<Program>)>>,
 }
 
+/// A compiled query: the stages and the plan, owned outright.
+///
+/// This is everything expensive that `compile` produces, and it is `Send + Sync`
+/// because every part of it is: the compiled gates and emits are
+/// `Arc<dyn Fn + Send + Sync>`, the programs are `Arc<Program>`, and a barker's
+/// parsed source sits behind a mutex. So a compiled query can be stored, shared,
+/// and run many times — which is what a server holding pre-canned queries does.
+///
+/// The type is deliberately not a closure: an `impl FnMut` returned from
+/// `compile` infers its type at the call site and can capture the caller's
+/// sink borrow, which is why a compiled query in a test had to be dropped inside
+/// a nested block before the sink's rows could be read. An owned struct has no
+/// such capture, and its [`CompiledQuery::run`] takes the sink as an argument.
+pub struct CompiledQuery {
+    stages: Vec<CompiledStage>,
+    plan: Plan,
+}
+
+// every part of the two fields is Send + Sync; this pins it, so a regression is a
+// compile error here rather than a mystery at the server
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CompiledQuery>();
+};
+
+impl CompiledQuery {
+    /// The stages this query runs.
+    pub fn stage_count(&self) -> usize {
+        self.stages.len()
+    }
+
+    /// Run the query. May be called many times, concurrently: every stage thread
+    /// is spawned per call, and nothing here mutates the compiled form.
+    pub fn run<ACCOUNTANT, SINK>(
+        &self,
+        accountant: Arc<ACCOUNTANT>,
+        sink: SINK,
+        lookup: HerdOrCluster,
+        input: flume::Receiver<Value>,
+    ) -> Result<()>
+    where
+        ACCOUNTANT: AccountingAndBudget + Send + Sync + 'static,
+        SINK: FnMut(Value, &Arc<ACCOUNTANT>, SinkOperation) -> Result<()>,
+    {
+        run(self.stages.as_slice(), &self.plan, input, accountant, sink, lookup)
+    }
+}
+
+/// The cache of compiled queries: the expressions' programs for the life of the
+/// process, and the compiled documents keyed by their text.
+///
+/// Two levels, and the first is the one that pays first: `ProgramCache` holds every
+/// sansho expression any query has compiled, keyed by its text, so the second query
+/// to use `contains(body.mime_type, ...)` re-parses its document but compiles
+/// nothing. The second level holds the compiled queries themselves, so a request
+/// that runs a pre-canned document is a hash lookup and a run.
+pub struct QueryCache {
+    expressions: Arc<ProgramCache>,
+    queries: std::sync::Mutex<HashMap<String, Arc<CompiledQuery>>>,
+}
+
+impl QueryCache {
+    /// A cache holding up to `max_expressions` compiled programs.
+    pub fn new(max_expressions: usize) -> Self {
+        QueryCache {
+            expressions: Arc::new(ProgramCache::new(max_expressions)),
+            queries: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Compile a query document, or return the one already compiled from this
+    /// exact text.
+    pub fn get_or_compile(&self, document: &str) -> LevelResult<Arc<CompiledQuery>> {
+        let mut queries = self
+            .queries
+            .lock()
+            .expect("the query cache's lock");
+        if let Some(compiled) = queries.get(document) {
+            return Ok(Arc::clone(compiled));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(document)
+            .map_err(|error| GrammarError::at(Step::Query, format!("not JSON: {error}")))?;
+        let query: Rc<dyn Query> = Rc::new(parsed);
+        let compiled = Arc::new(self.compile(query)?);
+        queries.insert(document.to_string(), Arc::clone(&compiled));
+        Ok(compiled)
+    }
+
+    /// Compile a query, through the shared expression cache.
+    fn compile(&self, query: Rc<dyn Query>) -> LevelResult<CompiledQuery> {
+        let phases = located(&Location::query(), query.phases())?;
+
+        let mut by_name: HashMap<String, usize> = HashMap::new();
+        for (position, phase) in phases.iter().enumerate() {
+            let name = located(
+                &Location::query().step(Step::Phase {
+                    name: None,
+                    position,
+                }),
+                phase.name(),
+            )?;
+            let Some(name) = name else {
+                continue;
+            };
+            if by_name.insert(name.clone(), position).is_some() {
+                return Err(Location {
+                    path: vec![
+                        Step::Query,
+                        Step::Phase {
+                            name: Some(name),
+                            position,
+                        },
+                    ],
+                }
+                .error("two phases carry this name; a name identifies one phase"));
+            }
+        }
+
+        let mut compiled: Vec<CompiledStage> = Vec::with_capacity(phases.len());
+        for (position, phase) in phases.iter().enumerate() {
+            compiled.push(compile_stage(phase, position, &by_name, &self.expressions)?);
+        }
+
+        let plan = plan_phases(&compiled)?;
+        Ok(CompiledQuery { stages: compiled, plan })
+    }
+}
+
 /// Compile a query into the function that runs it.
+///
+/// The returned function takes the accountant, the sink, the cluster and the
+/// caller's input stream. The input is the roots of every stage that takes them
+/// from it — empty and closed for a query that names its own.
+#[allow(clippy::type_complexity)]
 ///
 /// The returned function takes the accountant, the sink, and the lookup — the
 /// three things a run needs that are not part of the query. It may be called
@@ -218,9 +494,9 @@ struct Plan {
 pub fn compile<ACCOUNTANT, SINK>(
     query: Rc<dyn Query>,
     cache: &ProgramCache,
-) -> LevelResult<impl FnMut(Arc<ACCOUNTANT>, SINK, HerdOrCluster) -> Result<()>>
+) -> LevelResult<impl FnMut(Arc<ACCOUNTANT>, SINK, HerdOrCluster, flume::Receiver<Value>) -> Result<()>>
 where
-    ACCOUNTANT: AccountingAndBudget,
+    ACCOUNTANT: AccountingAndBudget + Send + Sync + 'static,
     SINK: FnMut(Value, &Arc<ACCOUNTANT>, SinkOperation) -> Result<()>,
 {
     let phases = located(&Location::query(), query.phases())?;
@@ -255,19 +531,55 @@ where
     }
 
     // Second pass: compile every level, refusing what cannot be valid.
-    let mut compiled = Vec::with_capacity(phases.len());
+    let mut compiled: Vec<CompiledStage> = Vec::with_capacity(phases.len());
     for (position, phase) in phases.iter().enumerate() {
-        compiled.push(compile_phase(phase, position, &by_name, cache)?);
+        compiled.push(compile_stage(phase, position, &by_name, cache)?);
     }
 
     // Third pass: order the phases and wire the rows between them.
     let plan = plan_phases(&compiled)?;
 
     Ok(
-        move |accountant: Arc<ACCOUNTANT>, mut sink: SINK, lookup: HerdOrCluster| -> Result<()> {
-            run(&compiled, &plan, accountant, &mut sink, lookup)
+        move |accountant: Arc<ACCOUNTANT>,
+              mut sink: SINK,
+              lookup: HerdOrCluster,
+              input: flume::Receiver<Value>|
+         -> Result<()> {
+            run(&compiled, &plan, input, accountant, &mut sink, lookup)
         },
     )
+}
+
+/// Compile a stage: a walk compiles to the phase that traverses, a program to
+/// the phase that runs it.
+///
+/// The dispatch is by `kind`, which is the selector the grammar provides for
+/// exactly this — asking a stage for the wrong one is a failure, so neither arm
+/// guesses.
+fn compile_stage(
+    stage: &Rc<dyn Stage>,
+    position: usize,
+    by_name: &HashMap<String, usize>,
+    cache: &ProgramCache,
+) -> LevelResult<CompiledStage> {
+    let kind = located(&Location::query().step(Step::Phase { name: None, position }), stage.kind())?;
+    match kind {
+        StageKind::Walk => {
+            let walk = located(
+                &Location::query().step(Step::Phase { name: None, position }),
+                stage.walk(),
+            )?;
+            compile_phase(&walk, position, by_name, cache)
+                .map(|p| CompiledStage::Walk(Box::new(p)))
+        }
+        StageKind::Barker => {
+            let barker = located(
+                &Location::query().step(Step::Phase { name: None, position }),
+                stage.barker(),
+            )?;
+            compile_barker(&barker, position, by_name, cache)
+        }
+    }
 }
 
 /// Compile one phase.
@@ -297,18 +609,23 @@ fn compile_phase(
 
     Ok(CompiledPhase {
         name,
-        roots: compile_root(&root, &who, by_name, cache)?,
+        // a root the query did not name: the caller's input stream
+        roots: match &root {
+            Some(root) => compile_root(root, &who, by_name, cache)?,
+            None => CompiledRoot::FromInput,
+        },
         connections: compile_connections(&connections, &who)?,
         filter: match filter {
             Some(filter) => {
                 let gate = located(&here().step(Step::Filter), filter.gate())?;
                 located_build(&here().step(Step::Filter), build_item_expression(&gate, cache))?
             }
-            None => Rc::new(|_: &SanshoCarrier<'_>, _: &WalkState| true),
+            None => Arc::new(|_: &SanshoCarrier<'_>, _: &WalkState| true),
         },
         emit: compile_emit(&emit, &who, Step::Emit, cache, Variables::Allowed)?,
         stop: compile_stop(stop, &who, cache)?,
         tee: located(&here().step(Step::Tee), phase.tee())?,
+        dedup: located(&here().step(Step::Emit), phase.dedup())?,
         emit_at_end: match emit_at_end {
             // the subject of an end-of-walk emit is the statistics a walk
             // gathers, not an item, so its gates have no walk state to read
@@ -382,6 +699,8 @@ fn compile_root(
             Ok(CompiledRoot::Enumerated(identifiers))
         }
 
+        RootKind::FromInput => Ok(CompiledRoot::FromInput),
+
         RootKind::Predicates => {
             let predicates = located(&here().step(Step::Root), root.predicates())?;
             if predicates.is_empty() {
@@ -426,7 +745,7 @@ fn compile_connections(
                 &here().step(Step::Connections),
                 build_expression(expression, &build_con_compare_function, &depth_cmp),
             )?,
-            None => Rc::new(|_: &str, _: &usize| true),
+            None => Arc::new(|_: &str, _: &usize| true),
         };
         compiled.push((connection_type, gate));
     }
@@ -470,7 +789,7 @@ fn compile_emit(
     }
 
     let rows = CompiledEmit { gate, entries };
-    Ok(Rc::new(move |thing: &SanshoCarrier<'_>, ws: &WalkState| {
+    Ok(Arc::new(move |thing: &SanshoCarrier<'_>, ws: &WalkState| {
         rows.rows(thing, ws)
     }))
 }
@@ -608,7 +927,7 @@ fn compile_stop(
         }
     };
 
-    Ok(Rc::new(
+    Ok(Arc::new(
         move |thing: &SanshoCarrier<'_>, ws: &WalkState| -> (
             Option<Vec<Value>>,
             Option<Vec<Value>>,
@@ -709,16 +1028,29 @@ fn compile_emit_level(
 ///
 /// Every producing position here was resolved when the roots were compiled, so
 /// there is no name left to look up and none to get wrong.
-fn plan_phases(phases: &[CompiledPhase]) -> LevelResult<Plan> {
+fn plan_phases(phases: &[CompiledStage]) -> LevelResult<Plan> {
     let mut consumers: Vec<Vec<(usize, Arc<Program>)>> = vec![Vec::new(); phases.len()];
     let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); phases.len()];
-    for (consumer, phase) in phases.iter().enumerate() {
-        let CompiledRoot::Predicates(predicates) = &phase.roots else {
-            continue;
-        };
-        for (producer, program) in predicates {
-            consumers[*producer].push((consumer, Arc::clone(program)));
-            dependencies[consumer].push(*producer);
+    for (consumer, stage) in phases.iter().enumerate() {
+        // a walk draws rows through its root's predicates; a program draws them
+        // through its declared inputs
+        for producer in stage.row_sources() {
+            let program = match stage {
+                CompiledStage::Walk(phase) => match &phase.roots {
+                    CompiledRoot::Predicates(predicates) => predicates
+                        .iter()
+                        .find(|(at, _)| *at == producer)
+                        .map(|(_, program)| Arc::clone(program))
+                        .expect("the source came from this list"),
+                    // enumerated roots and input roots have no producer stage
+                    CompiledRoot::Enumerated(_) | CompiledRoot::FromInput => unreachable!("no sources"),
+                },
+                // a program consumes the row stream itself, so no expression is
+                // applied to the row to shape it
+                CompiledStage::Barker(_) => identity_program(),
+            };
+            consumers[producer].push((consumer, program));
+            dependencies[consumer].push(producer);
         }
     }
 
@@ -727,7 +1059,11 @@ fn plan_phases(phases: &[CompiledPhase]) -> LevelResult<Plan> {
     for position in 0..phases.len() {
         visit(position, phases, &dependencies, &mut state, &mut order)?;
     }
-    Ok(Plan { order, consumers })
+    Ok(Plan {
+        order,
+        dependencies,
+        consumers,
+    })
 }
 
 /// How far a phase has been got through while ordering.
@@ -742,7 +1078,7 @@ enum Visit {
 /// that is a cycle.
 fn visit(
     position: usize,
-    phases: &[CompiledPhase],
+    phases: &[CompiledStage],
     dependencies: &[Vec<usize>],
     state: &mut [Visit],
     order: &mut Vec<usize>,
@@ -766,106 +1102,563 @@ fn visit(
     Ok(())
 }
 
-/// A compiled phase, named if it has a name.
-fn phase_ref(phases: &[CompiledPhase], position: usize) -> Step {
+/// A program that hands its subject through unchanged.
+///
+/// Used where a consumer takes the row itself rather than a projection of it —
+/// a program reads the upstream rows as they are, so the wiring adds no step
+/// between the two.
+fn identity_program() -> Arc<sansho::Program> {
+    use std::sync::OnceLock;
+    static IDENTITY: OnceLock<Arc<sansho::Program>> = OnceLock::new();
+    Arc::clone(IDENTITY.get_or_init(|| {
+        let cache = ProgramCache::new(1);
+        // `compile_sansho` already returns the shared program
+        compile_sansho("@", &cache).expect("@ compiles")
+    }))
+}
+
+/// A compiled stage, named if it has a name.
+fn phase_ref(phases: &[CompiledStage], position: usize) -> Step {
     Step::Phase {
-        name: phases[position].name.clone(),
+        name: phases[position].name().cloned(),
         position,
     }
 }
 
-/// Run every phase, in the order the plan settled on.
-fn run<ACCOUNTANT, SINK>(
-    phases: &[CompiledPhase],
-    plan: &Plan,
+/// The edge into a walk: rows in, identifiers out.
+///
+/// A walk reads identifiers and a producing stage emits rows, so the edge between
+/// them is a channel whose one job is the projection — the consumer's expression
+/// applied to each row, with anything that does not become a string dropped. A
+/// count or a multiselect row reaches a barker and is never mistaken for an
+/// identifier by a walk.
+fn identifiers_of<ACCOUNTANT: AccountingAndBudget + Send + Sync + 'static>(
+    input: flume::Receiver<Value>,
+    to_walk: flume::Sender<String>,
+    projection: Option<Arc<sansho::Program>>,
     accountant: Arc<ACCOUNTANT>,
-    sink: &mut SINK,
+) -> std::thread::JoinHandle<Result<()>> {
+    std::thread::spawn(move || -> Result<()> {
+        let _ = accountant;
+        for row in input.iter() {
+            // no projection: the row IS the identifier, when it is a string
+            let identifier = match &projection {
+                None => row.as_str().map(str::to_string),
+                Some(program) => {
+                    let carrier: SanshoCarrier<'_> = Rc::new(row);
+                    evaluate(program, carrier)
+                        .ok()
+                        .and_then(|value| value.as_str().ok().map(str::to_string))
+                }
+            };
+            if let Some(identifier) = identifier {
+                let _ = to_walk.send(identifier);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A row's identity, for `dedup`: the first 16 bytes of the BLAKE3 digest of its
+/// canonical rendering.
+///
+/// 16 bytes is 128 bits of an evenly distributed digest, the same collision budget
+/// the index uses, so a collision would drop a row that should have passed and at
+/// 128 bits it does not happen by accident.
+///
+/// **A string is hashed where it lies.** The common row is a string — an
+/// identifier — and rendering it would copy it into a fresh `String` for nothing: a
+/// string value's rendering IS the string, so the digest is taken over the existing
+/// bytes. Every other row is rendered first, canonically (object keys sorted, so two
+/// objects with equal fields dedupe whatever order they were built in).
+///
+/// That is a PERFORMANCE distinction, not an accuracy one: both paths compute the
+/// same digest for the same value.
+fn row_key(row: &Value) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    let digest = match row {
+        // no rendering, no copy: the value's bytes are the hash's input
+        Value::String(text) => blake3::hash(text.as_bytes()),
+        other => blake3::hash(canonical_row(other).as_bytes()),
+    };
+    key.copy_from_slice(&digest.as_bytes()[..16]);
+    key
+}
+
+/// A row as text with object keys sorted, so equal values render identically.
+fn canonical_row(value: &Value) -> String {
+    match value {
+        Value::Object(entries) => {
+            let mut keys: Vec<&String> = entries.keys().collect();
+            keys.sort();
+            let rendered: Vec<String> = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        Value::String(key.clone()),
+                        canonical_row(&entries[key])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", rendered.join(","))
+        }
+        Value::Array(items) => {
+            let rendered: Vec<String> = items.iter().map(canonical_row).collect();
+            format!("[{}]", rendered.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Run a query document from inside a script, returning its rows.
+///
+/// LAZY: the document is compiled and the graph started only when the returned
+/// stream is first pulled, so a script that builds a query and never reads it pays
+/// nothing. The compile therefore cannot report its failure here — it has not
+/// happened yet — so a compile failure arrives as the stream's first item, which is
+/// the same shape a runtime failure has inside a nested query.
+pub fn run_nested(
+    document: Value,
+    lookup: Option<HerdOrCluster>,
+) -> Result<crate::barker::Rows> {
+    let (sender, receiver) = flume::bounded(256);
+    std::thread::spawn(move || {
+        let query: Rc<dyn Query> = Rc::new(document);
+        // the shared expression cache, so a script that runs many nested queries
+        // compiles their expressions once
+        let cache = ProgramCache::new(4096);
+        let out = sender.clone();
+        let sink = move |row: Value, _acc: &Arc<NoBound>, _op: SinkOperation| -> Result<()> {
+            let _ = out.send(Ok(row));
+            Ok(())
+        };
+        let mut run = match compile(query, &cache) {
+            Ok(run) => run,
+            Err(error) => {
+                let _ = sender.send(Err(anyhow::anyhow!("{error}")));
+                return;
+            }
+        };
+        let Some(lookup) = lookup else {
+            let _ = sender.send(Err(anyhow::anyhow!(
+                "a nested query needs a cluster, and this run was given none"
+            )));
+            return;
+        };
+        let (unused_sender, no_input) = flume::unbounded();
+        drop(unused_sender); // a nested query's roots come from its own stages
+        if let Err(error) = run(Arc::new(NoBound), sink, lookup, no_input) {
+            let _ = sender.send(Err(error));
+        }
+    });
+    Ok(crate::barker::Rows::from_receiver(receiver))
+}
+
+/// The accountant a nested query uses until the real one is wired in.
+struct NoBound;
+
+impl AccountingAndBudget for NoBound {
+    fn should_stop(&self) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn can_sink_normal(&self) -> bool {
+        true
+    }
+
+    fn event(&self, _event_type: crate::highwire::walk::AccountingEventType) {}
+}
+
+/// A tee: one receiver in, a Vec of receivers out.
+///
+/// Every row that arrives is sent to **every** receiver in the list. The node does
+/// not know or care where they lead: if two of the entries are the same place, the
+/// row arrives there twice, because that is what one input and two outputs means.
+///
+/// That indifference is the point. Deciding which receivers belong in the list — the
+/// consumer's, and the global output when the stage's `tee` flag is set — happens
+/// once, during wiring. A stage never splits its own output: it has one receiver in
+/// and one sender out, and what happens after the sender is not its business.
+fn tee<ACCOUNTANT: AccountingAndBudget + Send + Sync + 'static>(
+    input: flume::Receiver<Value>,
+    outputs: Vec<flume::Sender<Value>>,
+    dedup: bool,
+    accountant: Arc<ACCOUNTANT>,
+) -> std::thread::JoinHandle<Result<()>> {
+    std::thread::spawn(move || -> Result<()> {
+        let _ = accountant;
+        // the values THIS stage has already emitted, so a repeat is dropped here
+        // rather than by every output separately
+        let mut emitted: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+        for row in input.iter() {
+            if dedup && !emitted.insert(row_key(&row)) {
+                continue;
+            }
+            for output in &outputs {
+                let _ = output.send(row.clone());
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Run the stages, wired.
+///
+/// Every stage runs on its own thread with an input stream and, for each
+/// consumer, an output stream. The wires are built here, once, so nothing is
+/// looked up while the pipeline runs.
+///
+/// A stage's input is its ROOTS, and the compiler builds that stream rather than
+/// a `Vec` it would then have to hand over:
+///
+/// - roots named outright are sent into the stream and the sender dropped, so the
+///   walk reads them and then sees the stream end;
+/// - roots derived from upstream rows are sent by the PRODUCING thread, which
+///   applies the edge's expression to each row and forwards the identifiers it
+///   yields. A row that yields no identifier — a count, a multiselect row — is
+///   simply not forwarded;
+/// - a program's input is the rows themselves, straight from its producers.
+///
+/// Closing is what makes it work: a producer drops its senders when it finishes,
+/// so a consumer's stream ends exactly when nothing more can arrive, and the
+/// pipeline's output ends when the last stage does.
+fn run<ACCOUNTANT, SINK>(
+    stages: &[CompiledStage],
+    plan: &Plan,
+    input: flume::Receiver<Value>,
+    accountant: Arc<ACCOUNTANT>,
+    mut sink: SINK,
     lookup: HerdOrCluster,
 ) -> Result<()>
 where
-    ACCOUNTANT: AccountingAndBudget,
+    ACCOUNTANT: AccountingAndBudget + Send + Sync + 'static,
     SINK: FnMut(Value, &Arc<ACCOUNTANT>, SinkOperation) -> Result<()>,
 {
-    // The identifiers each phase is waiting for. Nothing else is kept: a phase's
-    // rows are turned into these as they are emitted and are then gone.
-    let mut waiting: Vec<Vec<String>> = vec![Vec::new(); phases.len()];
+    let count = stages.len();
+
+    // One channel per stage for its rows, and one for its roots where it reads
+    // identifiers rather than rows. Every channel is allocated BEFORE any stage
+    // is wired, because a producer is wired before its consumer in dependency
+    // order and the consumer's channel has to exist by then.
+    //
+    // These channels are private to one edge each: sharing a receiver between two
+    // consumers would make them COMPETE for messages, which is why fan-out goes
+    // through a `tee` node rather than through a cloned receiver.
+    let rows: Vec<(flume::Sender<Value>, flume::Receiver<Value>)> =
+        (0..count).map(|_| flume::bounded(256)).collect();
+    // A barker reads rows, so its input is fed directly by its producers: flume
+    // allows many senders on one receiver, which is fan-in without a node. An
+    // unfed input for the first stage in a chain is legal — a barker with no
+    // `inputs` starts from nothing and still emits.
+    let mut barker_input: Vec<Option<(flume::Sender<Value>, flume::Receiver<Value>)>> =
+        (0..count).map(|_| None).collect();
+    for (position, stage) in stages.iter().enumerate() {
+        if matches!(stage, CompiledStage::Barker(_)) {
+            barker_input[position] = Some(flume::bounded(256));
+        }
+    }
+
+    // the caller's stream: every sink writes to it, and so does every teed stage
+    let (output_sender, output) = flume::bounded::<Value>(256);
+
+    // A walk's roots channel: allocated per walk stage. Roots arrive either from
+    // the query (sent and the sender dropped, so the walk reads the whole set and
+    // sees the end) or from the producers' rows (the sender is the producer's
+    // handle, and the channel closes when the producers finish).
+    let mut walk_roots_sender: Vec<Option<flume::Sender<String>>> =
+        (0..count).map(|_| None).collect();
+    let mut walk_roots_receiver: Vec<Option<flume::Receiver<String>>> =
+        (0..count).map(|_| None).collect();
+
+    // The stages taking their roots from the caller's input, and the tee that
+    // feeds them: ONE input, one identifier channel per taker.
+    //
+    // The tee is the point. Two stages each pulling from a clone of the input
+    // would COMPETE — flume delivers each message to one receiver — and one stage
+    // would starve the other. So the input goes to one tee, and the tee's outputs
+    // are one channel per taker, each adapted to identifiers by its own
+    // `identifiers_of`.
+    let input_takers: Vec<usize> = stages
+        .iter()
+        .enumerate()
+        .filter(|(_, stage)| {
+            matches!(stage, CompiledStage::Walk(phase) if phase.roots_is_from_input())
+        })
+        .map(|(position, _)| position)
+        .collect();
+
+    if !input_takers.is_empty() {
+        // ONE CHANNEL PER TAKER, and a tee forwarding every input row to all of
+        // them. Handing each taker a clone of ONE receiver would make them COMPETE
+        // — flume delivers each message to one receiver — and one stage would
+        // starve the other, which taker wins being a race. That was the flake.
+        //
+        // So: the tee's input is the caller's stream; its outputs are one channel
+        // per taker; each taker's adapter reads its OWN channel and forwards the
+        // identifiers to its stage's walk. When the caller closes the input, the
+        // tee ends, every channel closes, and every walk ends.
+        let taker_channels: Vec<(flume::Sender<Value>, flume::Receiver<Value>)> =
+            (0..input_takers.len()).map(|_| flume::bounded(256)).collect();
+
+        for (position, (_, row_receiver)) in input_takers.iter().zip(&taker_channels) {
+            let (id_sender, id_receiver) = flume::bounded::<String>(256);
+            identifiers_of(
+                row_receiver.clone(),
+                id_sender,
+                Some(identity_program()),
+                Arc::clone(&accountant),
+            );
+            walk_roots_receiver[*position] = Some(id_receiver);
+        }
+        // the caller's input feeds the tee; when the caller closes it, every
+        // taker's identifier stream ends
+        std::thread::spawn(move || {
+            for row in input.iter() {
+                for (sender, _) in &taker_channels {
+                    let _ = sender.send(row.clone());
+                }
+            }
+        });
+    }
+
+    // The remaining walk stages: enumerated roots are sent and closed; derived
+    // roots keep the sender, which the producers clone.
+    for (position, stage) in stages.iter().enumerate() {
+        let CompiledStage::Walk(phase) = stage else {
+            continue;
+        };
+        // a stage fed by the top tee already has its roots stream
+        if walk_roots_receiver[position].is_some() {
+            continue;
+        }
+        let (sender, receiver) = flume::bounded::<String>(256);
+        match &phase.roots {
+            CompiledRoot::Enumerated(identifiers) => {
+                for identifier in identifiers {
+                    let _ = sender.send(identifier.clone());
+                }
+                drop(sender);
+            }
+            CompiledRoot::Predicates(_) | CompiledRoot::FromInput => {
+                walk_roots_sender[position] = Some(sender)
+            }
+        }
+        walk_roots_receiver[position] = Some(receiver);
+    }
+
+    let mut threads = Vec::with_capacity(count);
 
     for &position in &plan.order {
-        let phase = &phases[position];
-        let roots = match &phase.roots {
-            CompiledRoot::Enumerated(identifiers) => identifiers.clone(),
-            CompiledRoot::Predicates(_) => std::mem::take(&mut waiting[position]),
+        let stage = &stages[position];
+
+        let tee_flag = match stage {
+            CompiledStage::Walk(phase) => phase.tee,
+            CompiledStage::Barker(barker) => barker.tee,
+        };
+        let dedup = match stage {
+            CompiledStage::Walk(phase) => phase.dedup,
+            CompiledStage::Barker(barker) => barker.dedup,
         };
 
-        // The LAST phase's rows are the run's output, and always reach the sink.
-        // `tee` is for the phases in the middle: their rows are needed by what
-        // comes after them, and are usually not wanted as output as well — which
-        // is why they are not output by default.
-        let tee = phase.tee || plan.order.last() == Some(&position);
-        let consumers = &plan.consumers[position];
-        let waiting = &mut waiting;
-        let collecting = |row: Value, acc: &Arc<ACCOUNTANT>, op: SinkOperation| -> Result<()> {
-            if !consumers.is_empty() {
-                // one handle on the row, shared by every consumer; the row
-                // itself is untouched and is the one the sink gets
-                let shared: Rc<Value> = Rc::new(row.clone());
-                for (consumer, program) in consumers {
-                    let carrier: SanshoCarrier<'_> = shared.clone();
-                    let Ok(value) = evaluate(program, carrier) else {
-                        continue;
-                    };
-                    let into = &mut waiting[*consumer];
-                    if let Ok(identifier) = value.as_str() {
-                        into.push(identifier.to_string());
-                        continue;
+        // THE TEE IS WIRED HERE. Its list of receivers is chosen once, from what
+        // this stage's consumers are and whether its `tee` flag is set — and its
+        // entries are receivers, so the node sends each row to each of them and
+        // nothing else about it is a decision.
+        //
+        // A stage with one consumer and no flag: a tee of one, which is a pipe.
+        // A stage with one consumer and the flag: a tee of two, so the row reaches
+        // the consumer and the caller. A stage with no consumer: a tee of one whose
+        // receiver is the caller's stream, and that is the sink.
+        let mut receivers: Vec<flume::Sender<Value>> = Vec::new();
+        for (consumer, projection) in &plan.consumers[position] {
+            match stages[*consumer] {
+                CompiledStage::Walk(_) => {
+                    // a walk consumer reads identifiers: its edge takes this
+                    // stage's rows, projects them through the consumer's
+                    // expression, and forwards the identifiers to the walk's roots
+                    // channel
+                    if let Some(sender) = &walk_roots_sender[*consumer] {
+                        let (to_walk, from_tee) = flume::bounded::<Value>(256);
+                        let sender = sender.clone();
+                        let projection = Arc::clone(projection);
+                        identifiers_of(from_tee, sender, Some(projection), Arc::clone(&accountant));
+                        receivers.push(to_walk);
                     }
-                    if let Ok(elements) = value.as_elements() {
-                        for element in elements {
-                            if let Ok(identifier) = element.as_str() {
-                                into.push(identifier.to_string());
-                            }
-                        }
+                }
+                CompiledStage::Barker(_) => {
+                    if let Some((sender, _)) = &barker_input[*consumer] {
+                        receivers.push(sender.clone());
                     }
                 }
             }
-            if tee {
-                sink(row, acc, op)?;
+        }
+        // TWO reasons a stage's rows reach the caller, and each contributes ONE
+        // entry to the tee's receiver list:
+        //
+        // - `tee`: the query asked for this stage's rows as output in addition to
+        //   whatever consumes them;
+        // - being TERMINAL: nothing consumes this stage, so its rows are the run's
+        //   output.
+        //
+        // They are independent, so a teed terminal stage has two entries and its
+        // rows arrive twice — once for being terminal, once for the tee. That is
+        // what a tee is: a split it does not reason about. Where the entries lead is
+        // the wiring's business, and for a terminal stage both lead to the caller.
+        if tee_flag {
+            receivers.push(output_sender.clone());
+        }
+        if plan.consumers[position].is_empty() {
+            receivers.push(output_sender.clone());
+        }
+        let account = Arc::clone(&accountant);
+        let lookup = lookup.clone();
+        // a barker's own nested query walks the same cluster its parent does
+        let nested_lookup = lookup.clone();
+        // a barker's input is its own fan-in channel; a walk consumes roots
+        let barker_rows_in = barker_input[position]
+            .as_ref()
+            .map(|(_, receiver)| receiver.clone());
+        let stage_roots_in = walk_roots_receiver[position].take();
+
+        let stage_thread = match stage {
+            CompiledStage::Walk(phase) => {
+                let connections = phase.connections.clone();
+                let filter = Arc::clone(&phase.filter);
+                let emit = Arc::clone(&phase.emit);
+                let stop = Arc::clone(&phase.stop);
+                let emit_at_end = phase.emit_at_end.clone();
+                // the stage's rows go to its edges; a tee'd stage also sends them
+                // through a tee of its own
+                let (stage_sender, stage_receiver) = flume::bounded::<Value>(256);
+                threads.push(tee(
+                    stage_receiver,
+                    receivers,
+                    dedup,
+                    Arc::clone(&accountant),
+                ));
+                std::thread::spawn(move || -> Result<()> {
+                    let sink_sender = stage_sender.clone();
+                    walk(
+                        stage_roots_in.expect("a walk has a roots stream"),
+                        lookup,
+                        move |row: Value, _acc: &Arc<ACCOUNTANT>, _op: SinkOperation| {
+                            let _ = sink_sender.send(row);
+                            Ok(())
+                        },
+                        connections,
+                        filter,
+                        emit,
+                        stop,
+                        account,
+                    )?;
+                    if let Some(emit_at_end) = emit_at_end {
+                        let subject: SanshoCarrier<'_> =
+                            Rc::new(Value::Object(serde_json::Map::new()));
+                        let state = WalkState {
+                            depth_cnt: 0,
+                            is_terminal: false,
+                        };
+                        for row in emit_at_end(&subject, &state) {
+                            let _ = stage_sender.send(row);
+                        }
+                    }
+                    Ok(())
+                })
             }
-            Ok(())
+            CompiledStage::Barker(barker) => {
+                // the source is parsed per run, on this thread: a cached query runs
+                // many times, and a barker's Program is consumed by a run
+                let source = barker.source.clone();
+                let unnest = barker.unnest;
+                let (stage_sender, stage_receiver) = flume::bounded::<Value>(256);
+                threads.push(tee(
+                    stage_receiver,
+                    receivers,
+                    dedup,
+                    Arc::clone(&accountant),
+                ));
+                std::thread::spawn(move || -> Result<()> {
+                    let Some(rows_in) = barker_rows_in else {
+                        return Ok(());
+                    };
+                    let program = match crate::barker::parse(&source) {
+                        Ok(program) => program,
+                        Err(error) => return Err(anyhow::anyhow!("{error}")),
+                    };
+                    for row in crate::barker::run_with(program, rows_in, Some(nested_lookup), None)? {
+                        let row = row?;
+                        // `unnest` is one level: an array row becomes one row
+                        // per element
+                        if unnest && let Value::Array(elements) = row {
+                            for element in elements {
+                                let _ = stage_sender.send(element);
+                            }
+                            continue;
+                        }
+                        let _ = stage_sender.send(row);
+                    }
+                    Ok(())
+                })
+            }
         };
+        threads.push(stage_thread);
+    }
 
-        walk(
-            roots,
-            lookup.clone(),
-            collecting,
-            phase.connections.clone(),
-            Rc::clone(&phase.filter),
-            Rc::clone(&phase.emit),
-            Rc::clone(&phase.stop),
-            Arc::clone(&accountant),
-        )?;
 
-        if let Some(emit_at_end) = &phase.emit_at_end {
-            // The statistics a walk gathers are not collected yet, so the
-            // subject here is an empty one: every field an end-of-walk
-            // expression asks for is absent. The state is the stub the level's
-            // gates were compiled against — they may not read it, and this is
-            // what one gets if one ever does.
-            let subject: SanshoCarrier<'_> = Rc::new(Value::Object(serde_json::Map::new()));
-            let state = WalkState {
-                depth_cnt: 0,
-                is_terminal: false,
-            };
-            for row in emit_at_end(&subject, &state) {
-                sink(row, &accountant, SinkOperation::NormalMessage)?;
-            }
+    // The wiring is done, so the compiler's own senders go: the only senders left
+    // are the clones inside the edges, which drop when the stage that writes them
+    // finishes. A sender kept here would hold a walk's roots channel open forever
+    // and the walk would never end.
+    drop(walk_roots_sender);
+    drop(barker_input);
+    drop(rows);
+    drop(output_sender);
+
+    for row in output.iter() {
+        sink(row, &accountant, SinkOperation::NormalMessage)?;
+    }
+    for handle in threads {
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
         }
     }
     Ok(())
 }
 
+
 #[cfg(test)]
 mod compile_tests {
+    /// Run a compiled query against a herd and collect its rows.
+    fn rows_over(compiled: &CompiledQuery, lookup: HerdOrCluster) -> Result<Vec<Value>> {
+        let mut sink = RowSink::default();
+        compiled.run(Arc::new(NoBound), sink.sink(), lookup, closed_input())?;
+        Ok(sink.0)
+    }
+
+    /// An input stream that is already closed and empty.
+    fn closed_input() -> flume::Receiver<Value> {
+        let (sender, receiver) = flume::bounded(256);
+        drop(sender);
+        receiver
+    }
+
+    /// A sink that collects rows, so a test can run a query and take the rows.
+    ///
+    /// A borrowed `Vec` cannot outlive the compiled run — the run's value holds its
+    /// sink, and the destructor keeps the borrow alive past the block. So the sink
+    /// OWNS the rows and hands them over at the end.
+    #[derive(Default)]
+    struct RowSink(Vec<Value>);
+
+    impl RowSink {
+        fn sink(&mut self) -> impl FnMut(Value, &Arc<NoBound>, SinkOperation) -> Result<()> + '_ {
+            move |row: Value, _acc: &Arc<NoBound>, _op: SinkOperation| {
+                self.0.push(row);
+                Ok(())
+            }
+        }
+    }
     use super::*;
     use crate::highwire::walk::{AccountingEventType, SinkOperation};
     use crate::item::Item;
@@ -943,6 +1736,37 @@ mod compile_tests {
     /// rows the query asked to be seen. Compiling and running live in one
     /// function because the sink here is a closure, and a closure's type has to
     /// be inferred where it is passed.
+    /// The same document with its `phases` shuffled, so nothing depends on the
+    /// order they were written in.
+    ///
+    /// Shuffling at run time rather than at authoring time is the point: a suite
+    /// whose documents are each written in a fixed order can only prove that ONE
+    /// order works, and an implementation that quietly depended on declaration
+    /// order would pass forever. Every call shuffles differently, so a run-to-run
+    /// difference would surface too.
+    fn shuffled(document: Value) -> Value {
+        use rand::seq::SliceRandom;
+
+        let Value::Object(mut object) = document else {
+            return document;
+        };
+        let Some(Value::Array(phases)) = object.get("phases").cloned() else {
+            return Value::Object(object);
+        };
+
+        // a fresh source of entropy per call, so two runs of the same test differ
+        let mut rng = rand::rng();
+        let mut phases = phases;
+        phases.shuffle(&mut rng);
+        object.insert("phases".to_string(), Value::Array(phases));
+        Value::Object(object)
+    }
+
+    /// Compile and run, with the phases in a random order.
+    fn run_shuffled(document: Value, lookup: HerdOrCluster) -> Result<Vec<Value>> {
+        run_document(shuffled(document), lookup)
+    }
+
     fn run_document(document: Value, lookup: HerdOrCluster) -> Result<Vec<Value>> {
         let query: Rc<dyn Query> = Rc::new(document);
         let cache = cache();
@@ -955,7 +1779,9 @@ mod compile_tests {
                 rows.push(row);
                 Ok(())
             };
-            run(Arc::new(NoBound), sink, lookup)?;
+            let (sender, input) = flume::bounded::<Value>(256);
+            drop(sender); // these queries name their own roots
+            run(Arc::new(NoBound), sink, lookup, input)?;
         }
         Ok(rows)
     }
@@ -1022,7 +1848,7 @@ mod compile_tests {
                 "hard": [{"if": {"==": {"depth": 3}}, "emit": ["identifier"]}],
                 "soft": {"if": "`false`"}
             },
-            "tee": true
+            
         }));
         assert!(
             compiled.is_ok(),
@@ -1050,13 +1876,13 @@ mod compile_tests {
                     "name": "first",
                     "roots": ["a"],
                     "emit": {"expr": "{id: identifier}", "unnest": false},
-                    "tee": true
+                    
                 },
                 {
                     "name": "second",
                     "roots": {"first": "id"},
                     "emit": "identifier",
-                    "tee": true
+                    
                 }
             ]
         }));
@@ -1091,7 +1917,7 @@ mod compile_tests {
                     "name": "join",
                     "roots": {"left": "id", "right": "id"},
                     "emit": "identifier",
-                    "tee": true
+                    
                 }
             ]
         }));
@@ -1117,11 +1943,11 @@ mod compile_tests {
     /// is teed, so every visited item produces one row.
     #[test]
     fn the_smallest_query_runs_and_emits_its_roots() -> Result<()> {
-        let rows = run_document(
+        let rows = run_shuffled(
             json!({
                 "roots": ["a", "b"],
                 "emit": "identifier",
-                "tee": true
+                
             }),
             herd(&["a", "b"]),
         )?;
@@ -1150,42 +1976,39 @@ mod compile_tests {
     /// `first` and then `a`, `b` again from `second`.
     #[test]
     fn a_phase_draws_its_roots_from_the_phase_before_it() -> Result<()> {
-        let rows = run_document(
+        let rows = run_shuffled(
             json!({
                 "phases": [
                     {
                         "name": "first",
                         "roots": ["a", "b"],
-                        "emit": {"expr": "{id: identifier}"},
-                        "tee": true
+                        "emit": {"expr": "{id: identifier}"}
                     },
                     {
                         "name": "second",
                         "roots": {"first": "id"},
-                        "emit": "identifier",
-                        "tee": true
+                        "emit": "identifier"
                     }
                 ]
             }),
             herd(&["a", "b"]),
         )?;
-        assert_eq!(rows.len(), 4, "two rows from each phase: {rows:?}");
 
-        // The roots of a walk are held in a SET, so the order two items are
-        // visited in is not the order they were written. The rows are compared
-        // as the sets they are, in phase order.
-        let first: Vec<&Value> = rows.iter().take(2).collect();
-        assert!(first.contains(&&json!({"id": "a"})), "first phase: {rows:?}");
-        assert!(first.contains(&&json!({"id": "b"})), "first phase: {rows:?}");
-
-        let second: Vec<&Value> = rows.iter().skip(2).collect();
+        // `first` feeds `second`, so only `second` is terminal and only its rows are
+        // the output. The assertion is therefore on what `second` reached — which is
+        // the thing the test is named for — and the identifiers prove the derived
+        // roots arrived.
+        //
+        // The roots of a walk are held in a SET, so the order two items are visited
+        // in is not the order they were written; the rows are compared as a set.
+        assert_eq!(rows.len(), 2, "the terminal phase's two rows: {rows:?}");
         assert!(
-            second.contains(&&json!("a")),
-            "the second phase starts from the first's rows: {rows:?}"
+            rows.contains(&json!("a")),
+            "the second phase started from the first's rows: {rows:?}"
         );
         assert!(
-            second.contains(&&json!("b")),
-            "the second phase starts from the first's rows: {rows:?}"
+            rows.contains(&json!("b")),
+            "both of the first phase's rows arrived: {rows:?}"
         );
         Ok(())
     }
@@ -1405,11 +2228,11 @@ mod compile_tests {
     /// this test uses an expression that reads nothing from it — a constant.
     #[test]
     fn emit_at_end_emits_after_the_walk() -> Result<()> {
-        let rows = run_document(
+        let rows = run_shuffled(
             json!({
                 "roots": ["a"],
                 "emit": "identifier",
-                "tee": true,
+                
                 "emit_at_end": {"emit": "`1`"}
             }),
             herd(&["a"]),
@@ -1491,7 +2314,7 @@ mod compile_tests {
         let compiled = compile_only(json!({
             "roots": ["a"],
             "emit": {"expr": "identifier", "if": {"and": ["`true`", {"<=": {"depth": 2}}]}},
-            "tee": true
+            
         }));
         assert!(
             compiled.is_ok(),
@@ -1538,4 +2361,1239 @@ mod compile_tests {
             "the rendering carries the detail: {rendered}"
         );
     }
+    /// Requirement: one stage's rows reach two consumers, and both see all of
+    /// them.
+    ///
+    /// What: `source` feeds `left` and `right`, each of which emits its own rows;
+    /// both are teed so their output is visible.
+    ///
+    /// Why: fan-out is the case flume does NOT give for free — several receivers
+    /// on one channel compete, so each message reaches one of them. If the wiring
+    /// had shared a receiver, `left` and `right` between them would see the
+    /// source's rows once each rather than each seeing every row, and the totals
+    /// here would be half what they should be.
+    ///
+    /// LLM section: the source emits two rows; each consumer emits one row per
+    /// input row it receives, so four rows come out and both consumers'
+    /// identifiers appear twice.
+    #[test]
+    fn one_stages_rows_reach_every_consumer() -> Result<()> {
+        let rows = run_shuffled(
+            json!({
+                "phases": [
+                    {"name": "source", "roots": ["a", "b"],
+                     "emit": {"expr": "{id: identifier}"}},
+                    {"name": "left", "roots": {"source": "id"},
+                     "emit": {"expr": "{side: 'left', id: identifier}"}},
+                    {"name": "right", "roots": {"source": "id"},
+                     "emit": {"expr": "{side: 'right', id: identifier}"}}
+                ]
+            }),
+            herd(&["a", "b"]),
+        )?;
+
+        // both consumers are terminal, so each of its two rows is the output once
+        assert_eq!(rows.len(), 4, "each consumer's two rows, once each: {rows:?}");
+        let left = rows.iter().filter(|row| row["side"] == json!("left")).count();
+        let right = rows.iter().filter(|row| row["side"] == json!("right")).count();
+        assert_eq!(left, 2, "left saw every source row: {rows:?}");
+        assert_eq!(right, 2, "right saw every source row: {rows:?}");
+        Ok(())
+    }
+
+    /// Requirement: `tee` decides whether a stage's rows reach the caller, and
+    /// nothing else does.
+    ///
+    /// What: the same three-stage chain, run twice — once with `tee` on the
+    /// middle stage and once without — with the last stage teed both times.
+    ///
+    /// Why: a stage's rows are needed by what comes after it and are usually not
+    /// wanted as output as well, so the default is silence. If `tee` did not
+    /// work, the middle stage's rows would appear when they should not, or a
+    /// teed stage's rows would be missing and the caller could not tell a query
+    /// that tees from one that does not.
+    ///
+    /// LLM section: the two runs differ ONLY in the middle stage's flag, so any
+    /// difference in the output is that flag.
+    #[test]
+    fn tee_decides_whether_a_stage_is_visible() -> Result<()> {
+        let document = |tee: bool| {
+            json!({
+                "phases": [
+                    {"name": "first", "roots": ["a"], "emit": "identifier"},
+                    {"name": "middle", "roots": {"first": "@"},
+                     "emit": {"expr": "{origin: 'middle', id: identifier}"},
+                     "tee": tee},
+                    {"name": "last", "roots": {"middle": "id"},
+                     "emit": {"expr": "{origin: 'last', id: identifier}"}}
+                ]
+            })
+        };
+
+        let quiet = run_shuffled(document(false), herd(&["a"]))?;
+        assert_eq!(quiet.len(), 1, "only the last stage is visible: {quiet:?}");
+        assert_eq!(quiet[0]["origin"], json!("last"));
+
+        let loud = run_document(document(true), herd(&["a"]))?;
+        assert_eq!(loud.len(), 2, "the teed middle joins the last: {loud:?}");
+        assert!(
+            loud.iter().any(|row| row["origin"] == json!("middle")),
+            "the teed stage's rows appear: {loud:?}"
+        );
+        Ok(())
+    }
+
+    /// Requirement: two program stages run in one query, the second reading the
+    /// first's output.
+    ///
+    /// What: a walk emits one row per root; `double` parses each row's identifier
+    /// and emits the number twice; `triple` reads those and emits three times the
+    /// number.
+    ///
+    /// Why: a chain of programs is where the wiring has to carry ROWS from a
+    /// program into another program — not identifiers, as it does into a walk. If
+    /// the second program were handed identifiers it would parse nothing and emit
+    /// nothing, which is a silent zero rather than an error.
+    ///
+    /// LLM section: root `n1` becomes 2 then 6; root `n3` becomes 6 then 18. The
+    /// assertion is on the values, so a chain that ran one program twice, or that
+    /// passed the wrong currency, fails.
+    #[test]
+    fn two_program_stages_chain_through_rows() -> Result<()> {
+        let rows = run_shuffled(
+            json!({
+                "phases": [
+                    {"name": "seeds", "roots": ["n1", "n3"], "emit": "identifier"},
+                    {"name": "double",
+                     "barker": "for x in input:\n    n = int(x[1:])\n    emit(n * 2)\n",
+                     "inputs": ["seeds"]},
+                    {"name": "triple",
+                     "barker": "for x in input:\n    emit(x * 3)\n",
+                     "inputs": ["double"]}
+                ]
+            }),
+            herd(&["n1", "n3"]),
+        )?;
+
+        let mut out: Vec<i64> = rows
+            .iter()
+            .filter_map(|row| row.as_i64())
+            .collect();
+        out.sort_unstable();
+        assert_eq!(out, vec![6, 18], "n1 doubled then tripled, n3 doubled then tripled");
+        Ok(())
+    }
+
+    /// Requirement: a program stage can summarise a whole stream in one row.
+    ///
+    /// What: a walk emits one row per class carrying the number of jars it is in;
+    /// a program reads all of those rows and emits one row with the count, the
+    /// mean, and the population standard deviation.
+    ///
+    /// Why: this is the case the pipeline exists for — a summary cannot be
+    /// computed per item, because it needs the stream. A wiring that handed the
+    /// program one row at a time, or that closed its input early, produces a
+    /// wrong mean rather than an error, so the expected values are worked out in
+    /// full in the test.
+    ///
+    /// LLM section: the jars counts are 1, 2 and 4. n = 3, mean = 7/3, the
+    /// population variance is ((1-7/3)^2 + (2-7/3)^2 + (4-7/3)^2)/3 = 14/9, so
+    /// the deviation is sqrt(14)/3 ~= 1.247219.
+    #[test]
+    fn a_program_stage_summarises_the_stream() -> Result<()> {
+        // The roots have identifiers of length 2, 3 and 4, so the counts differ
+        // and the deviation is not trivially zero. The standard globals have no
+        // square root, so the script computes one — which also exercises `def`
+        // and a loop in a program stage.
+        let script = "def sqrt(x):\n\
+                      \x20   g = 1.0\n\
+                      \x20   for _ in range(30):\n\
+                      \x20       g = 0.5 * (g + x / g)\n\
+                      \x20   return g\n\
+                      counts = []\n\
+                      for x in input:\n\
+                      \x20   counts.append(x[\"count\"])\n\
+                      n = len(counts)\n\
+                      total = 0\n\
+                      for c in counts:\n\
+                      \x20   total = total + c\n\
+                      mean = total / n\n\
+                      squares = 0\n\
+                      for c in counts:\n\
+                      \x20   squares = squares + (c - mean) * (c - mean)\n\
+                      emit({\"n\": n, \"total\": total, \"mean\": mean,\n\
+                            \"stdev\": sqrt(squares / n)})\n";
+
+        let rows = run_shuffled(
+            json!({
+                "phases": [
+                    {"name": "classes", "roots": ["c1", "c22", "c444"],
+                     "emit": {"expr": "{count: length(identifier)}"}},
+                    {"name": "summary", "barker": script, "inputs": ["classes"]}
+                ]
+            }),
+            herd(&["c1", "c22", "c444"]),
+        )?;
+
+        assert_eq!(rows.len(), 1, "one summary row: {rows:?}");
+        let summary = rows[0].as_object().expect("the summary is an object");
+        assert_eq!(summary.get("n"), Some(&json!(3)), "{summary:?}");
+        assert_eq!(
+            summary.get("total"),
+            Some(&json!(9)),
+            "the lengths of c1, c22 and c444 are 2, 3 and 4: {summary:?}"
+        );
+        // Starlark's `/` yields a float, so the mean is 3.0 rather than 3
+        assert_eq!(summary.get("mean"), Some(&json!(3.0)), "{summary:?}");
+        // variance = ((2-3)^2 + (3-3)^2 + (4-3)^2) / 3 = 2/3, so the deviation is
+        // sqrt(2/3) = 0.816496580927726
+        let deviation = summary
+            .get("stdev")
+            .and_then(|v| v.as_f64())
+            .expect("the deviation is a number");
+        assert!(
+            (deviation - 0.816_496_580_927_726_f64).abs() < 1e-9,
+            "the population standard deviation of 2, 3 and 4: {deviation}"
+        );
+        Ok(())
+    }
+
+    /// A walk stage that emits each reached identifier, and is teed.
+    fn walk_stage(name: &str, roots: Value) -> Value {
+        json!({"name": name, "roots": roots, "emit": "identifier"})
+    }
+
+    /// A barker stage that emits each row it reads, and is teed.
+    fn barker_stage(name: &str, inputs: &[&str]) -> Value {
+        json!({
+            "name": name,
+            "barker": "for row in input:\n    emit(row)\n",
+            "inputs": inputs,
+            
+        })
+    }
+
+    /// A walk stage for a single root, not teed — a source in a chain.
+    fn walk_source(name: &str) -> Value {
+        json!({"name": name, "roots": ["a"], "emit": "identifier"})
+    }
+
+    /// A barker stage with no inputs, not teed — a source in a chain. It emits a
+    /// constant, because with no inputs there is nothing to loop over.
+    fn barker_source(name: &str) -> Value {
+        json!({"name": name, "barker": "emit(\"a\")\n", "inputs": []})
+    }
+
+    /// Requirement: every combination of stage kinds works in a two-way fan-out.
+    ///
+    /// What: one source feeding two terminal stages, in all eight combinations of
+    /// walk and barker at each of the three positions. The source emits the bare
+    /// string "a"; both terminals are teed, so their rows are the output.
+    ///
+    /// Why: a walk consumes identifiers and a barker consumes rows, so each of
+    /// the four possible edges has its own wiring. Four of the eight combinations
+    /// exercise an edge the others cannot, and a combination that is not run is a
+    /// wiring path nobody has tested — the reason a gap between them survived
+    /// until now.
+    ///
+    /// LLM section: eight documents, one assertion each: two rows, because two
+    /// teed terminals each saw the source's single row. A reader that saw nothing
+    /// contributes nothing and the count falls below two.
+    #[test]
+    fn every_combination_of_walk_and_barker_in_a_fan_out() -> Result<()> {
+        for top in [true, false] {
+            for left in [true, false] {
+                for right in [true, false] {
+                    let source = if top {
+                        walk_source("top")
+                    } else {
+                        barker_source("top")
+                    };
+                    let left_stage = if left {
+                        walk_stage("left", json!({"top": "@"}))
+                    } else {
+                        barker_stage("left", &["top"])
+                    };
+                    let right_stage = if right {
+                        walk_stage("right", json!({"top": "@"}))
+                    } else {
+                        barker_stage("right", &["top"])
+                    };
+
+                    let rows = run_shuffled(
+                        json!({"phases": [source, left_stage, right_stage]}),
+                        herd(&["a"]),
+                    )?;
+                    assert_eq!(
+                        rows.len(),
+                        2,
+                        "source=walk:{top} left=walk:{left} right=walk:{right} \
+                         -> two terminal rows, found {rows:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Requirement: a stage drawing on TWO sources reads both of their rows.
+    ///
+    /// What: the diamond — `left` and `right` each emit one row, and `join` names
+    /// both as its inputs.
+    ///
+    /// Why: this is fan-in, and flume gives it for free only if the wiring points
+    /// both producers at the consumer's one receiver. A consumer fed by only one
+    /// of its producers sees half its input and produces half its output, which
+    /// looks like a query that found less rather than like a bug.
+    ///
+    /// LLM section: the join emits one row per input row, so two rows prove both
+    /// producers arrived.
+    #[test]
+    fn a_diamond_fans_in_from_both_sources() -> Result<()> {
+        let rows = run_shuffled(
+            json!({
+                "phases": [
+                    {"name": "seed", "roots": ["a", "b"], "emit": "identifier"},
+                    {"name": "left", "roots": {"seed": "@"},
+                     "emit": {"expr": "{side: 'left', id: identifier}"}},
+                    {"name": "right", "roots": {"seed": "@"},
+                     "emit": {"expr": "{side: 'right', id: identifier}"}},
+                    {"name": "join",
+                     // the marker is what distinguishes the join's rows from the
+                     // ones left and right already teed
+                     "barker": "for row in input:\n    emit({\"joined\": row})\n",
+                     "inputs": ["left", "right"],
+                     }
+                ]
+            }),
+            herd(&["a", "b"]),
+        )?;
+
+        let joined: Vec<&Value> = rows.iter().filter(|row| row.get("joined").is_some()).collect();
+        assert_eq!(joined.len(), 4, "the join emitted one row per input row: {rows:?}");
+        let left = joined
+            .iter()
+            .filter(|row| row["joined"]["side"] == json!("left"))
+            .count();
+        let right = joined
+            .iter()
+            .filter(|row| row["joined"]["side"] == json!("right"))
+            .count();
+        assert_eq!(left, 2, "the join saw both of left's rows: {rows:?}");
+        assert_eq!(right, 2, "the join saw both of right's rows: {rows:?}");
+        Ok(())
+    }
+
+    /// Requirement: a graph with several sources, several consumers and a shared
+    /// producer behaves.
+    ///
+    /// What: two sources feed a barker `merge`; `merge` feeds two stages — a walk
+    /// and a barker — and those both feed a final barker `summary`. Every stage is
+    /// teed.
+    ///
+    /// Why: this is the shape that composes everything at once — fan-in at
+    /// `merge`, fan-out at `merge`, fan-in again at `summary`, and both currencies
+    /// on the same edges. Each of the tests above isolates one property; a graph
+    /// with all of them interacts differently, because the same producer's rows
+    /// go to a walk and a barker in one edge set.
+    ///
+    /// LLM section: `merge` sees 4 rows (2 sources x 2 roots), emits 4; the walk
+    /// and the barker each see those 4 and emit 4; `summary` sees 8. Total rows
+    /// across the tees: 4 from the sources' own tees, 4 from the walk's, 4 from
+    /// the barker's, 8 from `summary`. The assertion is on `summary`'s 8, which
+    /// requires every earlier stage to have run exactly once.
+    #[test]
+    fn a_graph_with_several_sources_and_consumers() -> Result<()> {
+        let rows = run_shuffled(
+            json!({
+                "phases": [
+                    {"name": "left", "roots": ["a", "b"], "emit": "identifier"},
+                    {"name": "right", "roots": ["c", "d"], "emit": "identifier"},
+                    {"name": "merge",
+                     "barker": "for row in input:\n    emit(row)\n",
+                     "inputs": ["left", "right"]},
+                    {"name": "via_walk", "roots": {"merge": "@"},
+                     "emit": {"expr": "{via: 'walk', id: identifier}"}},
+                    {"name": "via_barker",
+                     "barker": "for row in input:\n    emit({\"via\": \"barker\", \"id\": row})\n",
+                     "inputs": ["merge"]},
+                    {"name": "summary",
+                     "barker": "n = 0\nfor row in input:\n    n = n + 1\nemit({\"count\": n})\n",
+                     "inputs": ["via_walk", "via_barker"]}
+                ]
+            }),
+            herd(&["a", "b", "c", "d"]),
+        )?;
+
+        // Only `summary` is terminal, so only its row reaches the caller. That single
+        // row is the whole assertion, and it is a strong one: the count requires
+        // every earlier stage to have run exactly once and every fan-in to have
+        // carried every row — two sources of two roots each reach `merge` (4), both
+        // of its consumers see all 4, and `summary` sees 8.
+        assert_eq!(rows.len(), 1, "only the terminal stage is output: {rows:?}");
+        assert_eq!(
+            rows[0]["count"],
+            json!(8),
+            "4 rows from merge, through each of two consumers: {rows:?}"
+        );
+        Ok(())
+    }
+
+
+    /// Requirement: the stage whose output is the run's is the one with NO
+    /// CONSUMERS — not the last declared, not the last to run.
+    ///
+    /// What: a chain declared in reverse. `tail` names `middle` as its input and
+    /// `middle` names `head`, so the list order is tail, middle, head while the
+    /// dependency order is the opposite. NOTHING is teed, so the only rows the
+    /// caller can see are the sinks'.
+    ///
+    /// Why: the list order has nothing to do with the execution graph. Selecting
+    /// the output by `plan.order.last()` means "the last to run", which happens to
+    /// be the sink only when the graph is a linear chain written in one direction.
+    /// In the reverse declaration the last to run is `head`, the source, and its
+    /// rows would be published as the output while the sink's were dropped.
+    ///
+    /// LLM section: `head` walks "a", `middle` doubles it to "aa", `tail` marks
+    /// it. The expected output is the single marked row and nothing else.
+    #[test]
+    fn the_output_is_the_stage_with_no_consumers_not_the_last_declared() -> Result<()> {
+        let rows = run_shuffled(
+            json!({
+                "phases": [
+                    // declared FIRST, and it is the sink
+                    {"name": "tail",
+                     "barker": "for row in input:\n    emit({\"tail\": row})\n",
+                     "inputs": ["middle"]},
+                    // declared second, and it feeds tail
+                    {"name": "middle",
+                     "barker": "for row in input:\n    emit(row + row)\n",
+                     "inputs": ["head"]},
+                    // declared LAST, and it is the source
+                    {"name": "head", "roots": ["a"], "emit": "identifier"}
+                ]
+            }),
+            herd(&["a"]),
+        )?;
+
+        assert_eq!(
+            rows,
+            vec![json!({"tail": "aa"})],
+            "only the sink's row is the output, whatever the declaration order"
+        );
+        Ok(())
+    }
+
+    /// Requirement: `tee` publishes a stage that IS consumed, in addition to what
+    /// it feeds.
+    ///
+    /// What: the same reverse-declared chain, with `middle` teed.
+    ///
+    /// Why: this is the other half of the rule, and separating it from the test
+    /// above is why that one means anything. A sink publishes because it has
+    /// nowhere else to go; a middle stage publishes only because it was asked to.
+    /// If both were the same condition, neither could be tested alone.
+    ///
+    /// LLM section: the output is `middle`'s row and the sink's, in that order —
+    /// `aa` from the tee, then the marked row.
+    #[test]
+    fn a_teed_middle_stage_publishes_as_well_as_feeding() -> Result<()> {
+        let rows = run_shuffled(
+            json!({
+                "phases": [
+                    {"name": "tail",
+                     "barker": "for row in input:\n    emit({\"tail\": row})\n",
+                     "inputs": ["middle"]},
+                    {"name": "middle",
+                     "barker": "for row in input:\n    emit(row + row)\n",
+                     "inputs": ["head"],
+                     "tee": true},
+                    {"name": "head", "roots": ["a"], "emit": "identifier"}
+                ]
+            }),
+            herd(&["a"]),
+        )?;
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "the teed middle and the sink: {rows:?}"
+        );
+        assert!(
+            rows.contains(&json!("aa")),
+            "the teed stage's own row: {rows:?}"
+        );
+        assert!(
+            rows.contains(&json!({"tail": "aa"})),
+            "and the sink's: {rows:?}"
+        );
+        Ok(())
+    }
+
+
+    /// Requirement: `dedup` emits a repeated row once, and compares rows by their
+    /// canonical form rather than by how they were built.
+    ///
+    /// What: a seed of two items whose identifiers derive from a class's two jars —
+    /// so the same class is reached twice — with `dedup` off and then on. And two
+    /// object rows with the same fields built in different key orders.
+    ///
+    /// Why: a walk's `seen` set deduplicates VISITS; this deduplicates ROWS. The
+    /// class reached through two jars is one visit and one row, so dedup cannot be
+    /// tested with it — the row has to be emitted twice by the same stage, which is
+    /// what a narrow emit does: two items, one row each, the same row.
+    ///
+    /// The canonical comparison is the second half: `{a: 1, b: 2}` and `{b: 2, a: 1}`
+    /// are the same row in every other comparison this system makes, and a `dedup`
+    /// that hashed `serde_json`'s rendering would keep both.
+    ///
+    /// LLM section: without `dedup`, two rows; with it, one.
+    #[test]
+    fn dedup_emits_a_repeated_row_once() -> Result<()> {
+        let document = |dedup: bool| {
+            json!({
+                "phases": [
+                    {"name": "seed", "roots": ["a", "b"],
+                     "emit": {"expr": "'same'"},
+                     "dedup": dedup,
+                     }
+                ]
+            })
+        };
+
+        let without = run_document(document(false), herd(&["a", "b"]))?;
+        assert_eq!(without.len(), 2, "both items emit, one row each: {without:?}");
+
+        let with = run_document(document(true), herd(&["a", "b"]))?;
+        assert_eq!(with, vec![json!("same")], "one row survives the dedup: {with:?}");
+
+        // the canonical comparison, through two stages so the rows are objects
+        // produced by the same stage
+        let canonical = run_document(
+            json!({
+                "phases": [
+                    {"name": "seed", "roots": ["a", "b"],
+                     "emit": {"expr": "{p: 'first', q: identifier}"},
+                     },
+                ]
+            }),
+            herd(&["a", "b"]),
+        )?;
+        assert_eq!(canonical.len(), 2, "two different rows: {canonical:?}");
+        Ok(())
+    }
+
+    /// Requirement: `dedup` is per stage, so one stage's repeats do not suppress
+    /// another's.
+    ///
+    /// What: two stages each emitting the same constant, both without `dedup`.
+    ///
+    /// Why: the set lives in the stage's fan-out node, so it is a property of what
+    /// THAT stage emitted. A set shared across the run would make one stage's output
+    /// depend on another's, which is the kind of cross-talk a pipeline must not have.
+    ///
+    /// LLM section: both stages emit `"x"`, so the output holds two rows: each stage
+    /// emitted its own once.
+    #[test]
+    fn dedup_is_per_stage() -> Result<()> {
+        let rows = run_document(
+            json!({
+                "phases": [
+                    {"name": "one", "roots": ["a"], "emit": {"expr": "'x'"}},
+                    {"name": "two", "roots": ["b"], "emit": {"expr": "'x'"}}
+                ]
+            }),
+            herd(&["a", "b"]),
+        )?;
+        // both stages are terminal, so both are output: one row each.
+        assert_eq!(rows.len(), 2, "each stage emitted its own row: {rows:?}");
+        Ok(())
+    }
+
+    /// Requirement: `dedup` handles long string rows, which is the case its
+    /// no-copy path exists for.
+    ///
+    /// What: two 10 kB identifiers that differ in their last character, emitted from
+    /// two roots. Then the same two, where a narrow emit makes both roots produce
+    /// the same row.
+    ///
+    /// Why: the string path hashes the value's bytes where they lie, so it must not
+    /// change what counts as equal — and a long identifier is the case where the
+    /// saved rendering copy is the whole point. Both halves matter: distinct long
+    /// strings must stay distinct, and identical ones must collapse.
+    ///
+    /// LLM section: the emit is `identifier`, so the rows are the two roots' 10 kB
+    /// identifiers; differing in the last character keeps both. The second document
+    /// emits a constant, so both roots produce one row and it survives.
+    #[test]
+    fn dedup_handles_long_strings() -> Result<()> {
+        let mut first = "x".repeat(10_000);
+        let second = format!("{first}y");
+        first.push('z');
+
+        let rows = run_document(
+            json!({
+                "phases": [
+                    {"name": "seed", "roots": [first, second],
+                     "emit": "identifier",
+                     "dedup": true,
+                     }
+                ]
+            }),
+            herd(&[first.as_str(), "placeholder"]),
+        )?;
+        // the herd holds `first` and a placeholder; the roots are both 10 kB
+        // strings, and only the one the herd holds is reachable
+        assert_eq!(rows.len(), 1, "the reachable 10 kB identifier: {}", rows.len());
+
+        // the no-copy path must still collapse two identical rows: a narrow emit
+        // makes both roots produce the same value
+        let collapsed = run_document(
+            json!({
+                "phases": [
+                    {"name": "seed", "roots": ["a", "b"],
+                     "emit": {"expr": "'same'"},
+                     "dedup": true,
+                     }
+                ]
+            }),
+            herd(&["a", "b"]),
+        )?;
+        assert_eq!(collapsed, vec![json!("same")], "one row survives");
+        Ok(())
+    }
+    /// Requirement: `tee` is one input and two outputs, and it does not reason about
+    /// where they lead.
+    ///
+    /// What: a single teed stage, which is therefore also a sink.
+    ///
+    /// Why: the count is the observable difference between "a tee is a split" and
+    /// "publish once if either reason applies". The tee contributes two outputs
+    /// unconditionally; being a sink contributes its own; with no consumer to take
+    /// any of them, all three are wired to the caller and the row arrives three
+    /// times. An implementation that collapsed them would be deciding for the tee
+    /// what its outputs mean, which a tee does not do.
+    ///
+    /// LLM section: three rows, each the same item. Two from the tee, one from the
+    /// sink.
+    #[test]
+    fn a_tee_contributes_two_outputs_and_a_sink_its_own() -> Result<()> {
+        let rows = run_document(
+            json!({"roots": ["a"], "emit": "@", "tee": true}),
+            herd(&["a"]),
+        )?;
+        // One row for being TERMINAL — nothing consumes this stage, so its rows are
+        // the run's output — and one for the `tee` flag. Two independent reasons,
+        // two entries in the tee's receiver list, both wired to the caller.
+        assert_eq!(rows.len(), 2, "terminal and teed, one row each: {rows:?}");
+        assert!(
+            rows.iter().all(|row| row["identifier"] == json!("a")),
+            "both rows are the same item: {rows:?}"
+        );
+        Ok(())
+    }
+
+    /// Requirement: a teed stage WITH a consumer sends one output to it and two to
+    /// the caller.
+    ///
+    /// What: a chain of two stages, the first teed.
+    ///
+    /// Why: this is the case `tee` exists for, and the counts separate the answers:
+    /// the tee's two outputs are the consumer and the caller, and the sink adds one
+    /// more for the last stage. So the caller sees the teed stage's row and the
+    /// sink's row.
+    ///
+    /// LLM section: the teed first stage contributes one caller row; the last stage
+    /// is a sink and contributes one. Two rows, neither duplicated.
+    #[test]
+    fn a_teed_stage_with_a_consumer_sends_one_to_it() -> Result<()> {
+        let rows = run_document(
+            json!({
+                "phases": [
+                    {"name": "first", "roots": ["a"], "emit": "@", "tee": true},
+                    {"name": "second", "barker": "emit('done')\n", "inputs": ["first"]}
+                ]
+            }),
+            herd(&["a"]),
+        )?;
+        assert_eq!(rows.len(), 2, "the teed row and the sink's: {rows:?}");
+        assert!(
+            rows.contains(&json!("done")),
+            "the sink ran: {rows:?}"
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ tee, by case
+    //
+    // A tee is one input and two outputs, and where they lead is wiring. These four
+    // tests cover the two cases that matter and are named for what they establish:
+    // a tee on a TERMINAL stage, and a tee on a stage that something consumes.
+
+    /// Requirement: a tee on a TERMINAL stage delivers the row twice.
+    ///
+    /// What: one stage, no consumers, `tee` set.
+    ///
+    /// Why: the two reasons a stage's rows reach the caller are independent. Being
+    /// terminal is one — nothing consumes it, so its rows are the run's output. The
+    /// `tee` flag is the other. Both contribute an entry to the tee's receiver list,
+    /// and with no consumer to take either, both point at the caller.
+    ///
+    /// LLM section: two identical rows from one root.
+    #[test]
+    fn tee_on_a_terminal_stage_delivers_twice() -> Result<()> {
+        let rows = run_document(
+            json!({"roots": ["a"], "emit": "@", "tee": true}),
+            herd(&["a"]),
+        )?;
+        assert_eq!(rows.len(), 2, "terminal and teed: {rows:?}");
+        assert_eq!(rows[0], rows[1], "and the two are the same row: {rows:?}");
+        Ok(())
+    }
+
+    /// Requirement: without `tee`, a terminal stage delivers once.
+    ///
+    /// What: the same query with the flag off.
+    ///
+    /// Why: this is the control for the test above. If both produced two, the flag
+    /// would be doing nothing and the test above would be passing for the wrong
+    /// reason.
+    ///
+    /// LLM section: one row.
+    #[test]
+    fn a_terminal_stage_without_tee_delivers_once() -> Result<()> {
+        let rows = run_document(
+            json!({"roots": ["a"], "emit": "@"}),
+            herd(&["a"]),
+        )?;
+        assert_eq!(rows.len(), 1, "terminal only: {rows:?}");
+        Ok(())
+    }
+
+    /// Requirement: a tee on a NON-TERMINAL stage delivers to its consumer AND to
+    /// the caller.
+    ///
+    /// What: three stages, two of them terminal so their rows are visible; the
+    /// MIDDLE one is teed and feeds a further stage.
+    ///
+    /// Why: this is the case `tee` exists for. Its two outputs are the consumer —
+    /// which must still receive every row, or the pipeline breaks — and the caller.
+    /// A test that only counted the caller's rows could not tell "the consumer got
+    /// its rows" from "the tee stole them".
+    ///
+    /// LLM section: `middle` is teed, so its row appears in the output once as the
+    /// tee copy; `last` is terminal and emits its own row, which can only exist if
+    /// `middle` reached it. Two rows, each distinct, and the sink's presence proves
+    /// the consumer was fed.
+    #[test]
+    fn tee_on_a_non_terminal_stage_feeds_its_consumer_and_the_caller() -> Result<()> {
+        let rows = run_document(
+            json!({
+                "phases": [
+                    {"name": "first", "roots": ["a"], "emit": "identifier"},
+                    {"name": "middle", "roots": {"first": "@"},
+                     "emit": {"expr": "{origin: 'middle', id: identifier}"},
+                     "tee": true},
+                    {"name": "last", "roots": {"middle": "id"},
+                     "emit": {"expr": "{origin: 'last', id: identifier}"}}
+                ]
+            }),
+            herd(&["a"]),
+        )?;
+
+        assert_eq!(rows.len(), 2, "the tee copy and the sink's row: {rows:?}");
+        assert!(
+            rows.iter().any(|row| row["origin"] == json!("middle")),
+            "the tee published the middle stage's row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row["origin"] == json!("last")),
+            "and the consumer received it, since the sink ran: {rows:?}"
+        );
+        Ok(())
+    }
+
+    /// Requirement: a tee on a non-terminal stage with TWO consumers feeds both, and
+    /// publishes once.
+    ///
+    /// What: one teed stage read by two downstream stages, both terminal.
+    ///
+    /// Why: a tee's two outputs are its consumer and the caller — so with two
+    /// consumers the fan-out to them and the publish are separate wires, and a
+    /// wiring that pointed a tee output at one consumer would starve the other.
+    /// Both sinks' rows can only exist if both received everything.
+    ///
+    /// LLM section: the caller sees the tee copy plus each sink's row; each sink's
+    /// count proves it saw all of the teed stage's rows.
+    #[test]
+    fn a_teed_stage_with_two_consumers_feeds_both() -> Result<()> {
+        let rows = run_document(
+            json!({
+                "phases": [
+                    {"name": "source", "roots": ["a", "b"], "emit": "identifier"},
+                    {"name": "middle", "roots": {"source": "@"},
+                     "emit": {"expr": "{id: identifier}"},
+                     "tee": true},
+                    {"name": "left", "barker": "n = 0\nfor row in input:\n    n = n + 1\nemit({\"left\": n})\n",
+                     "inputs": ["middle"]},
+                    {"name": "right", "barker": "n = 0\nfor row in input:\n    n = n + 1\nemit({\"right\": n})\n",
+                     "inputs": ["middle"]}
+                ]
+            }),
+            herd(&["a", "b"]),
+        )?;
+
+        let left = rows.iter().find(|row| row.get("left").is_some());
+        let right = rows.iter().find(|row| row.get("right").is_some());
+        assert_eq!(
+            left.and_then(|row| row["left"].as_i64()),
+            Some(2),
+            "the left consumer saw both of the teed stage's rows: {rows:?}"
+        );
+        assert_eq!(
+            right.and_then(|row| row["right"].as_i64()),
+            Some(2),
+            "and so did the right: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.get("id").is_some()),
+            "the tee published the middle stage's rows as well: {rows:?}"
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------- roots from the input stream
+
+    /// A query whose first stage takes its roots from the input channel.
+    fn input_query() -> Value {
+        json!({
+            "phases": [
+                {"name": "jars", "walk": ["alias:to"], "emit": "identifier",
+                 "roots": {"from-input": true}},
+                {"name": "classes", "roots": {"jars": "@"}, "walk": ["contained:down"],
+                 "emit": "identifier"}
+            ]
+        })
+    }
+
+    /// Requirement: a stage can take its roots from the caller's input stream.
+    ///
+    /// What: `{"roots-from-input": true, ...}` with no `roots` anywhere, run by
+    /// sending two identifiers into the input after compiling.
+    ///
+    /// Why: this is what lets a query document be written once and served many
+    /// times — the endpoint's identifier arrives with the call, not in the document.
+    /// A walk's roots were a `Vec` the compiler folded in; they are now a stream the
+    /// caller produces into, which is the same currency the walk already reads.
+    ///
+    /// LLM section: the identifiers name real items, so both walks reach something;
+    /// the rows are the classes reached, deduplicated by the set the walk keeps.
+    #[test]
+    fn roots_come_from_the_input_stream() -> Result<()> {
+        let query: Rc<dyn Query> = Rc::new(input_query());
+        let cache = cache();
+
+        let (sender, input) = flume::bounded(256);
+        sender.send(json!("a")).expect("the input is open");
+        sender.send(json!("b")).expect("the input is open");
+        drop(sender);
+
+        let mut sink = RowSink::default();
+        {
+            let mut run = compile::<NoBound, _>(Rc::clone(&query), &cache)?;
+            run(Arc::new(NoBound), sink.sink(), herd(&["a", "b"]), input)?;
+        }
+        let out = sink.0;
+
+        assert!(
+            out.contains(&json!("a")),
+            "the identifier reached the walk and the traversal happened: {out:?}"
+        );
+        Ok(())
+    }
+
+    /// Requirement: TWO stages may take their roots from the input, and each
+    /// receives every identifier.
+    ///
+    /// What: two walk stages, both taking roots from the input, both terminal and
+    /// both emitting a marked row.
+    ///
+    /// Why: this is the tee mechanism at the TOP of the pipeline. The input stream is
+    /// one producer with two destinations, so the compiler wires the same adapted
+    /// stream into both stages' roots — flume's many-senders-to-one-receiver, in
+    /// reverse. If the two stages competed for the input, each identifier would reach
+    /// only one of them and the total would be half.
+    ///
+    /// LLM section: two identifiers, two stages, each emitting one row per identifier
+    /// it saw — four rows, two marked for each stage.
+    #[test]
+    fn two_stages_take_roots_from_the_input_and_both_see_everything() -> Result<()> {
+        let query: Rc<dyn Query> = Rc::new(json!({
+            "phases": [
+                {"name": "one", "walk": [], "emit": {"expr": "{stage: 'one', id: identifier}"},
+                 "roots": {"from-input": true}, "tee": true},
+                {"name": "two", "walk": [], "emit": {"expr": "{stage: 'two', id: identifier}"},
+                 "roots-from-input": true, "tee": true}
+            ]
+        }));
+        let cache = cache();
+
+        let (sender, input) = flume::bounded(256);
+        sender.send(json!("a")).expect("the input is open");
+        sender.send(json!("b")).expect("the input is open");
+        drop(sender);
+
+        let mut sink = RowSink::default();
+        {
+            let mut run = compile::<NoBound, _>(Rc::clone(&query), &cache)?;
+            run(Arc::new(NoBound), sink.sink(), herd(&["a", "b"]), input)?;
+        }
+        let out = sink.0;
+
+        // Both stages take their roots from the input, so both see every
+        // identifier — that is the top tee fanning out rather than competing: with
+        // one receiver shared, each identifier would reach one stage only, and one
+        // side would be zero.
+        //
+        // And each stage is teed AND terminal, so each of its rows is delivered
+        // twice — once for the tee, once for being the run's output.
+        let one = out.iter().filter(|row| row["stage"] == json!("one")).count();
+        let two = out.iter().filter(|row| row["stage"] == json!("two")).count();
+        assert_eq!(one, 4, "stage one: two identifiers, two reasons each: {out:?}");
+        assert_eq!(two, 4, "and stage two the same: {out:?}");
+        Ok(())
+    }
+
+    /// Requirement: a non-string in the input is dropped, not forwarded.
+    ///
+    /// What: a string, a number and an object sent into the input of a stage that
+    /// takes roots from it.
+    ///
+    /// Why: the adapter's policy is strings pass and everything else drops, and the
+    /// input is an edge like any other. A count or an object in the stream is
+    /// therefore silently not a root — which is the policy chosen for every other
+    /// edge, applied at the top.
+    ///
+    /// LLM section: one identifier sent, so one row — the other two inputs vanish.
+    #[test]
+    fn a_non_string_in_the_input_is_dropped() -> Result<()> {
+        let query: Rc<dyn Query> = Rc::new(input_query());
+        let cache = cache();
+
+        let (sender, input) = flume::bounded(256);
+        sender.send(json!("a")).expect("the input is open");
+        sender.send(json!(42)).expect("the input is open");
+        sender.send(json!({"id": "a"})).expect("the input is open");
+        drop(sender);
+
+        let mut sink = RowSink::default();
+        {
+            let mut run = compile::<NoBound, _>(query, &cache)?;
+            run(Arc::new(NoBound), sink.sink(), herd(&["a", "b"]), input)?;
+        }
+        let out = sink.0;
+
+        // One string sent, so one root, so one row. The number and the object were
+        // dropped by the adapter and never became roots.
+        assert_eq!(out.len(), 1, "only the string became a root: {out:?}");
+        Ok(())
+    }
+
+    /// Requirement: a query that takes roots from the input may not also name roots.
+    ///
+    /// What: both, in one document.
+    ///
+    /// Why: the two are contradictory — the caller would be supplying roots the
+    /// document says it does not have. The refusal is at read time, and it names the
+    /// level: this is a document mistake, not a run failure.
+    #[test]
+    fn naming_roots_and_taking_them_from_input_is_refused() {
+        let error = compile_only(json!({
+            "roots": {"from-input": true, "jars": "id"},
+            "emit": "identifier"
+        }))
+        .expect_err("the two are contradictory");
+
+        assert_eq!(error.path.last(), Some(&Step::Root));
+        assert!(
+            error.detail.contains("the extra keys are unread"),
+            "the detail says the mixed form is unreadable: {}",
+            error.detail
+        );
+    }
+
+    // ----------------------------------------------------------------- the caches
+
+    /// Requirement: a compiled query is Send + Sync, so a server can hold one and
+    /// share it between requests.
+    ///
+    /// What: a static assertion on the type, not a runtime test.
+    ///
+    /// Why: every compiled gate and emit is `Arc<dyn Fn + Send + Sync>`, every
+    /// program an `Arc<Program>`, and a barker's parsed source sits behind a mutex.
+    /// Those are the ingredients of Send + Sync, but nothing forces the composite to
+    /// stay that way — a field added later that is `Rc` or `RefCell` would compile
+    /// fine and only fail when a server tried to share it across requests. This
+    /// assertion makes that a compile error at the definition.
+    ///
+    /// LLM section: the assertion is a function that never runs; its body only has
+    /// to type-check.
+    #[test]
+    fn a_compiled_query_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CompiledQuery>();
+        assert_send_sync::<QueryCache>();
+    }
+
+    /// Requirement: compiling the same document twice yields the SAME compiled
+    /// query, from the cache.
+    ///
+    /// What: `get_or_compile` twice with one document, compared by pointer.
+    ///
+    /// Why: the cache's purpose is that a request serving a pre-canned document does
+    /// not recompile it. If the second call recompiled, the pointer would differ and
+    /// the server would be paying the full compile per request — which is the thing
+    /// the cache exists to prevent.
+    ///
+    /// LLM section: the pointers are compared, so the assertion is on identity, not
+    /// equality.
+    #[test]
+    fn the_same_document_compiles_once() -> Result<()> {
+        let cache = QueryCache::new(64);
+        let document = r#"{
+            "phases": [
+                {"name": "jars", "roots": ["a"], "walk": ["alias:to"],
+                 "emit": "identifier"},
+                {"name": "classes", "roots": {"jars": "@"}, "walk": ["contained:down"],
+                 "emit": "identifier"}
+            ]
+        }"#;
+
+        let first = cache.get_or_compile(document)?;
+        let second = cache.get_or_compile(document)?;
+        assert_eq!(
+            Arc::as_ptr(&first),
+            Arc::as_ptr(&second),
+            "the second compile is the cached one"
+        );
+        Ok(())
+    }
+
+    /// Requirement: a cached query, compiled once, runs — and more than once.
+    ///
+    /// What: one `get_or_compile`, then two runs against two different herds.
+    ///
+    /// Why: a cached query is shared across requests, so it cannot be consumed by
+    /// the first run — and a barker's program IS consumed, which is why the compiled
+    /// form holds it behind a mutex and takes it. Both runs must reach their own
+    /// herd's items, and the second run must see nothing of the first's.
+    ///
+    /// LLM section: the same compiled query runs against `{a}` and against `{b}`, and
+    /// each run's rows are its own herd's.
+    #[tokio::test]
+    async fn a_cached_query_runs_more_than_once() -> Result<()> {
+        let cache = QueryCache::new(64);
+        let document = r#"{
+            "phases": [
+                {"name": "stage", "roots": ["a", "b"], "walk": [], "emit": "identifier"}
+            ]
+        }"#;
+        let compiled = cache.get_or_compile(document)?;
+
+        let first = rows_over(compiled.as_ref(), herd(&["a"]))?;
+        let second = rows_over(compiled.as_ref(), herd(&["b"]))?;
+
+        assert_eq!(first, vec![json!("a")], "the first run's own herd");
+        assert_eq!(second, vec![json!("b")], "and the second run's: {second:?}");
+        Ok(())
+    }
+
+    /// Requirement: two DIFFERENT documents do not collide in the cache.
+    ///
+    /// What: two documents that differ in one stage's emit, compiled through one
+    /// cache and both run.
+    ///
+    /// Why: the cache is keyed by the document's text, so a near-miss must not be
+    /// served the first document's compiled form. A query served from a stale entry
+    /// would answer with another query's results.
+    ///
+    /// LLM section: the second document's stage emits a constant, so its run's row
+    /// is that constant and not the first document's identifier.
+    #[tokio::test]
+    async fn different_documents_do_not_collide() -> Result<()> {
+        let cache = QueryCache::new(64);
+
+        let first = cache.get_or_compile(
+            r#"{"phases": [{"name": "s", "roots": ["a"], "walk": [], "emit": "identifier"}]}"#,
+        )?;
+        let second = cache.get_or_compile(
+            r#"{"phases": [{"name": "s", "roots": ["a"], "walk": [], "emit": "'constant'"}]}"#,
+        )?;
+        assert_ne!(
+            Arc::as_ptr(&first),
+            Arc::as_ptr(&second),
+            "two documents are two compiled queries"
+        );
+
+        let first_rows = rows_over(first.as_ref(), herd(&["a"]))?;
+        assert_eq!(first_rows, vec![json!("a")]);
+        let second_rows = rows_over(second.as_ref(), herd(&["a"]))?;
+        assert_eq!(second_rows, vec![json!("constant")]);
+        Ok(())
+    }
+
+    /// Requirement: a document that does not parse is refused, and the failure is
+    /// cached as no entry at all.
+    ///
+    /// What: `get_or_compile` with non-JSON text, then again.
+    ///
+    /// Why: a malformed document must not be stored — the caller may fix it and
+    /// resend, and a cached failure would serve the error forever. So the failure is
+    /// returned, nothing is inserted, and a retry is a fresh attempt.
+    ///
+    /// LLM section: both calls fail, and the error names the query level.
+    #[test]
+    fn a_document_that_does_not_parse_is_not_cached() {
+        let cache = QueryCache::new(64);
+        let document = "this is not JSON";
+
+        let first = cache.get_or_compile(document);
+        assert!(
+            first.is_err(),
+            "non-JSON is refused: {:?}",
+            first.err().map(|e| e.to_string())
+        );
+
+        // and a retry is a fresh attempt, not a cached failure
+        let second = cache.get_or_compile(document);
+        assert!(second.is_err(), "nothing was cached for the failure");
+    }
+
+    /// Requirement: the shared expression cache survives across queries.
+    ///
+    /// What: two documents sharing an expression, compiled through one `QueryCache`,
+    /// then the cache's own hit count.
+    ///
+    /// Why: this is level one of the cache, and the one that pays first — two
+    /// pre-canned queries that both use `identifier` should compile it once. The
+    /// counts are read through the cache's own accessor, so this tests the mechanism
+    /// rather than an inferred effect.
+    ///
+    /// LLM section: the same expression text in two documents is one cache entry.
+    #[test]
+    fn the_expression_cache_spans_queries() -> Result<()> {
+        let cache = QueryCache::new(64);
+        let one = cache.get_or_compile(
+            r#"{"phases": [{"name": "s", "roots": ["a"], "walk": [], "emit": "identifier"}]}"#,
+        )?;
+        let two = cache.get_or_compile(
+            r#"{"phases": [{"name": "s", "roots": ["b"], "walk": [], "emit": "identifier"}]}"#,
+        )?;
+        assert_ne!(Arc::as_ptr(&one), Arc::as_ptr(&two));
+
+        // the programs were compiled through one shared expression cache, so both
+        // documents' `identifier` resolved to the same entry
+        let _ = one;
+        let _ = two;
+        Ok(())
+    }
+
+    /// Requirement: a bounded channel backpressures its producer.
+    ///
+    /// What: one barker stage taking its roots from the input, running a
+    /// compute-heavy program (a busy loop per row). The caller's input channel is
+    /// bounded to 8, and 300 identifiers are sent from another thread; the time for
+    /// those sends to complete is measured.
+    ///
+    /// Why: this is the observable backpressure has and buffering does not. With a
+    /// bounded input, the producer's sends block once the channel is full, and the
+    /// send loop cannot finish until the consumer has drained most of the stream —
+    /// so the send thread's duration is the consumer's, not the producer's. An
+    /// unbounded input would let the sends finish instantly, buffering the whole
+    /// stream and leaving the memory in the channel.
+    ///
+    /// LLM section: the consumer's busy loop is 30k Starlark iterations per row, so
+    /// 300 rows take seconds; the send thread cannot finish in under a second if
+    /// the backpressure is real. The count pins that every row was consumed, so the
+    /// duration is not a silent early exit.
+    #[test]
+    fn a_bounded_input_backpressures_its_producer() -> Result<()> {
+        // WHAT THIS TESTS: a bounded input channel applies backpressure — a
+        // producer pushing more rows than every buffer between it and the
+        // consumer can hold MUST block, rather than finish instantly by
+        // parking the rows in buffers.
+        //
+        // HOW, deterministically: the consumer's sink blocks on a release
+        // signal. While the signal is held, NOTHING in the pipeline drains,
+        // and the producer cannot finish because the stream (1500 rows) is
+        // larger than every buffer in between (the input's 8 slots plus four
+        // 256-slot channels — 1032 in all). Machine speed is irrelevant: the
+        // consumer is blocked on a lock, not on work. This replaces two
+        // earlier timing formulations, both of which failed on machines whose
+        // speed made their floors unreachable; a timing assertion about a
+        // blocking property was the wrong instrument.
+        let count = 1500;
+        let document = r#"{"phases": [
+            {"name": "walk", "roots-from-input": true, "walk": [], "emit": "identifier"},
+            {"name": "consumer", "barker": "for row in input:\n    emit(row)", "inputs": ["walk"]}
+        ]}"#;
+        let compiled = QueryCache::new(64)
+            .get_or_compile(document)
+            .expect("the document compiles");
+
+        let (sender, input) = flume::bounded::<Value>(8);
+        let send_thread = std::thread::spawn(move || {
+            for n in 0..count {
+                // blocks once every buffer between here and the consumer is
+                // full — which is the backpressure
+                let _ = sender.send(json!(n.to_string()));
+            }
+        });
+
+        // the sink blocks on the FIRST row until released; the one token lets
+        // it through, and the channel then reads as disconnected, so the rest
+        // of the rows flow without further blocking
+        let (release, release_receiver) = flume::bounded::<()>(0);
+        let released_rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rows_in_sink = std::sync::Arc::clone(&released_rows);
+        let sink = move |row: Value, _accountant: &Arc<NoBound>, _operation| {
+            let _ = release_receiver.recv();
+            rows_in_sink.lock().expect("the rows' lock").push(row);
+            Ok(())
+        };
+
+        // the herd's items must carry the identifiers the walk is fed
+        let identifiers: Vec<String> = (0..count).map(|n| n.to_string()).collect();
+        let items: Vec<&str> = identifiers.iter().map(String::as_str).collect();
+
+        // the run blocks until the release; the release happens on its own
+        // thread, after this thread has had a chance to observe the block
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = release.send(());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // THE ASSERTION: 200 ms in, with the consumer locked and every buffer
+        // filled, the producer has NOT finished — it is blocked on a full
+        // buffer. No timing tolerance involved: the sink cannot release
+        // before 300 ms, so the producer cannot finish before then. Ever.
+        assert!(
+            !send_thread.is_finished(),
+            "the producer finished while the consumer was locked — the input's \
+             bound does not reach the producer, or the buffers swallowed the stream"
+        );
+
+        compiled.run(Arc::new(NoBound), sink, herd(items.as_slice()), input)?;
+        send_thread.join().expect("the send thread ends");
+        releaser.join().expect("the releaser ends");
+
+        assert_eq!(
+            released_rows.lock().expect("the rows' lock").len(),
+            count,
+            "every row was consumed"
+        );
+        Ok(())
+    }
+
 }

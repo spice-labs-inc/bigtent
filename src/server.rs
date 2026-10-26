@@ -67,7 +67,7 @@ use serde::Serialize;
 
 use crate::{
     item::{Item, ItemV3},
-    rodeo::{goat_trait::GoatRodeoTrait, holder::ClusterHolder},
+    rodeo::{goat_herd::GoatHerd, goat_trait::GoatRodeoTrait, holder::ClusterHolder},
 };
 #[cfg(test)]
 use std::println as info;
@@ -1120,19 +1120,26 @@ pub async fn metrics_middleware<GRT: GoatRodeoTrait + 'static>(
     response
 }
 
-pub async fn run_web_server<GRT: GoatRodeoTrait + 'static>(
-    index: Arc<ClusterHolder<GRT>>,
-) -> Result<()> {
+pub async fn run_web_server(index: Arc<ClusterHolder<GoatHerd>>) -> Result<()> {
     let state = index.clone();
     let addrs = index.the_args().to_socket_addrs();
     info!("Listen on {:?}", addrs);
 
     let app =
-        build_route(state.clone()).layer(middleware::from_fn_with_state(state, metrics_middleware));
+        build_route(state.clone())
+            .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
+
+    // V2 is served under its PREFIX ONLY — /v2 and /omnibor/v2. Its operational
+    // paths (health, metrics, purls, node_count, openapi) are the same names V1
+    // serves at the root, and merging two routers that both define /health panics;
+    // the prefix is what keeps the two surfaces distinct while both are served.
+    let queries = Arc::new(crate::highwire::compiler::QueryCache::new(4096));
+    let v2_state = Arc::new(crate::api_v2::V2State::new(index.clone(), queries));
+    let v2_bare = Router::new().nest("/v2", crate::api_v2::router_v2(v2_state.clone()));
+    let v2_nested = Router::new().nest("/omnibor/v2", crate::api_v2::router_v2(v2_state));
 
     let nested = Router::new().nest("/omnibor", app.clone());
-
-    let aggregated = nested.merge(app);
+    let aggregated = nested.merge(app).merge(v2_bare).merge(v2_nested);
 
     let s: &[SocketAddr] = &addrs;
     let listener = tokio::net::TcpListener::bind(s).await?;

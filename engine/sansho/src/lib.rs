@@ -63,7 +63,7 @@ mod ast_tests;
 
 use std::rc::Rc;
 
-pub use ast::canonical;
+pub use ast::{can_be_a_string, can_emit_a_string, canonical};
 pub use cache::ProgramCache;
 pub use corpus::{Driver, DriverOutcome, Unimplemented};
 pub use error::SanshoError;

@@ -23,7 +23,7 @@
 //!   not implement serde's case conversions, so it cannot honor it.
 //! - Any other serde attribute is ignored.
 //!
-//! ```ignore
+//! ```
 //! use sansho_derive::SanshoObject;
 //!
 //! #[derive(SanshoObject)]
@@ -35,8 +35,19 @@
 //!     scratch: Vec<u8>,
 //! }
 //!
+//! let item = Item {
+//!     identifier: "gitoid:blob:sha256:abc".to_string(),
+//!     body_mime_type: "application/java-archive".to_string(),
+//!     scratch: vec![],
+//! };
+//!
 //! let program = sansho::compile(&sansho::parse("bodyMimeType")?, None)?;
 //! let value = sansho::evaluate(&program, &item)?;
+//! assert_eq!(
+//!     sansho::materialize(&value)?,
+//!     serde_json::json!("application/java-archive")
+//! );
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 use proc_macro::TokenStream;

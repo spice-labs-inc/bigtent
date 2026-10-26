@@ -39,7 +39,7 @@ struct CursorEngine;
 
 impl Driver for CursorEngine {
     fn evaluate(&self, given: &serde_json::Value, expression: &str) -> DriverOutcome {
-        let bytes = match serde_cbor::to_vec(given) {
+        let bytes = match serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(given)) {
             Ok(bytes) => bytes,
             Err(e) => {
                 return DriverOutcome::Error(sansho::SanshoError::Input {
@@ -182,7 +182,7 @@ proptest! {
         };
         let materialized =
             sansho::evaluate(&program, &document).and_then(|value| sansho::materialize(&value));
-        let bytes = serde_cbor::to_vec(&document).expect("fixture encoding");
+        let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).expect("fixture encoding");
         let cursor = evaluate(&program, bytes.as_slice())
             .and_then(|value| materialize(&value));
         match (materialized, cursor) {
@@ -258,7 +258,7 @@ fn selective_materialization_budget() {
         .map(|i| serde_json::json!({"id": i, "payload": "x".repeat(100)}))
         .collect();
     let document = serde_json::json!({"items": big});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).unwrap();
 
     // the projection: every item's id (40,000 bytes of payload skipped)
     let parsed = parse("items[*].id").unwrap();
@@ -272,7 +272,7 @@ fn selective_materialization_budget() {
 #[test]
 fn probe_cursor_basic() {
     let doc = serde_json::json!({"foo": {"bar": {"baz": "correct"}}});
-    let bytes = serde_cbor::to_vec(&doc).unwrap();
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&doc)).unwrap();
     println!("cbor bytes: {:?}", bytes);
     for expr in ["foo", "foo.bar", "foo.bar.baz"] {
         let parsed = parse(expr).unwrap();

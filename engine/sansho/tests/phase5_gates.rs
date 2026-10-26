@@ -102,7 +102,7 @@ proptest! {
 
         fn fuzz_expressions_no_panics(expression in hostile_expression_strategy()) {
         let document = serde_json::json!({"a": {"b": [1, 2, 3]}, "c": "str"});
-        let bytes = serde_cbor::to_vec(&document).unwrap();
+        let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).unwrap();
         // the parse is the first gate: an error is structured; a panic
         // or a hang fails the test
         let parsed = match parse(&expression) {
@@ -167,7 +167,7 @@ proptest! {
         let hostile: Vec<u8> = match choice {
             // truncated valid document at every prefix length
             0 => {
-                let doc = serde_cbor::to_vec(&serde_json::json!({"a": {"b": [1, 2, 3]}}))
+                let doc = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&serde_json::json!({"a": {"b": [1, 2, 3]}})))
                     .unwrap_or_default();
                 let cut = bytes.first().copied().unwrap_or(0) as usize % (doc.len() + 1);
                 doc[..cut].to_vec()
@@ -180,7 +180,7 @@ proptest! {
             3 => vec![0x9F, 0x01, 0x02, 0xFF],
             // trailing garbage after a valid document
             _ => {
-                let mut doc = serde_cbor::to_vec(&serde_json::json!({"a": 1}))
+                let mut doc = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&serde_json::json!({"a": 1})))
                     .unwrap_or_default();
                 doc.extend_from_slice(&bytes);
                 doc

@@ -1,0 +1,64 @@
+{
+  "_comment": "A DIFFERENT graph from the on-disk cluster, for the in-memory source. Same topology, different values, so a test that reads one and reports the other fails.",
+  "items": [
+    {
+      "identifier": "pkg:maven/org.example/alpha@1.0",
+      "connections": {"alias:to": ["gitoid:blob:sha256:aaaa"]},
+      "body_mime_type": null,
+      "body": null
+    },
+    {
+      "identifier": "pkg:maven/org.example/beta@2.0",
+      "connections": {"alias:to": ["gitoid:blob:sha256:aaaa"]},
+      "body_mime_type": null,
+      "body": null
+    },
+    {
+      "identifier": "gitoid:blob:sha256:aaaa",
+      "connections": {
+        "alias:from": ["pkg:maven/org.example/alpha@1.0", "pkg:maven/org.example/beta@2.0"],
+        "contained:down": ["gitoid:blob:sha256:cccc", "gitoid:blob:sha256:dddd"]
+      },
+      "body_mime_type": "application/java-archive",
+      "body": {
+        "extra": {},
+        "file_names": ["lib/alpha.jar"],
+        "file_size": 1000,
+        "mime_type": ["application/java-archive"]
+      }
+    },
+    {
+      "identifier": "gitoid:blob:sha256:bbbb",
+      "connections": {"contained:down": ["gitoid:blob:sha256:cccc"]},
+      "body_mime_type": "application/java-archive",
+      "body": {
+        "extra": {},
+        "file_names": ["lib/beta.jar"],
+        "file_size": 2000,
+        "mime_type": ["application/java-archive"]
+      }
+    },
+    {
+      "identifier": "gitoid:blob:sha256:cccc",
+      "connections": {"contained:up": ["gitoid:blob:sha256:aaaa", "gitoid:blob:sha256:bbbb"]},
+      "body_mime_type": "application/java-vm",
+      "body": {
+        "extra": {},
+        "file_names": ["org/example/Shared.class"],
+        "file_size": 300,
+        "mime_type": ["application/java-vm"]
+      }
+    },
+    {
+      "identifier": "gitoid:blob:sha256:dddd",
+      "connections": {"contained:up": ["gitoid:blob:sha256:aaaa"]},
+      "body_mime_type": "application/java-vm",
+      "body": {
+        "extra": {},
+        "file_names": ["org/example/Only.class"],
+        "file_size": 400,
+        "mime_type": ["application/java-vm"]
+      }
+    }
+  ]
+}

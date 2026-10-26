@@ -280,3 +280,96 @@ pub fn base64url_encode(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// A `serde_json::Value` as a `serde_cbor::Value`.
+///
+/// Written by hand, and it has to be. Every serde-based route from JSON to CBOR
+/// is wrong when `serde_json`'s `arbitrary_precision` feature is enabled — which
+/// it is in any build that links a crate turning it on, because cargo unifies
+/// features across the graph. With that feature, `serde_json::Number` describes
+/// itself to a serializer as a one-field struct named
+/// `$serde_json::private::Number` rather than as a number, and a non-JSON serde
+/// format encodes that struct faithfully as a map — so a number arrives as an
+/// object. `serde_json`'s own serializers match on that name and read what it
+/// meant; no other format can.
+///
+/// This conversion never serializes anything. It reads the number out of the
+/// `Number` with `as_i64`, `as_u64` and `as_f64`, which the feature does not
+/// touch, so an integer stays an integer and a float stays a float.
+pub fn json_to_cbor_value(json: &serde_json::Value) -> serde_cbor::Value {
+    match json {
+        serde_json::Value::Null => serde_cbor::Value::Null,
+        serde_json::Value::Bool(value) => serde_cbor::Value::Bool(*value),
+        serde_json::Value::Number(number) => {
+            if let Some(signed) = number.as_i64() {
+                serde_cbor::Value::Integer(signed as i128)
+            } else if let Some(unsigned) = number.as_u64() {
+                serde_cbor::Value::Integer(unsigned as i128)
+            } else {
+                serde_cbor::Value::Float(number.as_f64().expect("a JSON number is a number"))
+            }
+        }
+        serde_json::Value::String(text) => serde_cbor::Value::Text(text.clone()),
+        serde_json::Value::Array(items) => {
+            serde_cbor::Value::Array(items.iter().map(json_to_cbor_value).collect())
+        }
+        serde_json::Value::Object(entries) => serde_cbor::Value::Map(
+            entries
+                .iter()
+                .map(|(key, member)| {
+                    (
+                        serde_cbor::Value::Text(key.clone()),
+                        json_to_cbor_value(member),
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod json_to_cbor_value_tests {
+    use super::json_to_cbor_value;
+    use serde_cbor::Value;
+
+    /// Requirement: a JSON number becomes a CBOR number, not a map.
+    ///
+    /// What: integers, a float, and a nested array, each checked for the variant
+    /// it must produce.
+    ///
+    /// Why: a `serde_json::Number` describes itself to a serializer as a
+    /// one-field struct named `$serde_json::private::Number` whenever the
+    /// `arbitrary_precision` feature is on, and a serde format encodes that
+    /// struct as a map. Every failure this function exists to prevent looks
+    /// exactly like that map, so the assertion is on the variant rather than on
+    /// the rendered form — a map holding the same digits would print plausibly
+    /// and be wrong.
+    ///
+    /// LLM section: the negative half matters as much as the positive one. If
+    /// the function ever regressed to a serde-based route, the numbers would
+    /// come back as `Value::Map` and every assertion here would fail.
+    #[test]
+    fn a_number_becomes_a_number() {
+        let json = serde_json::json!({"int": 503174, "float": 2.5, "list": [1, 2]});
+        let value = json_to_cbor_value(&json);
+
+        let Value::Map(entries) = &value else {
+            panic!("a JSON object is a CBOR map, found {value:?}");
+        };
+        assert_eq!(
+            entries.get(&Value::Text("int".to_string())),
+            Some(&Value::Integer(503174)),
+            "an integer stays an integer"
+        );
+        assert_eq!(
+            entries.get(&Value::Text("float".to_string())),
+            Some(&Value::Float(2.5)),
+            "a float stays a float"
+        );
+        assert_eq!(
+            entries.get(&Value::Text("list".to_string())),
+            Some(&Value::Array(vec![Value::Integer(1), Value::Integer(2)])),
+            "the elements of an array are converted too"
+        );
+    }
+}

@@ -198,15 +198,12 @@ mod tests {
                 map
             },
             body_mime_type: Some("application/vnd.cc.goatrodeo".to_string()),
-            body: Some(
-                serde_cbor::value::to_value(serde_json::json!({
-                    "extra": {},
-                    "file_names": file_names,
-                    "file_size": 3050u64 + n_file_names as u64,
-                    "mime_type": ["text/x-java-source"]
-                }))
-                .expect("the JSON body converts to a CBOR value"),
-            ),
+            body: Some(sansho::cbor::json_to_cbor_value(&serde_json::json!({
+                "extra": {},
+                "file_names": file_names,
+                "file_size": 3050u64 + n_file_names as u64,
+                "mime_type": ["text/x-java-source"]
+            }))),
         }
     }
 

@@ -188,17 +188,89 @@ impl std::fmt::Display for Step {
 /// The result of reading a level.
 pub type LevelResult<T> = std::result::Result<T, GrammarError>;
 
+/// One stage of a query: a graph traversal, or a program.
+///
+/// The two have the same SHAPE — rows or constants in, rows out — and different
+/// guarantees: a walk is bounded by the graph and deterministic, a program is
+/// computed code bounded only by its limits. So the trait says which one a stage
+/// is, and hands back the one it is; asking for the other is a failure located
+/// like any other mis-read.
+///
+/// `kind` exists so a caller never has to ask the wrong accessor: a scheduler
+/// that must not trust a non-deterministic stage can see what it has without
+/// running it.
+pub trait Stage: ExpressionBuilder {
+    /// Which kind of stage this is.
+    fn kind(&self) -> LevelResult<StageKind>;
+
+    /// The name other stages refer to this one by, when it has one.
+    fn name(&self) -> LevelResult<Option<String>>;
+
+    /// This stage as a walk, or a failure when it is not one.
+    fn walk(&self) -> LevelResult<Rc<dyn Walk>>;
+
+    /// This stage as a program, or a failure when it is not one.
+    fn barker(&self) -> LevelResult<Rc<dyn Barker>>;
+}
+
+/// Which of the two kinds of stage a stage is.
+#[derive(Debug)]
+pub enum StageKind {
+    /// A graph traversal.
+    Walk,
+
+    /// A program.
+    Barker,
+}
+
+/// A program, as a stage of a query.
+///
+/// It differs from a walk in what it consumes: a walk starts from identifiers it
+/// names or derives, while a program reads the ROWS of the stages named in
+/// `inputs` and emits rows of its own. The currency on both sides is the same —
+/// rows — which is what lets a program stand between two walks without a
+/// conversion between them.
+///
+/// There is no "at the end" level here: a program runs once, so anything that
+/// should happen after its last row is the last lines of the program.
+pub trait Barker {
+    /// The upstream stages whose rows this program reads, in the order it reads
+    /// them. Empty is legal: a program that needs no input still emits.
+    fn inputs(&self) -> LevelResult<Vec<String>>;
+
+    /// The program's source.
+    fn program(&self) -> LevelResult<&str>;
+
+    /// Whether this stage's rows also go to the caller, or only to the stages
+    /// downstream of it. Same meaning as a walk's `tee`: the middle of a
+    /// pipeline is usually not wanted as output as well as consumed.
+    fn tee(&self) -> LevelResult<bool>;
+
+    /// Whether an array a row evaluates to produces one row per element.
+    ///
+    /// Same meaning as a walk's `unnest`: one row per element, ONE level only. A
+    /// program that emits lists is usually emitting them because each element is
+    /// a row.
+    fn unnest(&self) -> LevelResult<bool>;
+
+    /// Whether repeated rows are emitted once.
+    ///
+    /// Same meaning as a walk's `dedup`: a value this stage has already emitted is
+    /// not emitted again.
+    fn dedup(&self) -> LevelResult<bool>;
+}
+
 /// The query level: the top of a walk query.
 ///
-/// The only level that is not owned by another. It exists so that "one walk"
-/// and "a chain of walks" are the same thing to everything downstream: a
-/// document that is a single walk is a query of one phase.
+/// The only level that is not owned by another. It exists so that "one stage"
+/// and "a chain of stages" are the same thing to everything downstream: a
+/// document that is a single stage is a query of one phase.
 pub trait Query {
-    /// The walks this query runs, in order.
+    /// The stages this query runs, in order.
     ///
-    /// A query that names phases returns them. A query that is a single walk
+    /// A query that names phases returns them. A query that is a single stage
     /// returns itself, as one element.
-    fn phases(&self) -> LevelResult<Vec<Rc<dyn Walk>>>;
+    fn phases(&self) -> LevelResult<Vec<Rc<dyn Stage>>>;
 }
 
 /// A walk: one rooted traversal, and the phases applied to the items it reaches.
@@ -211,7 +283,9 @@ pub trait Walk {
     fn name(&self) -> LevelResult<Option<String>>;
 
     /// Where this walk begins.
-    fn root(&self) -> LevelResult<Rc<dyn Root>>;
+    /// Where this walk starts, or `None` when it takes its roots from the
+    /// query's input stream.
+    fn root(&self) -> LevelResult<Option<Rc<dyn Root>>>;
 
     /// The connection types this walk traverses, each with the gate that admits
     /// an edge of that type.
@@ -232,6 +306,16 @@ pub trait Walk {
     /// Whether this walk's rows also go to the collector, or only to the walks
     /// downstream of it.
     fn tee(&self) -> LevelResult<bool>;
+
+    /// Whether repeated rows are emitted once.
+    ///
+    /// A row this stage has already emitted is not emitted again, compared by a
+    /// 16-byte BLAKE3 digest of the row's canonical form. Intended for streams of
+    /// identifiers, where "the same row" is unambiguous: a purl shared by two
+    /// visited items appears once. For rows that are objects the comparison is on
+    /// the canonical rendering, so two objects with equal fields dedupe whatever
+    /// order they were built in.
+    fn dedup(&self) -> LevelResult<bool>;
 
     /// What this walk emits once, after it finishes, over the statistics it
     /// gathered. Same semantics as `emit`, a different subject.
@@ -295,6 +379,9 @@ pub enum RootKind {
 
     /// The identifiers come from predicates over upstream walks' rows.
     Predicates,
+
+    /// The identifiers are the caller's input stream.
+    FromInput,
 }
 
 /// A predicate that derives a walk's starting identifiers from the rows of a

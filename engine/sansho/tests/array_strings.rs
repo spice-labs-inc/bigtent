@@ -133,7 +133,7 @@ fn the_value_source_and_a_carrier_both_answer() {
 #[test]
 fn a_computed_array_yields_its_own_text() {
     let document = serde_json::json!({"names": ["a", 3, "b", true]});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).unwrap();
     let program = sansho::compile(&sansho::parse("names[*]").unwrap(), None).unwrap();
     let carrier = sansho::evaluate(&program, bytes.as_slice()).expect("evaluates");
     let text: Vec<&str> = carrier

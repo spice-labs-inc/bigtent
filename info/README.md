@@ -13,6 +13,13 @@ This directory contains technical documentation for Big Tent.
 * [Operations Guide](operations.md) - Production deployment, TLS, monitoring, upgrades, and runbook
   ([LLM companion](llm/operations_llm.md))
 
+### Queries
+
+* [Writing a Query](writing_queries.md) - the stages, the edges, `tee`, and the functions a program can call
+  ([LLM companion](writing_queries_llm.md))
+* [Barker](barker.md) - Starlark in the pipeline: the phases, streaming, natives, boundedness
+  ([LLM companion](llm/barker_llm.md))
+
 ### Sansho (the JMESPath engine)
 
 * [Getting Started](sansho/getting_started.md) - the pieces, a first projection, the cache, in-memory documents

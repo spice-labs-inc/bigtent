@@ -1,0 +1,7 @@
+{
+  "roots": {
+    "from-input": true
+  },
+  "walk": [],
+  "emit": "{identifier: identifier, connections: connections, body: body, body_mime_type: body_mime_type}"
+}

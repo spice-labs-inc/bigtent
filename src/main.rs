@@ -537,6 +537,9 @@ async fn run_query(path_vec: &[PathBuf], args: &Args) -> Result<()> {
     let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&query_path)?)?;
 
     let query: Rc<dyn Query> = Rc::new(document);
+    // one cache for the process: every expression any query compiles is kept, so
+    // the second run of a pre-canned query re-parses its document but compiles
+    // nothing
     let cache = ProgramCache::new(4096);
     let mut run = compile::<NoBudget, PrintSink>(query, &cache)?;
 
@@ -559,10 +562,14 @@ async fn run_query(path_vec: &[PathBuf], args: &Args) -> Result<()> {
     };
 
     let started = std::time::Instant::now();
+    // a closed, empty input: this query names its own roots
+    let (no_roots_sender, no_roots) = flume::unbounded();
+    drop(no_roots_sender);
     run(
         Arc::new(NoBudget),
         print_row,
         HerdOrCluster::Cluster(cluster),
+        no_roots,
     )?;
     info!("Query complete in {:?}", started.elapsed());
     Ok(())

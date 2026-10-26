@@ -24,7 +24,7 @@ fn scan_program() -> std::sync::Arc<sansho::Program> {
 #[test]
 fn consumer_backends_agree_through_lookup() {
     let item = appendix_a(1_000, 500);
-    let bytes = serde_cbor::to_vec(&item).unwrap();
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&item)).unwrap();
     let program = scan_program();
 
     // the byte source (an Arc<Mmap>-backed slice in the real consumer;
@@ -48,7 +48,7 @@ fn consumer_backends_agree_through_lookup() {
 #[test]
 fn consumer_byte_source_borrows_in_place() {
     let item = appendix_a(10, 5);
-    let bytes = serde_cbor::to_vec(&item).unwrap();
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&item)).unwrap();
     let byte_source: &[u8] = &bytes;
     // the root is an object; the identifier member's string (via the
     // trait on the source) is borrowed from the input slice

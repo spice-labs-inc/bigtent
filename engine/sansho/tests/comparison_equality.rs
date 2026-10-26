@@ -49,7 +49,7 @@ fn path_outputs_agree() {
     for target in [10_000usize, 100_000, 1_000_000] {
         let entries = (target / 130).max(1);
         let document = build_item(entries);
-        let bytes = serde_cbor::to_vec(&document).unwrap();
+        let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).unwrap();
         let jmespath_variable = jmespath::Variable::from_serializable(&document).unwrap();
         for expression in [
             "body.file_names[?starts_with(@, 'gitoid:')]",

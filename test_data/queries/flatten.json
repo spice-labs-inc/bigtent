@@ -1,0 +1,17 @@
+{
+  "roots": {
+    "from-input": true
+  },
+  "walk": [
+    "alias:to",
+    "contained:down"
+  ],
+  "emit": {
+    "expr": "{identifier: identifier, body_mime_type: body_mime_type, file_names: body.file_names}",
+    "if": {
+      ">": {
+        "depth": 0
+      }
+    }
+  }
+}

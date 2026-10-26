@@ -13,10 +13,15 @@ content-addressable hashes that uniquely identify each artifact.
 ┌─────────────────────────────────────────────────────────────────┐
 │                        BigTent Server                           │
 ├──────────────────────────────┬──────────────────────────────────┤
-│      REST API (Axum)         │      Lookup CLI                  │
-│   /item /aa /north /flatten  │   --lookup identifiers.json      │
-│   /bulk /purls /openapi.json │   --output results.json          │
+│    REST API (Axum)           │      Lookup CLI                  │
+│  V1: /item /aa /north        │   --lookup identifiers.json      │
+│      /flatten /bulk /purls   │   --query  query.json            │
+│  V2: /v2/query /v2/health    │   --output results.json          │
+│      /v2/node_count /v2/...  │                                  │
 ├──────────────────────────────┴──────────────────────────────────┤
+│  api_v2 (V2 router)   highwire (query compiler + walk engine)   │
+│  barker (Starlark programs)   ← depends on →   highwire         │
+├──────────────────────────────────────────────────────────────────┤
 │                   ClusterHolder<GRT> / GoatHerd                 │
 │              (Hot-reload via ArcSwap)                           │
 ├─────────────────────────────────────────────────────────────────┤
@@ -173,6 +178,71 @@ Built on Axum with streaming support for large responses.
 └─────────────────────────────────────────────────┘
 ```
 
+## Query System
+
+The query system is three tiers, each with its own module, and the dependency
+direction is one-way: `api_v2 → barker → highwire → sansho + the accessors`.
+
+### High Wire (`src/highwire/`) — the grammar and the walk engine
+
+A query is a document of **stages**. A stage is either a **walk** — a traversal
+of the graph — or a **barker** — Starlark source. The traits are in
+`src/highwire/grammar.rs` (one per semantic level); the JSON reading of every
+trait is in `src/highwire/grammar_impl_serde.rs`.
+
+The walk engine (`src/highwire/walk.rs`) runs one walk: a stream of root
+identifiers in, rows out, following every connection type at every item of the
+frontier — a BFS over the union of the named edge types. Every channel is
+`bounded(256)`, so a slow consumer backpressures its producer.
+
+The compiler (`src/highwire/compiler.rs`) turns a document into a
+`CompiledQuery`: every level is read and compiled once (a syntax error anywhere is
+a located failure naming the stage and the level), the stages are ordered by their
+dependencies (a cycle is a compile error), and the wires — a channel per edge, a
+`tee` node per stage that fans out to every destination — are built. `CompiledQuery`
+is `Send + Sync`, held as an `Arc` in a `QueryCache`, and runnable many times
+concurrently.
+
+Roots come from three forms: named outright (`"roots": ["…"]`), derived from
+another stage's rows (`"roots": {"jars": "id"}`), or the caller's input stream
+(`"roots": {"from-input": true}`) — which is what lets a query document be written
+once and served many times.
+
+### Barker (`src/barker/`) — Starlark at a pipeline boundary
+
+Barker is [Starlark](https://github.com/facebook/starlark-rust), the hermetic
+Python dialect: no recursion, no `while`, no `import`, no I/O. A barker stage
+reads a stream of rows (`input`), runs arbitrary logic, and emits rows (`emit`).
+
+It is an element in the pipeline and a starter of pipelines: `highwire.walk`,
+`highwire.barker`, `highwire.from_stage`, `highwire.connection` and `highwire.run`
+are natives a script can call to build and run a query of its own, against the
+same cluster its parent was given. (See [Writing a Query](info/writing_queries.md).)
+
+The namespaces: `math`, `stats`, `collections`, `patterns`, `digest` (gitoids and
+Software Heritage ids via the `coordinates` crate), `dates`. Embedding
+applications add their own natives — a `#[starlark_module]` function passed to
+`barker::run_with`.
+
+### The two HTTP surfaces
+
+V1 (`src/server.rs`) is identifier-at-a-time: `/item`, `/aa`, `/north`,
+`/north_purls`, `/flatten`, `/flatten_source`, `/bulk` — each backed by an
+accessor, with bulk variants that fan over a list.
+
+V2 (`src/api_v2.rs`) is graph-at-a-time: `GET /v2/query?identifier=…&template=…`
+and `POST /v2/query {"roots": [...], "template"|"query"}` stream a query's rows as
+JSON lines. The pre-canned templates replicate the V1 endpoints, and the two
+surfaces are proven to agree: `tests/walk_over_a_graph.rs` and
+`tests/serve_both_apis.rs` compare the V1 accessors' output sets with the V2
+queries' output sets over the same fixture cluster, and every pair agrees.
+
+V2 also carries the operational endpoints — `/v2/health`, `/v2/healthz`,
+`/v2/readyz`, `/v2/metrics`, `/v2/node_count`, `/v2/purls` — and its own OpenAPI
+document at `/v2/openapi.json`. There is no authentication: exposing the query
+surface runs arbitrary traversal and arbitrary Starlark against the cluster, and
+that is a trust decision for whoever serves it.
+
 ## Data Flow
 
 ### Read Path
@@ -239,6 +309,15 @@ Built on Axum with streaming support for large responses.
 ```
 
 ## Threading Model
+
+### Query Pipelines
+
+Every stage of a compiled query runs on its own thread, with a `flume` channel
+per edge — `bounded(256)`, so a slow stage backpressures its producer rather than
+buffering the stream. A walk blocks on its input stream; a barker runs on its own
+thread because the Starlark evaluator is arena-bound and not `Send`. The caller's
+collection runs against the output channel, which closes when the last stage
+finishes.
 
 ### Server Mode
 

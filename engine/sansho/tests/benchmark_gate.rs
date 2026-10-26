@@ -88,7 +88,7 @@ fn per_evaluation(program: &sansho::Program, bytes: &[u8], minimum: Duration) ->
 #[test]
 fn benchmark_gate_prefix_filter_selectivity() {
     let document = scaled_item(4_000);
-    let bytes = serde_cbor::to_vec(&document).unwrap();
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).unwrap();
 
     let prefix = compile(
         &parse("body.file_names[?starts_with(@, 'gitoid:')]").unwrap(),
@@ -147,7 +147,7 @@ fn benchmark_gate_prefix_filter_selectivity() {
 #[test]
 fn benchmark_gate_no_selection_not_slower() {
     let document = scaled_item(4_000);
-    let bytes = serde_cbor::to_vec(&document).unwrap();
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).unwrap();
 
     // `identifier` must skip past the huge `body` sibling: the walk is
     // cheap for the machinery, but the format makes a late key cost the
@@ -194,7 +194,7 @@ fn benchmark_gate_no_selection_scale_invariance() {
     let entries = [1_000usize, 4_000, 16_000, 64_000];
     let documents: Vec<Vec<u8>> = entries
         .iter()
-        .map(|count| serde_cbor::to_vec(&scaled_item(*count)).unwrap())
+        .map(|count| serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&scaled_item(*count))).unwrap())
         .collect();
     // the series must actually grow, or the test measures nothing
     for pair in documents.windows(2) {
@@ -274,7 +274,7 @@ fn benchmark_gate_worst_case_legal_expression() {
         expression
     };
     let document = serde_json::json!({"a0": {"a1": {"a2": {"b": "found"}}}});
-    let bytes = serde_cbor::to_vec(&document).unwrap();
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).unwrap();
 
     let start = Instant::now();
     let parsed = parse(&nested).expect("the deep-but-legal expression parses");

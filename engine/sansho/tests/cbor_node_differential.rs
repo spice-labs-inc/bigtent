@@ -13,7 +13,7 @@ struct CborNodeEngine;
 
 impl Driver for CborNodeEngine {
     fn evaluate(&self, given: &serde_json::Value, expression: &str) -> DriverOutcome {
-        let bytes = match serde_cbor::to_vec(given) {
+        let bytes = match serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(given)) {
             Ok(bytes) => bytes,
             Err(e) => {
                 return DriverOutcome::Error(sansho::SanshoError::Input {
@@ -44,14 +44,8 @@ struct CborValueEngine;
 
 impl Driver for CborValueEngine {
     fn evaluate(&self, given: &serde_json::Value, expression: &str) -> DriverOutcome {
-        let value = match serde_cbor::value::to_value(given) {
-            Ok(value) => value,
-            Err(e) => {
-                return DriverOutcome::Error(sansho::SanshoError::Input {
-                    message: format!("fixture conversion: {e}"),
-                });
-            }
-        };
+        // the translator cannot fail: it rewrites the value, it does not serialize
+        let value = sansho::cbor::json_to_cbor_value(given);
         let parsed = match sansho::parse(expression) {
             Ok(parsed) => parsed,
             Err(e) => return DriverOutcome::Error(e),
@@ -117,7 +111,7 @@ fn corpus_green_through_cbor_node() {
 // until a consumer happened to use it.
 //
 // LLM section: the driver converts each corpus `given` with
-// `serde_cbor::value::to_value` and evaluates through the borrowed
+// the shared fixture conversion and evaluates through the borrowed
 // `&serde_cbor::Value` implementation. A failure prints the feature, the
 // expression, the document, and the outcome, so a regression names itself.
 #[test]
@@ -181,7 +175,7 @@ fn cbor_node_matches_cursor_engine() {
             .map(|_| serde_json::Value::Number(((next() % 1_000_000) as i64).into()))
             .collect();
         let given = serde_json::Value::Array(values);
-        let bytes = serde_cbor::to_vec(&given).unwrap();
+        let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&given)).unwrap();
         for expr in expressions {
             let parsed = sansho::parse(expr).unwrap();
             let program = sansho::compile(&parsed, None).unwrap();
@@ -299,7 +293,7 @@ fn escape_case_matrix_pins_the_mapping() {
     // trailing bytes after a valid document: silently ignored — the root
     // decode reads one document and does not require the slice to end at
     // it, so bytes past the document are never read
-    let mut doc = serde_cbor::to_vec(&serde_json::json!({"a": 1})).unwrap();
+    let mut doc = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&serde_json::json!({"a": 1}))).unwrap();
     doc.push(0x00); // one trailing byte
     let with_trailing = {
         let slice: &[u8] = &doc;
@@ -349,7 +343,7 @@ fn fuzz_truncated_slices_never_panic() {
         "connections": {"alias:from": ["pkg:a", "gitoid:b"], "contained:up": ["p"]},
         "body": {"file_names": ["a.java", "b.java"], "file_size": 3050}
     });
-    let full = serde_cbor::to_vec(&doc).unwrap();
+    let full = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&doc)).unwrap();
     let whole = sansho::compile(&sansho::parse("@").unwrap(), None).unwrap();
     for len in 0..full.len() {
         let truncated = &full[..len];

@@ -287,3 +287,276 @@ fn render_postfix(post: &Postfix, out: &mut String) {
         }
     }
 }
+
+/// Whether an expression can produce a string.
+///
+/// A REASONABLE EFFORT, not inference. It answers `true` whenever a string is
+/// among the shapes the expression can produce, and `false` only when it is
+/// certain that no string can come out — so a `false` is a proof of absence
+/// rather than a guess, and a caller may refuse on it.
+///
+/// Why this shape: a downstream stage may take only strings, and a `false` lets
+/// that be refused before anything runs. But an expression that can produce
+/// several shapes is legal as long as ONE of them is a string, because at
+/// runtime the non-strings are simply not forwarded — so this errs towards
+/// `true` everywhere the outcome is uncertain. A field access answers `true`
+/// even though it is usually a number, because nothing here knows the document.
+pub fn can_be_a_string(expression: &Expr) -> bool {
+    match expression {
+        // a pipe's result is its right-hand side
+        Expr::Pipe(_, right) => can_be_a_string(right),
+        // `||` and `&&` yield one of their operands
+        Expr::Or(left, right) | Expr::And(left, right) => {
+            can_be_a_string(left) || can_be_a_string(right)
+        }
+        // a comparison and a `!` always yield a boolean
+        Expr::Compare(..) | Expr::Not(_) => false,
+        Expr::Chain(primary, postfixes) => {
+            // a postfix that reshapes the result decides; otherwise the primary
+            // and every postfix have to be considered
+            postfixes
+                .iter()
+                .rev()
+                .find_map(postfix_decides)
+                .unwrap_or_else(|| can_be_a_string_primary(primary, postfixes))
+        }
+    }
+}
+
+/// Whether an emit entry can produce a string ROW.
+///
+/// [`can_be_a_string`] answers about the expression's VALUE. A row is not always
+/// the value: with `unnest` off the row is what the expression produced, and with
+/// it on a row is an ELEMENT of that value when the value is an array — and the
+/// value itself when it is not.
+///
+/// That difference decides real queries. `[identifier, 'literal']` with `unnest`
+/// emits two string rows, so an edge taking identifiers must accept it; the same
+/// expression without `unnest` emits one array row, which is not an identifier.
+/// And `{id: identifier}` with `unnest` still emits one object row, because there
+/// is no array to unnest — so `unnest` is not a licence to answer true.
+pub fn can_emit_a_string(expression: &Expr, unnest: bool) -> bool {
+    if can_be_a_string(expression) {
+        // the value itself can be a row
+        return true;
+    }
+    if !unnest {
+        // the row IS the value, and the value cannot be a string
+        return false;
+    }
+    // `unnest` can only help when the value can be an array. If it certainly
+    // cannot be one, there is nothing to unnest and the row is the value.
+    !certainly_not_an_array(expression)
+}
+
+/// Whether an expression's value certainly cannot be an array.
+///
+/// The mirror of [`can_be_a_string`] and read the same way: `true` is a proof
+/// that no array can come out, so a caller may rely on it.
+fn certainly_not_an_array(expression: &Expr) -> bool {
+    match expression {
+        Expr::Pipe(_, right) => certainly_not_an_array(right),
+        Expr::Or(left, right) | Expr::And(left, right) => {
+            certainly_not_an_array(left) && certainly_not_an_array(right)
+        }
+        Expr::Compare(..) | Expr::Not(_) => true,
+        Expr::Chain(primary, postfixes) => match postfixes.iter().rev().find_map(array_decides) {
+            Some(not_an_array) => not_an_array,
+            None => match primary {
+                // the current node can be an array
+                Primary::Current => false,
+                Primary::RawString(_) => true,
+                Primary::Literal(value) => !value.is_array(),
+                Primary::Field(_) | Primary::Function(..) => false,
+                Primary::MultiList(_) => false,
+                Primary::MultiHash(_) => true,
+            },
+        },
+    }
+}
+
+/// A postfix that settles whether the value is an array.
+fn array_decides(postfix: &Postfix) -> Option<bool> {
+    match postfix {
+        // always an array
+        Postfix::Flatten | Postfix::Filter(_) | Postfix::MultiList(_) | Postfix::Wildcard { .. } => {
+            Some(false)
+        }
+        // always an object
+        Postfix::MultiHash(_) => Some(true),
+        // depend on what they are applied to
+        Postfix::Field(_) | Postfix::Index(_) | Postfix::Slice(_) | Postfix::Function(..) => None,
+    }
+}
+
+/// A postfix whose result type it settles on its own, whatever came before it.
+fn postfix_decides(postfix: &Postfix) -> Option<bool> {
+    match postfix {
+        // a flatten always yields an array
+        Postfix::Flatten => Some(false),
+        // a filter always yields an array
+        Postfix::Filter(_) => Some(false),
+        // a multiselect on either side yields an object
+        Postfix::MultiHash(_) => Some(false),
+        // a multiselect list yields an array
+        Postfix::MultiList(_) => Some(false),
+        // the rest depend on what they are applied to
+        Postfix::Field(_)
+        | Postfix::Wildcard { .. }
+        | Postfix::Index(_)
+        | Postfix::Slice(_)
+        | Postfix::Function(..) => None,
+    }
+}
+
+/// The primary, with the postfixes that do not decide for themselves.
+fn can_be_a_string_primary(primary: &Primary, postfixes: &[Postfix]) -> bool {
+    match primary {
+        // the current node can be anything
+        Primary::Current => true,
+        // a raw string is a string
+        Primary::RawString(_) => true,
+        // a literal is a string only when it IS one
+        Primary::Literal(value) => value.is_string(),
+        // a field, a function call and the rest are unknown or non-string
+        Primary::Field(_) => true,
+        Primary::Function(..) => true,
+        Primary::MultiList(_) => false,
+        Primary::MultiHash(_) => false,
+    }
+    .then_some(true)
+    .or_else(|| {
+        // a postfix chain ending in a function call can yield a string whatever
+        // the primary was, because the function decides its own result type
+        (postfixes
+            .last()
+            .map(|postfix| matches!(postfix, Postfix::Function(..)))
+            .unwrap_or(false))
+        .then_some(true)
+    })
+    .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod can_be_a_string_tests {
+    use super::{can_be_a_string, can_emit_a_string};
+    use crate::parser::parse;
+
+    /// Requirement: a `false` from the analysis is a proof that no string can
+    /// come out, never a guess.
+    ///
+    /// What: expressions whose result shape is fixed — a comparison, a `!`, a
+    /// multiselect hash, a multiselect list, a literal number, a flatten, a
+    /// filter.
+    ///
+    /// Why: a downstream stage may take only strings, and refusing an edge on
+    /// this answer is only safe if `false` is certain. If any of these could
+    /// yield a string, a legal query would be refused at compile time and the
+    /// author would have no way to see why.
+    ///
+    /// LLM section: the assertion is on the SHAPE, which is what the function
+    /// answers, not on a rendered result.
+    #[test]
+    fn a_false_is_a_proof_of_absence() {
+        for expression in [
+            "a == b",
+            "!a",
+            "{id: identifier}",
+            "[identifier]",
+            "`1`",
+            "`true`",
+            "names[]",
+            "names[?@ == `1`]",
+        ] {
+            let parsed = parse(expression).expect("parses");
+            assert!(
+                !can_be_a_string(&parsed),
+                "`{expression}` cannot produce a string"
+            );
+        }
+    }
+
+    /// Requirement: `unnest` changes what a row is, and the analysis has to
+    /// follow it.
+    ///
+    /// What: a multiselect list, with and without `unnest`; a multiselect hash
+    /// with `unnest`; a comparison with `unnest`; a filter with `unnest`.
+    ///
+    /// Why: without `unnest` the row is the expression's value, so a list of
+    /// identifiers is one array row — not an identifier. With `unnest` each
+    /// ELEMENT becomes a row, and `[identifier, 'literal']` therefore emits two
+    /// string rows, which an edge taking identifiers must accept. An analysis
+    /// that ignored the flag would refuse that edge and call a legal query
+    /// illegal.
+    ///
+    /// LLM section: the multiselect list with `unnest` is the case this exists
+    /// for — its entries are the rows, so the entries are what to ask about. A
+    /// filter with `unnest` answers true because its elements are unknown, which
+    /// is the conservative answer the value-level check also gives.
+    #[test]
+    fn unnest_decides_what_a_row_is() {
+        let list = parse("[identifier, 'literal']").expect("parses");
+        assert!(
+            !can_emit_a_string(&list, false),
+            "without unnest the row is the array itself"
+        );
+        assert!(
+            can_emit_a_string(&list, true),
+            "with unnest each entry is a row, and both are strings"
+        );
+
+        let hash = parse("{id: identifier}").expect("parses");
+        assert!(
+            !can_emit_a_string(&hash, true),
+            "a hash is one object row whatever the flag says"
+        );
+
+        let compare = parse("a == b").expect("parses");
+        assert!(
+            !can_emit_a_string(&compare, true),
+            "a boolean is not an array, so unnest has nothing to unnest"
+        );
+
+        let filter = parse("names[?@ == `1`]").expect("parses");
+        assert!(
+            can_emit_a_string(&filter, true),
+            "the elements of a filtered array are unknown, so a string is possible"
+        );
+    }
+
+    /// Requirement: an expression that CAN produce a string answers true, even
+    /// when it can produce other shapes too.
+    ///
+    /// What: a raw string, a string literal, the current node, a field, a
+    /// function, a pipe whose right-hand side is a string, and a multiselect
+    /// whose entries include one.
+    ///
+    /// Why: the runtime policy is to forward strings and drop the rest, so an
+    /// expression that yields several shapes is legal as long as one of them is a
+    /// string. Refusing those would break queries that are perfectly well served
+    /// by the drop.
+    ///
+    /// LLM section: `body.file_size` is the case that makes this necessary — it
+    /// is a number in every document we have, and the analysis cannot know that,
+    /// so it answers true and the walk receives nothing.
+    #[test]
+    fn a_possible_string_is_enough() {
+        for expression in [
+            "'literal'",
+            "`\"quoted\"`",
+            "@",
+            "identifier",
+            "body.file_size",
+            "length(@)",
+            "identifier | @",
+            "a || b",
+            "a && 'fallback'",
+        ] {
+            let parsed = parse(expression).expect("parses");
+            assert!(
+                can_be_a_string(&parsed),
+                "`{expression}` can produce a string"
+            );
+        }
+    }
+}

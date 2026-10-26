@@ -52,6 +52,8 @@
 //! - `.gri` - Index files (GitOID → data offset mapping)
 //! - `.grd` - Data files (CBOR-encoded Items)
 
+pub mod api_v2;
+pub mod barker;
 pub mod bench_util;
 pub mod cluster_list;
 pub mod compare;

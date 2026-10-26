@@ -56,8 +56,9 @@
 //! or holds them behind an `Rc`, would not pay it at all.
 
 use crate::highwire::grammar::{
-    EmitEntry, GrammarError, ItemEmit, ItemFilter, ItemStop, LevelResult, Query, Root, RootKind,
-    RootPredicate, SanshoExpression, Step, StopRule, Walk, WalkConnection,
+    Barker, EmitEntry, GrammarError, ItemEmit, ItemFilter, ItemStop, LevelResult, Query, Root,
+    RootKind, RootPredicate, SanshoExpression, Stage, StageKind, Step, StopRule, Walk,
+    WalkConnection,
 };
 use crate::highwire::walk::{
     CompareTypes, ConFilter, ExpressionBuilder, WalkBuilder, build_con_compare_function,
@@ -297,17 +298,130 @@ impl WalkBuilder for serde_json::Value {
 /// form, and it is settled here so that nothing downstream has to know which one
 /// it was given.
 impl Query for serde_json::Value {
-    fn phases(&self) -> LevelResult<Vec<Rc<dyn Walk>>> {
+    fn phases(&self) -> LevelResult<Vec<Rc<dyn Stage>>> {
         match self.get("phases") {
             Some(serde_json::Value::Array(phases)) => Ok(phases
                 .iter()
-                .map(|phase| Rc::new(phase.clone()) as Rc<dyn Walk>)
+                .map(|phase| Rc::new(phase.clone()) as Rc<dyn Stage>)
                 .collect()),
             Some(other) => Err(GrammarError::at(
                 Step::Query,
                 format!("`phases` is an array of walks, found {other}"),
             )),
             None => Ok(vec![Rc::new(self.clone())]),
+        }
+    }
+}
+
+/// A stage, as JSON expresses it.
+///
+/// The selector is the `barker` key: a document that names a program is a
+/// program, anything else is a walk. That keeps every existing document valid
+/// unchanged — a walk is still a walk — and gives a program the one shape it
+/// needs, `{"barker": "<source>", "inputs"?: [...]}`.
+impl Stage for serde_json::Value {
+    fn kind(&self) -> LevelResult<StageKind> {
+        if self.get("barker").is_some() {
+            Ok(StageKind::Barker)
+        } else {
+            Ok(StageKind::Walk)
+        }
+    }
+
+    fn name(&self) -> LevelResult<Option<String>> {
+        Walk::name(self)
+    }
+
+    fn walk(&self) -> LevelResult<Rc<dyn Walk>> {
+        if self.get("barker").is_some() {
+            return Err(GrammarError::at(
+                Step::Query,
+                "this stage names a program; it is not a walk",
+            ));
+        }
+        Ok(Rc::new(self.clone()))
+    }
+
+    fn barker(&self) -> LevelResult<Rc<dyn Barker>> {
+        if self.get("barker").is_none() {
+            return Err(GrammarError::at(
+                Step::Query,
+                "this stage is a walk; it names no program",
+            ));
+        }
+        Ok(Rc::new(self.clone()))
+    }
+}
+
+/// A program, as JSON expresses it: `{"barker": "<source>", "inputs"?: [...]}`.
+impl Barker for serde_json::Value {
+    fn inputs(&self) -> LevelResult<Vec<String>> {
+        match self.get("inputs") {
+            Some(serde_json::Value::Array(inputs)) => {
+                let mut names = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let Some(name) = input.as_str() else {
+                        return Err(GrammarError::at(
+                            Step::Query,
+                            format!("every input is the name of a stage, found {input}"),
+                        ));
+                    };
+                    names.push(name.to_string());
+                }
+                Ok(names)
+            }
+            Some(other) => Err(GrammarError::at(
+                Step::Query,
+                format!("`inputs` is a list of stage names, found {other}"),
+            )),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn tee(&self) -> LevelResult<bool> {
+        match self.get("tee") {
+            Some(serde_json::Value::Bool(tee)) => Ok(*tee),
+            Some(other) => Err(GrammarError::at(
+                Step::Tee,
+                format!("`tee` is a boolean, found {other}"),
+            )),
+            None => Ok(false),
+        }
+    }
+
+    fn unnest(&self) -> LevelResult<bool> {
+        match self.get("unnest") {
+            Some(serde_json::Value::Bool(unnest)) => Ok(*unnest),
+            Some(other) => Err(GrammarError::at(
+                Step::Emit,
+                format!("`unnest` is a boolean, found {other}"),
+            )),
+            None => Ok(false),
+        }
+    }
+
+    fn dedup(&self) -> LevelResult<bool> {
+        match self.get("dedup") {
+            Some(serde_json::Value::Bool(dedup)) => Ok(*dedup),
+            Some(other) => Err(GrammarError::at(
+                Step::Emit,
+                format!("`dedup` is a boolean, found {other}"),
+            )),
+            None => Ok(false),
+        }
+    }
+
+    fn program(&self) -> LevelResult<&str> {
+        match self.get("barker") {
+            Some(serde_json::Value::String(source)) => Ok(source.as_str()),
+            Some(other) => Err(GrammarError::at(
+                Step::Query,
+                format!("a program is written as a string, found {other}"),
+            )),
+            None => Err(GrammarError::at(
+                Step::Query,
+                "this stage is a walk; it names no program",
+            )),
         }
     }
 }
@@ -328,14 +442,12 @@ impl Walk for serde_json::Value {
         }
     }
 
-    fn root(&self) -> LevelResult<Rc<dyn Root>> {
-        let Some(roots) = self.get("roots") else {
-            return Err(GrammarError::at(
-                Step::Root,
-                "a walk names where it starts, under `roots`",
-            ));
-        };
-        Ok(Rc::new(roots.clone()))
+    fn root(&self) -> LevelResult<Option<Rc<dyn Root>>> {
+        // `roots` is one key with three forms: a list of identifiers, an object
+        // naming the stages this walk derives them from, or `{"from-input": true}`
+        // for the caller's input stream. The absence means the walk has no roots,
+        // which only the compiler can judge.
+        Ok(self.get("roots").map(|roots| Rc::new(roots.clone()) as Rc<dyn Root>))
     }
 
     fn connections(&self) -> LevelResult<Vec<Rc<dyn WalkConnection>>> {
@@ -383,6 +495,17 @@ impl Walk for serde_json::Value {
             Some(other) => Err(GrammarError::at(
                 Step::Tee,
                 format!("`tee` is a boolean, found {other}"),
+            )),
+            None => Ok(false),
+        }
+    }
+
+    fn dedup(&self) -> LevelResult<bool> {
+        match self.get("dedup") {
+            Some(serde_json::Value::Bool(dedup)) => Ok(*dedup),
+            Some(other) => Err(GrammarError::at(
+                Step::Emit,
+                format!("`dedup` is a boolean, found {other}"),
             )),
             None => Ok(false),
         }
@@ -459,7 +582,26 @@ impl Root for serde_json::Value {
     fn kind(&self) -> LevelResult<RootKind> {
         match self {
             serde_json::Value::Array(_) => Ok(RootKind::Enumerated),
-            serde_json::Value::Object(_) => Ok(RootKind::Predicates),
+            // `{"from-input": true}` is the caller's input stream; any other object
+            // names the stages this walk derives its roots from. The from-input form
+            // is from-input ALONE — a mixed object would leave its extra keys
+            // silently unread, so it is refused here where the mistake is visible.
+            serde_json::Value::Object(entries) => {
+                if entries.get("from-input") == Some(&serde_json::Value::Bool(true)) {
+                    if entries.len() > 1 {
+                        return Err(GrammarError::at(
+                            Step::Root,
+                            format!(
+                                "`{{\"from-input\": true}}` is the whole root; the extra \
+                                 keys are unread: {entries:?}"
+                            ),
+                        ));
+                    }
+                    Ok(RootKind::FromInput)
+                } else {
+                    Ok(RootKind::Predicates)
+                }
+            }
             other => Err(GrammarError::at(
                 Step::Root,
                 format!(

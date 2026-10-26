@@ -1,0 +1,15 @@
+{
+  "roots": {
+    "from-input": true
+  },
+  "walk": [
+    "alias:to",
+    "tag:from",
+    "contained:up"
+  ],
+  "emit": {
+    "expr": "connections.\"alias:from\"",
+    "unnest": true,
+    "if": "length(connections.\"alias:from\") > `0`"
+  }
+}
