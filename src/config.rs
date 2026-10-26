@@ -119,17 +119,6 @@ pub struct Args {
     #[arg(long, num_args = 1..)]
     pub convert_to_v4: Vec<PathBuf>,
 
-    /// Run a query against the cluster given by `--rodeo` and print the rows
-    /// it emits, one JSON value per line.
-    ///
-    /// A query is a JSON walk definition: `roots` (the identifiers to start
-    /// from), `walk` (the connection types to follow, in order), and the
-    /// three gates — `filter`, `emit` and `stop` — each using the grammar of
-    /// its own definition. `filter` defaults to admitting every item, `stop`
-    /// to never firing, and `emit` is required.
-    #[arg(long)]
-    pub query: Option<PathBuf>,
-
     /// Compare two clusters for item equality. Exactly two paths, each a
     /// cluster directory or a `.grc` file. Works across key algorithms
     /// (V3/MD5 vs V4/BLAKE3). Prints a summary; exits 0 when every item

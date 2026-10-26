@@ -514,9 +514,9 @@ level; the corpus test `test_large_corpus_merge` for large runs).
 
 ## Query Operations
 
-Queries run through two surfaces — the CLI (`--query`) and the V2 HTTP endpoints
-(`/v2/query`) — over the same compiler and walk engine. This section is what an
-operator needs beyond [Writing a Query](writing_queries.md).
+Queries run through the V2 HTTP endpoints (`/v2/query`) over the same compiler
+and walk engine. This section is what an operator needs beyond
+[Writing a Query](writing_queries.md).
 
 ### What a query costs
 

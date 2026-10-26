@@ -15,8 +15,8 @@ content-addressable hashes that uniquely identify each artifact.
 ├──────────────────────────────┬──────────────────────────────────┤
 │    REST API (Axum)           │      Lookup CLI                  │
 │  V1: /item /aa /north        │   --lookup identifiers.json      │
-│      /flatten /bulk /purls   │   --query  query.json            │
-│  V2: /v2/query /v2/health    │   --output results.json          │
+│      /flatten /bulk /purls   │   --output results.json          │
+│  V2: /v2/query /v2/health    │                                  │
 │      /v2/node_count /v2/...  │                                  │
 ├──────────────────────────────┴──────────────────────────────────┤
 │  api_v2 (V2 router)   highwire (query compiler + walk engine)   │
