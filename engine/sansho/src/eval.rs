@@ -173,9 +173,13 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
         Edge::Compute(program) => {
             // a value-construct spliced into the chain: the program evaluates
             // over the current value and the result continues as a VALUE (a
-            // computed value has no backing position)
+            // computed value has no backing position). Materializing the flow
+            // matters for a parenthesised GROUP: its inner projection — a
+            // grouping — becomes the array value itself, so the postfixes
+            // project on that value `(foo[*].bar)[0]` instead of per element
+            // `foo[*].bar[0]`, which is the whole semantics of grouping.
             let flow = eval(program, node)?;
-            continue_flow(flow, rest)
+            continue_flow(Flow::Value(flow_value(flow)), rest)
         }
         Edge::Key(name) => match node.kind() {
             // the specification's null semantics: a miss on a value that is
@@ -451,7 +455,39 @@ pub fn truthy<'a>(value: &(dyn SanshoTrait<'a> + 'a)) -> bool {
 /// Value equality over the trait: the same kind and the same content,
 /// recursively for containers. Numbers compare as doubles (the
 /// specification's reduction); objects compare by key and member.
+/// The deepest a structural equality walk may descend. Two shared DAGs with
+/// equal denoted content but distinct memory force a full walk — 2^N node
+/// pairs for an N-deep chain — and nothing else bounds it: the materialization
+/// budget never sees it (the comparison's RESULT is one boolean node), and a
+/// hostile expression can build the operands in ~8 characters per level.
+/// Sixteen levels is far above any real document shape and caps the walk at
+/// ~65k pairs.
+const MAX_EQUALITY_DEPTH: u32 = 16;
+
 fn trait_equal<'a>(left: &SanshoCarrier<'a>, right: &SanshoCarrier<'a>) -> Result<bool, Stop> {
+    trait_equal_at(left, right, 0)
+}
+
+fn trait_equal_at<'a>(
+    left: &SanshoCarrier<'a>,
+    right: &SanshoCarrier<'a>,
+    depth: u32,
+) -> Result<bool, Stop> {
+    // pointer identity is equality, always: one shared allocation compares
+    // equal to itself without walking. The converse does NOT hold — distinct
+    // allocations may still be equal — so a false pointer comparison falls
+    // through to the structural walk.
+    if std::rc::Rc::ptr_eq(left, right) {
+        return Ok(true);
+    }
+    if depth > MAX_EQUALITY_DEPTH {
+        return Err(Stop::Error(SanshoError::Limit {
+            message: format!(
+                "equality exceeds a nesting depth of {MAX_EQUALITY_DEPTH}; \
+                 deep structures cannot be compared cheaply"
+            ),
+        }));
+    }
     if left.kind() != right.kind() {
         return Ok(false);
     }
@@ -470,7 +506,7 @@ fn trait_equal<'a>(left: &SanshoCarrier<'a>, right: &SanshoCarrier<'a>) -> Resul
             };
             Ok(a.len() == b.len() && {
                 for (va, vb) in a.iter().zip(&b) {
-                    if !trait_equal(va, vb)? {
+                    if !trait_equal_at(va, vb, depth + 1)? {
                         return Ok(false);
                     }
                 }
@@ -494,7 +530,7 @@ fn trait_equal<'a>(left: &SanshoCarrier<'a>, right: &SanshoCarrier<'a>) -> Resul
                     let Some(vb) = b.get(k) else {
                         return Ok(false);
                     };
-                    if !trait_equal(&v, vb)? {
+                    if !trait_equal_at(&v, vb, depth + 1)? {
                         return Ok(false);
                     }
                 }
@@ -960,6 +996,18 @@ fn escape_string(the_str: &str) -> String {
 /// and renders as `null`; a byte string has no JSON representation at all and
 /// renders as a placeholder.
 fn string_for<'b>(one: &SanshoCarrier<'b>, quote_string: bool) -> Result<String, Stop> {
+    // rendering a container walks its denoted tree — the same exponential
+    // walk materialization has — so it is budgeted at the SAME node maximum.
+    // The budget is per rendering call, like materialize's is per conversion.
+    let mut budget = crate::MaterializationBudget::default();
+    string_for_counted(one, quote_string, &mut budget)
+}
+
+fn string_for_counted<'b>(
+    one: &SanshoCarrier<'b>,
+    quote_string: bool,
+    budget: &mut crate::MaterializationBudget,
+) -> Result<String, Stop> {
     match one.kind() {
         Kind::String => Ok({
             let the_str = one.as_str()?;
@@ -982,7 +1030,8 @@ fn string_for<'b>(one: &SanshoCarrier<'b>, quote_string: bool) -> Result<String,
 
             let mut out = vec![];
             for v in arr {
-                out.push(string_for(&v, true)?);
+                budget.count_node().map_err(Stop::Error)?;
+                out.push(string_for_counted(&v, true, budget)?);
             }
 
             format!("[{}]", out.join(","))
@@ -993,10 +1042,11 @@ fn string_for<'b>(one: &SanshoCarrier<'b>, quote_string: bool) -> Result<String,
 
             let mut out = vec![];
             for (k, v) in arr {
+                budget.count_node().map_err(Stop::Error)?;
                 out.push(format!(
                     "\"{}\":{}",
                     escape_string(k),
-                    string_for(&v, true)?
+                    string_for_counted(&v, true, budget)?
                 ));
             }
 

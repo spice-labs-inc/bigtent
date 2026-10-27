@@ -15,6 +15,9 @@ WORKDIR /src/bigtent
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY benches ./benches
+# the workspace members: the root manifest declares them, and cargo cannot
+# even enumerate the workspace without their manifests
+COPY engine ./engine
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -26,6 +29,9 @@ COPY --from=planner /src/bigtent/recipe.json recipe.json
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY benches ./benches
+# the workspace members, for the same reason: cook reads their manifests, and
+# the final build compiles them into the binary
+COPY engine ./engine
 
 RUN cargo chef cook --release --recipe-path recipe.json --bin bigtent
 

@@ -13,6 +13,7 @@ use crate::rodeo::goat_herd::GoatHerd;
 use crate::rodeo::goat_trait::GoatRodeoTrait;
 use crate::rodeo::index::GetOffset;
 use anyhow::{Result, bail};
+use sansho::error::SanshoError;
 use flume::Receiver;
 use sansho::eval::truthy;
 use sansho::{Program, ProgramCache, SanshoCarrier, SanshoTrait};
@@ -26,7 +27,10 @@ use tokio::sync::mpsc::Sender;
 pub type Comparison<'s> = (CompareTypes, &'s str, Rc<dyn ExpressionBuilder>);
 
 /// An item predicate over a carrier of one lifetime.
-pub type ItemCompareFn<'a> = Arc<dyn Fn(SanshoCarrier<'a>, &WalkState) -> bool + Send + Sync>;
+/// Fallible like [`ItemGate`]: Err is an evaluation failure.
+pub type ItemCompareFn<'a> = Arc<
+    dyn Fn(SanshoCarrier<'a>, &WalkState) -> Result<bool, SanshoError> + Send + Sync,
+>;
 
 /// A leaf's comparison, built rather than called: the shape
 /// [`build_expression`] takes so that a gate context can choose its own leaf
@@ -39,7 +43,12 @@ pub type ConFilterBuilder = Arc<dyn Fn(&str) -> Result<ConFilter> + Send + Sync>
 /// every signature: they appear in the walk's interface, in the builders that
 /// produce them, and in the compiler that hands them over, and a reader should
 /// not have to check three spellings agree.
-pub type ItemGate = Arc<dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> bool + Send + Sync>;
+/// A gate returns Ok(false) for "does not match" and Err when the
+/// EVALUATION failed — a different fact the walk reports to the accountant
+/// rather than silently treating as a filter-out.
+pub type ItemGate = Arc<
+    dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> Result<bool, SanshoError> + Send + Sync,
+>;
 
 /// What an emit produces for one subject, compiled.
 pub type ItemEmitFn =
@@ -57,6 +66,62 @@ pub struct WalkState {
     pub depth_cnt: usize,
 }
 
+/// The cancellation a run's OWNER holds: set it, and every accountant-backed
+/// check in the pipeline sees it.
+///
+/// This is the flag for the granularity gap send-failure propagation cannot
+/// close: a stage learns a consumer vanished when it next SENDS, but a stage
+/// mid-computation — a barker in a long loop, a walk deep in a level — sends
+/// nothing for a while. The run's owner (the HTTP layer) flips this flag when
+/// the response is dropped, and the accountant's per-item checks — the same
+/// checks the budget work will use — stop the work promptly.
+#[derive(Clone, Default)]
+pub struct Cancellation {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Cancellation {
+    pub fn new() -> Self {
+        Cancellation {
+            flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Mark the run as cancelled: every check from now on reports it.
+    pub fn cancel(&self) {
+        self.flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The accountant that carries a [`Cancellation`]: the walk's per-level
+/// `should_stop` check and the barker stage's per-row check consult it.
+pub struct Cancelled {
+    pub cancellation: Cancellation,
+}
+
+impl AccountingAndBudget for Cancelled {
+    fn should_stop(&self) -> Option<Vec<Value>> {
+        if self.cancellation.is_cancelled() {
+            Some(vec![serde_json::json!({
+                "cancelled": "the run's consumer disconnected",
+            })])
+        } else {
+            None
+        }
+    }
+
+    fn can_sink_normal(&self) -> bool {
+        true
+    }
+
+    fn event(&self, _event_type: AccountingEventType) {}
+}
+
 pub trait AccountingAndBudget {
     fn should_stop(&self) -> Option<Vec<Value>>;
 
@@ -69,9 +134,45 @@ pub trait AccountingAndBudget {
     fn event(&self, event_type: AccountingEventType);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountingEventType {
+    /// An item was read from the cluster or herd.
     LoadItem,
+    /// A row was handed to a sink (the sinks fire this themselves).
     Emit,
+    /// The walk began. The accountant can clock the walk's duration from
+    /// this event to a `Terminated*` event.
+    WalkStarted,
+    /// One iteration of the walk's outer loop: one ROUND of traversal.
+    WalkRound,
+    /// A root or follow-on identifier resolved to NO item.
+    ItemMissing,
+    /// An edge was followed into the next round.
+    ConnectionFollowed,
+    /// An edge was dropped because the connection filter refused it.
+    ConnectionFiltered,
+    /// An edge was dropped because its target was already seen (a cycle
+    /// or a diamond — a different fact from being filtered).
+    ConnectionAlreadySeen,
+    /// One more depth level entered; the count of these is the walk's
+    /// maximum depth.
+    DepthLevel,
+    /// An item passed the item gate.
+    ItemAdmitted,
+    /// An item FAILED the item gate — its edges are never followed, so a
+    /// filtered item costs the walk its whole subtree.
+    ItemFiltered,
+    /// An item's EMIT produced at least one row.
+    ItemEmitted,
+    /// The walk ended because it ran out of items (no stop rule fired).
+    TerminatedExhausted,
+    /// The walk ended because a stop rule fired.
+    TerminatedByStop,
+    /// The walk ended because the accountant said stop.
+    TerminatedByBudget,
+    /// A GATE's evaluation ERRORED — distinct from evaluating false. The
+    /// gate cannot see the accountant, so the walk reports for it.
+    GateErrored,
 }
 
 pub enum SinkOperation {
@@ -82,7 +183,9 @@ pub enum SinkOperation {
 // filter the conn (note this is per connection type). The identifier borrows for
 // the document's lifetime, which is what lets the predicate be built once — a
 // predicate over a per-call borrow could not be stored
-pub type ConFilter = Arc<dyn Fn(&str, &usize) -> bool + Send + Sync>;
+/// Fallible like [`ItemGate`]: Err is an evaluation failure, reported and
+/// then treated as a filter-out.
+pub type ConFilter = Arc<dyn Fn(&str, &usize) -> Result<bool, SanshoError> + Send + Sync>;
 
 /// Which store a walk reads from.
 ///
@@ -132,17 +235,21 @@ pub fn walk<
     // the identifiers we've seen... don't re-walk them
     let mut seen: HashSet<String> = HashSet::new();
 
-    // FIXME capture here: the walk's own start instant, so the accountant can
-    // report `phase.elapsed_ns` for this walk alone (distinct from the global
-    // execution time of the whole chained request).
+    // the walk's start is an EVENT, not a timestamp here: the accountant
+    // clocks duration itself, from WalkStarted to a Terminated* event
+    accountant.event(AccountingEventType::WalkStarted);
 
     // a variable for "soft" stop
     let mut continue_walk = true;
 
     // if we're continuing and there are more items, keep traversing
     'outer: while continue_walk && !next_round.is_empty() {
-        // FIXME capture here: `walk.rounds` — one increment per iteration of
-        // this loop. Cheap: a single counter, incremented once per round.
+        // one round = one outer iteration = one depth level: the WalkRound
+        // count is the round count, and the DepthLevel count is the walk's
+        // maximum depth (the two are 1:1 with the round structure)
+        accountant.event(AccountingEventType::WalkRound);
+        accountant.event(AccountingEventType::DepthLevel);
+
         // stuff to process for this round
         let mut this_round = HashSet::new();
 
@@ -151,8 +258,6 @@ pub fn walk<
             seen.insert(v.clone());
             this_round.insert(v.clone());
         }
-        // FIXME capture here: `walk.seen` — the size of this set at the end of
-        // the walk. Free: the set already exists and maintains itself.
 
         // the place to store identifiers for the next round
         next_round.clear();
@@ -179,17 +284,15 @@ pub fn walk<
                 },
             };
             let Some(thing) = found else {
-                // FIXME capture here: `walk.items_missing` — an identifier that
-                // resolved to no item. Distinct from an item that was loaded and
-                // then filtered out; today both are silent.
+                // an identifier that resolved to nothing — distinct from an
+                // item that loaded and was filtered
+                accountant.event(AccountingEventType::ItemMissing);
                 continue;
             };
 
-            // FIXME capture here: `LoadItem` — the item count, one event per
-            // item actually read from the cluster or herd. `AccountingEventType::
-            // LoadItem` exists and is currently fired nowhere; this is the site.
-            // It is the counter behind both `walk.items_loaded` and
-            // `global.items_loaded`.
+            // the item was read: the accountant's LoadItem count is both
+            // `walk.items_loaded` and `global.items_loaded`
+            accountant.event(AccountingEventType::LoadItem);
 
             // pre-build stuff for the next round
             // We need to determine if this Item is terminal for
@@ -199,10 +302,6 @@ pub fn walk<
             let mut maybe_next_round: Vec<String> = vec![];
 
             for (con_name, con_filter) in &connections {
-                // FIXME capture here: `walk.connections` — one increment for
-                // `con_name` per edge actually followed. This is the vocabulary
-                // count, and it is what replaces a whole-cluster scan: it reports
-                // the edge types reachable from the given roots.
                 if let Some(conns) = thing
                     .get_key("connections")
                     .ok()
@@ -225,14 +324,19 @@ pub fn walk<
                             // note this is a vec because adding is cheap... later, we'll
                             // de-dup with the set
 
-                            if !seen.contains(maybe_con) && con_filter(maybe_con, &depth) {
+                            if seen.contains(maybe_con) {
+                                // a cycle or a diamond: a different fact from
+                                // being filtered
+                                accountant
+                                    .event(AccountingEventType::ConnectionAlreadySeen);
+                            } else if let Ok(true) = con_filter(maybe_con, &depth) {
+                                accountant
+                                    .event(AccountingEventType::ConnectionFollowed);
                                 maybe_next_round.push(maybe_con.to_string());
+                            } else {
+                                accountant
+                                    .event(AccountingEventType::ConnectionFiltered);
                             }
-                            // FIXME capture here: `walk.connections_filtered` —
-                            // edges dropped because the connection filter said no.
-                            // Also worth separating the edges dropped because the
-                            // identifier was already in `seen`, which is a
-                            // different fact (a cycle or a diamond).
                         }
                     }
                 }
@@ -243,39 +347,46 @@ pub fn walk<
                 depth_cnt: depth,
                 is_terminal: maybe_next_round.is_empty(),
             };
-            // FIXME capture here: `walk.max_depth` — keep the largest
-            // `depth_cnt` seen. Free: a single comparison per item.
-
-            // do we want to process the item?
-            if item_filter(&thing, &walk_state) {
-                // FIXME capture here: `walk.items_admitted` — the item passed the
-                // gate.
+            // do we want to process the item? An ERRORED gate is reported
+            // (GateErrored) and then treated as a non-match: the item is
+            // skipped either way, but the fact is not silent
+            match item_filter(&thing, &walk_state) {
+                Err(_) => {
+                    accountant.event(AccountingEventType::GateErrored);
+                    accountant.event(AccountingEventType::ItemFiltered);
+                    continue;
+                }
+                Ok(false) => {
+                    accountant.event(AccountingEventType::ItemFiltered);
+                    continue;
+                }
+                Ok(true) => {} // admitted, below
+            }
+            {
+                accountant.event(AccountingEventType::ItemAdmitted);
                 // queue up the next round
                 for s in maybe_next_round {
                     next_round.insert(s);
                 }
 
-                // emit the stuff for this round
+                // emit the stuff for this round. The ROWS are counted by the
+                // sinks themselves (they fire `Emit`); here only the ITEM-level
+                // fact is counted: did the emit produce anything at all.
+                let mut produced = false;
                 for emit_me in emit(&thing, &walk_state) {
-                    // FIXME capture here: `walk.rows_emitted` — one count per row
-                    // handed to the sink. Note the sinks already fire
-                    // `AccountingEventType::Emit`, so this may already be covered;
-                    // confirm before adding a second counter.
+                    produced = true;
                     sink(emit_me, &accountant, SinkOperation::NormalMessage)?;
                 }
-                // FIXME capture here: `walk.items_emitted` — one count for the
-                // item if the emit produced at least one row.
+                if produced {
+                    accountant.event(AccountingEventType::ItemEmitted);
+                }
 
                 // do stop logic
-                // FIXME capture here: `walk.stop` — that a stop fired, whether it
-                // was `hard` or `soft`, which rule arm matched, and the depth and
-                // round it fired at. This is the fact that is currently invisible:
-                // a stop that fires with nothing to report is indistinguishable
-                // from exhaustion.
                 match stop_fn(&thing, &walk_state) {
                     // both rules fire... emit both sets of values and stop
                     // immediately
                     (Some(a), Some(b)) => {
+                        accountant.event(AccountingEventType::TerminatedByStop);
                         for v in a {
                             sink(v, &accountant, SinkOperation::ErrorMessage)?;
                         }
@@ -287,6 +398,7 @@ pub fn walk<
 
                     // stop immediately
                     (_, Some(b)) => {
+                        accountant.event(AccountingEventType::TerminatedByStop);
                         for v in b {
                             sink(v, &accountant, SinkOperation::ErrorMessage)?;
                         }
@@ -295,6 +407,7 @@ pub fn walk<
 
                     // stop at end of loop
                     (Some(a), _) => {
+                        accountant.event(AccountingEventType::TerminatedByStop);
                         for v in a {
                             sink(v, &accountant, SinkOperation::ErrorMessage)?;
                         }
@@ -303,28 +416,23 @@ pub fn walk<
                     }
                     _ => {} // continue
                 }
-                // FIXME capture here: `walk.items_filtered` — the item did NOT
-                // pass the item gate. Note this also means its edges are never
-                // followed, so a filtered item costs the walk its whole subtree.
             }
         }
 
         if let Some(end_reasons) = accountant.should_stop() {
-            // FIXME capture here: `walk.stop.kind = budget` — the accountant, not
-            // a stop rule, ended the walk.
+            // the ACCOUNTANT ended the walk, not a stop rule
+            accountant.event(AccountingEventType::TerminatedByBudget);
             for r in end_reasons {
                 sink(r, &accountant, SinkOperation::ErrorMessage)?;
             }
 
-            bail!("Budget Exceeded"); // probably do some more structured error... maybe should_stop generates the return result... ???
+            bail!("Budget Exceeded");
         }
         depth += 1;
     }
-    // FIXME capture here: `walk.terminated_by` (`exhausted`, `stop`, `error`)
-    // and the walk's end instant for `phase.elapsed_ns`. Every `break 'outer`
-    // above and every `?` that returns early has to land here for the terminal
-    // state to be right, which is why this belongs in a guard rather than at the
-    // bottom of the happy path.
+    // the walk ended by running out of items; a stop-rule path reports
+    // TerminatedByStop where it breaks out
+    accountant.event(AccountingEventType::TerminatedExhausted);
     Ok(())
 }
 
@@ -367,7 +475,7 @@ pub trait ExpressionBuilder: Debug {
 }
 
 pub fn build_walk_for_str(s: &str) -> Result<(String, ConFilter)> {
-    Ok((s.to_string(), Arc::new(|_: &str, _: &usize| true)))
+    Ok((s.to_string(), Arc::new(|_: &str, _: &usize| Ok(true))))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,15 +497,12 @@ pub fn build_item_compare_function<'a>(
     let program = compile_sansho(expr, cache)?;
 
     Ok(Arc::new(
-        move |data: SanshoCarrier<'a>, _ws: &WalkState| -> bool {
+        move |data: SanshoCarrier<'a>, _ws: &WalkState| -> Result<bool, SanshoError> {
             // the thing is evaluated against the expression; a truthy
             // result matches (null and false do not). An evaluation
-            // error is a non-match: the expression itself was already
-            // validated at compile time.
-            match sansho::evaluate(&program, data.clone()) {
-                Ok(value) => truthy(&value),
-                Err(_) => false,
-            }
+            // ERROR propagates: the walk reports it (GateErrored) and
+            // treats it as a non-match, but the fact is not silent.
+            sansho::evaluate(&program, data.clone()).map(|value| truthy(&value))
         },
     ))
 }
@@ -412,11 +517,8 @@ pub fn build_item_compare_function<'a>(
 pub fn build_item_leaf(expr: &str, cache: &ProgramCache) -> Result<ItemGate> {
     let program = compile_sansho(expr, cache)?;
     Ok(Arc::new(
-        move |thing: &SanshoCarrier<'_>, _ws: &WalkState| -> bool {
-            match sansho::evaluate(&program, Rc::clone(thing)) {
-                Ok(value) => truthy(&value),
-                Err(_) => false,
-            }
+        move |thing: &SanshoCarrier<'_>, _ws: &WalkState| {
+            sansho::evaluate(&program, Rc::clone(thing)).map(|value| truthy(&value))
         },
     ))
 }
@@ -448,7 +550,7 @@ pub fn build_walk_state_cmp(
             let value = value as usize;
             Ok(Arc::new(
                 move |_thing: &SanshoCarrier<'_>, ws: &WalkState| {
-                    compare_ord(cmp, ws.depth_cnt, value)
+                    Ok(compare_ord(cmp, ws.depth_cnt, value))
                 },
             ))
         }
@@ -458,7 +560,7 @@ pub fn build_walk_state_cmp(
             };
             Ok(Arc::new(
                 move |_thing: &SanshoCarrier<'_>, ws: &WalkState| {
-                    compare_ord(cmp, ws.is_terminal, value)
+                    Ok(compare_ord(cmp, ws.is_terminal, value))
                 },
             ))
         }
@@ -494,7 +596,7 @@ pub(crate) fn build_item_expression(
     if let Some(not_b) = expression.not()? {
         let sub = build_item_expression(&not_b, cache)?;
         Ok(Arc::new(
-            move |thing: &SanshoCarrier<'_>, ws: &WalkState| !sub(thing, ws),
+            move |thing: &SanshoCarrier<'_>, ws: &WalkState| Ok(!sub(thing, ws)?),
         ))
     } else if let Some(and_b) = expression.and()? {
         let mut subs = vec![];
@@ -502,7 +604,14 @@ pub(crate) fn build_item_expression(
             subs.push(build_item_expression(&v, cache)?);
         }
         Ok(Arc::new(
-            move |thing: &SanshoCarrier<'_>, ws: &WalkState| subs.iter().all(|f| f(thing, ws)),
+            move |thing: &SanshoCarrier<'_>, ws: &WalkState| {
+                for f in &subs {
+                    if !f(thing, ws)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
         ))
     } else if let Some(or_b) = expression.or()? {
         let mut subs = vec![];
@@ -510,7 +619,14 @@ pub(crate) fn build_item_expression(
             subs.push(build_item_expression(&v, cache)?);
         }
         Ok(Arc::new(
-            move |thing: &SanshoCarrier<'_>, ws: &WalkState| subs.iter().any(|f| f(thing, ws)),
+            move |thing: &SanshoCarrier<'_>, ws: &WalkState| {
+                for f in &subs {
+                    if f(thing, ws)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            },
         ))
     } else if let Some((cmp_type, var_name, vs)) = expression.as_compare()? {
         build_walk_state_cmp(cmp_type, var_name, &vs)
@@ -527,8 +643,8 @@ pub fn build_con_compare_function(expr: &str) -> Result<ConFilter> {
             bail!("'start:' must have the thing that is being compared")
         }
         let cmp = cmp.to_string();
-        return Ok(Arc::new(move |conn: &str, _: &usize| -> bool {
-            conn.starts_with(&cmp)
+        return Ok(Arc::new(move |conn: &str, _: &usize| {
+            Ok(conn.starts_with(&cmp))
         }));
     }
     if let Some(cmp) = expr.strip_prefix("end:") {
@@ -536,8 +652,8 @@ pub fn build_con_compare_function(expr: &str) -> Result<ConFilter> {
             bail!("'end:' must have the thing that is being compared")
         }
         let cmp = cmp.to_string();
-        return Ok(Arc::new(move |conn: &str, _: &usize| -> bool {
-            conn.ends_with(&cmp)
+        return Ok(Arc::new(move |conn: &str, _: &usize| {
+            Ok(conn.ends_with(&cmp))
         }));
     }
     if let Some(re_text) = expr.strip_prefix("regex:") {
@@ -545,8 +661,8 @@ pub fn build_con_compare_function(expr: &str) -> Result<ConFilter> {
             bail!("'regex:' must have an actual regular expression")
         }
         let regex = regex::Regex::new(re_text)?;
-        return Ok(Arc::new(move |conn: &str, _: &usize| -> bool {
-            regex.is_match(conn)
+        return Ok(Arc::new(move |conn: &str, _: &usize| {
+            Ok(regex.is_match(conn))
         }));
     }
     bail!("Invalid expression '{expr}'")
@@ -571,14 +687,19 @@ pub fn build_expression<
 ) -> Result<ConFilter> {
     if let Some(not_b) = expression.not()? {
         let sub = build_expression(not_b, func_builder, cmp_builder)?;
-        Ok(Arc::new(move |v: &str, d: &usize| -> bool { !sub(v, d) }))
+        Ok(Arc::new(move |v: &str, d: &usize| Ok(!sub(v, d)?)))
     } else if let Some(and_b) = expression.and()? {
         let mut subs = vec![];
         for v in and_b {
             subs.push(build_expression(v, func_builder, cmp_builder)?);
         }
         Ok(Arc::new(move |v: &str, d: &usize| {
-            subs.iter().all(|f| f(v, d))
+            for f in &subs {
+                if !f(v, d)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }))
     } else if let Some(or_b) = expression.or()? {
         let mut subs = vec![];
@@ -586,7 +707,12 @@ pub fn build_expression<
             subs.push(build_expression(v, func_builder, cmp_builder)?);
         }
         Ok(Arc::new(move |v: &str, d: &usize| {
-            subs.iter().any(|f| f(v, d))
+            for f in &subs {
+                if f(v, d)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }))
     } else if let Some((cmp_type, var_name, vs)) = expression.as_compare()? {
         // the variable vocabulary lives with the comparator builder: it
@@ -625,23 +751,23 @@ pub fn depth_cmp(
     };
     let cmp_value: usize = cmp_value as usize;
     match cmp {
-        CompareTypes::EQ => Ok(Arc::new(move |_data: &str, d: &usize| -> bool {
-            *d == cmp_value
+        CompareTypes::EQ => Ok(Arc::new(move |_data: &str, d: &usize| {
+            Ok(*d == cmp_value)
         })),
-        CompareTypes::GT => Ok(Arc::new(move |_data: &str, d: &usize| -> bool {
-            *d > cmp_value
+        CompareTypes::GT => Ok(Arc::new(move |_data: &str, d: &usize| {
+            Ok(*d > cmp_value)
         })),
-        CompareTypes::GTE => Ok(Arc::new(move |_data: &str, d: &usize| -> bool {
-            *d >= cmp_value
+        CompareTypes::GTE => Ok(Arc::new(move |_data: &str, d: &usize| {
+            Ok(*d >= cmp_value)
         })),
-        CompareTypes::LT => Ok(Arc::new(move |_data: &str, d: &usize| -> bool {
-            *d < cmp_value
+        CompareTypes::LT => Ok(Arc::new(move |_data: &str, d: &usize| {
+            Ok(*d < cmp_value)
         })),
-        CompareTypes::LTE => Ok(Arc::new(move |_data: &str, d: &usize| -> bool {
-            *d <= cmp_value
+        CompareTypes::LTE => Ok(Arc::new(move |_data: &str, d: &usize| {
+            Ok(*d <= cmp_value)
         })),
-        CompareTypes::NOTEQ => Ok(Arc::new(move |_data: &str, d: &usize| -> bool {
-            *d != cmp_value
+        CompareTypes::NOTEQ => Ok(Arc::new(move |_data: &str, d: &usize| {
+            Ok(*d != cmp_value)
         })),
     }
 }
@@ -875,44 +1001,6 @@ mod tests {
         assert_eq!(json!(null).as_int(), None);
     }
 
-    // Requirement: the connection finder is what the walk's `ConFinder`
-    // bound accepts — a finder whose strings borrow from the thing it was
-    // handed. What: `find_connections` returns the named edge type's
-    // targets for a byte-source thing and for a borrowed JSON thing, an
-    // empty list for an unknown edge type, and it satisfies the walk's
-    // higher-ranked bound when called with a per-item borrow. Why: the
-    // walk hands the finder a borrow of the current item and expects the
-    // strings to live at least as long; a finder returning temporaries
-    // would force the walk to copy every target.
-    //
-    // LLM section: the same document is read twice — once as CBOR bytes,
-    // once as a borrowed JSON value — and both find the same targets.
-    #[test]
-    fn connection_finder_returns_document_borrows() {
-        /// The walk's connection-finder bound, spelled out: any thing,
-        /// called with a per-item borrow, returning borrows that live at
-        /// least that long. Kept while the test body below is commented out;
-        /// it is the bound that body exists to pin.
-        #[allow(dead_code)]
-        fn through_the_walk_bound<'b, FINDER>(
-            finder: FINDER,
-            thing: SanshoCarrier<'b>,
-            connection_type: &str,
-        ) -> Vec<&'b str>
-        where
-            FINDER: for<'x> Fn(&SanshoCarrier<'x>, &str) -> Vec<&'x str>,
-        {
-            finder(&thing, connection_type)
-        }
-
-        let _document = json!({
-            "connections": {
-                "alias:from": ["pkg:a", "gitoid:b"],
-                "contained:up": ["p"]
-            }
-        });
-    }
-
     // Requirement: the gate compiler is instantiable for the walk's
     // connection gate — a JSON gate compiled once, stored, and used later.
     // What: `build_expression` over the connection leaf builder and the
@@ -942,10 +1030,13 @@ mod tests {
         };
 
         // ...and used after it
-        assert!(stored("pkg:thing", &0), "a pkg: identifier at depth 0");
-        assert!(stored("gitoid:abc", &2), "a gitoid at the depth limit");
-        assert!(!stored("other", &0), "a different identifier");
-        assert!(!stored("pkg:thing", &3), "past the depth limit");
+        assert!(stored("pkg:thing", &0).unwrap(), "a pkg: identifier at depth 0");
+        assert!(
+            stored("gitoid:abc", &2).unwrap(),
+            "a gitoid at the depth limit"
+        );
+        assert!(!stored("other", &0).unwrap(), "a different identifier");
+        assert!(!stored("pkg:thing", &3).unwrap(), "past the depth limit");
     }
 
     // Requirement: the variable vocabulary lives with the comparator
@@ -976,8 +1067,8 @@ mod tests {
 
         let depth_test = depth_cmp(CompareTypes::LTE, "depth", &leaf(json!(2)))
             .expect("`depth` is a variable this builder reads");
-        assert!(depth_test("anything", &2), "at the limit");
-        assert!(!depth_test("anything", &3), "past the limit");
+        assert!(depth_test("anything", &2).unwrap(), "at the limit");
+        assert!(!depth_test("anything", &3).unwrap(), "past the limit");
 
         let error = depth_cmp(CompareTypes::LTE, "depth", &leaf(json!("two")))
             .err()

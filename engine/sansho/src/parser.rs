@@ -62,6 +62,12 @@ pub fn parse(input: &str) -> Result<Expr, SanshoError> {
 /// exceeds `max_depth`, or `None` if it never does. Iterative; skips
 /// quoted strings, raw strings, and backtick literals (which may legally
 /// contain bracket characters).
+///
+/// The depth counts EVERY character that begins a recursive-descent level:
+/// `[` and `{` (containers), `(` (groups and calls), and `!` (prefix
+/// negation, but not the `!=` operator). Undercounting any of them leaves
+/// the recursion it drives unguarded, and a hostile expression overflows
+/// the stack and aborts the process.
 fn excessive_depth_at(input: &str, max_depth: usize) -> Option<usize> {
     #[derive(Clone, Copy)]
     enum Inside {
@@ -98,13 +104,23 @@ fn excessive_depth_at(input: &str, max_depth: usize) -> Option<usize> {
                 '"' => inside = Inside::Quoted,
                 '\'' => inside = Inside::Raw,
                 '`' => inside = Inside::Literal,
-                '[' | '{' => {
+                '[' | '{' | '(' => {
                     depth += 1;
                     if depth > max_depth {
                         return Some(position);
                     }
                 }
-                ']' | '}' => depth = depth.saturating_sub(1),
+                ']' | '}' | ')' => depth = depth.saturating_sub(1),
+                // `!` begins a recursive negation parse — UNLESS it is the
+                // inequality operator `!=`, which recurses not at all. Each
+                // negation adds one level; negation has no closing token, so
+                // it contributes no decrement.
+                '!' if !input[position..].starts_with("!=") => {
+                    depth += 1;
+                    if depth > max_depth {
+                        return Some(position);
+                    }
+                }
                 _ => {}
             },
         }
@@ -263,27 +279,6 @@ fn parse_one_postfix(input: &str) -> IResult<&str, Postfix, nom::error::Error<&s
     }
 }
 
-fn rebuild_chain(inner: Expr, postfixes: Vec<Postfix>) -> Expr {
-    // the grouped expression becomes the head; its own pipe/logical
-    // continuations were already absorbed by the inner parse
-    match (inner, postfixes) {
-        (Expr::Chain(primary, existing), extra) if existing.is_empty() => {
-            let mut all = existing;
-            all.extend(extra);
-            Expr::Chain(primary, all)
-        }
-        (Expr::Chain(primary, existing), extra) => {
-            let mut all = existing;
-            all.extend(extra);
-            Expr::Chain(primary, all)
-        }
-        (other, extra) if extra.is_empty() => other,
-        (other, extra) => Expr::Pipe(
-            Box::new(other),
-            Box::new(Expr::Chain(Primary::Current, extra)),
-        ),
-    }
-}
 
 fn dot_form(input: &str) -> IResult<&str, Postfix, nom::error::Error<&str>> {
     let (rest, _) = char('.')(input)?;
@@ -449,9 +444,11 @@ fn parse_chain(input: &str) -> PResult<'_> {
             parse_expr,
             preceded(wsp, char(')')),
         ))(input)?;
-        // the grouped expression re-enters the postfix chain: (a || b).c
+        // the group is a VALUE the postfixes project on — NOT spliced into
+        // the grouped expression. Splicing made `(foo[*].bar)[0]` evaluate
+        // as `foo[*].bar[0]`, which is a different JMESPath program.
         let (rest, postfixes) = parse_postfixes(rest)?;
-        return Ok((rest, rebuild_chain(inner, postfixes)));
+        return Ok((rest, Expr::Chain(Primary::Grouped(Box::new(inner)), postfixes)));
     }
     // an expression may begin with a bracket selector: [0] indexes the
     // current node

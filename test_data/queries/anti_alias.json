@@ -6,7 +6,7 @@
     "alias:to"
   ],
   "emit": {
-    "expr": "{identifier: identifier, connections: connections, body: body, body_mime_type: body_mime_type}",
+    "expr": "@",
     "if": {
       "==": {
         "is_terminal": true

@@ -193,6 +193,13 @@ fn compile_program(expr: &Expr) -> Result<Program, SanshoError> {
             // the head: a field is the natural first edge; everything
             // else evaluates first and hands its value down
             match primary {
+                Primary::Grouped(inner) => {
+                    // the group computes a VALUE; the postfix edges that
+                    // follow project on it, which is the whole semantics of
+                    // grouping
+                    let program = compile_program(inner)?;
+                    edges.push(Edge::Compute(Box::new(program)));
+                }
                 Primary::Current => {}
                 Primary::Field(name) => edges.push(Edge::Key(name.clone())),
                 Primary::Literal(value) => {

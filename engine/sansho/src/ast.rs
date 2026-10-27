@@ -73,6 +73,11 @@ pub enum Postfix {
 /// The head of an expression: everything that is not a postfix chain.
 #[derive(Clone, Debug)]
 pub enum Primary {
+    /// A parenthesised expression: a VALUE the postfixes project on, not
+    /// sugar for splicing. `(foo[*].bar)[0]` indexes the grouped result;
+    /// the group must survive parsing, evaluation, AND the cache's
+    /// canonical form, or the three disagree.
+    Grouped(Box<Expr>),
     Current,
     Literal(J),
     RawString(String),
@@ -125,6 +130,42 @@ pub fn canonical_literal(value: &J) -> String {
 }
 
 /// The canonical form of an expression.
+// Precedence levels, LOW binding first. A child rendered by a parent of a
+// HIGHER level than itself gets parentheses, so the canonical form preserves
+// the parse — two expressions that parse differently never share a key.
+const PREC_PIPE: u8 = 1;
+const PREC_OR: u8 = 2;
+const PREC_AND: u8 = 3;
+const PREC_COMPARE: u8 = 4;
+const PREC_NOT: u8 = 5;
+const PREC_PRIMARY: u8 = 6;
+
+/// Render `expr` as a child of a parent at level `parent`, parenthesizing it
+/// when its own binding is looser than the parent's context requires.
+fn render_child(expr: &Expr, parent: u8, out: &mut String) {
+    let needs_parens = expr_precedence(expr) < parent;
+    if needs_parens {
+        out.push('(');
+        render(expr, out);
+        out.push(')');
+    } else {
+        render(expr, out);
+    }
+}
+
+/// The binding level of an expression's TOP operator. A chain or bare primary
+/// binds tightest and never needs parentheses.
+fn expr_precedence(expr: &Expr) -> u8 {
+    match expr {
+        Expr::Pipe(_, _) => PREC_PIPE,
+        Expr::Or(_, _) => PREC_OR,
+        Expr::And(_, _) => PREC_AND,
+        Expr::Compare(_, _, _) => PREC_COMPARE,
+        Expr::Not(_) => PREC_NOT,
+        Expr::Chain(_, _) => PREC_PRIMARY,
+    }
+}
+
 pub fn canonical(expr: &Expr) -> String {
     let mut out = String::new();
     render(expr, &mut out);
@@ -134,30 +175,30 @@ pub fn canonical(expr: &Expr) -> String {
 fn render(expr: &Expr, out: &mut String) {
     match expr {
         Expr::Pipe(left, right) => {
-            render(left, out);
+            render_child(left, PREC_PIPE, out);
             out.push_str(" | ");
-            render(right, out);
+            render_child(right, PREC_PIPE, out);
         }
         Expr::Or(left, right) => {
-            render(left, out);
+            render_child(left, PREC_OR, out);
             out.push_str(" || ");
-            render(right, out);
+            render_child(right, PREC_OR, out);
         }
         Expr::And(left, right) => {
-            render(left, out);
+            render_child(left, PREC_AND, out);
             out.push_str(" && ");
-            render(right, out);
+            render_child(right, PREC_AND, out);
         }
         Expr::Compare(op, left, right) => {
-            render(left, out);
+            render_child(left, PREC_COMPARE, out);
             out.push(' ');
             out.push_str(op.as_str());
             out.push(' ');
-            render(right, out);
+            render_child(right, PREC_COMPARE, out);
         }
         Expr::Not(inner) => {
             out.push('!');
-            render(inner, out);
+            render_child(inner.as_ref(), PREC_NOT, out);
         }
         Expr::Chain(primary, postfixes) => {
             render_primary(primary, out);
@@ -170,6 +211,11 @@ fn render(expr: &Expr, out: &mut String) {
 
 fn render_primary(primary: &Primary, out: &mut String) {
     match primary {
+        Primary::Grouped(inner) => {
+            out.push('(');
+            render(inner, out);
+            out.push(')');
+        }
         Primary::Current => out.push('@'),
         Primary::Literal(value) => out.push_str(&canonical_literal(value)),
         Primary::RawString(s) => {
@@ -365,6 +411,8 @@ fn certainly_not_an_array(expression: &Expr) -> bool {
             None => match primary {
                 // the current node can be an array
                 Primary::Current => false,
+                // a group is whatever the grouped expression yields — ask it
+                Primary::Grouped(inner) => certainly_not_an_array(inner),
                 Primary::RawString(_) => true,
                 Primary::Literal(value) => !value.is_array(),
                 Primary::Field(_) | Primary::Function(..) => false,
@@ -414,6 +462,8 @@ fn can_be_a_string_primary(primary: &Primary, postfixes: &[Postfix]) -> bool {
     match primary {
         // the current node can be anything
         Primary::Current => true,
+        // a group is a string only when the grouped expression is
+        Primary::Grouped(inner) => can_be_a_string(inner),
         // a raw string is a string
         Primary::RawString(_) => true,
         // a literal is a string only when it IS one

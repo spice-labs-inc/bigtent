@@ -132,12 +132,16 @@ Tests: `dedup_emits_a_repeated_row_once` (off, then on), `dedup_is_per_stage`,
 
 `src/api_v2.rs`. `GET /v2/query?identifier=…&template=<name>` and
 `POST /v2/query` with `{"roots": [...], "template": name}` or
-`{"roots": [...], "query": {...}}`; neither field means the DEFAULT template.
+`?template=<name>` on the POST itself, or `{"roots": [...], "query": {...}}`;
+neither field means the DEFAULT template. The template's name resolves
+against the request's registry on BOTH verbs (the body's field wins over the
+query parameter), so `with_template`/`without_template` hold on both.
 Output is JSON lines (`StreamBodyAs::json_nl`), streamed from a blocking run
 through a bounded(256) channel.
 
 | claim | test |
 |---|---|
+| the POST's template comes from the request's registry — body field or `?template=` — not a static list | `the_post_template_comes_from_the_registry` |
 | a custom template and a designated default answer an unspecified request | `a_custom_template_and_a_designated_default` |
 | an unknown default is refused at construction | `an_unknown_default_is_refused_at_construction` |
 | a caller's template replaces a built-in of the same name | `a_caller_template_replaces_a_builtin` |

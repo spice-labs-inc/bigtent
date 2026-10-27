@@ -73,7 +73,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// A gate over an item and the walk state, compiled.
-pub type Gate = Arc<dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> bool + Send + Sync>;
+/// The gate type is the WALK's `ItemGate`: fallible, so an evaluation error
+/// is reportable rather than indistinguishable from a filter-out.
+pub type Gate = crate::highwire::walk::ItemGate;
 
 /// What an emit produces for one subject, compiled.
 pub type EmitFn =
@@ -342,12 +344,6 @@ struct Plan {
     /// The phases in the order they must run.
     order: Vec<usize>,
 
-    /// Per stage, the stages that feed it. Recorded because it is what a wired
-    /// run would connect channels from; the sequential loop derives the same
-    /// information from each root's predicates, so nothing reads this yet.
-    #[allow(dead_code)]
-    dependencies: Vec<Vec<usize>>,
-
     /// Per phase, the phases that read its rows and the program each applies.
     /// Indexed by the producing phase's position.
     consumers: Vec<Vec<(usize, Arc<Program>)>>,
@@ -536,6 +532,57 @@ where
         compiled.push(compile_stage(phase, position, &by_name, cache)?);
     }
 
+    // Second-and-a-half pass: every walk whose roots READ another walk's rows
+    // must be feedable. The producer's emit entries are checked NOW, at compile
+    // time, for the CERTAIN failures: a row that is certainly a boolean, a
+    // multihash row without the key the consumer reads, or a key whose value is
+    // PROVED non-string (`can_be_a_string` returning false is proof of
+    // absence). Uncertain shapes — functions, pipes — pass: the check refuses
+    // only what it can prove, never what it cannot.
+    for (position, _) in phases.iter().enumerate() {
+        let CompiledStage::Walk(walk) = &compiled[position] else {
+            continue;
+        };
+        let CompiledRoot::Predicates(predicates) = &walk.roots else {
+            continue;
+        };
+        for (producer_position, _program) in predicates {
+            // a barker's output shape lives in its script, not in any type
+            // this check can read
+            if matches!(compiled[*producer_position], CompiledStage::Barker(_)) {
+                continue;
+            }
+            let producer = &phases[*producer_position];
+            let producer_walk = located(
+                &Location::query().step(Step::Phase {
+                    name: None,
+                    position: *producer_position,
+                }),
+                producer.walk(),
+            )?;
+            let emit = located(
+                &Location::query().step(Step::Phase {
+                    name: None,
+                    position: *producer_position,
+                }),
+                producer_walk.emit(),
+            )?;
+            let at = Location::query().step(Step::Phase {
+                name: None,
+                position: *producer_position,
+            });
+            for entry in located(&at, emit.entries())? {
+                let text = located(&at, entry.expression())?;
+                let expression = located(&at, sansho::parse(text).map_err(|e| {
+                    at.error(format!("the emit's expression does not parse: {e}"))
+                }))?;
+                if let Some(problem) = certain_key_problem(&expression, "id") {
+                    return Err(at.error(problem));
+                }
+            }
+        }
+    }
+
     // Third pass: order the phases and wire the rows between them.
     let plan = plan_phases(&compiled)?;
 
@@ -548,6 +595,67 @@ where
             run(&compiled, &plan, input, accountant, &mut sink, lookup)
         },
     )
+}
+
+/// The CERTAIN failures for a walk consuming another walk's rows under `key`:
+/// the producer's emit entry cannot possibly give `key` as a string. Returns
+/// the complaint, or `None` when the shape is feedable or merely uncertain.
+///
+/// The key is the common `id`; the extractor program decides the real key, and
+/// this conservative check reads only what it can prove:
+/// - a row that is certainly a BOOLEAN (a comparison, a negation) carries no
+///   key at all;
+/// - a row that is certainly an OBJECT (a multihash) without the key carries
+///   nothing for the consumer to read;
+/// - a multihash whose value at the key is PROVED non-string
+///   (`can_be_a_string` false is proof of absence).
+fn certain_key_problem(expression: &sansho::ast::Expr, key: &str) -> Option<String> {
+    use sansho::ast::{can_be_a_string, Expr, Primary, Postfix};
+
+    // a boolean row: no key, ever
+    if matches!(expression, Expr::Compare(_, _, _) | Expr::Not(_)) {
+        return Some(format!(
+            "this emit produces a boolean, and a boolean cannot feed the consumer's \
+             `{key}` root: the walk would start from nothing"
+        ));
+    }
+
+    // the row's shape, from the deciding postfix or the primary
+    let Expr::Chain(primary, postfixes) = expression else {
+        return None;
+    };
+    let deciding = postfixes
+        .iter()
+        .rev()
+        .find_map(|p| match p {
+            Postfix::MultiHash(entries) => Some(entries.clone()),
+            _ => None,
+        });
+    match (&primary, deciding) {
+        // the row IS the multihash: the key's value is what the consumer reads
+        (Primary::MultiHash(entries), None) => {
+            let (_, value) = entries.iter().find(|(k, _)| k == key)?;
+            if !can_be_a_string(value) {
+                return Some(format!(
+                    "this emit's `{key}` is proved unable to be a string, and the \
+                     consumer's root reads `{key}` as an identifier"
+                ));
+            }
+            None
+        }
+        // the row is a chain ending in a multihash
+        (_, Some(entries)) => {
+            let (_, value) = entries.iter().find(|(k, _)| k == key)?;
+            if !can_be_a_string(value) {
+                return Some(format!(
+                    "this emit's `{key}` is proved unable to be a string, and the \
+                     consumer's root reads `{key}` as an identifier"
+                ));
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Compile a stage: a walk compiles to the phase that traverses, a program to
@@ -620,7 +728,7 @@ fn compile_phase(
                 let gate = located(&here().step(Step::Filter), filter.gate())?;
                 located_build(&here().step(Step::Filter), build_item_expression(&gate, cache))?
             }
-            None => Arc::new(|_: &SanshoCarrier<'_>, _: &WalkState| true),
+            None => Arc::new(|_: &SanshoCarrier<'_>, _: &WalkState| Ok(true)),
         },
         emit: compile_emit(&emit, &who, Step::Emit, cache, Variables::Allowed)?,
         stop: compile_stop(stop, &who, cache)?,
@@ -745,7 +853,7 @@ fn compile_connections(
                 &here().step(Step::Connections),
                 build_expression(expression, &build_con_compare_function, &depth_cmp),
             )?,
-            None => Arc::new(|_: &str, _: &usize| true),
+            None => Arc::new(|_: &str, _: &usize| Ok(true)),
         };
         compiled.push((connection_type, gate));
     }
@@ -815,30 +923,73 @@ impl CompiledEmit {
     /// is examined. Otherwise the entries' rows are concatenated in order.
     ///
     /// The row rule per entry, in the order it applies: a gate that answers
-    /// false omits the entry; an evaluation error omits it; a null omits it
-    /// unless the entry asked for nulls; an array yields one row per element
-    /// when `unnest` is in effect, ONE LEVEL only, and one row holding the array
-    /// when it is not.
+    /// false omits the entry; a gate that ERRORS becomes an error row; an
+    /// evaluation error becomes an error row; a null omits it unless the
+    /// entry asked for nulls; an array yields one row per element when
+    /// `unnest` is in effect, ONE LEVEL only, and one row holding the array
+    /// when it is not; and a MATERIALIZATION failure — including the
+    /// materialization budget's refusal — becomes an error row.
+    ///
+    /// NOTHING is silently dropped. A row that cannot be produced is
+    /// reported as `{"error": {...}}`, with the item's identifier where the
+    /// item has one, so a client sees truncation rather than a gap that
+    /// looks like absent data.
     fn rows(&self, thing: &SanshoCarrier<'_>, ws: &WalkState) -> Vec<Value> {
-        if let Some(gate) = &self.gate
-            && !gate(thing, ws)
-        {
-            return Vec::new();
+        // the item's identifier, for error rows' context (an item without
+        // one simply omits the field)
+        let identifier = thing
+            .get_key("identifier")
+            .ok()
+            .flatten()
+            .and_then(|v| sansho::materialize(&v).ok());
+        let error_row = |detail: String| -> Value {
+            let mut error = serde_json::Map::new();
+            if let Some(id) = &identifier {
+                error.insert("identifier".to_string(), id.clone());
+            }
+            error.insert("detail".to_string(), serde_json::Value::String(detail));
+            serde_json::json!({ "error": error })
+        };
+
+        if let Some(gate) = &self.gate {
+            match gate(thing, ws) {
+                Ok(false) => return Vec::new(),
+                Err(e) => {
+                    // the LEVEL's gate errored: report and emit nothing
+                    return vec![error_row(format!("the emit's gate failed: {e}"))];
+                }
+                Ok(true) => {}
+            }
         }
         let mut rows = Vec::new();
         for entry in &self.entries {
-            if let Some(gate) = &entry.gate
-                && !gate(thing, ws)
-            {
-                continue;
+            if let Some(gate) = &entry.gate {
+                match gate(thing, ws) {
+                    Ok(false) => continue,
+                    Err(e) => {
+                        rows.push(error_row(format!("the entry's gate failed: {e}")));
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
             }
-            let Ok(value) = evaluate(&entry.program, Rc::clone(thing)) else {
-                continue;
+            let value = match evaluate(&entry.program, Rc::clone(thing)) {
+                Ok(value) => value,
+                Err(e) => {
+                    rows.push(error_row(format!("the emit's expression failed: {e}")));
+                    continue;
+                }
             };
             if entry.unnest && let Ok(elements) = value.as_elements() {
                 for element in elements {
-                    let Ok(row) = materialize(&element) else {
-                        continue;
+                    let row = match materialize(&element) {
+                        Ok(row) => row,
+                        Err(e) => {
+                            rows.push(error_row(format!(
+                                "the emit's row failed to materialize: {e}"
+                            )));
+                            continue;
+                        }
                     };
                     if row.is_null() && !entry.emit_null {
                         continue;
@@ -850,7 +1001,9 @@ impl CompiledEmit {
             match materialize(&value) {
                 Ok(row) if row.is_null() && !entry.emit_null => {}
                 Ok(row) => rows.push(row),
-                Err(_) => {}
+                Err(e) => rows.push(error_row(format!(
+                    "the emit's row failed to materialize: {e}"
+                ))),
             }
         }
         rows
@@ -960,7 +1113,11 @@ impl CompiledRule {
     /// not firing: a caller can tell a stop from exhaustion by whether a rule
     /// answered at all.
     fn fires(&self, thing: &SanshoCarrier<'_>, ws: &WalkState) -> Option<Vec<Value>> {
-        if !(self.gate)(thing, ws) {
+        // an ERRORED gate does not fire: a stop must be deliberate, and a
+        // gate that cannot evaluate is not evidence for stopping. (The walk
+        // reports its OWN gate errors as GateErrored events; a stop rule's
+        // gate error is quiet by this policy — the stop just doesn't fire.)
+        if !(self.gate)(thing, ws).unwrap_or(false) {
             return None;
         }
         Some(match &self.report {
@@ -1059,11 +1216,9 @@ fn plan_phases(phases: &[CompiledStage]) -> LevelResult<Plan> {
     for position in 0..phases.len() {
         visit(position, phases, &dependencies, &mut state, &mut order)?;
     }
-    Ok(Plan {
-        order,
-        dependencies,
-        consumers,
-    })
+    // the dependencies stay LOCAL: only the topological sort reads them, so
+    // they are not part of the plan the run sees
+    Ok(Plan { order, consumers })
 }
 
 /// How far a phase has been got through while ordering.
@@ -1152,7 +1307,11 @@ fn identifiers_of<ACCOUNTANT: AccountingAndBudget + Send + Sync + 'static>(
                 }
             };
             if let Some(identifier) = identifier {
-                let _ = to_walk.send(identifier);
+                // a failed send means the receiver is gone — the pipeline is
+                // tearing down, so the adapter stops
+                to_walk
+                    .send(identifier)
+                    .map_err(|_| anyhow::anyhow!("the roots' consumer is gone"))?;
             }
         }
         Ok(())
@@ -1230,25 +1389,35 @@ pub fn run_nested(
         let cache = ProgramCache::new(4096);
         let out = sender.clone();
         let sink = move |row: Value, _acc: &Arc<NoBound>, _op: SinkOperation| -> Result<()> {
-            let _ = out.send(Ok(row));
+            // the nested query's consumer — the outer stage — is gone when
+            // this fails; stopping is the teardown
+            out.send(Ok(row))
+                .map_err(|_| anyhow::anyhow!("the nested query's consumer is gone"))?;
             Ok(())
         };
         let mut run = match compile(query, &cache) {
             Ok(run) => run,
             Err(error) => {
-                let _ = sender.send(Err(anyhow::anyhow!("{error}")));
+                if sender.send(Err(anyhow::anyhow!("{error}"))).is_err() {
+                    return; // the receiver is gone; the pipeline is tearing down
+                }
                 return;
             }
         };
         let Some(lookup) = lookup else {
-            let _ = sender.send(Err(anyhow::anyhow!(
+            let result = sender.send(Err(anyhow::anyhow!(
                 "a nested query needs a cluster, and this run was given none"
             )));
+            if result.is_err() {
+                return; // the receiver is gone; the pipeline is tearing down
+            }
             return;
         };
         let (unused_sender, no_input) = flume::unbounded();
         drop(unused_sender); // a nested query's roots come from its own stages
         if let Err(error) = run(Arc::new(NoBound), sink, lookup, no_input) {
+            // reporting the error is best-effort: a gone receiver IS the
+            // teardown, so its failure is not an error of its own
             let _ = sender.send(Err(error));
         }
     });
@@ -1296,7 +1465,11 @@ fn tee<ACCOUNTANT: AccountingAndBudget + Send + Sync + 'static>(
                 continue;
             }
             for output in &outputs {
-                let _ = output.send(row.clone());
+                // a failed send means this destination is gone — the pipeline
+                // is tearing down, so the tee stops
+                output
+                    .send(row.clone())
+                    .map_err(|_| anyhow::anyhow!("the tee's consumer is gone"))?;
             }
         }
         Ok(())
@@ -1335,6 +1508,13 @@ where
     ACCOUNTANT: AccountingAndBudget + Send + Sync + 'static,
     SINK: FnMut(Value, &Arc<ACCOUNTANT>, SinkOperation) -> Result<()>,
 {
+    // THE ENTRY RULE, applied at the ONE place every caller passes through:
+    // the lookup is normalized to the cheapest form that can actually serve
+    // the walk — a lone V4 cluster reads raw bytes, a V3 cluster is
+    // materialized through a one-member herd — so NO caller can reach the
+    // walk with a lookup the byte source cannot parse.
+    let lookup = crate::highwire::walk_lookup(lookup);
+
     let count = stages.len();
 
     // One channel per stage for its rows, and one for its roots where it reads
@@ -1416,7 +1596,10 @@ where
         std::thread::spawn(move || {
             for row in input.iter() {
                 for (sender, _) in &taker_channels {
-                    let _ = sender.send(row.clone());
+                    // a failed send means the taker is gone — teardown
+                    if sender.send(row.clone()).is_err() {
+                        return; // the taker is gone; the pipeline is tearing down
+                    }
                 }
             }
         });
@@ -1436,7 +1619,11 @@ where
         match &phase.roots {
             CompiledRoot::Enumerated(identifiers) => {
                 for identifier in identifiers {
-                    let _ = sender.send(identifier.clone());
+                    // enumerated roots are few and internal; a failure means
+                    // the walk is gone and the teardown has begun
+                    sender
+                        .send(identifier.clone())
+                        .map_err(|_| anyhow::anyhow!("the walk is gone"))?;
                 }
                 drop(sender);
             }
@@ -1543,7 +1730,12 @@ where
                         stage_roots_in.expect("a walk has a roots stream"),
                         lookup,
                         move |row: Value, _acc: &Arc<ACCOUNTANT>, _op: SinkOperation| {
-                            let _ = sink_sender.send(row);
+                            // a failed send means the stage's tee is gone —
+                            // the client disconnected — and ending the walk
+                            // is the teardown
+                            sink_sender
+                                .send(row)
+                                .map_err(|_| anyhow::anyhow!("the walk's consumer is gone"))?;
                             Ok(())
                         },
                         connections,
@@ -1578,6 +1770,7 @@ where
                     dedup,
                     Arc::clone(&accountant),
                 ));
+                let stage_accountant = Arc::clone(&accountant);
                 std::thread::spawn(move || -> Result<()> {
                     let Some(rows_in) = barker_rows_in else {
                         return Ok(());
@@ -1587,16 +1780,33 @@ where
                         Err(error) => return Err(anyhow::anyhow!("{error}")),
                     };
                     for row in crate::barker::run_with(program, rows_in, Some(nested_lookup), None)? {
+                        // the accountant's check runs per ROW pulled, so a
+                        // cancelled run stops between rows even when the stage
+                        // is slow to send
+                        if let Some(reasons) = stage_accountant.should_stop() {
+                            for reason in reasons {
+                                let _ = stage_sender.send(serde_json::json!({
+                                    "stop": reason
+                                }));
+                            }
+                            return Ok(()); // cancelled: stop, the teardown is underway
+                        }
                         let row = row?;
                         // `unnest` is one level: an array row becomes one row
-                        // per element
+                        // per element. A failed send means the tee is gone —
+                        // the client disconnected — and the stage stops: the
+                        // error ends this thread, and the join below reaps it.
                         if unnest && let Value::Array(elements) = row {
                             for element in elements {
-                                let _ = stage_sender.send(element);
+                                stage_sender
+                                    .send(element)
+                                    .map_err(|_| anyhow::anyhow!("the stage's consumer is gone"))?;
                             }
                             continue;
                         }
-                        let _ = stage_sender.send(row);
+                        stage_sender
+                            .send(row)
+                            .map_err(|_| anyhow::anyhow!("the stage's consumer is gone"))?;
                     }
                     Ok(())
                 })
@@ -1615,20 +1825,266 @@ where
     drop(rows);
     drop(output_sender);
 
-    for row in output.iter() {
-        sink(row, &accountant, SinkOperation::NormalMessage)?;
-    }
-    for handle in threads {
-        if let Err(panic) = handle.join() {
-            std::panic::resume_unwind(panic);
+    // THE RUN LOOP. The outcome is CAPTURED, not `?`-propagated: an early
+    // return here would skip the joins below and leave every stage thread
+    // running detached — a disconnected client's query would churn CPU for
+    // as long as its work lasted (the leak the PR review measured at ~2 cores
+    // for 12+ seconds).
+    let loop_result = (|| -> Result<()> {
+        for row in output.iter() {
+            sink(row, &accountant, SinkOperation::NormalMessage)?;
+        }
+        Ok(())
+    })();
+
+    // the run stops reading: with the output receiver gone, every stage's
+    // next send FAILS, and (the stages propagate send failures) the teardown
+    // cascades backward through the pipeline
+    drop(output);
+
+    // every stage thread is joined on EVERY exit path — success, sink error,
+    // or a stage's own error — so no thread outlives the run that spawned it.
+    // A stage's error surfaces as the run's error (the first one wins);
+    // a stage PANIC surfaces as a panic, as it always did.
+    let mut stage_error = loop_result;
+    for (i, handle) in threads.drain(..).enumerate() {
+        let _ = i;
+        match handle.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(Err(error)) if stage_error.is_ok() => stage_error = Err(error),
+            _ => {}
         }
     }
-    Ok(())
+    stage_error
 }
 
 
 #[cfg(test)]
 mod compile_tests {
+    /// A recording accountant: every event lands here with its count, so a
+    /// test can assert the walk reported its own lifecycle.
+    #[derive(Default)]
+    struct RecordingAccountant {
+        counts: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    }
+
+    impl RecordingAccountant {
+        fn count(&self, name: &str) -> usize {
+            *self
+                .counts
+                .lock()
+                .expect("the event lock")
+                .get(name)
+                .unwrap_or(&0)
+        }
+    }
+
+    impl crate::highwire::walk::AccountingAndBudget for RecordingAccountant {
+        fn should_stop(&self) -> Option<Vec<Value>> {
+            None
+        }
+
+        fn can_sink_normal(&self) -> bool {
+            true
+        }
+
+        fn event(&self, event_type: crate::highwire::walk::AccountingEventType) {
+            let name = format!("{event_type:?}");
+            *self
+                .counts
+                .lock()
+                .expect("the event lock")
+                .entry(name)
+                .or_insert(0) += 1;
+        }
+    }
+
+    /// POLICY (compile-time errors surface to the caller): a walk whose roots
+    /// come from another walk's rows reads a KEY from those rows; when the
+    /// producer's emit CERTAINLY cannot provide that key as a string — a
+    /// boolean row, a number row, an object without the key, a value proved
+    /// non-string — the compiler REFUSES the document. Today it compiles and
+    /// the consumer silently receives nothing.
+    #[test]
+    fn a_producer_that_cannot_feed_its_consumer_is_refused_at_compile() {
+        // a boolean row: certainly no key `id`, certainly not a string
+        let compiled = compile_only(json!({
+            "phases": [
+                {
+                    "name": "first",
+                    "roots": ["a"],
+                    "emit": {"expr": "length(identifier) > `0`", "unnest": false},
+                },
+                {
+                    "name": "second",
+                    "roots": {"first": "id"},
+                    "emit": "identifier",
+                }
+            ]
+        }));
+        assert!(
+            compiled.is_err(),
+            "a boolean row cannot feed a keyed root: {compiled:?}"
+        );
+
+        // an object row whose `id` value is PROVED non-string (a comparison)
+        let compiled = compile_only(json!({
+            "phases": [
+                {
+                    "name": "first",
+                    "roots": ["a"],
+                    "emit": {"expr": "{id: length(identifier) > `0`}", "unnest": false},
+                },
+                {
+                    "name": "second",
+                    "roots": {"first": "id"},
+                    "emit": "identifier",
+                }
+            ]
+        }));
+        assert!(
+            compiled.is_err(),
+            "an `id` that is a boolean cannot be a root identifier: {compiled:?}"
+        );
+    }
+
+    /// THE ENTRY RULE (owner directive): the walk's lookup is chosen by
+    /// CHEAPEST CORRECT ACCESS, and the rule is applied inside `run` — the
+    /// one place every caller passes through — so no caller can reach the
+    /// walk with a lookup the byte source cannot parse:
+    /// * a one-member herd whose member is a V4 cluster → the cluster itself
+    ///   (raw bytes; no Item materialization);
+    /// * a V3 cluster → wrapped in a one-member herd (the herd path
+    ///   materializes Items, which V3 storage requires);
+    /// * a V4 cluster → passed straight through — the SAME allocation;
+    /// * anything else → the herd, unchanged.
+    #[test]
+    fn the_walk_entry_selects_the_cheapest_correct_lookup() {
+        let dir_v3 = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data/cluster_a");
+        let dir_v4 = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data/v4/cluster_0");
+
+        let load = |dir| {
+            tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(crate::rodeo::goat::GoatRodeoCluster::cluster_files_in_dir(dir, false, vec![]))
+                .expect("the cluster loads")
+                .into_iter()
+                .next()
+                .expect("one cluster")
+        };
+        let v3 = Arc::new(load(dir_v3));
+        let v4 = Arc::new(load(dir_v4));
+
+        // a V3 cluster alone: wrapped in a herd
+        match crate::highwire::walk_lookup(HerdOrCluster::Cluster(Arc::clone(&v3))) {
+            HerdOrCluster::Herd(herd) => assert_eq!(
+                herd.get_herd().len(),
+                1,
+                "the V3 cluster is wrapped as a one-member herd"
+            ),
+            other => panic!("a V3 cluster must become a herd, not {other:?}"),
+        }
+
+        // a V4 cluster alone: passed straight through — the SAME allocation
+        match crate::highwire::walk_lookup(HerdOrCluster::Cluster(Arc::clone(&v4))) {
+            HerdOrCluster::Cluster(same) => assert!(
+                Arc::ptr_eq(&same, &v4),
+                "a V4 cluster passes through untouched"
+            ),
+            other => panic!("a V4 cluster must pass through, not {other:?}"),
+        }
+
+        // a herd of ONE V4 cluster: collapsed to the cluster
+        let one_v4 = crate::highwire::walk_lookup(HerdOrCluster::Herd(Arc::new(GoatHerd::new(
+            vec![crate::rodeo::member::member_core(Arc::clone(&v4))],
+        ))));
+        match one_v4 {
+            HerdOrCluster::Cluster(same) => assert!(
+                Arc::ptr_eq(&same, &v4),
+                "a one-V4-member herd collapses to the cluster"
+            ),
+            other => panic!("a one-V4-member herd must collapse, not {other:?}"),
+        }
+
+        // a herd of one V3 member: stays a herd
+        let one_v3 = crate::highwire::walk_lookup(HerdOrCluster::Herd(Arc::new(GoatHerd::new(
+            vec![crate::rodeo::member::member_core(Arc::clone(&v3))],
+        ))));
+        assert!(
+            matches!(one_v3, HerdOrCluster::Herd(_)),
+            "a V3 member cannot collapse: the herd materializes it"
+        );
+
+        // a synthetic (non-cluster) member: stays a herd
+        let synthetic = crate::highwire::walk_lookup(HerdOrCluster::Herd(Arc::new(GoatHerd::new(
+            vec![member_synth(RoboticGoat::new(
+                "x",
+                Vec::new(),
+                serde_json::Value::Object(Default::default()),
+            ))],
+        ))));
+        assert!(
+            matches!(synthetic, HerdOrCluster::Herd(_)),
+            "a synthetic member is not a cluster and stays in the herd"
+        );
+    }
+
+    /// FINDING (the no-deferred-instrumentation rule): the walk's
+    /// instrumentation points were deferred comments; they are now accountant
+    /// events. This test walks the fixture
+    /// (3 items, arity 1-2-1: one root, two mid, one terminal) and asserts the
+    /// lifecycle's SHAPE — the walk started, walked its round, loaded and
+    /// admitted its items, emitted, and terminated by exhaustion.
+    #[test]
+    fn the_walk_reports_its_lifecycle_to_the_accountant() -> Result<()> {
+        let accountant = Arc::new(RecordingAccountant::default());
+        let document = r#"{"phases": [
+            {"name": "walk", "roots": ["pkg:maven/uk.co.real-logic/artio-core@0.118"],
+             "walk": [], "emit": "identifier"}
+        ]}"#;
+        let compiled = QueryCache::new(64).get_or_compile(document)?;
+        let mut sink = RowSink::default();
+        let (sender, input) = flume::bounded::<Value>(8);
+        drop(sender);
+        compiled.run(
+            Arc::clone(&accountant),
+            sink.sink(),
+            herd(&["pkg:maven/uk.co.real-logic/artio-core@0.118"]),
+            input,
+        )?;
+
+        // the lifecycle's shape, not exact counts that would couple the test
+        // to the fixture's graph
+        assert!(
+            accountant.count("WalkStarted") >= 1,
+            "the walk reported its start: {:?}",
+            accountant.counts
+        );
+        assert!(
+            accountant.count("WalkRound") >= 1,
+            "the walk reported its rounds: {:?}",
+            accountant.counts
+        );
+        assert!(
+            accountant.count("LoadItem") >= 1,
+            "the walk reported the items it loaded: {:?}",
+            accountant.counts
+        );
+        assert!(
+            accountant.count("ItemAdmitted") >= 1,
+            "the walk reported the items the gate admitted: {:?}",
+            accountant.counts
+        );
+        assert!(
+            accountant.count("TerminatedExhausted") == 1,
+            "a walk with no stop rules ends by exhaustion: {:?}",
+            accountant.counts
+        );
+        Ok(())
+    }
+
     /// Run a compiled query against a herd and collect its rows.
     fn rows_over(compiled: &CompiledQuery, lookup: HerdOrCluster) -> Result<Vec<Value>> {
         let mut sink = RowSink::default();
@@ -1652,8 +2108,12 @@ mod compile_tests {
     struct RowSink(Vec<Value>);
 
     impl RowSink {
-        fn sink(&mut self) -> impl FnMut(Value, &Arc<NoBound>, SinkOperation) -> Result<()> + '_ {
-            move |row: Value, _acc: &Arc<NoBound>, _op: SinkOperation| {
+        /// Generic over the accountant: a test's sink works with whatever
+        /// accountant the test's run carries.
+        fn sink<A: AccountingAndBudget>(
+            &mut self,
+        ) -> impl FnMut(Value, &Arc<A>, SinkOperation) -> Result<()> + '_ {
+            move |row: Value, _acc: &Arc<A>, _op: SinkOperation| {
                 self.0.push(row);
                 Ok(())
             }
@@ -3592,6 +4052,103 @@ mod compile_tests {
             released_rows.lock().expect("the rows' lock").len(),
             count,
             "every row was consumed"
+        );
+        Ok(())
+    }
+
+    /// FINDING 10 (PR #171 review): when the consumer vanishes — the client
+    /// disconnected — the STAGE THREADS must stop, not keep evaluating into
+    /// the void. The mechanism is the channels themselves: a send into a
+    /// dropped receiver FAILS, and the failure propagates. Today every stage
+    /// discards it (`let _ = sender.send(..)`), so a barker emitting millions
+    /// of rows keeps burning CPU long after the client is gone.
+    ///
+    /// THE TEST observes the work, not the wall clock: a barker counts its
+    /// emissions into a shared counter; the run ends because the consumer
+    /// dropped; 300 ms later the counter must be FROZEN. Before the fix it
+    /// keeps growing — the stages never learn the consumer is gone.
+    #[test]
+    fn a_vanished_consumer_stops_the_stage_threads() -> Result<()> {
+        let count = 5;
+        let identifiers: Vec<String> = (0..count).map(|n| n.to_string()).collect();
+        let items: Vec<&str> = identifiers.iter().map(String::as_str).collect();
+
+        // the barker AMPLIFIES: two million emissions per input row — ten
+        // million rows of work for five roots. Without send-failure
+        // propagation the stage threads churn through all of it; with it they
+        // stop at the first failed send, milliseconds in. The elapsed bound
+        // below is the assertion; the counter is diagnostic only (the sink
+        // runs on the run thread and stops when the run does).
+        let emissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&emissions);
+        let script = "for row in input:\n    for i in range(2000000):\n        emit(row)";
+        let document = format!(
+            r#"{{"phases": [
+                {{"name": "walk", "roots-from-input": true, "walk": [], "emit": "identifier"}},
+                {{"name": "loud", "barker": {}, "inputs": ["walk"]}}
+            ]}}"#,
+            serde_json::to_string(script).expect("a script quotes"),
+        );
+        let compiled = QueryCache::new(64).get_or_compile(&document)?;
+
+        // the consumer: a channel the test drops after the first rows
+        let (consumer_sender, consumer_receiver) = flume::bounded::<Value>(8);
+        let sink = move |row: Value, _acc: &Arc<NoBound>, _op| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            consumer_sender
+                .send(row)
+                .map_err(|_| anyhow::anyhow!("the consumer is gone"))?;
+            Ok(())
+        };
+
+        let (sender, input) = flume::bounded::<Value>(64);
+        // the feeder is its own thread: the channel is bounded, and the sends
+        // must be free to block while the pipeline drains
+        std::thread::spawn(move || {
+            for n in 0..count {
+                let _ = sender.send(json!(n.to_string()));
+            }
+        });
+
+        // the consumer reads a FEW rows, then disconnects by dropping the
+        // receiver — the shape of an HTTP client closing the response
+        std::thread::spawn(move || {
+            for _ in 0..5 {
+                let Ok(_row) = consumer_receiver.recv() else {
+                    break;
+                };
+            }
+            // the receiver drops here, at scope's end
+        });
+
+        let herd = herd(items.as_slice());
+        let started = std::time::Instant::now();
+        let run_result = {
+            // the consumer stops after a handful of rows, so the run must end
+            // in error rather than emit on
+            std::thread::spawn(move || {
+                compiled.run(Arc::new(NoBound), sink, herd, input)
+            })
+            .join()
+            .expect("the run thread does not panic")
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            run_result.is_err(),
+            "the run must report the vanished consumer, not succeed"
+        );
+
+        // THE ASSERTION: the run JOINS every stage thread on every exit path
+        // (that is the fix), so the run's duration IS the teardown: with
+        // propagation the stages stop at their first failed send and the run
+        // returns in milliseconds; without it the join waits out the barker's
+        // ten million emissions — minutes. The bound has an order of
+        // magnitude of margin on both sides, and being a duration (not a CPU
+        // measurement) it is unaffected by other tests running in parallel.
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the stage threads kept working after the consumer vanished: \
+             the run took {elapsed:?} to notice and reap them"
         );
         Ok(())
     }

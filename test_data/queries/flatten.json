@@ -1,17 +1,19 @@
 {
-  "roots": {
-    "from-input": true
-  },
-  "walk": [
-    "alias:to",
-    "contained:down"
-  ],
-  "emit": {
-    "expr": "{identifier: identifier, body_mime_type: body_mime_type, file_names: body.file_names}",
-    "if": {
-      ">": {
-        "depth": 0
+  "phases": [
+    {
+      "name": "walk",
+      "roots": {"from-input": true},
+      "walk": ["alias:to", "contained:down"],
+      "emit": {
+        "expr": "connections.\"contained:down\"[*]",
+        "unnest": true
       }
+    },
+    {
+      "name": "unique",
+      "barker": "for row in input:\n    emit(row)",
+      "dedup": true,
+      "inputs": ["walk"]
     }
-  }
+  ]
 }

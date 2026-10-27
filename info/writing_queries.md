@@ -228,9 +228,16 @@ The V2 surface serves the named queries at `/v2/query`:
 ```
 GET  /v2/query?identifier=…&template=flatten
 POST /v2/query  {"roots": ["…"], "template": "flatten"}
+POST /v2/query?template=flatten  {"roots": ["…"]}
 POST /v2/query  {"roots": ["…"], "query": { <a full query document> }}
 GET  /v2/query?identifier=…          (no template: the default)
 ```
+
+On both verbs the template's name resolves against the server's registry —
+the same registry for GET and POST — so a template your application added
+with `with_template()` runs on both, and one removed with `without_template()`
+runs on neither. On POST the body's `template` field wins when the query
+parameter is also given.
 
 A registry is **empty by default** — the built-ins are available to add, not
 forced upon the server. `TemplateRegistry::new()` starts with nothing; add the

@@ -504,3 +504,88 @@ async fn a_caller_template_replaces_a_builtin() -> std::result::Result<(), anyho
         Ok(())
     }
 
+
+/// Finding 9 (PR #171 review): the POST's `template` must resolve from the
+/// SAME registry the GET uses — the request's state — not a hard-coded
+/// built-in list. A custom template registered with `with_template` must run
+/// on POST; today the POST consults a static table and answers 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_post_template_comes_from_the_registry() -> std::result::Result<(), anyhow::Error> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/walk_v4");
+    let clusters = GoatRodeoCluster::cluster_files_in_dir(dir, false, vec![])
+        .await
+        .expect("the fixture cluster loads");
+    let cluster = clusters.into_iter().next().expect("one cluster");
+    let herd = bigtent::rodeo::goat_herd::GoatHerd::new(vec![Arc::new(
+        bigtent::rodeo::member::HerdMember::Cluster(cluster),
+    )]);
+    let holder = ClusterHolder::new_from_cluster(arc_swap::ArcSwap::from_pointee(herd), None)
+        .await
+        .expect("the holder builds");
+
+    let templates = TemplateRegistry::new().with_template(
+        "sizes",
+        r#"{"roots": {"from-input": true}, "walk": [], "emit": "{len: length(identifier)}"}"#,
+    );
+
+    let mut app = router_v2(Arc::new(V2State::with_templates(
+        holder,
+        Arc::new(QueryCache::new(64)),
+        templates,
+    )
+    .expect("the state builds")));
+
+    let identifier = "pkg:maven/uk.co.real-logic/artio-core@0.118";
+
+    // the POST naming the custom template in the BODY: the registry's text
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/query")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"template": "sizes", "roots": ["{identifier}"]}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .expect("the request is served");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a registered template runs on POST — the registry, not a static list"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let text = String::from_utf8(body).expect("text");
+    assert!(
+        text.contains("\"len\":43"),
+        "the POST ran the REGISTRY's template: {text}"
+    );
+
+    // the POST naming the template in the QUERY PARAMETER: same source
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/query?template=sizes")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"roots": ["{identifier}"]}}"#)))
+                .unwrap(),
+        )
+        .await
+        .expect("the request is served");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the query parameter names a template on POST too"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let text = String::from_utf8(body).expect("text");
+    assert!(
+        text.contains("\"len\":43"),
+        "the query-parameter template ran: {text}"
+    );
+    Ok(())
+}

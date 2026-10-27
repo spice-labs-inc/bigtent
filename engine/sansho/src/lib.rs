@@ -108,10 +108,84 @@ pub fn evaluate<'a, T: SanshoTrait<'a>>(
 pub fn materialize<'a, T: SanshoTrait<'a> + ?Sized>(
     value: &T,
 ) -> Result<serde_json::Value, SanshoError> {
+    materialize_counted(
+        value,
+        &mut MaterializationBudget::default(),
+    )
+}
+
+/// The materialization budget: how much one conversion may emit.
+///
+/// A carrier is a refcount-shared structure whose DENOTED tree can be
+/// exponentially larger than the memory it holds — a chained `[@,@]` grows
+/// the denoted tree 2x per stage while growing memory by one node. Nothing
+/// upstream bounds that: the JMESPath spec has no resource semantics and
+/// every implementation defers the cost to the consumer (verified by survey,
+/// PR #171 review, finding 4). Sansho's consumer is a server, so the walk
+/// that pays is ours — this budget is the boundary.
+///
+/// Per conversion, not per process: each `materialize` call gets a fresh
+/// budget, so a pipeline's rows are individually bounded and one bad row
+/// does not spend the next row's allowance. When the accountant lands, the
+/// constants here become parameters it supplies.
+#[derive(Clone, Copy, Default)]
+pub struct MaterializationBudget {
+    /// Nodes emitted so far, counting each occurrence (sharing is invisible
+    /// by construction: the denoted size is the consumer's cost).
+    nodes: u64,
+    /// Rendered text bytes so far: string contents, byte encodings, keys.
+    bytes: u64,
+}
+
+/// The node budget: the most nodes one conversion may emit.
+pub const MAX_MATERIALIZED_NODES: u64 = 500_000;
+/// The text budget: the most rendered string bytes one conversion may emit.
+pub const MAX_MATERIALIZED_STRING_BYTES: u64 = 10_000_000;
+
+impl MaterializationBudget {
+    fn count_node(&mut self) -> Result<(), SanshoError> {
+        self.nodes += 1;
+        if self.nodes > MAX_MATERIALIZED_NODES {
+            return Err(SanshoError::Limit {
+                message: format!(
+                    "materialization exceeds {} nodes (shared structures can denote \
+                     exponentially many); narrow the expression",
+                    MAX_MATERIALIZED_NODES
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn count_bytes(&mut self, bytes: u64) -> Result<(), SanshoError> {
+        self.bytes += bytes;
+        if self.bytes > MAX_MATERIALIZED_STRING_BYTES {
+            return Err(SanshoError::Limit {
+                message: format!(
+                    "materialization exceeds {} bytes of string text; narrow the expression",
+                    MAX_MATERIALIZED_STRING_BYTES
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn materialize_counted<'a, T: SanshoTrait<'a> + ?Sized>(
+    value: &T,
+    budget: &mut MaterializationBudget,
+) -> Result<serde_json::Value, SanshoError> {
     match value.kind() {
-        Kind::Null => Ok(serde_json::Value::Null),
-        Kind::Bool => Ok(serde_json::Value::Bool(value.as_bool()?)),
+        Kind::Null => {
+            budget.count_node()?;
+            Ok(serde_json::Value::Null)
+        }
+        Kind::Bool => {
+            budget.count_node()?;
+            Ok(serde_json::Value::Bool(value.as_bool()?))
+        }
         Kind::Number => {
+            budget.count_node()?;
             let number = match value.as_sansho_number()? {
                 SanshoNumber::I64(v) => serde_json::Number::from(v),
                 SanshoNumber::U64(v) => serde_json::Number::from(v),
@@ -121,21 +195,32 @@ pub fn materialize<'a, T: SanshoTrait<'a> + ?Sized>(
             };
             Ok(serde_json::Value::Number(number))
         }
-        Kind::String => Ok(serde_json::Value::String(value.as_str()?.to_string())),
-        Kind::Bytes => Ok(serde_json::Value::String(cbor::base64url_encode(
-            value.as_bytes()?,
-        ))),
+        Kind::String => {
+            budget.count_node()?;
+            let text = value.as_str()?;
+            budget.count_bytes(text.len() as u64)?;
+            Ok(serde_json::Value::String(text.to_string()))
+        }
+        Kind::Bytes => {
+            budget.count_node()?;
+            let encoded = cbor::base64url_encode(value.as_bytes()?);
+            budget.count_bytes(encoded.len() as u64)?;
+            Ok(serde_json::Value::String(encoded))
+        }
         Kind::Array => {
+            budget.count_node()?;
             let mut items = Vec::new();
             for element in value.as_elements()? {
-                items.push(materialize(&element)?);
+                items.push(materialize_counted(&element, budget)?);
             }
             Ok(serde_json::Value::Array(items))
         }
         Kind::Object => {
+            budget.count_node()?;
             let mut object = serde_json::Map::new();
             for (key, member) in value.as_object()? {
-                object.insert(key.to_string(), materialize(&member)?);
+                budget.count_bytes(key.len() as u64)?;
+                object.insert(key.to_string(), materialize_counted(&member, budget)?);
             }
             Ok(serde_json::Value::Object(object))
         }

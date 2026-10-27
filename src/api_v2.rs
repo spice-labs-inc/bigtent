@@ -141,8 +141,9 @@ pub struct ReadyzResponse {
 // ------------------------------------------------------- the pre-canned templates
 
 /// The passthrough query: every root's item, no traversal.
-const PASSTHROUGH: &str = r#"{"roots": {"from-input": true}, "walk": [], "emit":
-    "{identifier: identifier, connections: connections, body: body, body_mime_type: body_mime_type}"}"#;
+// the full item IS the row: `@`, always — an enumeration drifts when the
+// item's shape gains a field
+const PASSTHROUGH: &str = r#"{"roots": {"from-input": true}, "walk": [], "emit": "@"}"#;
 
 /// The pre-canned queries V2 serves by name.
 ///
@@ -244,19 +245,83 @@ const TEMPLATES: &[(&str, &str)] = &[
     (
         "anti_alias",
         r#"{"roots": {"from-input": true}, "walk": ["alias:to"], "emit":
-            {"expr": "{identifier: identifier, connections: connections, body: body, body_mime_type: body_mime_type}",
-             "if": {"==": {"is_terminal": true}}}}"#,
+            {"expr": "@", "if": {"==": {"is_terminal": true}}}}"#,
     ),
     (
         "north",
+        // V1's north emits the FULL items of the BFS (Either::Left(Item)) —
+        // the same shape /item emits; the traversal's own dedup (the walk's
+        // `seen` set) matches V1's `processed` set, so no dedup stage.
         r#"{"roots": {"from-input": true}, "walk": ["alias:to", "tag:from", "contained:up"],
-            "emit": "{identifier: identifier}"}"#,
+            "emit": "@"}"#,
     ),
     (
         "north_purls",
-        r#"{"roots": {"from-input": true}, "walk": ["alias:to", "tag:from", "contained:up"],
-            "emit": {"expr": "connections.\"alias:from\"", "unnest": true,
-                     "if": "length(connections.\"alias:from\") > `0`"}}"#,
+        // V1's rule, expressed in the query: each visited item's alias:from
+        // values, filtered IN THE EXPRESSION to pkg:-prefixed targets — no
+        // gate — and a DEDUP stage after the walk: two different items can
+        // carry the same purl (a diamond), and V1's `found_purls` set emits
+        // it once globally. An item without the edge yields null; a filter
+        // projection over null is null; a null row is dropped by the emit's
+        // null rule.
+        r#"{"phases": [
+            {"name": "walk", "roots": {"from-input": true},
+             "walk": ["alias:to", "tag:from", "contained:up"],
+             "emit": {"expr": "connections.\"alias:from\"[?starts_with(@, 'pkg:')]", "unnest": true}},
+            {"name": "unique", "barker": "for row in input:\n    emit(row)",
+             "dedup": true, "inputs": ["walk"]}
+        ]}"#,
+    ),
+    (
+        "flatten",
+        // V1's rule: each visited item's contains:down TARGET STRINGS are
+        // emitted (the alias:to hop is navigation, never emitted; the root's
+        // own targets included — no depth gate); a null edge projects to
+        // null and drops. Dedup: V1's processed set emits a target once.
+        r#"{"phases": [
+            {"name": "walk", "roots": {"from-input": true},
+             "walk": ["alias:to", "contained:down"],
+             "emit": {"expr": "connections.\"contained:down\"[*]", "unnest": true}},
+            {"name": "unique", "barker": "for row in input:\n    emit(row)",
+             "dedup": true, "inputs": ["walk"]}
+        ]}"#,
+    ),
+    (
+        "flatten_source",
+        // V1's source=true: the traversal ALSO follows build:down edges, and
+        // BOTH kinds of targets emit only when the EMITTING item carries a
+        // build:down edge (the gate is null-safe: no edge is an empty list).
+        // The edge name is build:down — the old template's build:from is not
+        // an edge type at all.
+        r#"{"phases": [
+            {"name": "walk", "roots": {"from-input": true},
+             "walk": ["alias:to", "contained:down", "build:down"],
+             "emit": [
+                {"expr": "connections.\"contained:down\"[*]", "unnest": true,
+                 "if": "length(connections.\"build:down\" || `[]`) > `0`"},
+                {"expr": "connections.\"build:down\"[*]", "unnest": true,
+                 "if": "length(connections.\"build:down\" || `[]`) > `0`"}
+             ]},
+            {"name": "unique", "barker": "for row in input:\n    emit(row)",
+             "dedup": true, "inputs": ["walk"]}
+        ]}"#,
+    ),
+    (
+        "north_purls",
+        // V1's rule, expressed in the query: each visited item's alias:from
+        // values, filtered IN THE EXPRESSION to pkg:-prefixed targets — no
+        // gate — and a DEDUP stage after the walk: two different items can
+        // carry the same purl (a diamond), and V1's `found_purls` set emits
+        // it once globally. An item without the edge yields null; a filter
+        // projection over null is null; a null row is dropped by the emit's
+        // null rule.
+        r#"{"phases": [
+            {"name": "walk", "roots": {"from-input": true},
+             "walk": ["alias:to", "tag:from", "contained:up"],
+             "emit": {"expr": "connections.\"alias:from\"[?starts_with(@, 'pkg:')]", "unnest": true}},
+            {"name": "unique", "barker": "for row in input:\n    emit(row)",
+             "dedup": true, "inputs": ["walk"]}
+        ]}"#,
     ),
     (
         "flatten",
@@ -273,17 +338,9 @@ const TEMPLATES: &[(&str, &str)] = &[
         r#"{"roots": {"from-input": true}, "walk": ["alias:to", "contained:down", "build:from"],
             "emit": {"expr": "{identifier: identifier, file_names: body.file_names}",
                      "if": {"and": [{">": {"depth": 0}},
-                                    "length(connections.\"build:from\") > `0`"]}}}"#,
+                                    "length(connections.\"build:from\" || `[]`) > `0`"]}}}"#,
     ),
 ];
-
-/// A template's text by name, or `None` for an unknown one.
-fn template(name: &str) -> Option<&'static str> {
-    TEMPLATES
-        .iter()
-        .find(|(known, _)| *known == name)
-        .map(|(_, text)| *text)
-}
 
 // ---------------------------------------------------------------- the endpoints
 
@@ -455,12 +512,19 @@ pub struct QueryPost {
 
 /// The POST form: a set of roots, and a template or an inline query.
 ///
-/// With neither, the basic lookup runs — which is `/bulk`'s shape.
+/// With neither, the basic lookup runs — which is `/bulk`'s shape. The
+/// template's name comes from the body's `template` field or the
+/// `?template=` query parameter — the body wins when both are given — and
+/// resolves against the server's registry, the same registry the GET's
+/// `?template=` names.
 #[utoipa::path(
     post,
     path = "/query",
     tag = "query",
     request_body = QueryPost,
+    params(
+        ("template" = Option<String>, Query, description = "The pre-canned query; the body's `template` field wins when both are given")
+    ),
     responses(
         (status = 200, description = "The rows, as JSON lines"),
         (status = 404, description = "Unknown template"),
@@ -469,12 +533,22 @@ pub struct QueryPost {
 )]
 async fn query_post(
     State(state): State<Arc<V2State<GoatHerd>>>,
+    AxumQuery(params): AxumQuery<HashMap<String, String>>,
     Json(body): Json<QueryPost>,
 ) -> Result<Response, (StatusCode, Json<String>)> {
     let roots = body.roots.unwrap_or_default();
 
-    let compiled = if let Some(name) = &body.template {
-        let Some(text) = template(name) else {
+    // the template's name comes from either the request's query parameter or
+    // the body's field — the body wins when both are given — and resolves
+    // against the REQUEST's registry, exactly as the GET does: a caller that
+    // registered, replaced, or removed a template with `with_template`/
+    // `without_template` sees the same template on both verbs. The static
+    // built-in list the POST once consulted ignored the state entirely: a
+    // custom template answered 404 and a removed builtin still ran.
+    let template_name = body.template.as_deref().or_else(|| params.get("template").map(String::as_str));
+
+    let compiled = if let Some(name) = template_name {
+        let Some(text) = state.templates.get(name) else {
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(format!("no template named `{name}`")),
@@ -569,11 +643,28 @@ async fn stream_query(
     let (rows_tx, rows_receiver) = flume::bounded::<Value>(256);
     let rows_sender = rows_tx.clone();
     let lookup = HerdOrCluster::Herd(state.holder.get_cluster());
+
+    // THE CANCELLATION: when the response body is dropped — the client
+    // disconnected — this guard flips the flag, and the run's accountant
+    // checks stop the work promptly, even in a stage that is mid-computation
+    // and not sending. Send-failure propagation handles the rest.
+    let cancellation = crate::highwire::walk::Cancellation::new();
+    struct CancelGuard(crate::highwire::walk::Cancellation);
+    impl Drop for CancelGuard {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+
+    let cancellation_moved = cancellation.clone();
     std::thread::Builder::new()
         .name("v2-query-run".to_string())
         .spawn(move || {
+            let accountant = Arc::new(crate::highwire::walk::Cancelled {
+                cancellation,
+            });
             let sink = move |row: Value,
-                             _acc: &Arc<NoBudget>,
+                             _acc: &Arc<crate::highwire::walk::Cancelled>,
                              op: SinkOperation|
                   -> anyhow::Result<()> {
                 // a stop's report is marked, so it cannot be mistaken for a row the
@@ -587,10 +678,10 @@ async fn stream_query(
                     .map_err(|_| anyhow::anyhow!("the response stream closed"))?;
                 Ok(())
             };
-            if let Err(error) =
-                compiled.run(Arc::new(NoBudget), sink, lookup, input)
-            {
-                // a run failure is a row too, so the client sees it in the stream
+            if let Err(error) = compiled.run(accountant, sink, lookup, input) {
+                // a run failure is a row too, so the client sees it in the stream.
+                // A FAILED send means the client is gone; there is nothing left
+                // to report to, so the failure is swallowed deliberately.
                 let _ = rows_sender.send(serde_json::json!({ "error": error.to_string() }));
             }
         })
@@ -601,7 +692,14 @@ async fn stream_query(
     use axum_streams::StreamBodyAs;
     // JSON LINES: one row per line, which is what a streaming client reads
     // incrementally; a JSON array would require the whole response before parsing
-    Ok(StreamBodyAs::json_nl(rows_receiver.into_stream()).into_response())
+    // the GUARD rides the stream: when the body is dropped — the client
+    // disconnected — the guard drops with it and cancels the run
+    let guard = CancelGuard(cancellation_moved);
+    let stream = futures::StreamExt::map(rows_receiver.into_stream(), move |row| {
+        let _ = &guard; // the guard's lifetime is the stream's
+        row
+    });
+    Ok(StreamBodyAs::json_nl(stream).into_response())
 }
 
 /// An error located the way every compilation error is.

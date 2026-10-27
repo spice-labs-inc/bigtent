@@ -7,5 +7,5 @@
     "tag:from",
     "contained:up"
   ],
-  "emit": "{identifier: identifier}"
+  "emit": "@"
 }

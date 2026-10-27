@@ -328,7 +328,12 @@ pub fn run_with(
             // would either end the run or be invisible to whatever is downstream,
             // and neither is what a failure inside one stage should do. The
             // shape is fixed so a consumer can recognise it: a single key naming
-            // the failure.
+            // the failure. A FAILED send means the consumer is gone — the
+            // teardown has begun — and is swallowed only because this thread
+            // is finishing anyway; there is nothing left to report to.
+            // a FAILED send means the consumer is gone — the teardown has
+            // begun — and is swallowed only because this thread is finishing
+            // anyway; there is nothing left to report to
             let _ = sender.send(Ok(serde_json::json!({
                 "error": format!("{error}"),
             })));
