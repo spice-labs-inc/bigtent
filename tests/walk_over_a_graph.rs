@@ -126,8 +126,8 @@ async fn herd_of_both() -> HerdOrCluster {
 struct RowSink(Vec<Value>);
 
 impl RowSink {
-    fn sink(&mut self) -> impl FnMut(Value, &Arc<NoBound>, SinkOperation) -> Result<()> + '_ {
-        move |row: Value, _acc: &Arc<NoBound>, _op: SinkOperation| {
+    fn sink(&mut self) -> impl FnMut(Value, &Arc<dyn bigtent::highwire::walk::AccountingAndBudget + Send + Sync>, SinkOperation) -> Result<()> + '_ {
+        move |row: Value, _acc: &Arc<dyn bigtent::highwire::walk::AccountingAndBudget + Send + Sync>, _op: SinkOperation| {
             self.0.push(row);
             Ok(())
         }
@@ -143,7 +143,7 @@ fn rows(document: Value, lookup: HerdOrCluster) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     {
         let mut run = run;
-        let sink = |row: Value, _acc: &Arc<NoBound>, _op: SinkOperation| -> Result<()> {
+        let sink = |row: Value, _acc: &Arc<dyn bigtent::highwire::walk::AccountingAndBudget + Send + Sync>, _op: SinkOperation| -> Result<()> {
             out.push(row);
             Ok(())
         };
@@ -418,11 +418,9 @@ async fn nested_count(source: Source, purl: &str) -> Result<Vec<Value>> {
         ]
     });
 
-    // a barker with no inputs still needs its input stream closed, or it waits
-    let (sender, receiver) = flume::unbounded::<Value>();
-    drop(sender);
-    let _ = receiver;
-
+    // (no input plumbing here: `rows` owns the input stream and closes it. A
+    // detached `unbounded` channel used to sit here connected to nothing, which
+    // proved nothing about the run.)
     rows(document, source.lookup().await)
 }
 
@@ -771,10 +769,34 @@ async fn the_basic_walk_over_cluster_a_emits_rows() -> Result<()> {
     let cluster = clusters.into_iter().next().expect("one cluster");
     let root = "gitoid:blob:sha256:5110e3464c462309adb4645f8664ed16338218211f4a86cc72cf5d2fd269df25";
     let rows = run_endpoint("basic_walk", &[root], HerdOrCluster::Cluster(cluster))?;
-    println!("BASIC WALK ROWS: {}", rows.len());
-    for row in rows.iter().take(6) {
-        println!("  {row:?}");
+
+    // THE ASSERTIONS: the walk produced rows, none of them an error row (a
+    // failure would be visible as `{"error": …}` rather than silence), and the
+    // root itself is among them — `emit: "@"` emits every visited item and the
+    // root is visited first.
+    assert!(!rows.is_empty(), "the walk over a real V3 cluster emits rows");
+    let errors: Vec<&Value> = rows.iter().filter(|row| row.get("error").is_some()).collect();
+    assert!(
+        errors.is_empty(),
+        "no row is an error row — the byte path cannot read V3 storage, so the \
+         entry rule must have selected the herd: {errors:?}"
+    );
+    // every row is a FULL ITEM (an object with an identifier), not a bare
+    // string — `emit: "@"` emits the item itself
+    for row in &rows {
+        assert!(
+            row.get("identifier").is_some(),
+            "each row is the item, with its identifier: {row:?}"
+        );
     }
+    assert!(
+        rows.iter().any(|row| row["identifier"] == serde_json::json!(root)),
+        "the root is among the visited items: {rows:?}"
+    );
+    assert!(
+        rows.len() > 1,
+        "the walk FOLLOWED its north edges rather than stopping at the root: {rows:?}"
+    );
     Ok(())
 }
 
@@ -791,10 +813,32 @@ async fn the_pkg_filter_emit_yields_one_purl_on_the_known_item() -> Result<()> {
     let cluster = clusters.into_iter().next().expect("one cluster");
     let root = "gitoid:blob:sha256:5110e3464c462309adb4645f8664ed16338218211f4a86cc72cf5d2fd269df25";
     let rows = run_endpoint("filtered_emit", &[root], HerdOrCluster::Cluster(cluster))?;
-    println!("FILTERED EMIT ROWS: {}", rows.len());
-    for row in rows.iter().take(6) {
-        println!("  {row:?}");
-    }
+
+    // THE ASSERTIONS: every row is a PURL — that is the filter's whole job.
+    // The root's `alias:from` carries seven values (one purl, six hash
+    // identities) and the walk also reaches the canonical item's own
+    // `alias:from`; a filter that passed everything would emit the hashes too,
+    // and one that dropped everything would emit nothing.
+    let emitted: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.as_str().map(str::to_string))
+        .collect();
+    assert!(!emitted.is_empty(), "the filtered emit produces rows: {rows:?}");
+    assert!(
+        emitted.iter().all(|value| value.starts_with("pkg:")),
+        "every row is a purl — no hash identity survives the filter: {rows:?}"
+    );
+    let mut sorted = emitted.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted,
+        vec![
+            "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0".to_string(),
+            "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0?type=pom".to_string(),
+        ],
+        "exactly the item's two purls: {rows:?}"
+    );
     Ok(())
 }
 
@@ -1264,5 +1308,97 @@ async fn the_aa_trap_graph_v1_and_v2_agree_on_every_rule() -> Result<()> {
             "/aa agrees for {root}: V1 {v1_ids:?} vs V2 {v2_ids:?}"
         );
     }
+    Ok(())
+}
+
+/// THE TWO-ROOT AA TRAP (PR #171 review, finding 20): the walk's `seen` set is
+/// shared across ALL roots of one request — so with roots [purl, its gitoid],
+/// the gitoid is already in `seen` when the purl's turn processes its
+/// `alias:to` child. The OLD is_terminal ("my round produced nothing") then
+/// marked the purl terminal and the V2 answer contained THE PURL as its own
+/// canonical item — where V1 maps both roots to the gitoid. Demonstrated live
+/// on cluster_a: V2 ["pkg:docker/red-kibble-1@1.0.0", "gitoid:…"] vs V1
+/// [gitoid, gitoid].
+///
+/// THE FIX: `is_terminal` is a property of the ITEM (no filter-admitted child
+/// exists), not of the traversal round; a child excluded because of `seen` is
+/// still a child. The fix costs one flag write per admitted edge — no extra
+/// traversal.
+///
+/// THE AGREEMENT RULE: V1's per-root antialiasing (both roots map to the same
+/// gitoid) vs V2's template run over BOTH roots in ONE request: the union of
+/// canonical items must be exactly the gitoid.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_two_root_aa_trap_agrees_with_v1() -> Result<()> {
+    use bigtent::item::EdgeType as _;
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/cluster_a");
+    let clusters = GoatRodeoCluster::cluster_files_in_dir(dir, false, vec![])
+        .await
+        .expect("cluster_a loads");
+    let cluster = Arc::new(clusters.into_iter().next().expect("one cluster"));
+
+    // a real purl/gitoid alias pair from the cluster's own purl list
+    let purls: Vec<String> = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/cluster_a/purls.txt"),
+    )
+    .unwrap()
+    .lines()
+    .map(str::trim)
+    .filter(|l| !l.is_empty())
+    .map(str::to_string)
+    .collect();
+
+    let mut tested = 0;
+    for purl in &purls {
+        let Some(item) = cluster.item_for_identifier(purl) else {
+            continue;
+        };
+        let gitoids: Vec<String> = item
+            .connections
+            .iter()
+            .filter(|(k, _)| k.is_alias_to())
+            .flat_map(|(_, v)| v.iter().cloned())
+            .collect();
+        let Some(gitoid) = gitoids.first() else {
+            continue;
+        };
+
+        // V1: each root's canonical item, separately
+        let v1_purl = (*cluster)
+            .clone()
+            .antialias_for(purl)
+            .map(|i| i.identifier)
+            .unwrap_or_default();
+        let v1_gitoid = (*cluster)
+            .clone()
+            .antialias_for(gitoid)
+            .map(|i| i.identifier)
+            .unwrap_or_default();
+
+        // V2: BOTH roots in ONE request — the shape that trips the shared
+        // `seen` set
+        let v2 = run_endpoint("anti_alias", &[purl, gitoid], HerdOrCluster::Cluster(Arc::clone(&cluster)))?;
+        let v2_ids = query_identifiers(&v2);
+
+        // both roots' canonical answers, as a set — V1's per-root answers
+        // unioned, deduped
+        let mut expected: Vec<String> = vec![v1_purl.clone(), v1_gitoid.clone()];
+        expected.sort();
+        expected.dedup();
+
+        assert_eq!(
+            v2_ids.len(),
+            expected.len(),
+            "the purl must not appear as its own canonical item: V2 {v2_ids:?}"
+        );
+        let expected_set: std::collections::HashSet<String> = expected.into_iter().collect();
+        let v2_set: std::collections::HashSet<String> = v2_ids.iter().cloned().collect();
+        assert_eq!(v2_set, expected_set, "the canonical answers agree for {purl}");
+        tested += 1;
+        if tested >= 25 {
+            break;
+        }
+    }
+    assert!(tested > 0, "at least one alias pair is exercised");
     Ok(())
 }

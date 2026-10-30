@@ -58,6 +58,65 @@ pub fn parse(input: &str) -> Result<Expr, SanshoError> {
     }
 }
 
+/// WHERE A STRING ENDS — the ONE implementation.
+///
+/// The parser has no separate lexer: each combinator that reads a string does
+/// its own skipping, and the nesting guard needs the same answer *before* the
+/// recursive parse runs. Duplicating the rules produced a disagreement (an
+/// escaped quote inside a raw string flipped the guard's state and disabled
+/// it). These three skippers are the single source of truth for where a
+/// delimited string ends; the guard uses them, and a test pins the parser's
+/// consumption to them.
+///
+/// `input` starts AT the opening delimiter; the answer is the byte offset just
+/// past the closing one, or `None` when the string never closes (the parser
+/// refuses that with a syntax error, so the guard is free to stop scanning).
+mod lexeme {
+    /// A double-quoted string: `\\` escapes the next character.
+    pub(crate) fn skip_quoted(input: &str) -> Option<usize> {
+        let bytes = input.as_bytes();
+        let mut i = 1; // past the opening quote, which the caller saw
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2, // the escaped character, whatever it is
+                b'"' => return Some(i + 1),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    /// A raw (single-quoted) string: the ONLY escape is `\'`; a backslash
+    /// before anything else is plain content and does not escape it.
+    pub(crate) fn skip_raw(input: &str) -> Option<usize> {
+        let bytes = input.as_bytes();
+        let mut i = 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
+                b'\\' => i += 1, // a plain backslash: the NEXT byte is not escaped
+                b'\'' => return Some(i + 1),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    /// A backtick literal (JSON text): `\\` escapes the next character.
+    pub(crate) fn skip_literal(input: &str) -> Option<usize> {
+        let bytes = input.as_bytes();
+        let mut i = 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'`' => return Some(i + 1),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+}
+
 /// The byte position of the first character where structural nesting
 /// exceeds `max_depth`, or `None` if it never does. Iterative; skips
 /// quoted strings, raw strings, and backtick literals (which may legally
@@ -69,61 +128,48 @@ pub fn parse(input: &str) -> Result<Expr, SanshoError> {
 /// the recursion it drives unguarded, and a hostile expression overflows
 /// the stack and aborts the process.
 fn excessive_depth_at(input: &str, max_depth: usize) -> Option<usize> {
-    #[derive(Clone, Copy)]
-    enum Inside {
-        None,
-        Quoted,
-        Raw,
-        Literal,
-    }
+    let characters: Vec<(usize, char)> = input.char_indices().collect();
     let mut depth = 0usize;
-    let mut inside = Inside::None;
-    let mut escape = false;
-    for (position, character) in input.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match inside {
-            Inside::Quoted => match character {
-                '\\' => escape = true,
-                '"' => inside = Inside::None,
-                _ => {}
-            },
-            Inside::Raw => {
-                if character == '\'' {
-                    inside = Inside::None;
+    let mut index = 0usize;
+    while index < characters.len() {
+        let (position, character) = characters[index];
+        match character {
+            // a STRING is skipped by the shared lexer — the same code the
+            // parser's own rules are pinned to, so the guard cannot disagree
+            // about where one ends
+            '"' | '\'' | '`' => {
+                let end = match character {
+                    '"' => lexeme::skip_quoted(&input[position..]),
+                    '\'' => lexeme::skip_raw(&input[position..]),
+                    _ => lexeme::skip_literal(&input[position..]),
+                };
+                // an unterminated string: the parser refuses it with a syntax
+                // error, so there is nothing left for the guard to protect
+                let end = end?;
+                let end = position + end;
+                while index < characters.len() && characters[index].0 < end {
+                    index += 1;
+                }
+                continue;
+            }
+            '[' | '{' | '(' => {
+                depth += 1;
+                if depth > max_depth {
+                    return Some(position);
                 }
             }
-            Inside::Literal => match character {
-                '\\' => escape = true,
-                '`' => inside = Inside::None,
-                _ => {}
-            },
-            Inside::None => match character {
-                '"' => inside = Inside::Quoted,
-                '\'' => inside = Inside::Raw,
-                '`' => inside = Inside::Literal,
-                '[' | '{' | '(' => {
-                    depth += 1;
-                    if depth > max_depth {
-                        return Some(position);
-                    }
+            ']' | '}' | ')' => depth = depth.saturating_sub(1),
+            // `!` begins a recursive negation parse — UNLESS it is the
+            // inequality operator `!=`, which recurses not at all
+            '!' if !input[position..].starts_with("!=") => {
+                depth += 1;
+                if depth > max_depth {
+                    return Some(position);
                 }
-                ']' | '}' | ')' => depth = depth.saturating_sub(1),
-                // `!` begins a recursive negation parse — UNLESS it is the
-                // inequality operator `!=`, which recurses not at all. Each
-                // negation adds one level; negation has no closing token, so
-                // it contributes no decrement.
-                '!' if !input[position..].starts_with("!=") => {
-                    depth += 1;
-                    if depth > max_depth {
-                        return Some(position);
-                    }
-                }
-                _ => {}
-            },
+            }
+            _ => {}
         }
+        index += 1;
     }
     None
 }

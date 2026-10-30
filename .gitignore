@@ -29,7 +29,7 @@ benches/target/
 /workspace/
 
 # Core dumps from crashed test binaries (never commit)
-core.*
+/core.*
 
 # Editor backup and swap files
 *~

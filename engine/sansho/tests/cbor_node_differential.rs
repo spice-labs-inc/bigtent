@@ -246,9 +246,27 @@ fn escape_case_matrix_pins_the_mapping() {
     };
     let obj2 = value2.as_object().unwrap();
     assert_eq!(obj2["f16"], serde_json::json!(0.0), "f16 zero");
-    assert_eq!(obj2["f32"], serde_json::json!(0), "+Inf coerces to 0");
-    assert_eq!(obj2["f64"], serde_json::json!(0), "NaN coerces to 0");
-    assert_eq!(obj2["neg0"], serde_json::json!(-0.0), "-0.0 preserved");
+    // JSON has no spelling for a non-finite number, so materializing one
+    // answers `null` — the same answer the evaluator's text rendering gives
+    assert_eq!(
+        obj2["f32"],
+        serde_json::Value::Null,
+        "+Inf materializes as null"
+    );
+    assert_eq!(
+        obj2["f64"],
+        serde_json::Value::Null,
+        "NaN materializes as null"
+    );
+    // ASSERTED BY BITS: `serde_json`'s `Number` equality compares the floats, so
+    // `json!(-0.0) == json!(0.0)` is true and the old assertion could pass on a
+    // mapping that had coerced the sign away.
+    let neg_zero = obj2["neg0"].as_f64().expect("a number");
+    assert_eq!(
+        neg_zero.to_bits(),
+        (-0.0f64).to_bits(),
+        "-0.0 keeps its sign bit, not just a zero value"
+    );
 
     // invalid-UTF-8 text is invalid CBOR — major type 3 is defined as
     // UTF-8 — so it is an INPUT error, raised where the text is read. The

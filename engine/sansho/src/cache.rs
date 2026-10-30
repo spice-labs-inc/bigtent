@@ -70,9 +70,16 @@ impl ProgramCache {
     /// most-recently-used; counts the hit.
     pub(crate) fn get(&self, expr: &Expr) -> Option<Arc<Program>> {
         let key = CacheKey::of_expr(expr);
-        let mut inner = self.inner.lock().expect("cache lock");
+        // a POISONED lock is recovered, not fatal: the cache is a derived
+        // structure rebuilt by compiling, so the data behind a poisoned lock
+        // (a half-updated LRU order) is repaired by the next insert rather than
+        // taking the process down. `error.rs` promises the public interface
+        // does not panic; this is what makes that true.
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if inner.entries.contains_key(&key) {
-            let program = inner.entries.get(&key).expect("checked").clone();
+            // raced past the check is impossible: the get follows the contains;
+        // the graceful form keeps no panic path
+        let program = inner.entries.get(&key)?.clone();
             inner.hits += 1;
             inner.order.retain(|k| k != &key);
             inner.order.push(key);
@@ -85,9 +92,29 @@ impl ProgramCache {
     /// least-recently-used entries while over the bound.
     pub(crate) fn put(&self, expr: &Expr, program: Arc<Program>) {
         let key = CacheKey::of_expr(expr);
-        let mut inner = self.inner.lock().expect("cache lock");
+        // a POISONED lock is recovered, not fatal: the cache is a derived
+        // structure rebuilt by compiling, so the data behind a poisoned lock
+        // (a half-updated LRU order) is repaired by the next insert rather than
+        // taking the process down. `error.rs` promises the public interface
+        // does not panic; this is what makes that true.
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A ZERO BOUND CACHES NOTHING: the eviction loop cannot make room for
+        // zero entries, so nothing is inserted rather than one program being
+        // held by a cache whose bound is zero.
+        if inner.max_entries == 0 {
+            return;
+        }
+        // IDEMPOTENT: `get` and `put` are separate lock acquisitions, so another
+        // thread may have compiled and inserted this same expression while this
+        // one was compiling. The first program is kept — the two are compiled
+        // from the same canonical expression — and a duplicate neither counts a
+        // miss nor touches the LRU order (a duplicate key there would corrupt
+        // it), nor evicts anything.
+        if inner.entries.contains_key(&key) {
+            return;
+        }
         inner.misses += 1;
-        while inner.entries.len() >= inner.max_entries {
+        while inner.entries.len() >= inner.max_entries && !inner.entries.is_empty() {
             match inner.order.first().cloned() {
                 Some(oldest) => {
                     inner.entries.remove(&oldest);
@@ -103,7 +130,7 @@ impl ProgramCache {
 
     /// The cache's statistics: (hits, misses, evictions, entries).
     pub fn stats(&self) -> (usize, usize, usize, usize) {
-        let inner = self.inner.lock().expect("cache lock");
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             inner.hits,
             inner.misses,

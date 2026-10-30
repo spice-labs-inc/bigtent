@@ -197,3 +197,110 @@ fn navigation_and_iteration_agree() {
         "a skipped field is not reachable by name"
     );
 }
+
+// ---------------------------------------------------------------------------
+// RAW IDENTIFIERS (second review, findings 3 and 13)
+// ---------------------------------------------------------------------------
+
+/// A struct whose JSON-ish member names are Rust keywords, so the fields are
+/// raw identifiers. `r#type` is the field Rust forces you to write when the
+/// member is called `type`.
+#[derive(SanshoObject, serde::Serialize)]
+struct Keyworded {
+    r#type: String,
+    r#match: u64,
+    r#move: bool,
+}
+
+fn keyworded() -> Keyworded {
+    Keyworded {
+        r#type: "application/java-archive".to_string(),
+        r#match: 7,
+        r#move: true,
+    }
+}
+
+/// FINDINGS 3/13: a raw identifier's member name is the name WITHOUT the `r#`
+/// prefix — `type`, not `r#type`.
+///
+/// Why it matters: `proc_macro2::Ident::to_string()` keeps the prefix, so the
+/// member was `"r#type"`; a query saying `type` returned null (a wrong answer,
+/// not an error), `keys(@)` listed a key nobody would write, and `serde` — which
+/// strips the prefix — serialized the very same struct under `"type"`, so the
+/// derived source and serde disagreed about the document's shape.
+///
+/// THEORY: the member is reachable by the name the DEVELOPER writes in a query,
+/// and not by the Rust spelling; and the derived object equals what serde
+/// produces for the same value, which is the contract the bug violated.
+#[test]
+fn a_raw_identifier_is_its_name_without_the_prefix() {
+    let document = keyworded();
+
+    // the member is `type`, and reading it gives the field's value
+    let program = sansho::compile(&sansho::parse("type").unwrap(), None).unwrap();
+    let value = sansho::evaluate(&program, &document)
+        .and_then(|value| sansho::materialize(&value))
+        .expect("the member reads");
+    assert_eq!(
+        value,
+        serde_json::json!("application/java-archive"),
+        "`type` must find the field"
+    );
+
+    // and `r#type` is NOT a member: the Rust spelling is not the document's
+    let program = sansho::compile(&sansho::parse("keys(@)").unwrap(), None).unwrap();
+    let keys = sansho::evaluate(&program, &document)
+        .and_then(|value| sansho::materialize(&value))
+        .expect("the keys read");
+    let keys: Vec<String> = keys
+        .as_array()
+        .expect("keys is an array")
+        .iter()
+        .map(|key| key.as_str().expect("a key is text").to_string())
+        .collect();
+    assert!(
+        keys.contains(&"type".to_string()),
+        "the member set holds `type`: {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|key| key.starts_with("r#")),
+        "no member carries the Rust prefix: {keys:?}"
+    );
+
+    // THE CONTRACT: the derived source and serde describe the SAME document
+    let derived = {
+        let program = sansho::compile(&sansho::parse("@").unwrap(), None).unwrap();
+        sansho::evaluate(&program, &document)
+            .and_then(|value| sansho::materialize(&value))
+            .expect("the whole value reads")
+    };
+    let serde_shape =
+        serde_json::to_value(&document).expect("serde serializes the same struct");
+    for member in ["type", "match", "move"] {
+        assert_eq!(
+            derived.get(member),
+            serde_shape.get(member),
+            "derived and serde agree on `{member}`: {derived} vs {serde_shape}"
+        );
+    }
+}
+
+/// A CONTROL: an explicit `#[serde(rename)]` still wins over the field's own
+/// name — the rename path must keep precedence after the unraw change.
+#[derive(SanshoObject)]
+struct Renamed {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[test]
+fn an_explicit_rename_still_wins() {
+    let document = Renamed {
+        kind: "jar".to_string(),
+    };
+    let program = sansho::compile(&sansho::parse("type").unwrap(), None).unwrap();
+    let value = sansho::evaluate(&program, &document)
+        .and_then(|value| sansho::materialize(&value))
+        .expect("the renamed member reads");
+    assert_eq!(value, serde_json::json!("jar"));
+}

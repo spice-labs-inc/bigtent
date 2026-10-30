@@ -34,7 +34,7 @@ fn mixed_array() -> Vec<u8> {
 fn only_readable_text_elements_are_yielded() {
     let bytes = mixed_array();
     let slice: &[u8] = &bytes;
-    let text: Vec<&str> = slice
+    let text: Vec<std::borrow::Cow<str>> = slice
         .as_array_str()
         .expect("an array answers")
         .collect();
@@ -57,7 +57,7 @@ fn an_indefinite_array_ends_at_its_break() {
     bytes.extend_from_slice(&[0x63, b'x', b'y', b'z']); // "xyz"
     bytes.push(0xff); // the break
     let slice: &[u8] = &bytes;
-    let text: Vec<&str> = slice
+    let text: Vec<std::borrow::Cow<str>> = slice
         .as_array_str()
         .expect("an array answers")
         .collect();
@@ -82,7 +82,7 @@ fn a_non_array_answers_an_error_and_an_empty_array_does_not() {
 
     let empty: Vec<u8> = vec![0x80]; // array(0)
     let slice: &[u8] = &empty;
-    let yielded: Vec<&str> = slice
+    let yielded: Vec<std::borrow::Cow<str>> = slice
         .as_array_str()
         .expect("an empty array is an array")
         .collect();
@@ -114,7 +114,7 @@ fn the_value_source_and_a_carrier_both_answer() {
 
     let program = sansho::compile(&sansho::parse("names").unwrap(), None).unwrap();
     let carrier = sansho::evaluate(&program, &document).expect("evaluates");
-    let text: Vec<&str> = carrier
+    let text: Vec<std::borrow::Cow<str>> = carrier
         .as_array_str()
         .expect("the carrier forwards the read")
         .collect();
@@ -136,7 +136,7 @@ fn a_computed_array_yields_its_own_text() {
     let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).unwrap();
     let program = sansho::compile(&sansho::parse("names[*]").unwrap(), None).unwrap();
     let carrier = sansho::evaluate(&program, bytes.as_slice()).expect("evaluates");
-    let text: Vec<&str> = carrier
+    let text: Vec<std::borrow::Cow<str>> = carrier
         .as_array_str()
         .expect("a computed array answers")
         .collect();

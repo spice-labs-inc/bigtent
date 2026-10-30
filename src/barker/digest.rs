@@ -38,22 +38,22 @@ fn swh_of(gitoid: &str) -> String {
 pub fn digest(builder: &mut GlobalsBuilder) {
     /// The SHA-1 digest of the text's bytes, as hex — no framing.
     fn sha1(text: Value) -> anyhow::Result<String> {
-        Ok(coordinates::sha1(as_bytes(text)?))
+        Ok(coordinates::sha1(as_bytes("sha1", text)?))
     }
 
     /// The SHA-256 digest of the text's bytes, as hex — no framing.
     fn sha256(text: Value) -> anyhow::Result<String> {
-        Ok(coordinates::sha256(as_bytes(text)?))
+        Ok(coordinates::sha256(as_bytes("sha256", text)?))
     }
 
     /// The SHA-512 digest of the text's bytes, as hex.
     fn sha512(text: Value) -> anyhow::Result<String> {
-        Ok(coordinates::sha512(as_bytes(text)?))
+        Ok(coordinates::sha512(as_bytes("sha512", text)?))
     }
 
     /// The MD5 digest of the text's bytes, as hex.
     fn md5(text: Value) -> anyhow::Result<String> {
-        Ok(coordinates::md5(as_bytes(text)?))
+        Ok(coordinates::md5(as_bytes("md5", text)?))
     }
 
     /// The BLAKE3 digest of the text's bytes, as hex.
@@ -61,19 +61,19 @@ pub fn digest(builder: &mut GlobalsBuilder) {
     /// BLAKE3 is not among the identifiers the `coordinates` crate defines, so
     /// this is the one digest computed here rather than there.
     fn blake3(text: Value) -> anyhow::Result<String> {
-        Ok(::blake3::hash(as_bytes(text)?).to_hex().to_string())
+        Ok(::blake3::hash(as_bytes("blake3", text)?).to_hex().to_string())
     }
 
     /// The git blob id with SHA-1, in the corpus's form:
     /// `gitoid:blob:sha1:<40 hex>`.
     fn gitoid_sha1(text: Value) -> anyhow::Result<String> {
-        Ok(coordinates::gitoid_blob_sha1(as_bytes(text)?))
+        Ok(coordinates::gitoid_blob_sha1(as_bytes("gitoid_sha1", text)?))
     }
 
     /// The git blob id with SHA-256, in the corpus's form:
     /// `gitoid:blob:sha256:<64 hex>`.
     fn gitoid_sha256(text: Value) -> anyhow::Result<String> {
-        Ok(coordinates::gitoid_blob_sha256(as_bytes(text)?))
+        Ok(coordinates::gitoid_blob_sha256(as_bytes("gitoid_sha256", text)?))
     }
 
     /// The Software Heritage content identifier with SHA-1:
@@ -83,12 +83,12 @@ pub fn digest(builder: &mut GlobalsBuilder) {
     /// so the two identifiers describe the same content and differ only in their
     /// prefix.
     fn swh_sha1(text: Value) -> anyhow::Result<String> {
-        Ok(swh_of(&coordinates::gitoid_blob_sha1(as_bytes(text)?)))
+        Ok(swh_of(&coordinates::gitoid_blob_sha1(as_bytes("swh_sha1", text)?)))
     }
 
     /// The Software Heritage content identifier with SHA-256:
     /// `swh:1:cnt:<64 hex>`, over the git blob digest as above.
     fn swh_sha256(text: Value) -> anyhow::Result<String> {
-        Ok(swh_of(&coordinates::gitoid_blob_sha256(as_bytes(text)?)))
+        Ok(swh_of(&coordinates::gitoid_blob_sha256(as_bytes("swh_sha256", text)?)))
     }
 }

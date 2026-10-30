@@ -26,6 +26,7 @@ use crate::error::SanshoError;
 use std::collections::HashMap;
 use std::fmt::{self};
 use std::rc::Rc;
+use std::borrow::Cow;
 
 /// The kind of a value, as the evaluator sees it.
 ///
@@ -150,7 +151,7 @@ pub trait Member<'a>: SanshoTrait<'a> {
 //         self.reference.kind()
 //     }
 //
-//     fn as_str(&self) -> Result<&str, SanshoError> {
+//     fn as_str(&self) -> Result<Cow<'_, str>, SanshoError> {
 //         self.reference.as_str()
 //     }
 //
@@ -220,7 +221,7 @@ pub trait SanshoTrait<'a>: 'a {
     /// mmap'd CBOR text, the in-memory strings); owned for a value form,
     /// which has no borrowable storage. A byte string is not text: it is
     /// [`Kind::Bytes`] and answers `None` here — see [`Self::as_bytes`].
-    fn as_str(&self) -> Result<&str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'_, str>, SanshoError> {
         Err(SanshoError::Evaluation {
             message: "Not a String type".to_string(),
         })
@@ -317,7 +318,7 @@ pub trait SanshoTrait<'a>: 'a {
     /// source whose storage holds the text itself supplies its own walk.
     fn as_array_str<'s>(
         &'s self,
-    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    ) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         Err(SanshoError::Evaluation {
             message: format!("as_array_str requires an array, found {}", self.kind()),
         })
@@ -348,7 +349,7 @@ impl<'a> SanshoTrait<'a> for SanshoCarrier<'a> {
         (**self).kind()
     }
 
-    fn as_str(&self) -> Result<&str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'_, str>, SanshoError> {
         (**self).as_str()
     }
 
@@ -382,7 +383,7 @@ impl<'a> SanshoTrait<'a> for SanshoCarrier<'a> {
 
     fn as_array_str<'s>(
         &'s self,
-    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    ) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         (**self).as_array_str()
     }
 

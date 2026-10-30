@@ -81,10 +81,10 @@ impl<'a> SanshoTrait<'a> for Vec<SanshoCarrier<'a>> {
     fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Ok((*self).clone())
     }
-    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         // the elements may be any kind; the text-bearing ones are yielded
         Ok(Box::new(
-            self.iter().filter_map(|element| element.as_str().ok()),
+            self.iter().map(|element| element.as_str().ok()).collect::<Vec<_>>().into_iter().flatten(),
         ))
     }
 
@@ -117,10 +117,10 @@ impl<'a> SanshoTrait<'a> for &'a Vec<SanshoCarrier<'a>> {
     fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Ok((*self).clone())
     }
-    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         // the elements may be any kind; the text-bearing ones are yielded
         Ok(Box::new(
-            self.iter().filter_map(|element| element.as_str().ok()),
+            self.iter().map(|element| element.as_str().ok()).collect::<Vec<_>>().into_iter().flatten(),
         ))
     }
 
@@ -156,9 +156,11 @@ impl<'a> SanshoTrait<'a> for &'a BTreeSet<String> {
     fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Ok(self.iter().map(Member::carrier).collect())
     }
-    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         // every element is text
-        Ok(Box::new(self.iter().map(|text| text.as_str())))
+        Ok(Box::new(
+            self.iter().map(|text| Cow::Borrowed(text.as_str())),
+        ))
     }
 
     fn container_len(&self) -> Result<usize, SanshoError> {
@@ -191,9 +193,11 @@ impl<'a> SanshoTrait<'a> for &'a HashSet<String> {
     fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         Ok(self.iter().map(Member::carrier).collect())
     }
-    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         // every element is text
-        Ok(Box::new(self.iter().map(|text| text.as_str())))
+        Ok(Box::new(
+            self.iter().map(|text| Cow::Borrowed(text.as_str())),
+        ))
     }
 
     fn container_len(&self) -> Result<usize, SanshoError> {
@@ -232,9 +236,11 @@ impl<'a> SanshoTrait<'a> for HashSet<String> {
             .map(|v| Rc::new(v.to_string()) as SanshoCarrier<'a>)
             .collect())
     }
-    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    fn as_array_str<'s>(&'s self) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         // every element is text
-        Ok(Box::new(self.iter().map(|text| text.as_str())))
+        Ok(Box::new(
+            self.iter().map(|text| Cow::Borrowed(text.as_str())),
+        ))
     }
 
     fn container_len(&self) -> Result<usize, SanshoError> {
@@ -396,7 +402,7 @@ impl<'a> SanshoTrait<'a> for &'a Option<SanshoCarrier<'a>> {
         }
     }
 
-    fn as_str(&self) -> Result<&'a str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'a, str>, SanshoError> {
         match self {
             Some(member) => member.as_str(),
             None => Err(SanshoError::Evaluation {
@@ -506,9 +512,9 @@ impl<'a> SanshoTrait<'a> for &'a Option<serde_cbor::Value> {
 
     /// The text borrows the document: the binding comes from the place
     /// behind the `'a` reference, so the return is `'a`-bounded.
-    fn as_str(&self) -> Result<&'a str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'a, str>, SanshoError> {
         match self {
-            Some(serde_cbor::Value::Text(text)) => Ok(text.as_str()),
+            Some(serde_cbor::Value::Text(text)) => Ok(Cow::Borrowed(text.as_str())),
             _ => Err(SanshoError::Evaluation {
                 message: "Not a String type".to_string(),
             }),
@@ -633,7 +639,7 @@ where
         }
     }
 
-    fn as_str(&self) -> Result<&str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'_, str>, SanshoError> {
         match self {
             Cow::Borrowed(reference) => reference.as_str(),
             Cow::Owned(value) => value.as_str(),
@@ -719,7 +725,7 @@ where
 
     fn as_array_str<'s>(
         &'s self,
-    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    ) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         match self {
             Cow::Borrowed(reference) => reference.as_array_str(),
             Cow::Owned(value) => value.as_array_str(),
@@ -738,7 +744,7 @@ where
         }
     }
 
-    fn as_str(&self) -> Result<&str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'_, str>, SanshoError> {
         match self {
             Some(v) => v.as_str(),
             None => Err(SanshoError::Evaluation {

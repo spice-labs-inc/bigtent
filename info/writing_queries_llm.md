@@ -188,10 +188,11 @@ JSON reader feeds — there is no second grammar.
 | the output is the stage with no consumers, not the last declared | `the_output_is_the_stage_with_no_consumers_not_the_last_declared` |
 | `tee` publishes a consumed stage in addition | `a_teed_middle_stage_publishes_as_well_as_feeding` |
 
-`run_nested` in `src/highwire/compiler.rs` is lazy: it spawns a thread that
-compiles and runs only when the returned stream is first pulled, and a compile
-failure arrives as the stream's first item because it has not happened yet when
-`run` returns.
+`run_nested` in `src/highwire/compiler.rs` STARTS EAGERLY: it spawns the thread
+that compiles and runs as soon as it is called, and the returned stream is then
+pulled row by row from the running graph. A compile failure arrives as the
+stream's first item (the thread reports it there), NOT as an error from `run`
+itself — `run` has already returned by then.
 
 A nested query needs the cluster: `run_with` carries `Option<HerdOrCluster>` in the
 script's `Context`, and a nested run with no cluster reports that as an error item.

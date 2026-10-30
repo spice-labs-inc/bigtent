@@ -177,7 +177,7 @@ async fn call_root(hm: &Arc<HerdMember>) -> Receiver<Item> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-#[allow(clippy::await_holding_lock)] // the hook guard intentionally serializes tests across awaits
+#[expect(clippy::await_holding_lock)] // the hook guard intentionally serializes tests across awaits
 async fn test_purls_and_merge() {
     // serialize against the conversion tests' global injection hooks
     let _hook_guard = crate::rodeo::convert::phase3_tests::merge_hook_guard();

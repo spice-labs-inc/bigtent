@@ -737,7 +737,7 @@ impl GoatRodeoCluster {
         hash: u64,
         suffix: &str,
     ) -> Result<File> {
-        #[allow(clippy::collapsible_if)] // nested recursion reads clearer than a let-chain
+        #[expect(clippy::collapsible_if)] // nested recursion reads clearer than a let-chain
         fn find(name: &str, dir: &Path) -> Result<Option<PathBuf>> {
             for entry in dir.read_dir()? {
                 let entry = entry?;

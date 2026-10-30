@@ -109,10 +109,17 @@ fn graph_strategy() -> impl Strategy<Value = Graph> {
         prop::collection::vec(
             (
                 0usize..6,               // the source item
-                prop::option::of(0usize..2), // which north edge (or none)
-                0usize..6,               // the target item
-                prop::option::of(0usize..3), // an alias:from slot 1 (or none)
-                prop::option::of(0usize..3), // an alias:from slot 2 (or none)
+                // EVERY north edge is reachable — `contained:up` included,
+                // which a 0..2 index could never select
+                prop::option::of(0usize..NORTH_EDGES.len()),
+                // the target may name NO item: `n` is the item count, so a
+                // target of `n` or more dangles, and both implementations must
+                // skip a missing item the same way
+                0usize..8,
+                // the WHOLE pool, so `md5:noise` and `sha1:noise` (the values a
+                // narrow range made unreachable) can appear
+                prop::option::of(0usize..VALUES.len()),
+                prop::option::of(0usize..VALUES.len()),
             ),
             2..8,
         ),
@@ -130,7 +137,7 @@ fn graph_strategy() -> impl Strategy<Value = Graph> {
             for (source, edge, target, slot1, slot2) in edges {
                 if let Some(edge_index) = edge {
                     let edge_name = NORTH_EDGES[edge_index % NORTH_EDGES.len()];
-                    let target_id = format!("i{}", target % n);
+                    let target_id = format!("i{}", target);
                     items[source % n]
                         .connections
                         .entry(edge_name.to_string())
@@ -180,7 +187,7 @@ fn v2_rows(
 ) -> Result<Vec<String>, anyhow::Error> {
     struct Rows(Vec<serde_json::Value>);
     impl Rows {
-        fn sink(&mut self) -> impl FnMut(serde_json::Value, &std::sync::Arc<NoBudget>, bigtent::highwire::walk::SinkOperation) -> Result<(), anyhow::Error> + '_ {
+        fn sink(&mut self) -> impl FnMut(serde_json::Value, &std::sync::Arc<dyn bigtent::highwire::walk::AccountingAndBudget + Send + Sync>, bigtent::highwire::walk::SinkOperation) -> Result<(), anyhow::Error> + '_ {
             move |row, _a, _op| {
                 self.0.push(row);
                 Ok(())
@@ -200,7 +207,7 @@ fn v2_rows(
 
     let mut rows = Rows(Vec::new());
     {
-        let mut run = bigtent::highwire::compiler::compile::<NoBudget, _>(query, &cache)?;
+        let mut run = bigtent::highwire::compiler::compile::<_>(query, &cache)?;
         run(std::sync::Arc::new(NoBudget), rows.sink(), lookup, input)?;
     }
     let mut v2: Vec<String> = rows
@@ -271,16 +278,16 @@ proptest! {
         let mut reference: Vec<String> = expected.iter().cloned().collect();
         reference.sort();
 
-        // V1: the real accessor
+        // V1: the real accessor, over the SAME lookup the V2 leg uses — a
+        // second `as_member()` would clone the item list and quietly give the
+        // two implementations different graphs
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let v1 = runtime.block_on(v1_rows(&graph, HerdOrCluster::Herd(Arc::new(GoatHerd::new(
-            vec![graph.as_member()],
-        )))));
-        assert_eq!(v1, reference, "V1 matches the reference model");
+        let v1 = runtime.block_on(v1_rows(&graph, lookup.clone()));
+        assert_eq!(v1, reference, "V1 matches the reference model — graph {graph:?}");
 
         // V2: the template
         let v2 = v2_rows(&graph, lookup, "north_purls").expect("the template runs");
-        assert_eq!(v2, reference, "V2 matches the reference model");
+        assert_eq!(v2, reference, "V2 matches the reference model — graph {graph:?}");
     }
 }
 
@@ -290,40 +297,112 @@ proptest! {
 /// `contains:down` edges (the alias hop is navigation, never emitted),
 /// deduped globally.
 fn flatten_strategy() -> impl Strategy<Value = Graph> {
-    graph_strategy() // the same generator: north edges drive the traversal,
-                     // alias:from values are irrelevant to flatten
+    // ITEMS HAVE ROLES, as the corpora do. An ALIAS is a naming item — a purl
+    // or a hash identity — with `alias:to` pointing at content and `alias:from`
+    // carrying its names; it never contains anything and is never contained. A
+    // CONTENT item may carry `contained:down` to its members (files, classes,
+    // nested archives) and may be the target of both an alias and a
+    // containment edge.
+    //
+    // Without the roles the generator produced impossible items — an item that
+    // aliases and is contained, an item containing itself — and the property
+    // test "found" a V1/V2 divergence that exists only on that impossible data.
+    (
+        2usize..6,
+        prop::collection::vec(
+            (
+                0usize..6,                   // the source item
+                prop::option::of(0usize..3), // 0 alias:to, 1 contained:down, 2 none
+                0usize..8,                   // the target (may dangle)
+            ),
+            2..8,
+        ),
+        0usize..2, // the root item
+    )
+        .prop_map(|(n, edges, root)| {
+            let mut items: Vec<Item> = (0..n)
+                .map(|i| Item {
+                    identifier: format!("i{i}"),
+                    connections: BTreeMap::new(),
+                    body_mime_type: None,
+                    body: None,
+                })
+                .collect();
+            // even indices are ALIASES, odd are CONTENT
+            let is_alias = |index: usize| index.is_multiple_of(2);
+            for (source, edge, target) in edges {
+                let source = source % n;
+                match edge {
+                    // an ALIAS aliases content: the target must be content, and
+                    // a target that dangles is still a legal shape
+                    Some(0) if is_alias(source) => {
+                        if target < n && is_alias(target) {
+                            continue; // an alias does not alias an alias
+                        }
+                        items[source]
+                            .connections
+                            .entry("alias:to".to_string())
+                            .or_default()
+                            .insert(format!("i{target}"));
+                    }
+                    // CONTENT contains content: strictly downward, so the graph
+                    // is a DAG like the corpora's (a nested archive is deeper)
+                    Some(1) if !is_alias(source) && target > source => {
+                        items[source]
+                            .connections
+                            .entry("contained:down".to_string())
+                            .or_default()
+                            .insert(format!("i{target}"));
+                    }
+                    _ => continue,
+                }
+            }
+            Graph {
+                items,
+                root: format!("i{root}"),
+            }
+        })
 }
 
 fn expected_flatten(graph: &Graph) -> HashSet<String> {
-    let mut found = HashSet::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: Vec<&Item> = Vec::new();
-    if let Some(first) = graph.items.iter().find(|i| i.identifier == graph.root) {
-        queue.push(first);
-    }
-    while let Some(item) = queue.pop() {
-        if !visited.insert(item.identifier.clone()) {
-            continue;
-        }
-        for (edge, targets) in &item.connections {
-            if edge == "contained:down" {
+    // V1's rule, mirrored EXACTLY: a round-based BFS in which a target is
+    // emitted only when it is in neither THIS round's set nor the processed set.
+    // Two consequences the worklist model this replaces got wrong — and the
+    // property test found both:
+    //   * SELF-EDGE: a target that is the item being processed is skipped, so
+    //     `i0 -> i0` emits nothing;
+    //   * SAME-ROUND PICKUP: an item is moved to `processed` as soon as it is
+    //     handled, so a later item in the same round that points at it skips it,
+    //     while a target queued for the NEXT round is not yet skipped.
+    let mut emitted: HashSet<String> = HashSet::new();
+    let mut processed: HashSet<String> = HashSet::new();
+    let mut to_find: HashSet<String> = HashSet::new();
+    to_find.insert(graph.root.clone());
+    while !to_find.is_empty() {
+        let mut next: HashSet<String> = HashSet::new();
+        for identifier in to_find.clone() {
+            let Some(item) = graph.items.iter().find(|i| i.identifier == identifier) else {
+                continue;
+            };
+            for (edge, targets) in &item.connections {
                 for target in targets {
-                    found.insert(target.clone()); // the TARGET STRING, deduped
-                    if let Some(next) = graph.items.iter().find(|i| &i.identifier == target) {
-                        queue.push(next);
+                    if to_find.contains(target) || processed.contains(target) {
+                        continue;
                     }
-                }
-            } else if edge == "alias:to" {
-                // navigation only: enqueue, never emit
-                for target in targets {
-                    if let Some(next) = graph.items.iter().find(|i| &i.identifier == target) {
-                        queue.push(next);
+                    if edge == "contained:down" {
+                        next.insert(target.clone());
+                        emitted.insert(target.clone());
+                    } else if edge == "alias:to" {
+                        // the alias hop is NAVIGATION: enqueued, never emitted
+                        next.insert(target.clone());
                     }
                 }
             }
+            processed.insert(identifier);
         }
+        to_find = next;
     }
-    found
+    emitted
 }
 
 proptest! {
@@ -345,10 +424,10 @@ proptest! {
             _ => unreachable!(),
         };
         let v1 = runtime_block(herd, &graph);
-        assert_eq!(v1, reference, "V1 matches the reference model");
+        assert_eq!(v1, reference, "V1 matches the reference model — graph {graph:?}");
 
         // V2: the template
         let v2 = v2_rows(&graph, lookup, "flatten").expect("the template runs");
-        assert_eq!(v2, reference, "V2 matches the reference model");
+        assert_eq!(v2, reference, "V2 matches the reference model — graph {graph:?}");
     }
 }

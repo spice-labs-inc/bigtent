@@ -13,9 +13,11 @@
 //! hands it to the same compiler the JSON reader feeds — so a query built here and
 //! one parsed from a document are the same query, and there is no second grammar.
 //!
-//! Everything is lazy. `run` returns a rows value and does nothing until it is
-//! iterated: the document is compiled, and the graph's stages started, on the
-//! first pull.
+//! `run` STARTS EAGERLY: it compiles the document and starts the graph's stages
+//! before returning, and the rows are then pulled one at a time from the running
+//! graph — so a nested query feeds its parent rather than being materialised.
+//! A script that builds a query and never reads it still pays for the work that
+//! was started.
 
 use crate::barker::{Context, Rows};
 use starlark::any::ProvidesStaticType;
@@ -210,7 +212,7 @@ pub fn highwire(builder: &mut GlobalsBuilder) {
     /// a list of connection types, plain strings or `connection` values, and
     /// defaults to none. `emit` is required: a stage that emits nothing produces
     /// nothing.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn walk(
         name: Value,
         roots: Value,
@@ -307,9 +309,11 @@ pub fn highwire(builder: &mut GlobalsBuilder) {
 
     /// Run a query built from these stages, returning its rows.
     ///
-    /// Nothing happens until the result is iterated: the document is compiled, and
-    /// the graph started, on the first pull. The rows stream, so a nested query
-    /// feeds its parent rather than being materialised.
+    /// THE WORK STARTS HERE, not on the first pull: the document is compiled and
+    /// the graph's stages started before this returns, and the rows are then read
+    /// one at a time from the running graph — a nested query feeds its parent
+    /// rather than being materialised. A caller that builds a query and never
+    /// reads it has still started the work.
     fn run(
         stages: Value,
         eval: &mut starlark::eval::Evaluator,
@@ -339,6 +343,7 @@ pub fn highwire(builder: &mut GlobalsBuilder) {
         crate::highwire::compiler::run_nested(
             serde_json::Value::Object([("phases".to_string(), phases.into())].into_iter().collect()),
             context.lookup.clone(),
+            context.accountant.clone(),
         )
     }
 }

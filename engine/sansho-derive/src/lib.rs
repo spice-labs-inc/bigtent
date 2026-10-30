@@ -73,6 +73,23 @@ struct Member {
 /// the value — copying either is cheap. Every other field is carried as a
 /// reference to it, whatever its type, as long as that reference
 /// implements the trait.
+/// A field's member name: the identifier WITHOUT the `r#` prefix.
+///
+/// `Ident::to_string()` keeps the prefix a raw identifier carries, but the
+/// prefix is Rust syntax, not part of the document — a field written `r#type`
+/// is the member `type`. `serde` strips it too (its `unraw`), so without this
+/// the derived source and serde would describe the same struct with different
+/// member names: a query for `type` would return null and `keys(@)` would list
+/// a key nobody writes. `proc-macro2` 1.0.107 ships no `IdentExt`, so the
+/// prefix is stripped here.
+fn member_name(ident: &proc_macro2::Ident) -> String {
+    let spelled = ident.to_string();
+    match spelled.strip_prefix("r#") {
+        Some(name) => name.to_string(),
+        None => spelled,
+    }
+}
+
 fn is_copied(ty: &Type) -> bool {
     match ty {
         Type::Reference(_) => true,
@@ -131,7 +148,7 @@ pub fn sansho_object(input: TokenStream) -> TokenStream {
     let mut members: Vec<Member> = Vec::new();
     for field in &fields.named {
         let ident = field.ident.clone().expect("named fields");
-        let mut name = ident.to_string();
+        let mut name = member_name(&ident);
         let mut skipped = false;
 
         for attr in &field.attrs {

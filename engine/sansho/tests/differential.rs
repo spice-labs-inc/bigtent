@@ -243,15 +243,15 @@ fn json_strategy(depth: u32) -> impl proptest::strategy::Strategy<Value = serde_
 }
 
 // Requirement: memory proportional to output, not
-// input. What: a projection selecting NOTHING from a large document
-// materializes nothing beyond the navigation (the decode-count stays
-// bounded by the selected nodes, not the document size). Why: the
-// selective-materialization budget (plan
-// `selective_materialization_budget`).
+// input.
 //
-// LLM section: a 4,000-element document with a projection that selects
-// one small field per element decodes exactly the traversed positions —
-// never the unselected siblings' subtrees.
+// WHAT THIS TEST ACTUALLY PINS, and what it does not: it pins the SHAPE of a
+// projection over a large document — 4,000 rows, each carrying only `id`, with
+// no payload in any row. It does NOT observe decoding: the engine exposes no
+// read counter, so an implementation that decoded every payload eagerly would
+// still pass. Pinning the decode count needs a counting source (a wrapper type
+// counting `as_str`/`get_index`/… calls) that the test support does not have
+// yet; until it exists the doc comment must not claim the count is bounded.
 #[test]
 fn selective_materialization_budget() {
     let big: Vec<serde_json::Value> = (0..4000)
@@ -266,7 +266,22 @@ fn selective_materialization_budget() {
 
     let value = sansho::materialize(&evaluate(&program, bytes.as_slice()).expect("evaluates"))
         .expect("materializes");
-    assert_eq!(value.as_array().map(|a| a.len()), Some(4000));
+    let rows = value.as_array().expect("an array of rows");
+    assert_eq!(rows.len(), 4000, "one row per element");
+    // every row carries the selected field and NOTHING else: the payloads are
+    // not part of the projection's output
+    // the rows are the selected VALUES (a projection yields values, not
+    // items), so the payload never appears
+    let first = &rows[0];
+    assert!(
+        first.is_number() || first.is_string() || first.is_object(),
+        "a projected value: {first:?}"
+    );
+    let rendered = serde_json::Value::Array(rows.clone()).to_string();
+    assert!(
+        !rendered.contains("payload"),
+        "no payload reaches the output"
+    );
 }
 
 #[test]

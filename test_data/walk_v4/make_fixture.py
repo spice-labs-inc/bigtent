@@ -21,10 +21,8 @@ exercise the encoder, the index and the decoder as well as the walk.
 import hashlib
 import json
 import os
-import struct
 
 OUT = "/data/test_data/walk_v4"
-CLUSTER_NAME = "walk"
 
 # ---------------------------------------------------------------- the items
 

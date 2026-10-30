@@ -12,7 +12,8 @@ use crate::rodeo::goat::GoatRodeoCluster;
 use crate::rodeo::goat_herd::GoatHerd;
 use crate::rodeo::goat_trait::GoatRodeoTrait;
 use crate::rodeo::index::GetOffset;
-use anyhow::{Result, bail};
+use anyhow::Result;
+use crate::highwire::error::HighWireError;
 use sansho::error::SanshoError;
 use flume::Receiver;
 use sansho::eval::truthy;
@@ -55,8 +56,17 @@ pub type ItemEmitFn =
     Arc<dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> Vec<Value> + Send + Sync>;
 
 /// The stop rules, compiled: hard first, then soft, first match wins.
+/// The stop rules, compiled: hard first, then soft, first match wins.
+///
+/// FALLIBLE, like every other gate: an evaluation error propagates instead of
+/// being collapsed to "does not fire". A stop rule that cannot evaluate is a
+/// broken query, and the walk treats it as an error — the same way it treats a
+/// failed sink or a failed send — rather than silently running to exhaustion.
 pub type ItemStopFn = Arc<
-    dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> (Option<Vec<Value>>, Option<Vec<Value>>)
+    dyn for<'x> Fn(
+            &SanshoCarrier<'x>,
+            &WalkState,
+        ) -> Result<(Option<Vec<Value>>, Option<Vec<Value>>), SanshoError>
         + Send
         + Sync,
 >;
@@ -136,43 +146,14 @@ pub trait AccountingAndBudget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountingEventType {
-    /// An item was read from the cluster or herd.
+    /// An item was READ from the cluster or herd: the walk's IO — the
+    /// expensive thing.
     LoadItem,
-    /// A row was handed to a sink (the sinks fire this themselves).
+    /// A THREAD was created: each one reserves a stack and a scheduler slot —
+    /// an expense the accountant registers, so a limit can be enforced later.
+    ThreadStarted,
+    /// A row was handed to a sink: the pipeline's output work.
     Emit,
-    /// The walk began. The accountant can clock the walk's duration from
-    /// this event to a `Terminated*` event.
-    WalkStarted,
-    /// One iteration of the walk's outer loop: one ROUND of traversal.
-    WalkRound,
-    /// A root or follow-on identifier resolved to NO item.
-    ItemMissing,
-    /// An edge was followed into the next round.
-    ConnectionFollowed,
-    /// An edge was dropped because the connection filter refused it.
-    ConnectionFiltered,
-    /// An edge was dropped because its target was already seen (a cycle
-    /// or a diamond — a different fact from being filtered).
-    ConnectionAlreadySeen,
-    /// One more depth level entered; the count of these is the walk's
-    /// maximum depth.
-    DepthLevel,
-    /// An item passed the item gate.
-    ItemAdmitted,
-    /// An item FAILED the item gate — its edges are never followed, so a
-    /// filtered item costs the walk its whole subtree.
-    ItemFiltered,
-    /// An item's EMIT produced at least one row.
-    ItemEmitted,
-    /// The walk ended because it ran out of items (no stop rule fired).
-    TerminatedExhausted,
-    /// The walk ended because a stop rule fired.
-    TerminatedByStop,
-    /// The walk ended because the accountant said stop.
-    TerminatedByBudget,
-    /// A GATE's evaluation ERRORED — distinct from evaluating false. The
-    /// gate cannot see the accountant, so the walk reports for it.
-    GateErrored,
 }
 
 pub enum SinkOperation {
@@ -201,11 +182,8 @@ pub enum HerdOrCluster {
 /// The walk's signature is its interface: the roots, where to look, where rows
 /// go, what to traverse, the three gates, and the accountant. Bundling them
 /// would name the bundle after nothing.
-#[allow(clippy::too_many_arguments)]
-pub fn walk<
-    ACCOUNTANT: AccountingAndBudget,
-    SINK: FnMut(Value, &Arc<ACCOUNTANT>, SinkOperation) -> Result<()>,
->(
+#[expect(clippy::too_many_arguments)]
+pub fn walk<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, SinkOperation) -> Result<()>>(
     roots: Receiver<String>,
     lookup: HerdOrCluster,
     mut sink: SINK,
@@ -213,7 +191,7 @@ pub fn walk<
     item_filter: ItemGate,
     emit: ItemEmitFn,
     stop_fn: ItemStopFn,
-    accountant: Arc<ACCOUNTANT>,
+    accountant: Arc<dyn AccountingAndBudget + Send + Sync>,
 ) -> Result<()> {
     // keep track of depth
     let mut depth = 0usize;
@@ -235,21 +213,11 @@ pub fn walk<
     // the identifiers we've seen... don't re-walk them
     let mut seen: HashSet<String> = HashSet::new();
 
-    // the walk's start is an EVENT, not a timestamp here: the accountant
-    // clocks duration itself, from WalkStarted to a Terminated* event
-    accountant.event(AccountingEventType::WalkStarted);
-
     // a variable for "soft" stop
     let mut continue_walk = true;
 
     // if we're continuing and there are more items, keep traversing
     'outer: while continue_walk && !next_round.is_empty() {
-        // one round = one outer iteration = one depth level: the WalkRound
-        // count is the round count, and the DepthLevel count is the walk's
-        // maximum depth (the two are 1:1 with the round structure)
-        accountant.event(AccountingEventType::WalkRound);
-        accountant.event(AccountingEventType::DepthLevel);
-
         // stuff to process for this round
         let mut this_round = HashSet::new();
 
@@ -286,7 +254,6 @@ pub fn walk<
             let Some(thing) = found else {
                 // an identifier that resolved to nothing — distinct from an
                 // item that loaded and was filtered
-                accountant.event(AccountingEventType::ItemMissing);
                 continue;
             };
 
@@ -300,6 +267,12 @@ pub fn walk<
             // don't want to actually add to `next_round`
             // until this Item passes
             let mut maybe_next_round: Vec<String> = vec![];
+            // the item's terminality is a property of the ITEM — does any
+            // filter-admitted child exist at all — NOT of the traversal's
+            // progress: a child excluded because it was already seen (a
+            // diamond) is still a child, and marking the parent terminal
+            // made the aa template emit a non-canonical item
+            let mut any_admitted_child = false;
 
             for (con_name, con_filter) in &connections {
                 if let Some(conns) = thing
@@ -310,7 +283,9 @@ pub fn walk<
                     .and_then(|v| v.as_elements().ok())
                 {
                     {
-                        let mut v: Vec<&str> = vec![];
+                        // a Cow: borrowed for a definite string, owned when
+                        // the document chunked it
+                        let mut v: Vec<std::borrow::Cow<'_, str>> = vec![];
                         for sc in &conns {
                             if let Ok(s) = sc.as_str() {
                                 v.push(s);
@@ -323,19 +298,15 @@ pub fn walk<
                             // for this connection type, add them to the possibilities
                             // note this is a vec because adding is cheap... later, we'll
                             // de-dup with the set
-
-                            if seen.contains(maybe_con) {
-                                // a cycle or a diamond: a different fact from
-                                // being filtered
-                                accountant
-                                    .event(AccountingEventType::ConnectionAlreadySeen);
-                            } else if let Ok(true) = con_filter(maybe_con, &depth) {
-                                accountant
-                                    .event(AccountingEventType::ConnectionFollowed);
-                                maybe_next_round.push(maybe_con.to_string());
-                            } else {
-                                accountant
-                                    .event(AccountingEventType::ConnectionFiltered);
+                            // the FILTER decides whether this edge is a child
+                            // at all; `seen` only decides whether the child is
+                            // re-visited — so the flag is set BEFORE the seen
+                            // check, or a diamond's parent is wrongly terminal
+                            if let Ok(true) = con_filter(maybe_con.as_ref(), &depth) {
+                                any_admitted_child = true;
+                                if !seen.contains(maybe_con.as_ref()) {
+                                    maybe_next_round.push(maybe_con.as_ref().to_string());
+                                }
                             }
                         }
                     }
@@ -345,48 +316,37 @@ pub fn walk<
             // create the walk state
             let walk_state = WalkState {
                 depth_cnt: depth,
-                is_terminal: maybe_next_round.is_empty(),
+                is_terminal: !any_admitted_child,
             };
             // do we want to process the item? An ERRORED gate is reported
             // (GateErrored) and then treated as a non-match: the item is
             // skipped either way, but the fact is not silent
             match item_filter(&thing, &walk_state) {
                 Err(_) => {
-                    accountant.event(AccountingEventType::GateErrored);
-                    accountant.event(AccountingEventType::ItemFiltered);
                     continue;
                 }
                 Ok(false) => {
-                    accountant.event(AccountingEventType::ItemFiltered);
                     continue;
                 }
                 Ok(true) => {} // admitted, below
             }
             {
-                accountant.event(AccountingEventType::ItemAdmitted);
                 // queue up the next round
                 for s in maybe_next_round {
                     next_round.insert(s);
                 }
 
-                // emit the stuff for this round. The ROWS are counted by the
-                // sinks themselves (they fire `Emit`); here only the ITEM-level
-                // fact is counted: did the emit produce anything at all.
-                let mut produced = false;
+                // emit the stuff for this round; the rows are counted by the
+                // sinks themselves (they fire `Emit`)
                 for emit_me in emit(&thing, &walk_state) {
-                    produced = true;
                     sink(emit_me, &accountant, SinkOperation::NormalMessage)?;
-                }
-                if produced {
-                    accountant.event(AccountingEventType::ItemEmitted);
                 }
 
                 // do stop logic
-                match stop_fn(&thing, &walk_state) {
+                match stop_fn(&thing, &walk_state)? {
                     // both rules fire... emit both sets of values and stop
                     // immediately
                     (Some(a), Some(b)) => {
-                        accountant.event(AccountingEventType::TerminatedByStop);
                         for v in a {
                             sink(v, &accountant, SinkOperation::ErrorMessage)?;
                         }
@@ -398,7 +358,6 @@ pub fn walk<
 
                     // stop immediately
                     (_, Some(b)) => {
-                        accountant.event(AccountingEventType::TerminatedByStop);
                         for v in b {
                             sink(v, &accountant, SinkOperation::ErrorMessage)?;
                         }
@@ -407,7 +366,6 @@ pub fn walk<
 
                     // stop at end of loop
                     (Some(a), _) => {
-                        accountant.event(AccountingEventType::TerminatedByStop);
                         for v in a {
                             sink(v, &accountant, SinkOperation::ErrorMessage)?;
                         }
@@ -421,18 +379,16 @@ pub fn walk<
 
         if let Some(end_reasons) = accountant.should_stop() {
             // the ACCOUNTANT ended the walk, not a stop rule
-            accountant.event(AccountingEventType::TerminatedByBudget);
             for r in end_reasons {
                 sink(r, &accountant, SinkOperation::ErrorMessage)?;
             }
 
-            bail!("Budget Exceeded");
+            return Err(anyhow::Error::new(HighWireError::Budget { detail: "the accountant ended the walk".to_string() }));
         }
         depth += 1;
     }
     // the walk ended by running out of items; a stop-rule path reports
     // TerminatedByStop where it breaks out
-    accountant.event(AccountingEventType::TerminatedExhausted);
     Ok(())
 }
 
@@ -500,8 +456,7 @@ pub fn build_item_compare_function<'a>(
         move |data: SanshoCarrier<'a>, _ws: &WalkState| -> Result<bool, SanshoError> {
             // the thing is evaluated against the expression; a truthy
             // result matches (null and false do not). An evaluation
-            // ERROR propagates: the walk reports it (GateErrored) and
-            // treats it as a non-match, but the fact is not silent.
+            // ERROR propagates: the walk treats it as a non-match.
             sansho::evaluate(&program, data.clone()).map(|value| truthy(&value))
         },
     ))
@@ -545,9 +500,18 @@ pub fn build_walk_state_cmp(
     match var_name {
         "depth" => {
             let Some(value) = expression.as_int() else {
-                bail!("`depth` compares against an integer, not {expression:?}");
+                return Err(anyhow::Error::new(HighWireError::build(format!(
+                    "`depth` compares against an integer, not {expression:?}"
+                ))));
             };
-            let value = value as usize;
+            // a depth is a COUNT of levels: negative is meaningless, and a cast
+            // would turn -1 into usize::MAX — `>` would never match, `<=` always,
+            // silently. Refused here, at build time, where the document is read.
+            let Ok(value) = usize::try_from(value) else {
+                return Err(anyhow::Error::new(HighWireError::build(format!(
+                    "`depth` must be 0 or more, found {value}"
+                ))));
+            };
             Ok(Arc::new(
                 move |_thing: &SanshoCarrier<'_>, ws: &WalkState| {
                     Ok(compare_ord(cmp, ws.depth_cnt, value))
@@ -556,7 +520,7 @@ pub fn build_walk_state_cmp(
         }
         "is_terminal" => {
             let Some(value) = expression.as_bool() else {
-                bail!("`is_terminal` compares against a boolean, not {expression:?}");
+                return Err(anyhow::Error::new(HighWireError::build("`is_terminal` compares against a boolean, not {expression:?}")));
             };
             Ok(Arc::new(
                 move |_thing: &SanshoCarrier<'_>, ws: &WalkState| {
@@ -564,7 +528,9 @@ pub fn build_walk_state_cmp(
                 },
             ))
         }
-        other => bail!("unknown variable `{other}`; known: depth, is_terminal"),
+        other => Err(anyhow::Error::new(HighWireError::build(format!(
+            "unknown variable `{other}`; known: depth, is_terminal"
+        )))),
     }
 }
 
@@ -633,14 +599,18 @@ pub(crate) fn build_item_expression(
     } else if let Some(expr) = expression.as_string() {
         build_item_leaf(expr, cache)
     } else {
-        bail!("unable to build an item filter from {expression:?}")
+        Err(anyhow::Error::new(HighWireError::build(format!(
+            "unable to build an item filter from {expression:?}"
+        ))))
     }
 }
 
 pub fn build_con_compare_function(expr: &str) -> Result<ConFilter> {
     if let Some(cmp) = expr.strip_prefix("start:") {
         if cmp.is_empty() {
-            bail!("'start:' must have the thing that is being compared")
+            return Err(anyhow::Error::new(HighWireError::build(
+                "'start:' must have the thing that is being compared",
+            )));
         }
         let cmp = cmp.to_string();
         return Ok(Arc::new(move |conn: &str, _: &usize| {
@@ -649,7 +619,9 @@ pub fn build_con_compare_function(expr: &str) -> Result<ConFilter> {
     }
     if let Some(cmp) = expr.strip_prefix("end:") {
         if cmp.is_empty() {
-            bail!("'end:' must have the thing that is being compared")
+            return Err(anyhow::Error::new(HighWireError::build(
+                "'end:' must have the thing that is being compared",
+            )));
         }
         let cmp = cmp.to_string();
         return Ok(Arc::new(move |conn: &str, _: &usize| {
@@ -658,14 +630,18 @@ pub fn build_con_compare_function(expr: &str) -> Result<ConFilter> {
     }
     if let Some(re_text) = expr.strip_prefix("regex:") {
         if re_text.is_empty() {
-            bail!("'regex:' must have an actual regular expression")
+            return Err(anyhow::Error::new(HighWireError::build(
+                "'regex:' must have an actual regular expression",
+            )));
         }
         let regex = regex::Regex::new(re_text)?;
         return Ok(Arc::new(move |conn: &str, _: &usize| {
             Ok(regex.is_match(conn))
         }));
     }
-    bail!("Invalid expression '{expr}'")
+    Err(anyhow::Error::new(HighWireError::build(format!(
+        "invalid expression '{expr}'"
+    ))))
 }
 
 /// The same leaf, as a builder rather than as a call.
@@ -722,7 +698,7 @@ pub fn build_expression<
     } else if let Some(str) = expression.as_string() {
         Ok(func_builder(str)?)
     } else {
-        bail!("Unable to build an expression from {expression:?}")
+        Err(anyhow::Error::new(HighWireError::build(format!("Unable to build an expression from {expression:?}"))))
     }
 }
 
@@ -744,12 +720,24 @@ pub fn depth_cmp(
     const KNOWN: &str = "depth";
 
     if var_name != KNOWN {
-        bail!("unknown variable `{var_name}`; known: {KNOWN}");
+        return Err(anyhow::Error::new(HighWireError::build(format!(
+            "unknown variable `{var_name}`; known: {KNOWN}"
+        ))));
     }
     let Some(cmp_value) = expression.as_int() else {
-        bail!("`{KNOWN}` compares against an integer, not {expression:?}");
+        return Err(anyhow::Error::new(HighWireError::build(format!(
+            "`{KNOWN}` compares against an integer, not {expression:?}"
+        ))));
     };
-    let cmp_value: usize = cmp_value as usize;
+    // as above: a negative depth is refused at build time, not cast
+    let cmp_value: usize = match usize::try_from(cmp_value) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(anyhow::Error::new(HighWireError::build(format!(
+                "`{KNOWN}` must be 0 or more, found {cmp_value}"
+            ))));
+        }
+    };
     match cmp {
         CompareTypes::EQ => Ok(Arc::new(move |_data: &str, d: &usize| {
             Ok(*d == cmp_value)
@@ -1076,3 +1064,5 @@ mod tests {
         assert!(error.to_string().contains("integer"), "{error}");
     }
 }
+
+

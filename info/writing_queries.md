@@ -311,9 +311,11 @@ A stage value is what `run` collects and what `from_stage` and `inputs` take. Th
 builders render the same document the JSON reader parses, so a query built in a
 script and the same query written as JSON are the same query.
 
-**Everything is lazy.** `run` returns a rows value and does nothing until it is
-iterated: the document is compiled, and the graph's stages started, on the first
-pull. A script that builds a query and never reads it pays nothing.
+**`run` starts the work eagerly; the ROWS are pulled lazily.** `run` compiles
+the document and starts the graph's stages before it returns, and the rows are
+then read one at a time from the running graph — so a nested query feeds its
+parent rather than being materialised. A script that builds a query and never
+reads it has still paid for the work that was started.
 
 Three checks happen at construction rather than at compile time, because the
 mistake is in the script: a missing `emit`, roots that mix identifiers with

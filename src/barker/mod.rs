@@ -35,7 +35,7 @@
 //! let program = barker::parse("emit(double(21))\n")?;
 //! let (sender, input) = flume::unbounded();
 //! drop(sender); // the stream is empty and closed
-//! let rows = barker::run_with(program, input, None, Some(my_natives))?;
+//! let rows = barker::run_with(program, input, None, Some(my_natives), None)?;
 //! let out: Vec<serde_json::Value> = rows.collect::<Result<Vec<_>, _>>()?;
 //! assert_eq!(out, vec![serde_json::json!(42)]);
 //! # Ok::<(), anyhow::Error>(())
@@ -50,6 +50,7 @@
 //! instead of waiting for it to finish.
 
 pub mod collections;
+pub mod error;
 pub mod dates;
 pub mod highwire;
 pub mod digest;
@@ -79,13 +80,25 @@ pub type Natives = fn(&mut GlobalsBuilder);
 /// It lives in the evaluator's `extra`, which is how a native reaches
 /// per-evaluation state without a global and without capturing anything.
 /// `pub(crate)` because the highwire natives read it too.
-#[derive(Debug, ProvidesStaticType)]
+#[derive(ProvidesStaticType)]
 pub(crate) struct Context {
     /// The row stream `emit` writes to.
     pub(crate) out: Sender<Result<serde_json::Value>>,
 
     /// The cluster a nested query walks, when this run was given one.
     pub(crate) lookup: Option<crate::highwire::walk::HerdOrCluster>,
+
+    /// THE accountant — one instance, created by the embedder, shared via
+    /// `Arc` across everything: the walk, the tees, every barker thread, and
+    /// every nested query. A nested `run` receives the SAME Arc its parent
+    /// received; there is no per-run accounting.
+    ///
+    /// `None` means no accountant was supplied — a no-op run. THREAD
+    /// EXHAUSTION IS A POSSIBILITY with the no-op implementation: nothing
+    /// counts the threads a self-reproducing `highwire.run` creates, so
+    /// nothing stops one. That changes with a real implementation, which will
+    /// count and enforce.
+    pub(crate) accountant: Option<std::sync::Arc<dyn crate::highwire::walk::AccountingAndBudget + Send + Sync>>,
 }
 
 /// The natives Big Tent provides to every program.
@@ -97,14 +110,23 @@ fn big_tent_natives(builder: &mut GlobalsBuilder) {
     /// immediately — so a program that emits and then keeps working has already
     /// delivered the row.
     fn emit(x: Value, eval: &mut Evaluator) -> anyhow::Result<NoneType> {
+        // graceful, not expect: a misuse is an error row, never a thread death
         let context = eval
             .extra
-            .expect("the evaluator always carries a context")
-            .downcast_ref::<Context>()
-            .expect("the evaluator's extra is a context");
+            .ok_or_else(|| anyhow::anyhow!("emit ran without the run's context"))
+            .and_then(|extra| {
+                extra
+                    .downcast_ref::<Context>()
+                    .ok_or_else(|| anyhow::anyhow!("emit ran without the run's context"))
+            })?;
+        // depth-limited conversion: starlark's own `to_json_value` recurses
+        // through serde with no bound, so a script that nests a value a
+        // thousand deep overflowed the thread's stack and ABORTED the server.
+        // A depth error here becomes an error row, not a crash.
+        let json = crate::barker::values::to_json_limited(x, 0)?;
         context
             .out
-            .send(Ok(x.to_json_value()?))
+            .send(Ok(json))
             .map_err(|_| anyhow::anyhow!("the row stream was closed"))?;
         Ok(NoneType)
     }
@@ -205,6 +227,9 @@ impl<'v> StarlarkValue<'v> for Rows {
     ) -> Option<Value<'v>> {
         match self.0.recv().ok()? {
             Ok(row) => Some(heap.alloc(row)),
+            // a failed row ends the stream with a PANIC — this API cannot
+            // return an error mid-iteration — and the run_with umbrella
+            // (finding 7) catches it and makes it an error row
             Err(error) => panic!("the nested query failed: {error}"),
         }
     }
@@ -259,8 +284,11 @@ pub fn parse(program: &str) -> Result<Program> {
 }
 
 /// Run a parsed program over a stream of rows, with Big Tent's natives.
+/// A run with NO accountant: fine for one-shot scripts; a self-reproducing
+/// nested `run` under the no-op cannot be stopped (thread exhaustion is a
+/// possibility that a real accountant will close).
 pub fn run(program: Program, input: Receiver<serde_json::Value>) -> Result<Rows> {
-    run_with(program, input, None, None)
+    run_with(program, input, None, None, None)
 }
 
 /// Run a parsed program over a stream of rows, with Big Tent's natives and the
@@ -269,19 +297,43 @@ pub fn run(program: Program, input: Receiver<serde_json::Value>) -> Result<Rows>
 /// Execution happens on its own thread, and its rows come back through a channel
 /// — so this returns as soon as the program has started, and the caller can read
 /// rows while it runs. The program is consumed: a parsed program is run once.
+/// Run a program over an input stream.
+///
+/// `accountant` is THE shared accountant instance — the same `Arc` the caller
+/// gave the walk and every other stage; a nested query receives it through the
+/// `Context` and passes it down again. There is one instance per request, with
+/// `AtomicUsize` counters, shared across everything.
 pub fn run_with(
     program: Program,
     input: Receiver<serde_json::Value>,
     lookup: Option<crate::highwire::walk::HerdOrCluster>,
     natives: Option<Natives>,
+    accountant: Option<std::sync::Arc<dyn crate::highwire::walk::AccountingAndBudget + Send + Sync>>,
 ) -> Result<Rows> {
     let Program { ast } = program;
-    let (sender, receiver) = flume::unbounded();
+    // bounded(256), like every other channel in the pipeline: a script that
+    // emits faster than its consumer reads BLOCKS, and a slow client cannot
+    // grow the server's memory (the 1.68 GB finding)
+    let (sender, receiver) = flume::bounded(256);
+
+    // the evaluator's own thread, registered on THE shared instance: thread
+    // creation is an expense (a stack and a scheduler slot per thread), and a
+    // self-reproducing `highwire.run` can create many. The no-op accountant
+    // (None) cannot enforce a limit — thread exhaustion is a possibility
+    // there — and a real implementation will count and enforce.
+    if let Some(accountant) = &accountant {
+        accountant.event(crate::highwire::walk::AccountingEventType::ThreadStarted);
+    }
 
     std::thread::spawn(move || {
-        // the evaluator is built here because it is not Send: it cannot be made
-        // on one thread and run on another
-        let outcome = Module::with_temp_heap(|module| {
+        // THE UMBRELLA (finding 7): a PANIC anywhere in the evaluator — a
+        // native's unchecked precondition, a nested query's failure — used to
+        // kill this thread, close the channel, and leave the client with
+        // partial rows and a clean 200. The panic is caught and becomes the
+        // SAME failure the Result path produces: an error row.
+        let sender_for_panic = sender.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Module::with_temp_heap(|module| {
             // standard library, then Big Tent's natives and namespaces, then the
             // embedder's — `with` consumes the builder, so the layers are composed
             // in order
@@ -308,6 +360,7 @@ pub fn run_with(
             let context = Context {
                 out: sender.clone(),
                 lookup: lookup.clone(),
+                accountant: accountant.clone(),
             };
             let mut eval = Evaluator::new(&module);
             eval.extra = Some(&context);
@@ -320,8 +373,18 @@ pub fn run_with(
 
             eval.eval_module(ast, &globals)?;
             starlark::Result::Ok(())
+        })
+        })).unwrap_or_else(|payload| {
+            // the panic payload, as the message of a normal failure
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "the evaluator panicked".to_string());
+            Err(anyhow::anyhow!("{message}").into())
         });
 
+        let _ = &sender_for_panic;
         if let Err(error) = outcome {
             // A program that failed says so as a ROW, not as the end of the
             // stream. A pipeline carries rows; an error that lived outside them
@@ -334,9 +397,8 @@ pub fn run_with(
             // a FAILED send means the consumer is gone — the teardown has
             // begun — and is swallowed only because this thread is finishing
             // anyway; there is nothing left to report to
-            let _ = sender.send(Ok(serde_json::json!({
-                "error": format!("{error}"),
-            })));
+            let row = crate::barker::error_row(&error);
+            let _ = sender.send(Ok(row));
         }
     });
 
@@ -603,6 +665,7 @@ mod tests {
             stream(&[]),
             None,
             Some(embedder_natives),
+            None,
         )?;
         let out: Vec<serde_json::Value> = rows.collect::<Result<Vec<_>>>()?;
         assert_eq!(out, vec![json!(42)]);
@@ -646,7 +709,7 @@ mod function_tests {
             sender.send(value.clone()).expect("the stream accepts rows");
         }
         drop(sender);
-        run_with(parse(script).expect("the script parses"), receiver, lookup, None)
+        run_with(parse(script).expect("the script parses"), receiver, lookup, None, None)
             .expect("the program runs")
             .collect::<Result<Vec<_>>>()
             .expect("every row converts")
@@ -1328,4 +1391,204 @@ mod function_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod finding_tests {
+    use super::*;
+
+    /// FINDING 6 (PR review): the emit's value→JSON conversion recursed with
+    /// no depth limit — `x = 1; for i in range(1000): x = [x]; emit(x)`
+    /// overflowed the script thread's stack and ABORTED the server. The
+    /// conversion must refuse deep nesting with an error (which becomes an
+    /// error row), not die.
+    #[test]
+    fn deeply_nested_emit_is_an_error_not_an_abort() {
+        let program = parse("x = 1\nfor i in range(1000):\n    x = [x]\nemit(x)\n")
+            .expect("the script parses");
+        let (sender, input) = flume::unbounded();
+        sender.send(serde_json::json!(1)).expect("sends");
+        drop(sender);
+        let rows: Vec<_> = run_with(program, input, None, None, None)
+            .expect("the run starts")
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter().any(|row| row.is_err()
+                || row.as_ref().ok().is_some_and(|r| r.get("error").is_some())),
+            "deep nesting must be an error row, not a stack overflow: {rows:?}"
+        );
+    }
+
+    /// FINDING 8 (PR review): the barker's row channel was UNBOUNDED — a slow
+    /// consumer let a script emit millions of rows into memory (1.68 GB
+    /// measured). The channel must be bounded(256) like every other channel
+    /// in the pipeline: a script that outruns its consumer BLOCKS.
+    #[test]
+    fn the_barker_channel_is_bounded() {
+        let program = parse("for i in range(1000):\n    emit(i)\n")
+            .expect("the script parses");
+        let (sender, input) = flume::unbounded();
+        sender.send(serde_json::json!(1)).expect("sends");
+        drop(sender);
+        let rows = run_with(program, input, None, None, None).expect("the run starts");
+        // do NOT read: a bounded channel fills to 256 and the script blocks;
+        // an unbounded channel buffers all 1000
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            rows.0.len() <= 256,
+            "the barker's channel is unbounded: {} rows buffered with no reader",
+            rows.0.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod umbrella_red_tests {
+    use crate::barker::{parse, run_with};
+
+    /// THE UMBRELLA (finding 7): a panic anywhere in the evaluator — the
+    /// reviewer's repro is a nested `highwire.run` of a malformed document —
+    /// killed the evaluator thread, closed the channel, and the client got
+    /// the partial rows and a clean 200. EVERY panic in the evaluator must
+    /// become an ERROR ROW.
+    #[test]
+    fn an_evaluator_panic_becomes_an_error_row() {
+        let program = parse(concat!(
+            "rows = highwire.run([highwire.walk(name=\"x\", roots=[\"pkg:x\"], emit=\"(((\")])\n",
+            "for row in rows:\n    emit(row)\n",
+        ))
+        .expect("the script parses");
+        let (sender, input) = flume::unbounded();
+        sender.send(serde_json::json!(1)).expect("sends");
+        drop(sender);
+        let rows: Vec<serde_json::Value> = run_with(program, input, None, None, None)
+            .expect("the run starts")
+            .filter_map(|row| row.ok())
+            .collect();
+        let errors: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter_map(|row| row.get("error"))
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "an evaluator panic must produce an error row, not a silent 200: {rows:?}"
+        );
+    }
+}
+
+/// An error ROW: the message, the machine-readable kind, and the kind's
+/// structured data.
+///
+/// The shape is `{"error": "<message>", "kind": "<code>", "data": {<fields>}}` —
+/// `error` stays the human text every consumer already reads; `kind` lets a
+/// client branch without parsing prose; `data` carries the kind's own fields
+/// (which argument, what was expected, which bound). `kind` and `data` are
+/// absent when the failure is not ours (a script's own syntax error, a
+/// Starlark builtin's failure).
+pub fn error_row(error: &starlark::Error) -> serde_json::Value {
+    let payload: Option<&anyhow::Error> = match error.kind() {
+        starlark::ErrorKind::Other(e)
+        | starlark::ErrorKind::Native(e)
+        | starlark::ErrorKind::Value(e)
+        | starlark::ErrorKind::Function(e)
+        | starlark::ErrorKind::Scope(e)
+        | starlark::ErrorKind::Fail(e)
+        | starlark::ErrorKind::Parser(e)
+        | starlark::ErrorKind::Internal(e)
+        | starlark::ErrorKind::StackOverflow(e)
+        | starlark::ErrorKind::Freeze(e) => Some(e),
+        _ => None,
+    };
+    if let Some(payload) = payload {
+        if let Some(kind) = payload
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::barker::error::BarkerError>())
+        {
+            return serde_json::json!({
+                "error": format!("{error}"),
+                "kind": barker_kind_code(kind),
+                "data": barker_kind_data(kind),
+            });
+        }
+        if let Some(kind) = payload
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::highwire::error::HighWireError>())
+        {
+            return serde_json::json!({
+                "error": format!("{error}"),
+                "kind": kind.code(),
+                "data": highwire_kind_data(kind),
+            });
+        }
+    }
+    serde_json::json!({ "error": format!("{error}") })
+
+}
+
+/// The structured fields of a Barker failure kind.
+pub fn barker_kind_data(kind: &crate::barker::error::BarkerError) -> serde_json::Value {
+    use crate::barker::error::BarkerError;
+    match kind {
+        BarkerError::Type {
+            function,
+            argument,
+            expected,
+            found,
+        } => serde_json::json!({
+            "function": function,
+            "argument": argument,
+            "expected": expected,
+            "found": found,
+        }),
+        BarkerError::Value { function, detail }
+        | BarkerError::Range { function, detail }
+        | BarkerError::Unrepresentable { function, detail } => serde_json::json!({
+            "function": function,
+            "detail": detail,
+        }),
+        BarkerError::Pattern {
+            function,
+            pattern,
+            reason,
+        } => serde_json::json!({
+            "function": function,
+            "pattern": pattern,
+            "reason": reason,
+        }),
+        BarkerError::Date {
+            function,
+            text,
+            reason,
+        } => serde_json::json!({
+            "function": function,
+            "text": text,
+            "reason": reason,
+        }),
+    }
+}
+
+/// The structured fields of a High Wire failure kind.
+pub fn highwire_kind_data(kind: &crate::highwire::error::HighWireError) -> serde_json::Value {
+    use crate::highwire::error::HighWireError;
+    match kind {
+        HighWireError::ConsumerGone { stage } => serde_json::json!({ "stage": stage }),
+        HighWireError::Budget { detail }
+        | HighWireError::Wiring { detail }
+        | HighWireError::Build { detail }
+        | HighWireError::Nested { detail } => serde_json::json!({ "detail": detail }),
+    }
+}
+
+
+/// The stable code of a Barker failure kind.
+pub fn barker_kind_code(kind: &crate::barker::error::BarkerError) -> String {
+    match kind {
+        crate::barker::error::BarkerError::Type { .. } => "type",
+        crate::barker::error::BarkerError::Value { .. } => "value",
+        crate::barker::error::BarkerError::Range { .. } => "range",
+        crate::barker::error::BarkerError::Pattern { .. } => "pattern",
+        crate::barker::error::BarkerError::Date { .. } => "date",
+        crate::barker::error::BarkerError::Unrepresentable { .. } => "unrepresentable",
+    }
+    .to_string()
 }

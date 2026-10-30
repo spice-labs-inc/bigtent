@@ -16,6 +16,7 @@ use std::rc::Rc;
 
 use crate::error::SanshoError;
 use crate::view::{Kind, SanshoCarrier, SanshoNumber, SanshoTrait};
+use std::borrow::Cow;
 
 /// The borrowed form: members are BORROWED values (zero-copy).
 impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
@@ -33,11 +34,11 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
         }
     }
 
-    fn as_str(&self) -> Result<&'a str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'a, str>, SanshoError> {
         let value: &'a serde_cbor::Value = self;
         match value {
             // the text borrows the document
-            serde_cbor::Value::Text(text) => Ok(text.as_str()),
+            serde_cbor::Value::Text(text) => Ok(Cow::Borrowed(text.as_str())),
             _ => Err(SanshoError::Evaluation {
                 message: "Not a String type".to_string(),
             }),
@@ -137,12 +138,12 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
 
     fn as_array_str<'s>(
         &'s self,
-    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    ) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         let value: &'s serde_cbor::Value = self;
         match value {
             serde_cbor::Value::Array(items) => Ok(Box::new(items.iter().filter_map(|item| {
                 match item {
-                    serde_cbor::Value::Text(text) => Some(text.as_str()),
+                    serde_cbor::Value::Text(text) => Some(Cow::Borrowed(text.as_str())),
                     _ => None,
                 }
             }))),

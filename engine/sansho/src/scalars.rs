@@ -13,6 +13,7 @@
 
 use crate::error::SanshoError;
 use crate::view::{Kind, SanshoNumber, SanshoTrait};
+use std::borrow::Cow;
 
 /// The number scalars: a register-sized value, no members, no text.
 macro_rules! number_scalar_impl {
@@ -62,9 +63,9 @@ impl<'a> SanshoTrait<'a> for &'a str {
         Kind::String
     }
 
-    fn as_str(&self) -> Result<&'a str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'a, str>, SanshoError> {
         let ret: &'a str = self;
-        Ok(ret)
+        Ok(Cow::Borrowed(ret))
     }
 
     fn to_string_sansho(&self) -> String {
@@ -80,9 +81,9 @@ impl<'a> SanshoTrait<'a> for &'a String {
         Kind::String
     }
 
-    fn as_str(&self) -> Result<&'a str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'a, str>, SanshoError> {
         let ret: &'a str = self;
-        Ok(ret)
+        Ok(Cow::Borrowed(ret))
     }
 
     fn to_string_sansho(&self) -> String {
@@ -95,8 +96,8 @@ impl<'a> SanshoTrait<'a> for String {
         Kind::String
     }
 
-    fn as_str(&self) -> Result<&str, SanshoError> {
-        Ok(self as &str)
+    fn as_str(&self) -> Result<Cow<'_, str>, SanshoError> {
+        Ok(Cow::Borrowed(self as &str))
     }
 
     fn to_string_sansho(&self) -> String {

@@ -88,7 +88,7 @@ pub enum Edge {
 /// and wrong arities are compile errors.
 pub fn function_arity(name: &str) -> Option<(usize, Option<usize>)> {
     match name {
-        "abs" | "avg" | "ceil" | "floor" | "length" | "max" | "mean" | "min" | "reverse"
+        "abs" | "avg" | "ceil" | "floor" | "length" | "max" | "min" | "reverse"
         | "sort" | "sum" | "to_array" | "to_number" | "to_string" | "keys" | "values" | "type" => {
             Some((1, Some(1)))
         }
@@ -120,7 +120,6 @@ pub fn function_implemented(name: &str) -> bool {
             | "map"
             | "max"
             | "max_by"
-            | "mean"
             | "min"
             | "min_by"
             | "merge"

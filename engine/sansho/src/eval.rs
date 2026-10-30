@@ -582,7 +582,7 @@ pub fn order_compare<'a>(
             _ => None,
         },
         (Kind::String, Kind::String) => match (left.as_str(), right.as_str()) {
-            (Ok(a), Ok(b)) => Some(a.cmp(b)),
+            (Ok(a), Ok(b)) => Some(a.as_ref().cmp(b.as_ref())),
             _ => None,
         },
         _ => None,
@@ -801,7 +801,7 @@ fn eval_function<'a>(
         }
         ("contains", (Some(subject), Some(needle))) => match subject.kind() {
             Kind::String => match (subject.as_str(), needle.as_str()) {
-                (Ok(s), Ok(n)) => Ok(Rc::new(s.contains(n)) as SanshoCarrier<'a>),
+                (Ok(s), Ok(n)) => Ok(Rc::new(s.contains(n.as_ref())) as SanshoCarrier<'a>),
                 _ => Err(type_error("contains", kind_name(subject.clone()))),
             },
             Kind::Array => {
@@ -823,7 +823,7 @@ fn eval_function<'a>(
         ("abs", (Some(one), None)) => numeric("abs", one.clone(), f64::abs),
         ("ceil", (Some(one), None)) => numeric("ceil", one.clone(), f64::ceil),
         ("floor", (Some(one), None)) => numeric("floor", one.clone(), f64::floor),
-        ("avg" | "mean", (Some(one), None)) => match one.kind() {
+        ("avg", (Some(one), None)) => match one.kind() {
             Kind::Array => {
                 let items = one.as_elements()?;
                 if items.is_empty() {
@@ -1012,9 +1012,9 @@ fn string_for_counted<'b>(
         Kind::String => Ok({
             let the_str = one.as_str()?;
             if quote_string {
-                format!("\"{}\"", escape_string(the_str))
+                format!("\"{}\"", escape_string(the_str.as_ref()))
             } else {
-                the_str.to_string()
+                the_str.as_ref().to_string()
             }
         }),
         Kind::Null => Ok("null".to_string()),
@@ -1093,7 +1093,7 @@ fn order_values<'a>(
             })),
         },
         (Kind::String, Kind::String) => match (left.as_str(), right.as_str()) {
-            (Ok(a), Ok(b)) => Ok(a.cmp(b)),
+            (Ok(a), Ok(b)) => Ok(a.as_ref().cmp(b.as_ref())),
             _ => Err(Stop::Error(SanshoError::Evaluation {
                 message: "cannot order strings".to_string(),
             })),
@@ -1111,7 +1111,7 @@ fn string_predicate<'a>(
     predicate: fn(&str, &str) -> bool,
 ) -> Result<SanshoCarrier<'a>, Stop> {
     match (subject.as_str(), argument.as_str()) {
-        (Ok(s), Ok(p)) => Ok(Rc::new(predicate(s, p))),
+        (Ok(s), Ok(p)) => Ok(Rc::new(predicate(s.as_ref(), p.as_ref()))),
         _ => Err(type_error(name, kind_name(subject.clone()))),
     }
 }

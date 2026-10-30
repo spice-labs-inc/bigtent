@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 pub mod compiler;
+pub mod error;
 pub mod grammar;
 mod grammar_impl_serde;
 pub mod walk;

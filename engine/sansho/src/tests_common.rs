@@ -1,4 +1,4 @@
-//! The shared test-support fixture builder: the Appendix-A-shaped item
+//! The shared test-support fixture builder: the corpus-shaped item
 //! with parameterized connection and file-name counts — the machinery
 //! the benchmarks and the escape-case matrix rest on. Included via
 //! `#[path]` by the benches and the integration tests; not part of the
@@ -7,7 +7,7 @@
 use serde_json::Value as J;
 use std::collections::BTreeMap;
 
-/// The Appendix-A-shaped item:
+/// The corpus-shaped item:
 /// - `connections`: a map of connection type → targets — `alias:from`
 ///   with `n_connections` entries (every other one `pkg:`-prefixed),
 ///   `contained:up` with a single parent entry;
@@ -84,7 +84,7 @@ pub fn appendix_a(n_connections: usize, n_file_names: usize) -> J {
     )
 }
 
-/// The connection count of an Appendix-A item (for assertions).
+/// The connection count of a corpus-shaped item (for assertions).
 ///
 /// This file is included by several targets through `#[path]`, and each uses
 /// a subset of it, so an item that is unused in one includer is not dead.

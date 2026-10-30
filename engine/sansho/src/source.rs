@@ -12,6 +12,7 @@
 //! prints it. That is a debugging aid, not part of an evaluation.
 
 use minicbor::Decoder;
+use std::borrow::Cow;
 use minicbor::data::Type;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -26,10 +27,59 @@ fn item_type(bytes: &[u8]) -> Option<Type> {
     Decoder::new(bytes).datatype().ok()
 }
 
+/// Whether the item begins with a TAG head (major type 6).
+///
+/// `Decoder::datatype()` SKIPS tags — it reports the datatype of the tagged
+/// item — so a tagged value looks like its content to everything downstream.
+/// The CBOR Goat Rodeo writes and the CBOR of merged items never contain a
+/// tag, so a tag carries no meaning here and is answered as `null`; it is
+/// never silently unwrapped to its content.
+fn is_tagged(bytes: &[u8]) -> bool {
+    // major type 6 is the top three bits `110`
+    bytes
+        .first()
+        .is_some_and(|head| head & 0xE0 == 0xC0)
+}
+
 /// The member's extent, as a refcounted borrow of the document: the member
 /// is the document's own bytes, so wrapping it in a refcount copies nothing.
 fn member<'a>(bytes: &'a [u8], start: usize, end: usize) -> SanshoCarrier<'a> {
     Rc::new(&bytes[start..end])
+}
+
+/// The document's text as a `Cow`: borrowed when it is one run of bytes (the
+/// zero-copy path every document Goat Rodeo writes takes), assembled when the
+/// document chunked it.
+fn decoder_text<'a>(bytes: &'a [u8]) -> Result<Cow<'a, str>, SanshoError> {
+    let mut decoder = Decoder::new(bytes);
+    let text: &'a str = decoder.str().map_err(decoder_error)?;
+    Ok(Cow::Borrowed(text))
+}
+
+/// The number of items in an INDEFINITE-LENGTH container: the items are walked
+/// with their payloads skipped, and the break byte ends the count. O(n) in the
+/// container, no allocation.
+fn count_until_break(bytes: &[u8], object: bool) -> Result<usize, SanshoError> {
+    let mut decoder = Decoder::new(bytes);
+    // step past the indefinite-length head
+    if object {
+        decoder.map().map_err(decoder_error)?;
+    } else {
+        decoder.array().map_err(decoder_error)?;
+    }
+    let mut count = 0usize;
+    loop {
+        match decoder.datatype().map_err(decoder_error)? {
+            minicbor::data::Type::Break => {
+                decoder.skip().map_err(decoder_error)?;
+                return Ok(if object { count / 2 } else { count });
+            }
+            _ => {
+                decoder.skip().map_err(decoder_error)?;
+                count += 1;
+            }
+        }
+    }
 }
 
 /// The decoder's error, as the engine's Input error: a malformed or
@@ -49,6 +99,12 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
         // no JMESPath type, and a byte minicbor cannot classify — answer
         // null, and every read of them answers an error, so the kind is the
         // least-wrong answer rather than a claim about the document.
+        // A TAG is null: it is not a value this engine evaluates, and the
+        // documents it reads never carry one. `datatype()` would skip the tag
+        // and report its CONTENT's type, so the check comes first.
+        if is_tagged(self) {
+            return Kind::Null;
+        }
         match item_type(self) {
             Some(Type::Map) | Some(Type::MapIndef) => Kind::Object,
             Some(Type::Array) | Some(Type::ArrayIndef) => Kind::Array,
@@ -67,23 +123,49 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
             | Some(Type::Int)
             | Some(Type::F16)
             | Some(Type::F32)
-            | Some(Type::F64)
-            | Some(Type::Tag) => Kind::Number,
+            | Some(Type::F64) => Kind::Number,
+            // UNREACHABLE, and the reason matters: minicbor's `datatype()`
+            // SKIPS a tag and reports the TAGGED ITEM's type, so no document
+            // can arrive here with a tag. The `is_tagged` check at the top of
+            // `kind()` is what answers a tag, as `null` — a tag carries no
+            // meaning in the documents this engine reads. The arm stays so the
+            // match is exhaustive: naming every minicbor type is what makes an
+            // upgrade that adds one fail this build instead of silently
+            // becoming a kind it is not.
+            Some(Type::Tag) => Kind::Null,
             Some(Type::Simple) | Some(Type::Break) | Some(Type::Unknown(_)) => Kind::Null,
             // a document with no decodable first item at all
             None => Kind::Null,
         }
     }
 
-    fn as_str(&self) -> Result<&'a str, SanshoError> {
+    fn as_str(&self) -> Result<Cow<'a, str>, SanshoError> {
         match self.kind() {
-            // a chunked text item has no single `&str` to lend: it is named
-            // rather than reported as a type error
-            Kind::String if item_type(self) == Some(Type::StringIndef) => Err(SanshoError::Input {
-                message: "indefinite-length text".to_string(),
-            }),
+            // CHUNKED text has no single run of bytes to lend, so it is
+            // assembled: each chunk is a complete, valid UTF-8 string, and the
+            // concatenation is what the document denotes. The definite case
+            // below keeps its zero-copy borrow.
+            Kind::String if item_type(self) == Some(Type::StringIndef) => {
+                let mut decoder = Decoder::new(self);
+                // step past the indefinite-length HEAD byte: `str()` cannot
+                // read an indefinite head, and `skip()` would jump the whole
+                // item, so the position moves one byte on
+                decoder.set_position(1);
+                let mut assembled = String::new();
+                loop {
+                    match decoder.datatype().map_err(decoder_error)? {
+                        minicbor::data::Type::Break => {
+                            decoder.skip().map_err(decoder_error)?;
+                            return Ok(Cow::Owned(assembled));
+                        }
+                        // every chunk is a complete UTF-8 string: concatenation
+                        // is what the document denotes
+                        _ => assembled.push_str(decoder.str().map_err(decoder_error)?),
+                    }
+                }
+            }
             // the text borrows the document
-            Kind::String => Decoder::new(self).str().map_err(decoder_error),
+            Kind::String => decoder_text(self),
             _ => Err(SanshoError::Evaluation {
                 message: "Not a String type".to_string(),
             }),
@@ -160,21 +242,17 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
     fn get_key(&self, name: &str) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
         let bytes: &'a [u8] = self;
         let mut decoder = Decoder::new(bytes);
-        let count = match self.kind() {
-            Kind::Object => {
-                decoder
-                    .map()
-                    .map_err(decoder_error)?
-                    .ok_or_else(|| SanshoError::Input {
-                        message: "indefinite-length map".to_string(),
-                    })?
-            }
-            _ => {
-                return Err(SanshoError::Evaluation {
-                    message: "Not an object type".to_string(),
-                });
-            }
-        };
+        // a DEFINITE container reports its count; an INDEFINITE one is
+        // counted by walking it — the same accessor answers both
+        let count = self.container_len()? as u64;
+        // step past the HEAD: `skip()` would jump the whole container, break
+        // byte and all, so an indefinite head is one byte and a definite one
+        // is consumed by reading its length back
+        if item_type(bytes) == Some(Type::MapIndef) {
+            decoder.set_position(1);
+        } else {
+            decoder.map().map_err(decoder_error)?;
+        }
         for _ in 0..count {
             let key = match decoder.datatype() {
                 Ok(Type::String) => decoder.str().map_err(decoder_error)?,
@@ -198,21 +276,17 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
     fn get_index(&self, index: usize) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
         let bytes: &'a [u8] = self;
         let mut decoder = Decoder::new(bytes);
-        let count = match self.kind() {
-            Kind::Array => {
-                decoder
-                    .array()
-                    .map_err(decoder_error)?
-                    .ok_or_else(|| SanshoError::Input {
-                        message: "indefinite-length array".to_string(),
-                    })?
-            }
-            _ => {
-                return Err(SanshoError::Evaluation {
-                    message: "Not an array type".to_string(),
-                });
-            }
-        };
+        // a DEFINITE container reports its count; an INDEFINITE one is
+        // counted by walking it — the same accessor answers both
+        let count = self.container_len()? as u64;
+        // step past the HEAD: `skip()` would jump the whole container, break
+        // byte and all, so an indefinite head is one byte and a definite one
+        // is consumed by reading its length back
+        if item_type(bytes) == Some(Type::ArrayIndef) {
+            decoder.set_position(1);
+        } else {
+            decoder.array().map_err(decoder_error)?;
+        }
         for position in 0..count {
             let start = decoder.position();
             decoder.skip().map_err(decoder_error)?;
@@ -227,21 +301,22 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
     fn as_object(&self) -> Result<std::collections::HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
         let bytes: &'a [u8] = self;
         let mut decoder = Decoder::new(bytes);
-        let count = match self.kind() {
-            Kind::Object => {
-                decoder
-                    .map()
-                    .map_err(decoder_error)?
-                    .ok_or_else(|| SanshoError::Input {
-                        message: "indefinite-length map".to_string(),
-                    })?
-            }
-            _ => {
-                return Err(SanshoError::Evaluation {
-                    message: format!("entries requires an object, found {}", self.kind()),
-                });
-            }
-        };
+        // both encodings have a count: the definite head, or a walk to the
+        // break byte
+        if self.kind() != Kind::Object {
+            return Err(SanshoError::Evaluation {
+                message: format!("entries requires an object, found {}", self.kind()),
+            });
+        }
+        let count = self.container_len()? as u64;
+        // step past the HEAD: `skip()` would jump the whole container, break
+        // byte and all, so an indefinite head is one byte and a definite one
+        // is consumed by reading its length back
+        if item_type(bytes) == Some(Type::MapIndef) {
+            decoder.set_position(1);
+        } else {
+            decoder.map().map_err(decoder_error)?;
+        }
         let mut members = HashMap::new();
         for _ in 0..count {
             // the key borrows the document: no key string is built
@@ -265,21 +340,20 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
     fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
         let bytes: &'a [u8] = self;
         let mut decoder = Decoder::new(bytes);
-        let count = match self.kind() {
-            Kind::Array => {
-                decoder
-                    .array()
-                    .map_err(decoder_error)?
-                    .ok_or_else(|| SanshoError::Input {
-                        message: "indefinite-length array".to_string(),
-                    })?
-            }
-            _ => {
-                return Err(SanshoError::Evaluation {
-                    message: format!("elements requires an array, found {}", self.kind()),
-                });
-            }
-        };
+        if self.kind() != Kind::Array {
+            return Err(SanshoError::Evaluation {
+                message: format!("elements requires an array, found {}", self.kind()),
+            });
+        }
+        let count = self.container_len()? as u64;
+        // step past the HEAD: `skip()` would jump the whole container, break
+        // byte and all, so an indefinite head is one byte and a definite one
+        // is consumed by reading its length back
+        if item_type(bytes) == Some(Type::ArrayIndef) {
+            decoder.set_position(1);
+        } else {
+            decoder.array().map_err(decoder_error)?;
+        }
         let mut members = Vec::with_capacity(count.min(1024) as usize);
         for _ in 0..count {
             let start = decoder.position();
@@ -292,7 +366,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
 
     fn as_array_str<'s>(
         &'s self,
-    ) -> Result<Box<dyn Iterator<Item = &'s str> + 's>, SanshoError> {
+    ) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
         match self.kind() {
             Kind::Array => {
                 let slice: &'s [u8] = self;
@@ -316,7 +390,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
                         // an element whose text is not valid UTF-8 is
                         // skipped, not reported: this is the lenient read
                         if let Ok(text) = decoder.str() {
-                            return Some(text);
+                            return Some(Cow::Borrowed(text));
                         }
                     } else if kind == Type::StringIndef {
                         // a chunked text item has no single `&str`: the
@@ -337,20 +411,17 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
     fn container_len(&self) -> Result<usize, SanshoError> {
         let mut decoder = Decoder::new(self);
         match self.kind() {
-            Kind::Object => decoder
-                .map()
-                .map_err(decoder_error)?
-                .map(|count| count as usize)
-                .ok_or_else(|| SanshoError::Input {
-                    message: "indefinite-length map".to_string(),
-                }),
-            Kind::Array => decoder
-                .array()
-                .map_err(decoder_error)?
-                .map(|count| count as usize)
-                .ok_or_else(|| SanshoError::Input {
-                    message: "indefinite-length array".to_string(),
-                }),
+            // an indefinite-length container CARRIES ITS LENGTH IMPLICITLY:
+            // the items are walked and the break byte ends them, so the count
+            // costs a scan and no allocation.
+            Kind::Object => match decoder.map().map_err(decoder_error)? {
+                Some(count) => Ok(count as usize),
+                None => count_until_break(self, true),
+            },
+            Kind::Array => match decoder.array().map_err(decoder_error)? {
+                Some(count) => Ok(count as usize),
+                None => count_until_break(self, false),
+            },
             _ => Err(SanshoError::Evaluation {
                 message: "Not an Array or Object".to_string(),
             }),

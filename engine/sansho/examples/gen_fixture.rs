@@ -27,11 +27,17 @@ fn main() {
         }
     });
     let bytes = serde_cbor::to_vec(&item).expect("fixture encoding");
-    let out = std::path::Path::new("tests/fixtures/item_a.cbor");
+    // RESOLVED AGAINST THE CRATE, not the caller's working directory: run from
+    // the workspace root (`cargo run -p sansho --example gen_fixture`), a
+    // relative path writes `./tests/fixtures` at the workspace root instead of
+    // beside the crate's own tests.
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/item_a.cbor");
+    let out = out.as_path();
     std::fs::create_dir_all(out.parent().unwrap()).unwrap();
     std::fs::write(out, &bytes).unwrap();
     std::fs::write(
-        std::path::Path::new("tests/fixtures/item_a.json"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/item_a.json"),
         serde_json::to_string_pretty(&item).unwrap(),
     )
     .unwrap();

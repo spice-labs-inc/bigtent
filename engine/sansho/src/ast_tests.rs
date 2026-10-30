@@ -25,6 +25,15 @@ mod tests {
             };
             match crate::evaluate(&program, given).and_then(|value| crate::materialize(&value)) {
                 Ok(value) => crate::DriverOutcome::Result(value),
+                // NOT IMPLEMENTED and a genuine error are different facts: the
+                // compliance report counts the first as "not implemented yet"
+                // and the second as a failure. The public entry maps both to an
+                // error, so the distinction is recovered from its message.
+                Err(crate::error::SanshoError::Evaluation { message })
+                    if message == "Not implemented" =>
+                {
+                    crate::DriverOutcome::NotImplemented
+                }
                 Err(e) => crate::DriverOutcome::Error(e),
             }
         }
@@ -213,10 +222,14 @@ mod tests {
     // whose value is another literal.
     #[test]
     fn canonical_round_trips_backslash_literal() {
-        let original = r##"`"\\"`.{a:`"b"`}`"##.trim_end_matches('`');
+        // the expression, written out with no trimming: a backtick literal
+        // holding a JSON string with one backslash, a dot, then a multi-select
+        // hash whose value is another literal. (`trim_end_matches` used to strip
+        // a trailing backtick the literal did not need, which meant the test
+        // was not exercising the expression it displayed.)
+        let original = r##"`"\\"`.{a:`"b"`}"##;
         let parsed = parse(original).expect("parses");
         let once = canonical(&parsed);
-        println!("PROBE original={:?} canonical={:?}", original, once);
         let reparsed = parse(&once).expect("canonical form must re-parse");
         assert_eq!(once, canonical(&reparsed), "fixed point for {original:?}");
     }
@@ -284,16 +297,24 @@ mod slice_tests {
                 }
             }
         }
+        // EVERY feature the module documents as green is enforced here, not a
+        // subset: a doc claim with no assertion is the defect this list had —
+        // `indices`, `multiselect`, `filters` and `wildcard` were advertised and
+        // never checked.
         for feature in [
             "basic",
             "boolean",
             "current",
             "escape",
+            "filters",
             "identifiers",
+            "indices",
             "literal",
+            "multiselect",
             "pipe",
             "slice",
             "syntax",
+            "wildcard",
         ] {
             let report = reports
                 .iter()

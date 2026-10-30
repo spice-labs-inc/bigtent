@@ -590,7 +590,7 @@ async fn convert_chunks(
 
 #[cfg(test)]
 pub(crate) mod phase3_tests {
-    #![allow(clippy::await_holding_lock)] // the hook guard intentionally serializes tests across awaits
+    #![expect(clippy::await_holding_lock)] // the hook guard intentionally serializes tests across awaits
     use super::*;
     use crate::item::ITEM_METADATA_MIME_TYPE;
     use crate::rodeo::index::ItemOffset;

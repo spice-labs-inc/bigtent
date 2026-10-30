@@ -429,7 +429,7 @@ mod tests {
     /// to BLAKE3 with rust-equal items; the bounded and materializing
     /// strategies must agree with each other and with the source.
     #[test]
-    #[allow(clippy::await_holding_lock)] // the hook guard intentionally serializes tests across awaits
+    #[expect(clippy::await_holding_lock)] // the hook guard intentionally serializes tests across awaits
     fn bounded_and_materializing_agree_on_fixture() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

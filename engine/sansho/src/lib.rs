@@ -186,12 +186,18 @@ fn materialize_counted<'a, T: SanshoTrait<'a> + ?Sized>(
         }
         Kind::Number => {
             budget.count_node()?;
+            // JSON has no spelling for a NON-FINITE number, so one answers
+            // `null` — the JavaScript convention, and the same answer the
+            // evaluator's text rendering gives. (The carrier still holds the
+            // value; the policy is about JSON, not about evaluation.)
             let number = match value.as_sansho_number()? {
                 SanshoNumber::I64(v) => serde_json::Number::from(v),
                 SanshoNumber::U64(v) => serde_json::Number::from(v),
-                SanshoNumber::F64(v) => {
-                    serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0))
-                }
+                SanshoNumber::F64(v) => match serde_json::Number::from_f64(v) {
+                    Some(number) => number,
+                    // NaN, +Infinity, -Infinity
+                    None => return Ok(serde_json::Value::Null),
+                },
             };
             Ok(serde_json::Value::Number(number))
         }

@@ -140,11 +140,6 @@ pub struct ReadyzResponse {
 
 // ------------------------------------------------------- the pre-canned templates
 
-/// The passthrough query: every root's item, no traversal.
-// the full item IS the row: `@`, always — an enumeration drifts when the
-// item's shape gains a field
-const PASSTHROUGH: &str = r#"{"roots": {"from-input": true}, "walk": [], "emit": "@"}"#;
-
 /// The pre-canned queries V2 serves by name.
 ///
 /// A registry is EMPTY by default — the built-ins are available to add, not forced
@@ -240,107 +235,32 @@ impl TemplateRegistry {
 /// The templates V2 serves by name. Each is a full query document whose roots come
 /// from the input stream, so the text is fixed and the identifiers arrive with the
 /// call — the same relationship `/item/{gitoid}` has to `/bulk`.
+/// THE BUILT-IN TEMPLATES — read from the documents the tests exercise.
+///
+/// They are `include_str!` rather than literals because they used to exist
+/// twice: a text here and a twin under `test_data/queries/`. Every equivalence
+/// test reads the twin, so a corrected twin could ship beside a stale served
+/// text — which is exactly what happened to `flatten` and `flatten_source`,
+/// where the fix was inert in production and green in the suite. With
+/// `include_str!` there is one text, and divergence is impossible.
 const TEMPLATES: &[(&str, &str)] = &[
-    ("item", PASSTHROUGH),
+    ("item", include_str!("../test_data/queries/item.json")),
     (
         "anti_alias",
-        r#"{"roots": {"from-input": true}, "walk": ["alias:to"], "emit":
-            {"expr": "@", "if": {"==": {"is_terminal": true}}}}"#,
+        include_str!("../test_data/queries/anti_alias.json"),
     ),
-    (
-        "north",
-        // V1's north emits the FULL items of the BFS (Either::Left(Item)) —
-        // the same shape /item emits; the traversal's own dedup (the walk's
-        // `seen` set) matches V1's `processed` set, so no dedup stage.
-        r#"{"roots": {"from-input": true}, "walk": ["alias:to", "tag:from", "contained:up"],
-            "emit": "@"}"#,
-    ),
+    ("north", include_str!("../test_data/queries/north.json")),
     (
         "north_purls",
-        // V1's rule, expressed in the query: each visited item's alias:from
-        // values, filtered IN THE EXPRESSION to pkg:-prefixed targets — no
-        // gate — and a DEDUP stage after the walk: two different items can
-        // carry the same purl (a diamond), and V1's `found_purls` set emits
-        // it once globally. An item without the edge yields null; a filter
-        // projection over null is null; a null row is dropped by the emit's
-        // null rule.
-        r#"{"phases": [
-            {"name": "walk", "roots": {"from-input": true},
-             "walk": ["alias:to", "tag:from", "contained:up"],
-             "emit": {"expr": "connections.\"alias:from\"[?starts_with(@, 'pkg:')]", "unnest": true}},
-            {"name": "unique", "barker": "for row in input:\n    emit(row)",
-             "dedup": true, "inputs": ["walk"]}
-        ]}"#,
+        include_str!("../test_data/queries/north_purls.json"),
     ),
-    (
-        "flatten",
-        // V1's rule: each visited item's contains:down TARGET STRINGS are
-        // emitted (the alias:to hop is navigation, never emitted; the root's
-        // own targets included — no depth gate); a null edge projects to
-        // null and drops. Dedup: V1's processed set emits a target once.
-        r#"{"phases": [
-            {"name": "walk", "roots": {"from-input": true},
-             "walk": ["alias:to", "contained:down"],
-             "emit": {"expr": "connections.\"contained:down\"[*]", "unnest": true}},
-            {"name": "unique", "barker": "for row in input:\n    emit(row)",
-             "dedup": true, "inputs": ["walk"]}
-        ]}"#,
-    ),
+    ("flatten", include_str!("../test_data/queries/flatten.json")),
     (
         "flatten_source",
-        // V1's source=true: the traversal ALSO follows build:down edges, and
-        // BOTH kinds of targets emit only when the EMITTING item carries a
-        // build:down edge (the gate is null-safe: no edge is an empty list).
-        // The edge name is build:down — the old template's build:from is not
-        // an edge type at all.
-        r#"{"phases": [
-            {"name": "walk", "roots": {"from-input": true},
-             "walk": ["alias:to", "contained:down", "build:down"],
-             "emit": [
-                {"expr": "connections.\"contained:down\"[*]", "unnest": true,
-                 "if": "length(connections.\"build:down\" || `[]`) > `0`"},
-                {"expr": "connections.\"build:down\"[*]", "unnest": true,
-                 "if": "length(connections.\"build:down\" || `[]`) > `0`"}
-             ]},
-            {"name": "unique", "barker": "for row in input:\n    emit(row)",
-             "dedup": true, "inputs": ["walk"]}
-        ]}"#,
-    ),
-    (
-        "north_purls",
-        // V1's rule, expressed in the query: each visited item's alias:from
-        // values, filtered IN THE EXPRESSION to pkg:-prefixed targets — no
-        // gate — and a DEDUP stage after the walk: two different items can
-        // carry the same purl (a diamond), and V1's `found_purls` set emits
-        // it once globally. An item without the edge yields null; a filter
-        // projection over null is null; a null row is dropped by the emit's
-        // null rule.
-        r#"{"phases": [
-            {"name": "walk", "roots": {"from-input": true},
-             "walk": ["alias:to", "tag:from", "contained:up"],
-             "emit": {"expr": "connections.\"alias:from\"[?starts_with(@, 'pkg:')]", "unnest": true}},
-            {"name": "unique", "barker": "for row in input:\n    emit(row)",
-             "dedup": true, "inputs": ["walk"]}
-        ]}"#,
-    ),
-    (
-        "flatten",
-        // the accessor emits the TARGETS of the edges it follows, never the seed —
-        // so the depth gate excludes the root
-        r#"{"roots": {"from-input": true}, "walk": ["alias:to", "contained:down"],
-            "emit": {"expr": "{identifier: identifier, body_mime_type: body_mime_type, file_names: body.file_names}",
-                     "if": {">": {"depth": 0}}}}"#,
-    ),
-    (
-        "flatten_source",
-        // the accessor's rule, verbatim: an edge is emitted only when the EMITTING
-        // item has a build:from edge — not a mime filter
-        r#"{"roots": {"from-input": true}, "walk": ["alias:to", "contained:down", "build:from"],
-            "emit": {"expr": "{identifier: identifier, file_names: body.file_names}",
-                     "if": {"and": [{">": {"depth": 0}},
-                                    "length(connections.\"build:from\" || `[]`) > `0`"]}}}"#,
+        include_str!("../test_data/queries/flatten_source.json"),
     ),
 ];
+
 
 // ---------------------------------------------------------------- the endpoints
 
@@ -664,7 +584,7 @@ async fn stream_query(
                 cancellation,
             });
             let sink = move |row: Value,
-                             _acc: &Arc<crate::highwire::walk::Cancelled>,
+                             _acc: &Arc<dyn crate::highwire::walk::AccountingAndBudget + Send + Sync>,
                              op: SinkOperation|
                   -> anyhow::Result<()> {
                 // a stop's report is marked, so it cannot be mistaken for a row the
@@ -685,7 +605,7 @@ async fn stream_query(
                 let _ = rows_sender.send(serde_json::json!({ "error": error.to_string() }));
             }
         })
-        .expect("the query thread spawns");
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json("the query's worker could not start".into())))?;
 
     // the response: every row as one JSON line, in the order the pipeline emitted
     use axum::response::IntoResponse as _;

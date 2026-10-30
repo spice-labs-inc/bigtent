@@ -197,7 +197,14 @@ impl ExpressionBuilder for serde_json::Value {
                 ),
             ));
         }
-        let (variable, value) = operands.iter().next().expect("exactly one entry");
+        // the len check above makes this unreachable; the graceful form
+        // keeps the rule that no input shape can panic
+        let (variable, value) = operands.iter().next().ok_or_else(|| {
+            GrammarError::at(
+                Step::Gate,
+                "a comparison carries exactly one operand, and this has none".to_string(),
+            )
+        })?;
         Ok(Some((
             compare_type,
             variable.as_str(),

@@ -3,7 +3,7 @@
     {
       "name": "walk",
       "roots": {"from-input": true},
-      "walk": ["alias:to", "tag:from", "contained:up"],
+      "walk": ["alias:to", "tag:from", "contained:up", "build:up"],
       "emit": {
         "expr": "connections.\"alias:from\"[?starts_with(@, 'pkg:')]",
         "unnest": true

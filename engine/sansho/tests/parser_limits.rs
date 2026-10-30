@@ -57,3 +57,49 @@ fn nesting_at_the_limit_still_parses() {
         other => panic!("65 nested brackets must be a Limit error, not {other:?}"),
     }
 }
+
+/// FINDING (second review, #4/#55): the guard's hand-written lexer and the
+/// parser's disagree about an ESCAPED QUOTE inside a raw string.
+///
+/// `'\''` is a raw string holding one quote: the parser reads `\'` as content
+/// and the following `'` as the end. The guard's `Inside::Raw` arm ignores the
+/// backslash, so it reads the `\'` as the END and the next `'` as a NEW raw
+/// string — flipping its state. It then treats every following bracket as
+/// string content and stops counting, so the depth limit is off exactly when
+/// the input is hostile.
+///
+/// THEORY: after a legal raw string, deep nesting must still be refused.
+#[test]
+fn an_escaped_quote_in_a_raw_string_does_not_disable_the_guard() {
+    let expression = format!("{} | x{}", "'\\''", "(".repeat(2_000)) + &")".repeat(2_000);
+    match parse(&expression) {
+        Err(SanshoError::Limit { .. }) => {}
+        other => panic!(
+            "2000 nested groups after a raw string must be a Limit error, not {other:?} — \
+             the guard's raw-string arm disagrees with the parser's"
+        ),
+    }
+}
+
+/// The same invariant for all three string forms, each carrying an ESCAPED
+/// delimiter: the guard must still see the deep nesting that follows.
+#[test]
+fn escaped_delimiters_do_not_disable_the_guard() {
+    let deep = format!("{}@{}", "(".repeat(2_000), ")".repeat(2_000));
+    let cases = [
+        // a quoted string with an escaped quote
+        format!("\"a\\\"b\" | {deep}"),
+        // a raw string with an escaped quote
+        format!("'a\\'b' | {deep}"),
+        // a backtick literal with an escaped quote (valid JSON text)
+        format!("`\"a\\\"b\"` | {deep}"),
+    ];
+    for expression in cases {
+        match parse(&expression) {
+            Err(SanshoError::Limit { .. }) => {}
+            other => panic!(
+                "deep nesting after an escaped delimiter must be refused, not {other:?}"
+            ),
+        }
+    }
+}
