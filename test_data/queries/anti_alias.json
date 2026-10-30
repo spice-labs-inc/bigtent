@@ -1,0 +1,16 @@
+{
+  "roots": {
+    "from-input": true
+  },
+  "walk": [
+    "alias:to"
+  ],
+  "emit": {
+    "expr": "@",
+    "if": {
+      "==": {
+        "is_terminal": true
+      }
+    }
+  }
+}

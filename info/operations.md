@@ -11,6 +11,7 @@ deployment, TLS/authentication, log management, monitoring, upgrades, and troubl
 - [Monitoring and Alerting](#monitoring-and-alerting)
 - [Upgrade and Migration](#upgrade-and-migration)
 - [Operational Runbook](#operational-runbook)
+- [Query Operations](#query-operations)
 
 ---
 
@@ -510,3 +511,76 @@ After a mixed-version merge, `bigtent --rodeo <dest> --check` validates
 the output cluster, and lookups against the output must resolve source
 identifiers (`test_mixed_herd_lookup_resolves_both_versions` at the herd
 level; the corpus test `test_large_corpus_merge` for large runs).
+
+## Query Operations
+
+Queries run through the V2 HTTP endpoints (`/v2/query`) over the same compiler
+and walk engine. This section is what an operator needs beyond
+[Writing a Query](writing_queries.md).
+
+### What a query costs
+
+| stage kind | threads | memory profile |
+|---|---|---|
+| walk | one thread + one `tee` fan-out thread | the `seen` set (one entry per visited identifier, ~40 bytes each) plus a bounded(256) channel per edge |
+| barker | one thread + one `tee` thread + one Starlark evaluator thread | the program's own heap (the Starlark evaluator is arena-bound), bounded by whatever the evaluator's limits enforce once resource accounting lands |
+
+A query with S stages and E edges costs roughly `2*S + E` threads, all of them
+blocking on channel receives for their whole lives. Threads cost ~80µs to spawn
+(measured: 80.34 µs/thread spawn, 90.10 µs spawn+join on the development machine)
+and ~8 MB of virtual stack each, so thread counts are not the constraint at
+realistic stage counts; the `seen` sets are. A walk over 219,525 identifiers held
+a `seen` set of roughly 24 MB.
+
+### Backpressure
+
+Every channel in a pipeline is `bounded(256)`. A slow consumer slows its producer
+rather than buffering the stream — a barker running a 1000-iteration loop per row
+slows the walk feeding it, which slows the walk's root consumption, which slows
+the caller's production. The observable is a bounded pipeline's memory profile,
+demonstrated by `a_bounded_input_backpressures_its_producer`.
+
+Two operational consequences:
+
+- **A blocked stage cannot check its stop rules.** A walk blocked on a full
+  fan-out resumes only when its consumer drains. Until resource accounting lands
+  this is harmless; afterwards, a budget-exhausted walk may be blocked past its
+  own limit.
+- **A client that stops reading ends the run.** The response stream is one of the
+  pipeline's channels; when it is dropped, the send fails, the run errors, and
+  every stage unwinds.
+
+### The caches
+
+- **`ProgramCache`** — every sansho expression a query compiles, keyed by text,
+  LRU with a cap (4096 entries in the server). A cache hit is a hash lookup; a
+  miss is a parse and a compile.
+- **`QueryCache`** — compiled query documents keyed by their text, unbounded in
+  entries by design: it holds the pre-canned templates the server was built with,
+  plus every distinct inline document — but inline documents are compiled per
+  request and NOT cached (a cache keyed on caller-controlled text is a memory leak
+  the caller controls). So in practice the `QueryCache` holds exactly the server's
+  templates, and its memory is bounded by them.
+
+### Diagnosing a slow or empty query
+
+1. **Empty output, no error** — check the roots. A stage whose roots name nothing
+   in the corpus emits nothing, silently; this is the most common "broken" query
+   and it is not broken. `test_cluster`'s fixture exists to test exactly this.
+2. **Empty output with an `{"error": …}` row** — the barker stage failed; the row
+   carries the message and its position.
+3. **A compile failure** — the error names the stage and the level:
+   `at the query -> phase `classes` -> its root: a root draws on \`jars\`, and no
+   stage is named that`. Fix the document, not the server.
+4. **Slow** — check the consumer's work first: backpressure means the slowest
+   stage sets the pace, and the timing of the whole run is the timing of the
+   slowest stage's per-row work.
+
+### A run that hangs
+
+A pipeline can hang only if a cycle exists in the wiring — the compiler refuses
+cycles at compile time — or if a stage's consumer never finishes. The
+`the_served_app_answers_v1_and_v2_and_they_agree` test exercises the real server
+end to end; if a served request hangs, check whether the client stopped reading
+(the response stream must be drained or closed) and whether every stage's input
+stream closes when its producers finish.

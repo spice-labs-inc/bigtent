@@ -452,7 +452,7 @@ async fn test_v4_cluster_lookup_traversal_and_roots() {
         .unwrap();
     let mut found = false;
     while let Some(e) = north.recv().await {
-        #[allow(clippy::collapsible_if)] // the Left guard + target check read clearly nested
+        #[expect(clippy::collapsible_if)] // the Left guard + target check read clearly nested
         if let tokio_util::either::Either::Left(item) = e {
             if item.identifier == "pkg:npm:container@1" {
                 found = true;

@@ -1,0 +1,7 @@
+{
+  "roots": {
+    "from-input": true
+  },
+  "walk": [],
+  "emit": "@"
+}

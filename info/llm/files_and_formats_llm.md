@@ -37,7 +37,7 @@ algorithm; a v4 cluster declaring MD5 resolves with MD5 keys).
 
 ## Item shape (version 4)
 
- * `identifier`: required string.
+* `identifier`: required string.
 * `connections`: required (default empty) map: edge type string → array
   of target identifier strings; keys sorted, target arrays sorted and
   deduplicated; empty target arrays are preserved as given.

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3a5e71d36d2ae4282b9558247f08abfe4155ed3c9b96f00b082fe9b93eb534ae # shrinks to graph = Graph { items: [Item { identifier: "i0", connections: {"alias:from": {"pkg:a"}}, body_mime_type: None, body: None }, Item { identifier: "i1", connections: {}, body_mime_type: None, body: None }], root: "i0" }
+cc f3074c3766e17a799899086a8c5399efa6d9c5fb5df40bcf51ffae2ffd8ba245 # shrinks to graph = Graph { items: [Item { identifier: "i0", connections: {"contained:down": {"i0"}}, body_mime_type: None, body: None }, Item { identifier: "i1", connections: {}, body_mime_type: None, body: None }], root: "i0" }
+cc ba1472a69f8530468f026a1c0fb65d54dd2766876ba80ea6926cec207e6f98b4 # shrinks to graph = Graph { items: [Item { identifier: "i0", connections: {"contained:down": {"i1"}}, body_mime_type: None, body: None }, Item { identifier: "i1", connections: {"alias:to": {"i0"}}, body_mime_type: None, body: None }], root: "i1" }

@@ -125,10 +125,15 @@ impl RoboticGoat {
             map.insert("tag".to_string(), tag_name.into());
             map.insert("date".to_string(), iso8601_now().into());
 
-            // there's gotta be a better way to convert from serde_json to serde_cbor///
-            let ser = serde_cbor::to_vec(&serde_json::Value::Object(map))?;
+            // the bytes are the identifier's preimage, so they are still needed;
+            // the body comes from the translator, which does not serialize
+            let ser = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(
+                &serde_json::Value::Object(map.clone()),
+            ))?;
 
-            let body: serde_cbor::Value = serde_cbor::from_reader(&ser[..])?;
+            let body: serde_cbor::Value = sansho::cbor::json_to_cbor_value(
+                &serde_json::Value::Object(map),
+            );
 
             let identifier = format!("tag:sha256:{}", hex::encode(sha256_for_slice(&ser)));
 

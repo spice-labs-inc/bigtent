@@ -614,6 +614,8 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
+    // Query mode: --rodeo + --query (run a query and print the rows)
+
     match (&cluster_source, &args.fresh_merge, &args.lookup, args.check) {
         // Check mode: --rodeo/--cluster-list + --check (validate and exit)
         (Some(source), v, None, true) if v.is_empty() => {

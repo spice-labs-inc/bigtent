@@ -251,7 +251,7 @@ impl ClusterWriter {
     /// carries `previous: 0` and an empty `depends_on`, and BigTent
     /// neither maintains nor consults the chain, which keeps multi-file
     /// output byte-deterministic (H5).
-    #[allow(clippy::collapsible_if)] // nested check keeps the out-of-order guard readable
+    #[expect(clippy::collapsible_if)] // nested check keeps the out-of-order guard readable
     pub async fn write_item_with_hash(
         &mut self,
         cbor_bytes: Vec<u8>,

@@ -35,8 +35,11 @@ For detailed setup instructions, see [GETTING_STARTED.md](GETTING_STARTED.md).
 |----------|-------------|
 | [GETTING_STARTED.md](GETTING_STARTED.md) | Installation, building, and first steps |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design, components, and data flow |
+| [Writing a Query](info/writing_queries.md) | The query grammar, stages, tee/dedup/unnest, and the namespaces |
+| [Barker](info/barker.md) | Starlark in the pipeline: phases, streaming, natives, boundedness |
 | [BENCHMARKING.md](BENCHMARKING.md) | Merge benchmarking suite and performance tracking |
 | [PERFORMANCE.md](PERFORMANCE.md) | Performance tuning and optimization |
+| [info/README.md](info/README.md) | The documentation tree (queries, Barker, Sansho engine, operations) |
 | [info/config.md](info/config.md) | Configuration reference |
 | [info/files_and_formats.md](info/files_and_formats.md) | File format specifications |
 
@@ -96,7 +99,26 @@ Output is a JSON object mapping each identifier to its Item or `null`:
 
 ## API Endpoints
 
-All endpoints are available at both `/` and `/omnibor/` prefixes.
+All endpoints are available at both `/` and `/omnibor/` prefixes. V2's are at
+`/v2/` and `/omnibor/v2/`.
+
+### OpenAPI Specification
+
+* `GET /openapi.json` - V1 specification (auto-generated from code)
+* `GET /v2/openapi.json` - V2 specification, describing the V2 surface only
+
+### Query (V2)
+
+* `GET /v2/query?identifier=...&template=flatten` - run a named query from one identifier
+* `POST /v2/query` with `{"roots": [...], "template": "flatten"}` - run it from a set
+* `POST /v2/query` with `{"roots": [...], "query": {...}}` - run an inline query document
+* Omitting `template` runs the default (the item lookup). The response is **JSON
+  lines**, streamed as the query produces.
+
+The named queries replicate the V1 traversal endpoints — `item`, `anti_alias`,
+`north`, `north_purls`, `flatten`, `flatten_source` — and are proven to return the
+same sets. Embedding applications define their own templates at construction. See
+[Writing a Query](info/writing_queries.md).
 
 ### OpenAPI Specification
 
@@ -124,6 +146,9 @@ All endpoints are available at both `/` and `/omnibor/` prefixes.
 
 * `GET /node_count` - Total items in the cluster
 * `GET /purls` - Download all Package URLs as text file
+
+The same six are served under V2: `/v2/node_count`, `/v2/purls`, `/v2/health`,
+`/v2/healthz`, `/v2/readyz`, `/v2/metrics`, documented at `/v2/openapi.json`.
 
 ### URL Encoding Note
 

@@ -1,0 +1,374 @@
+//! The differential tests: the cursor backend (raw CBOR bytes) against
+//! the materialized backend (in-memory JSON) — the corpus's
+//! backend-agreement requirement, plus the byte-level
+//! properties: single-pass consumption, shared-navigation decode-once,
+//! and the selective-materialization budget.
+
+use proptest::prelude::*;
+use serde_json::Value;
+use sansho::corpus::{Driver, DriverOutcome, load_corpus, run_corpus};
+use sansho::{compile, evaluate, materialize, parse};
+use std::path::Path;
+
+/// The test's own engine: parse, compile, evaluate through the trait, then
+/// materialize. No engine-side type of its own — `evaluate` is generic over
+/// the trait, so a `&serde_json::Value` document needs no encoding.
+struct TestEngine;
+
+impl sansho::Driver for TestEngine {
+    fn evaluate(&self, given: &serde_json::Value, expression: &str) -> sansho::DriverOutcome {
+        let parsed = match sansho::parse(expression) {
+            Ok(parsed) => parsed,
+            Err(e) => return sansho::DriverOutcome::Error(e),
+        };
+        let program = match sansho::compile(&parsed, None) {
+            Ok(program) => program,
+            Err(e) => return sansho::DriverOutcome::Error(e),
+        };
+        match sansho::evaluate(&program, given).and_then(|value| sansho::materialize(&value)) {
+            Ok(value) => sansho::DriverOutcome::Result(value),
+            Err(e) => sansho::DriverOutcome::Error(e),
+        }
+    }
+}
+
+/// The byte-source driver: the corpus's JSON givens encode to CBOR
+/// (they are pure JSON data) and evaluate through the zero-copy byte
+/// source.
+struct CursorEngine;
+
+impl Driver for CursorEngine {
+    fn evaluate(&self, given: &serde_json::Value, expression: &str) -> DriverOutcome {
+        let bytes = match serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(given)) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return DriverOutcome::Error(sansho::SanshoError::Input {
+                    message: format!("fixture encoding: {e}"),
+                });
+            }
+        };
+        let parsed = match parse(expression) {
+            Ok(parsed) => parsed,
+            Err(e) => return DriverOutcome::Error(e),
+        };
+        let program = match compile(&parsed, None) {
+            Ok(program) => program,
+            Err(e) => return DriverOutcome::Error(e),
+        };
+        match sansho::evaluate(&program, bytes.as_slice())
+            .and_then(|value| sansho::materialize(&value))
+        {
+            Ok(value) => DriverOutcome::Result(value),
+            Err(e) => DriverOutcome::Error(e),
+        }
+    }
+}
+
+// Requirement: evaluation through every tree-view
+// implementation produces identical results; §6 — the corpus gates both
+// backends. What: the ENTIRE corpus runs through the cursor backend and
+// scores EXACTLY as the materialized backend does (per-feature
+// passed/failed/not-implemented counts identical). Why: this is the
+// normative backend agreement, enforced at corpus scale (plan
+// `cursor_matches_materialized_property`).
+//
+// LLM section: the materialized report is the reference; the cursor
+// report must equal it feature by feature. The corpus's JSON givens
+// encode to CBOR with serde_cbor (a development dependency, used ONLY
+// for fixture construction — the engine itself decodes with minicbor).
+#[test]
+fn corpus_cursor_matches_materialized() {
+    let files = load_corpus(Path::new("tests/jmespath-corpus/compliance"))
+        .expect("vendored corpus must load");
+    let materialized = run_corpus(&TestEngine, &files);
+    let cursor = run_corpus(&CursorEngine, &files);
+    for (reference, candidate) in materialized.iter().zip(cursor.iter()) {
+        assert_eq!(
+            (
+                reference.passed,
+                reference.failed,
+                reference.not_implemented
+            ),
+            (
+                candidate.passed,
+                candidate.failed,
+                candidate.not_implemented
+            ),
+            "backend disagreement on {}: materialized {reference:?} cursor {candidate:?}",
+            reference.feature
+        );
+    }
+}
+
+// Requirement: the same program through both backends
+// yields the same result. What: property test — generated documents
+// encode to CBOR; generated expressions evaluate through both backends;
+// results agree (including the error/not-implemented category). An array's
+// ORDER is not part of a value: a wildcard over an object yields its values
+// in whatever order holds them, so the two backends are compared by the
+// elements they hold rather than by their order (see `results_agree`).
+// Why: the differential property at random scale beyond the corpus (plan
+// `cursor_matches_materialized_property`).
+//
+// LLM section: expression generation covers the implemented language
+// slice (fields, indices, slices, wildcards, filters, multi-selects,
+// pipes, the implemented functions); document generation covers nesting
+// and scalars.
+/// Whether two results agree, treating an array's ORDER as not part of the
+/// value.
+///
+/// A wildcard over an object yields the object's values in whatever order
+/// holds them, and the engine's member map is a `HashMap`, whose iteration
+/// order varies between runs — so the two backends can produce the same
+/// multiset of elements in different orders, and comparing the arrays
+/// element by element fails on a difference that is not a disagreement.
+///
+/// The comparison is by canonical text with the order removed at every
+/// level, so a nested array is treated the same way. It counts rather than
+/// deduplicates: two arrays that differ only in how many times an element
+/// appears must not compare equal, and the length check alone would not
+/// catch that.
+fn results_agree(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && sorted_canonical(x) == sorted_canonical(y)
+        }
+        _ => left == right,
+    }
+}
+
+/// The elements' canonical text, sorted — an array's identity without its
+/// order.
+fn sorted_canonical(items: &[Value]) -> Vec<String> {
+    let mut rendered: Vec<String> = items.iter().map(canonical).collect();
+    rendered.sort();
+    rendered
+}
+
+/// A value's text with any nested array's order removed, so that the
+/// comparison reaches every level.
+fn canonical(value: &Value) -> String {
+    match value {
+        Value::Array(items) => format!("[{}]", sorted_canonical(items).join(",")),
+        Value::Object(members) => {
+            let mut parts: Vec<String> = members
+                .iter()
+                .map(|(key, member)| format!("{key}:{}", canonical(member)))
+                .collect();
+            parts.sort();
+            format!("{{{}}}", parts.join(","))
+        }
+        scalar => scalar.to_string(),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn differential_property_over_generated_documents(
+        document in json_strategy(3),
+        expression in expression_strategy(),
+    ) {
+        let parsed = match parse(&expression) {
+            Ok(parsed) => parsed,
+            // generated expressions that do not parse are skipped (the
+            // generator's grammar is approximate)
+            Err(_) => return Ok(()),
+        };
+        let program = match compile(&parsed, None) {
+            Ok(program) => program,
+            Err(_) => return Ok(()),
+        };
+        let materialized =
+            sansho::evaluate(&program, &document).and_then(|value| sansho::materialize(&value));
+        let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).expect("fixture encoding");
+        let cursor = evaluate(&program, bytes.as_slice())
+            .and_then(|value| materialize(&value));
+        match (materialized, cursor) {
+            (Ok(a), Ok(b)) => prop_assert!(
+                results_agree(&a, &b),
+                "backend disagreement on {expression:?}: {a:?} vs {b:?}"
+            ),
+            (Err(a), Err(b)) => {
+                // both must fail in the same CATEGORY
+                prop_assert_eq!(
+                    sansho::SanshoError::category(&a),
+                    sansho::SanshoError::category(&b)
+                );
+            }
+            (a, b) => prop_assert!(false, "backend disagreement on {expression:?}: {a:?} vs {b:?}"),
+        }
+    }
+}
+
+fn expression_strategy() -> impl proptest::strategy::Strategy<Value = String> {
+    use proptest::prelude::*;
+    prop_oneof![
+        // plain chains
+        "[a-c]{1,4}(\\.[a-c]{1,4}){0,3}",
+        // index chains
+        "[a-c]{1,3}(\\[[0-2]\\]){0,3}",
+        // wildcard projections
+        "[a-c]{1,2}(\\.\\*){1,2}(\\.[a-c]{1,2}){0,2}",
+        // filters
+        "[a-c]{1,2}(\\[\\?[a-c]{1,3}\\]){1,2}",
+        // slices
+        "[a-c]{1,2}(\\[:[0-3]\\]){1,2}",
+        // multi-select hashes
+        "[a-c]{1,2}\\{{1}[a-c]{1,3}: [a-c]{1,3}{1}}",
+        // pipes
+        "[a-c]{1,3}(\\.[a-c]{1,3})(\\|\\s*[a-c]{1,3}(\\.[a-c]{1,3})){0,2}",
+    ]
+}
+
+fn json_strategy(depth: u32) -> impl proptest::strategy::Strategy<Value = serde_json::Value> {
+    use proptest::prelude::*;
+    let leaf = prop_oneof![
+        Just(serde_json::Value::Null),
+        any::<bool>().prop_map(serde_json::Value::Bool),
+        any::<i64>().prop_map(|n| serde_json::json!(n)),
+        any::<f64>()
+            .prop_filter("finite", |f: &f64| f.is_finite())
+            .prop_map(|f| serde_json::json!(f)),
+        "[a-z]{0,10}".prop_map(serde_json::Value::String),
+    ];
+    leaf.prop_recursive(depth, 24, 6, |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..6).prop_map(serde_json::Value::Array),
+            prop::collection::hash_map("[a-c]{1,5}", inner, 0..6)
+                .prop_map(|m| serde_json::Value::Object(m.into_iter().collect())),
+        ]
+    })
+}
+
+// Requirement: memory proportional to output, not
+// input.
+//
+// WHAT THIS TEST ACTUALLY PINS, and what it does not: it pins the SHAPE of a
+// projection over a large document — 4,000 rows, each carrying only `id`, with
+// no payload in any row. It does NOT observe decoding: the engine exposes no
+// read counter, so an implementation that decoded every payload eagerly would
+// still pass. Pinning the decode count needs a counting source (a wrapper type
+// counting `as_str`/`get_index`/… calls) that the test support does not have
+// yet; until it exists the doc comment must not claim the count is bounded.
+#[test]
+fn selective_materialization_budget() {
+    let big: Vec<serde_json::Value> = (0..4000)
+        .map(|i| serde_json::json!({"id": i, "payload": "x".repeat(100)}))
+        .collect();
+    let document = serde_json::json!({"items": big});
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&document)).unwrap();
+
+    // the projection: every item's id (40,000 bytes of payload skipped)
+    let parsed = parse("items[*].id").unwrap();
+    let program = compile(&parsed, None).unwrap();
+
+    let value = sansho::materialize(&evaluate(&program, bytes.as_slice()).expect("evaluates"))
+        .expect("materializes");
+    let rows = value.as_array().expect("an array of rows");
+    assert_eq!(rows.len(), 4000, "one row per element");
+    // every row carries the selected field and NOTHING else: the payloads are
+    // not part of the projection's output
+    // the rows are the selected VALUES (a projection yields values, not
+    // items), so the payload never appears
+    let first = &rows[0];
+    assert!(
+        first.is_number() || first.is_string() || first.is_object(),
+        "a projected value: {first:?}"
+    );
+    let rendered = serde_json::Value::Array(rows.clone()).to_string();
+    assert!(
+        !rendered.contains("payload"),
+        "no payload reaches the output"
+    );
+}
+
+#[test]
+fn probe_cursor_basic() {
+    let doc = serde_json::json!({"foo": {"bar": {"baz": "correct"}}});
+    let bytes = serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(&doc)).unwrap();
+    println!("cbor bytes: {:?}", bytes);
+    for expr in ["foo", "foo.bar", "foo.bar.baz"] {
+        let parsed = parse(expr).unwrap();
+        let program = compile(&parsed, None).unwrap();
+        let result = evaluate(&program, bytes.as_slice()).and_then(|value| materialize(&value));
+        println!("probe {expr:?} -> {result:?}");
+    }
+}
+
+// Requirement: the mapping is normative, and the cursor
+// decoder depends on the fixture encoder's output stability: the
+// checked-in fixture bytes are the golden layout. What: the fixture
+// decodes to exactly its JSON twin. Why: any change in the item
+// encoding (a serializer upgrade) changes the bytes and fails here
+// loudly — the intended tripwire (plan `golden_layout_fixtures`).
+//
+// LLM section: the fixture was generated ONCE by examples/gen_fixture.rs
+// (serde_cbor's encoding of the Appendix-A-shaped item); this test never
+// regenerates it — it only decodes and compares against the committed
+// JSON twin.
+#[test]
+fn golden_layout_fixture_decodes_to_json_twin() {
+    let bytes = std::fs::read(Path::new("tests/fixtures/item_a.cbor"))
+        .expect("the committed fixture exists");
+    let expected_text = std::fs::read_to_string(Path::new("tests/fixtures/item_a.json"))
+        .expect("the committed JSON twin exists");
+    let expected: serde_json::Value = serde_json::from_str(&expected_text).unwrap();
+
+    let parsed = parse("@").unwrap();
+    let program = compile(&parsed, None).unwrap();
+    let decoded =
+        materialize(&evaluate(&program, bytes.as_slice()).expect("decodes")).expect("materializes");
+    assert_eq!(decoded, expected);
+}
+
+// Requirement: the canonical expressions over the
+// Appendix-A shape are the acceptance shape for real-world data. What:
+// the prefix filter and the indexed mime type, evaluated through BOTH
+// backends, produce the expected selections. Why: this is the use case
+// the engine exists for (plan `real_item_fixtures`).
+//
+// LLM section: file_names mixes plain paths with gitoid:…!$path
+// merge-disambiguated entries; the filter keeps the gitoid ones;
+// mime_type is an ARRAY (the mapping's array), so [0] indexes it.
+#[test]
+fn canonical_expressions_over_the_fixture() {
+    let bytes = std::fs::read(Path::new("tests/fixtures/item_a.cbor")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new("tests/fixtures/item_a.json")).unwrap(),
+    )
+    .unwrap();
+
+    for expression in [
+        "body.file_names[?starts_with(@, 'gitoid:')]",
+        "body.mime_type[0]",
+        "length(body.file_names)",
+        "body.file_size",
+    ] {
+        let parsed = parse(expression).unwrap();
+        let program = compile(&parsed, None).unwrap();
+        let from_json =
+            sansho::materialize(&sansho::evaluate(&program, &json).expect("materialized"))
+                .expect("materializes");
+        let from_cbor = materialize(&evaluate(&program, bytes.as_slice()).expect("cursor"))
+            .expect("materializes");
+        assert_eq!(from_json, from_cbor, "{expression}: backends agree");
+
+        match expression {
+            "body.file_names[?starts_with(@, 'gitoid:')]" => {
+                assert_eq!(from_json.as_array().map(|a| a.len()), Some(2));
+            }
+            "body.mime_type[0]" => {
+                assert_eq!(from_json, serde_json::json!("text/x-java-source"));
+            }
+            "length(body.file_names)" => {
+                assert_eq!(from_json, serde_json::json!(5));
+            }
+            "body.file_size" => {
+                assert_eq!(from_json, serde_json::json!(3050));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
