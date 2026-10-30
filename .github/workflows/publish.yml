@@ -91,6 +91,7 @@ jobs:
           outputs: type=oci,dest=target/release/bigtent-image.oci.tar
 
       - name: Index and Upload ADG
+        if: vars.SPICE_LABS_UPLOADS == 'on'
         uses: spice-labs-inc/action-spice-labs-surveyor@v5
         with:
           spice_pass: "${{ secrets.SPICE_PASS }}"
