@@ -103,7 +103,77 @@ pub const GOAT_RODEO_DATA_FILE_SUFFIX: &str = "grd";
 pub const GOAT_RODEO_INDEX_FILE_SUFFIX: &str = "gri";
 pub const GOAT_RODEO_CLUSTER_FILE_SUFFIX: &str = "grc";
 
+/// The raw byte span of a length-prefixed CBOR item at `pos` within a
+/// data-file byte slice: `[u32 LE length][CBOR item]`. Pure byte-level
+/// (no decode, no I/O) so it is testable without a mapped file.
+pub fn read_item_bytes_at(data: &[u8], pos: usize) -> Option<&[u8]> {
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let length =
+        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+    let start = pos + 4;
+    let end = start.checked_add(length)?;
+    if end > data.len() {
+        return None;
+    }
+    Some(&data[start..end])
+}
+
 impl DataFile {
+    /// The raw byte span of the length-prefixed item at `pos`, WITHOUT
+    /// decoding it: the Sansho integration interface's no-decode accessor —
+    /// the engine walks the bytes selectively, so the host must not
+    /// decode first (that would defeat selective materialization).
+    ///
+    /// Returns the CBOR bytes of the item itself (without the length
+    /// prefix), or `None` when the position/length is out of range.
+    pub fn read_item_bytes_at(&self, pos: usize) -> Option<&[u8]> {
+        read_item_bytes_at(self.file.as_ref(), pos)
+    }
+
+    /// Read the raw byte span of the length-prefixed item at `pos`,
+    /// WITHOUT deserializing it. This is the byte path's read: the Sansho
+    /// integration walks the returned span selectively, so nothing here
+    /// may decode.
+    ///
+    /// An unreadable length, or a length that claims more bytes than the
+    /// mapped file has remaining (which would otherwise permit a
+    /// multi-gigabyte allocation per lookup), is an `Err` naming the file
+    /// and offset (H3). The lookup boundary logs the error and reports
+    /// the item as absent.
+    pub fn read_bytes_at(&self, pos: usize) -> Result<&[u8]> {
+        let file_len = self.file.len();
+        if pos >= file_len || file_len - pos < 4 {
+            bail!(
+                "Offset {} is past the end of data file {:016x}.{} ({} bytes)",
+                pos,
+                self.hash,
+                GOAT_RODEO_DATA_FILE_SUFFIX,
+                file_len
+            );
+        }
+        let mut my_reader: &[u8] = &self.file[pos..];
+
+        let item_len = read_u32_sync(&mut my_reader)?;
+
+        // H3: reject lengths beyond the remaining mapped bytes BEFORE the
+        // allocation, so a corrupt or malicious length cannot trigger a
+        // multi-gigabyte allocation.
+        if item_len as usize > my_reader.len() {
+            bail!(
+                "Item length {} at offset {} in data file {:016x}.{} exceeds the remaining {} bytes",
+                item_len,
+                pos,
+                self.hash,
+                GOAT_RODEO_DATA_FILE_SUFFIX,
+                my_reader.len()
+            );
+        }
+
+        Ok(&self.file[(pos + 4)..(pos + 4 + item_len as usize)])
+    }
+
     pub async fn new(dir: &PathBuf, hash: u64, expected_envelope_version: u32) -> Result<DataFile> {
         let mut data_file = GoatRodeoCluster::find_data_or_index_file_from_sha256(
             dir,
@@ -404,7 +474,7 @@ mod tests {
 
         // a missing connections member is tolerated in both versions
         let no_conn = item_bytes_without_connections("gitoid:blob:sha256:noconn");
-        let hash = write_grd(dir.path(), 2, &[no_conn.clone()]).unwrap();
+        let hash = write_grd(dir.path(), 2, std::slice::from_ref(&no_conn)).unwrap();
         let df = open(dir.path(), hash, 2);
         assert!(df.read_item_at(df.data_offset).is_ok());
         let hash = write_grd(dir.path(), 1, &[no_conn]).unwrap();

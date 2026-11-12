@@ -67,7 +67,7 @@ use serde::Serialize;
 
 use crate::{
     item::{Item, ItemV3},
-    rodeo::{goat_trait::GoatRodeoTrait, holder::ClusterHolder},
+    rodeo::{goat_herd::GoatHerd, goat_trait::GoatRodeoTrait, holder::ClusterHolder},
 };
 #[cfg(test)]
 use std::println as info;
@@ -138,26 +138,33 @@ pub enum ItemFormat {
     V4,
 }
 
+/// The media type Prometheus scrapes: one constant, used by every handler that
+/// serves the exposition format, so two endpoints cannot advertise it differently.
+pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
 impl ItemFormat {
     /// The static rejection message (no internal details).
     pub const BAD_FORMAT_MESSAGE: &str = "The 'item_format' parameter must be one of: v3, v4";
 
     /// Parse the `item_format` parameter out of the raw query string.
     ///
-    /// The handlers use `Query<HashMap<String, String>>`, which is
-    /// silently last-wins on duplicates; conflicting duplicates must be
-    /// detected, so this parses the raw query itself.
+    /// The handlers use `Query<HashMap<String, String>>`, which is silently
+    /// last-wins on duplicates; conflicting duplicates must be detected, so the
+    /// pairs are read with `form_urlencoded` — the protocol's own parser, not a
+    /// split on `&` and `=`.
     pub fn from_raw_query(raw: Option<&str>) -> Result<Self, String> {
         let mut chosen: Option<ItemFormat> = None;
         if let Some(query) = raw {
-            for pair in query.split('&') {
-                let mut parts = pair.splitn(2, '=');
-                let key = parts.next().unwrap_or("");
+            // `form_urlencoded` is the application/x-www-form-urlencoded parser the
+            // crate already depends on through `url`. It yields decoded (key, value)
+            // pairs, preserves duplicates, and maps `+` to a space — the three things
+            // a hand-rolled `split('&')` gets wrong, and the same rules axum's own
+            // `Query` extractor applies to every other parameter.
+            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
                 if key != "item_format" {
                     continue;
                 }
-                let value = parts.next().unwrap_or("");
-                let this = match value {
+                let this = match value.as_ref() {
                     "v4" => ItemFormat::V4,
                     "v3" => ItemFormat::V3,
                     _ => return Err(ItemFormat::BAD_FORMAT_MESSAGE.to_string()),
@@ -199,10 +206,14 @@ async fn stream_items<GRT: GoatRodeoTrait + 'static>(
 
     tokio::spawn(async move {
         for item_id in items {
-            if let Some(i) = rodeo.get_cluster().item_for_identifier(&item_id)
-                && !mtx.is_closed()
-            {
-                let _ = mtx.send(i).await;
+            if let Some(i) = rodeo.get_cluster().item_for_identifier(&item_id) {
+                // the `is_closed` check this replaces was a TOCTOU: the receiver
+                // can close between the check and the send, and the send's failure
+                // was discarded. A failed send IS the consumer being gone, so the
+                // stream stops resolving items for a client that left.
+                if mtx.send(i).await.is_err() {
+                    break;
+                }
             }
         }
     });
@@ -397,15 +408,17 @@ async fn readyz<GRT: GoatRodeoTrait + 'static>(
 async fn serve_metrics<GRT: GoatRodeoTrait + 'static>(
     State(rodeo): State<Arc<ClusterHolder<GRT>>>,
 ) -> Result<Response, StatusCode> {
-    // Update dynamic gauges before scraping
-    let info = rodeo.health_info();
-    let _ = info; // health_info() already updates the gauges
+    // Update the dynamic gauges before scraping. The call is the point: it
+    // recomputes the gauges, and its return value is for the HEALTH endpoint, so
+    // binding it here only to discard it said the opposite.
+    rodeo.health_info();
 
     match rodeo.metrics().encode() {
-        Ok(body) => Ok(Response::builder()
-            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-            .body(body.into())
-            .unwrap()),
+        Ok(body) => Ok((
+            [(axum::http::header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+            body,
+        )
+            .into_response()),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -914,6 +927,26 @@ async fn serve_north_purls_bulk<GRT: GoatRodeoTrait + 'static>(
     do_north(rodeo, payload, true, ItemFormat::V3).await
 }
 
+/// THE STATUS A FAILED PURL READ DESERVES.
+///
+/// Only "the file is not there" is a 404. A permission failure, a truncated read or a
+/// write failure is the SERVER's problem: reporting it as "no purls.txt" names a cause
+/// that is not the one, and hides a broken deployment behind a routine answer.
+pub fn purl_failure(error: &anyhow::Error) -> (StatusCode, Json<String>) {
+    let missing = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::NotFound);
+    if missing {
+        (StatusCode::NOT_FOUND, Json("no purls.txt".into()))
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(format!("the PURL list could not be read: {error}")),
+        )
+    }
+}
+
 /// Download the purls.txt file containing all Package URLs in the cluster.
 ///
 /// Returns the raw purls.txt file as a downloadable text file.
@@ -931,14 +964,16 @@ async fn gimme_purls<GRT: GoatRodeoTrait + 'static>(
     req: ExtractRequest,
 ) -> Result<Response<ServeFileSystemResponseBody>, (StatusCode, Json<String>)> {
     match rodeo.get_purl() {
-        Err(_) => Err((StatusCode::NOT_FOUND, Json("no purls.txt".into()))),
+        Err(error) => Err(purl_failure(&error)),
         Ok(path) => {
             match tower_http::services::ServeFile::new(path)
                 .try_call(req)
                 .await
             {
                 Ok(v) => Ok(v),
-                Err(_) => Err((StatusCode::NOT_FOUND, Json("no purls.txt".into()))),
+                // the file was resolved a moment ago, so a failure here is the read's,
+                // and only a vanished file is a 404
+                Err(error) => Err(purl_failure(&anyhow::Error::new(error))),
             }
         }
     }
@@ -1120,19 +1155,26 @@ pub async fn metrics_middleware<GRT: GoatRodeoTrait + 'static>(
     response
 }
 
-pub async fn run_web_server<GRT: GoatRodeoTrait + 'static>(
-    index: Arc<ClusterHolder<GRT>>,
-) -> Result<()> {
+pub async fn run_web_server(index: Arc<ClusterHolder<GoatHerd>>) -> Result<()> {
     let state = index.clone();
     let addrs = index.the_args().to_socket_addrs();
     info!("Listen on {:?}", addrs);
 
     let app =
-        build_route(state.clone()).layer(middleware::from_fn_with_state(state, metrics_middleware));
+        build_route(state.clone())
+            .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
+
+    // V2 is served under its PREFIX ONLY — /v2 and /omnibor/v2. Its operational
+    // paths (health, metrics, purls, node_count, openapi) are the same names V1
+    // serves at the root, and merging two routers that both define /health panics;
+    // the prefix is what keeps the two surfaces distinct while both are served.
+    let queries = Arc::new(crate::highwire::compiler::QueryCache::new(4096));
+    let v2_state = Arc::new(crate::api_v2::V2State::new(index.clone(), queries));
+    let v2_bare = Router::new().nest("/v2", crate::api_v2::router_v2(v2_state.clone()));
+    let v2_nested = Router::new().nest("/omnibor/v2", crate::api_v2::router_v2(v2_state));
 
     let nested = Router::new().nest("/omnibor", app.clone());
-
-    let aggregated = nested.merge(app);
+    let aggregated = nested.merge(app).merge(v2_bare).merge(v2_nested);
 
     let s: &[SocketAddr] = &addrs;
     let listener = tokio::net::TcpListener::bind(s).await?;

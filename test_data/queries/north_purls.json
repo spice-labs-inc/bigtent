@@ -1,0 +1,19 @@
+{
+  "phases": [
+    {
+      "name": "walk",
+      "roots": {"from-input": true},
+      "walk": ["alias:to", "tag:from", "contained:up", "build:up"],
+      "emit": {
+        "expr": "connections.\"alias:from\"[?starts_with(@, 'pkg:')]",
+        "unnest": true
+      }
+    },
+    {
+      "name": "unique",
+      "barker": "for row in input:\n    emit(row)",
+      "dedup": true,
+      "inputs": ["walk"]
+    }
+  ]
+}

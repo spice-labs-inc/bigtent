@@ -1,0 +1,27 @@
+{
+  "phases": [
+    {
+      "name": "walk",
+      "roots": {"from-input": true},
+      "walk": ["alias:to", "contained:down", "build:down"],
+      "emit": [
+        {
+          "expr": "connections.\"contained:down\"[*]",
+          "unnest": true,
+          "if": "length(connections.\"build:down\" || `[]`) > `0`"
+        },
+        {
+          "expr": "connections.\"build:down\"[*]",
+          "unnest": true,
+          "if": "length(connections.\"build:down\" || `[]`) > `0`"
+        }
+      ]
+    },
+    {
+      "name": "unique",
+      "barker": "for row in input:\n    emit(row)",
+      "dedup": true,
+      "inputs": ["walk"]
+    }
+  ]
+}

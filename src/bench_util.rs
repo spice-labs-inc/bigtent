@@ -92,7 +92,6 @@ impl SyntheticItemGenerator {
         items
     }
 
-    #[allow(clippy::collapsible_if)] // nested offset/item chain reads in write order
     fn generate_item(&self, idx: usize, rng: &mut StdRng) -> Item {
         let gitoid = format!("gitoid:blob:sha256:{:016x}", idx);
         let file_size = rng.random_range(100..10000);

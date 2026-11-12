@@ -1,0 +1,185 @@
+[
+  {
+    "identifier": "pkg:maven/uk.co.real-logic/artio-core@0.118",
+    "connections": {
+      "alias:to": [
+        "gitoid:blob:sha256:8eba64f7eef0da9c9312a51033c61ee3f5c981edb6e34dc6b986ad65de56d515"
+      ]
+    },
+    "body_mime_type": null,
+    "body": {
+      "extra": {},
+      "file_names": [
+        "pkg:maven/uk.co.real-logic/artio-core@0.118"
+      ],
+      "file_size": 0,
+      "mime_type": []
+    }
+  },
+  {
+    "identifier": "pkg:maven/uk.co.real-logic/artio-codecs@0.118",
+    "connections": {
+      "alias:to": [
+        "gitoid:blob:sha256:8eba64f7eef0da9c9312a51033c61ee3f5c981edb6e34dc6b986ad65de56d515"
+      ]
+    },
+    "body_mime_type": null,
+    "body": {
+      "extra": {},
+      "file_names": [
+        "pkg:maven/uk.co.real-logic/artio-codecs@0.118"
+      ],
+      "file_size": 0,
+      "mime_type": []
+    }
+  },
+  {
+    "identifier": "pkg:deb/debian/tk8.6@8.6.14-1build1?arch=amd64",
+    "connections": {},
+    "body_mime_type": null,
+    "body": null
+  },
+  {
+    "identifier": "gitoid:blob:sha256:8eba64f7eef0da9c9312a51033c61ee3f5c981edb6e34dc6b986ad65de56d515",
+    "connections": {
+      "alias:from": [
+        "pkg:maven/uk.co.real-logic/artio-core@0.118",
+        "pkg:maven/uk.co.real-logic/artio-codecs@0.118"
+      ],
+      "contained:down": [
+        "gitoid:blob:sha256:cacfa4827b6f2e4930c5488c50a81731f0d2b975e9517ffcd3a2bade93ccb6a1",
+        "gitoid:blob:sha256:f48177aaf70b8d330e92bc8fe1be5bf39c7385a37a8313c070d7fa1a6205bddc",
+        "gitoid:blob:sha256:65fb1731438b234b57c75b4c43141f2d77e616227829d06b53e32a0fd37a1537"
+      ],
+      "contained:up": []
+    },
+    "body_mime_type": "application/java-archive",
+    "body": {
+      "extra": {},
+      "file_names": [
+        "repo_ea/artio-core-0.118.jar"
+      ],
+      "file_size": 513213,
+      "mime_type": [
+        "application/java-archive"
+      ]
+    }
+  },
+  {
+    "identifier": "gitoid:blob:sha256:64ae3426902dad67ada5070599c738d3d44f476cc60243ded9811af6b9d299fe",
+    "connections": {
+      "contained:down": [
+        "gitoid:blob:sha256:cacfa4827b6f2e4930c5488c50a81731f0d2b975e9517ffcd3a2bade93ccb6a1"
+      ],
+      "contained:up": []
+    },
+    "body_mime_type": "application/java-archive",
+    "body": {
+      "extra": {},
+      "file_names": [
+        "repo_ea/artio-codecs-0.118.jar"
+      ],
+      "file_size": 412000,
+      "mime_type": [
+        "application/java-archive"
+      ]
+    }
+  },
+  {
+    "identifier": "gitoid:blob:sha256:65fb1731438b234b57c75b4c43141f2d77e616227829d06b53e32a0fd37a1537",
+    "connections": {
+      "contained:down": [
+        "gitoid:blob:sha256:8d0dee982200d5e2fc23f592dc96f0294802033347364fdbdb9ebbb2bf3832e1"
+      ],
+      "contained:up": [
+        "gitoid:blob:sha256:8eba64f7eef0da9c9312a51033c61ee3f5c981edb6e34dc6b986ad65de56d515"
+      ]
+    },
+    "body_mime_type": "application/java-archive",
+    "body": {
+      "extra": {},
+      "file_names": [
+        "BOOT-INF/lib/javassist-3.21.0-GA.jar"
+      ],
+      "file_size": 741000,
+      "mime_type": [
+        "application/java-archive"
+      ]
+    }
+  },
+  {
+    "identifier": "gitoid:blob:sha256:cacfa4827b6f2e4930c5488c50a81731f0d2b975e9517ffcd3a2bade93ccb6a1",
+    "connections": {
+      "contained:up": [
+        "gitoid:blob:sha256:8eba64f7eef0da9c9312a51033c61ee3f5c981edb6e34dc6b986ad65de56d515",
+        "gitoid:blob:sha256:64ae3426902dad67ada5070599c738d3d44f476cc60243ded9811af6b9d299fe"
+      ]
+    },
+    "body_mime_type": "application/java-vm",
+    "body": {
+      "extra": {},
+      "file_names": [
+        "artio/EncodingException.class"
+      ],
+      "file_size": 1234,
+      "mime_type": [
+        "application/java-vm"
+      ]
+    }
+  },
+  {
+    "identifier": "gitoid:blob:sha256:f48177aaf70b8d330e92bc8fe1be5bf39c7385a37a8313c070d7fa1a6205bddc",
+    "connections": {
+      "contained:up": [
+        "gitoid:blob:sha256:8eba64f7eef0da9c9312a51033c61ee3f5c981edb6e34dc6b986ad65de56d515"
+      ]
+    },
+    "body_mime_type": "application/java-vm",
+    "body": {
+      "extra": {},
+      "file_names": [
+        "artio/core/CoreOnly.class"
+      ],
+      "file_size": 2345,
+      "mime_type": [
+        "application/java-vm"
+      ]
+    }
+  },
+  {
+    "identifier": "gitoid:blob:sha256:8d0dee982200d5e2fc23f592dc96f0294802033347364fdbdb9ebbb2bf3832e1",
+    "connections": {
+      "contained:up": [
+        "gitoid:blob:sha256:65fb1731438b234b57c75b4c43141f2d77e616227829d06b53e32a0fd37a1537"
+      ]
+    },
+    "body_mime_type": "application/java-vm",
+    "body": {
+      "extra": {},
+      "file_names": [
+        "javassist/expr/FieldAccess.class"
+      ],
+      "file_size": 3456,
+      "mime_type": [
+        "application/java-vm"
+      ]
+    }
+  },
+  {
+    "identifier": "tag:sha256:f867d30b9066b32864b69fa2ab7a28efc35c6920",
+    "connections": {
+      "tag:from": [
+        "gitoid:blob:sha256:8eba64f7eef0da9c9312a51033c61ee3f5c981edb6e34dc6b986ad65de56d515"
+      ]
+    },
+    "body_mime_type": null,
+    "body": {
+      "extra": {},
+      "file_names": [
+        "tag:sha256:f867d30b9066b32864b69fa2ab7a28efc35c6920"
+      ],
+      "file_size": 0,
+      "mime_type": []
+    }
+  }
+]

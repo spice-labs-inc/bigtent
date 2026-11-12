@@ -1,0 +1,19 @@
+{
+  "phases": [
+    {
+      "name": "walk",
+      "roots": {"from-input": true},
+      "walk": ["alias:to", "contained:down"],
+      "emit": {
+        "expr": "connections.\"contained:down\"[*]",
+        "unnest": true
+      }
+    },
+    {
+      "name": "unique",
+      "barker": "for row in input:\n    emit(row)",
+      "dedup": true,
+      "inputs": ["walk"]
+    }
+  ]
+}

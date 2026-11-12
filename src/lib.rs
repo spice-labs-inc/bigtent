@@ -1,3 +1,12 @@
+// THE SANSJO ERROR TYPE IS DELIBERATELY LARGE: it carries a span, the document path
+// and the expression text, because a diagnostic that cannot point at anything is the
+// string-wrapped error this project removed. Boxing it would put an allocation on the
+// failure path of every projection.
+#![expect(
+    clippy::result_large_err,
+    reason = "the error carries its location and its source by design"
+)]
+
 //! # BigTent - An Opinionated Graph Database for Software Artifacts
 //!
 //! BigTent is a high-performance graph database designed to serve millions of GitOIDs
@@ -52,11 +61,15 @@
 //! - `.gri` - Index files (GitOID → data offset mapping)
 //! - `.grd` - Data files (CBOR-encoded Items)
 
+pub mod api_v2;
+pub mod barker;
 pub mod bench_util;
 pub mod cluster_list;
 pub mod compare;
 pub mod config;
 pub mod fresh_merge;
+pub mod highwire;
+pub mod item_sansho_impl;
 pub mod main_utils;
 pub mod pid_file;
 pub mod server;

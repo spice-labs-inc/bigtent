@@ -169,8 +169,8 @@ pub async fn merge_fresh<PB: Into<PathBuf>>(
 /// temporary root for converted sources (default: a random directory
 /// under the system temporary directory); `force_temp_dir` overrides the
 /// ownership/permission safety checks on an explicit root (logged).
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::collapsible_if)] // mixed-version checks nest for readability
+#[expect(clippy::too_many_arguments)]
+#[expect(clippy::collapsible_if)] // mixed-version checks nest for readability
 pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
     clusters: Vec<Arc<HerdMember>>,
     merge_buffer_limit: usize,
@@ -525,12 +525,15 @@ pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
                             for (edge_type, targets) in item.connections {
                                 connections.entry(edge_type).or_default().extend(targets);
                             }
-
+                            // todo!("WHAT THE FUCK IS UNWRAP??");
                             let body: ItemMetaData = from_value(item.body.unwrap()).unwrap();
                             file_size = body.file_size;
                             bodies.push(body);
                         }
 
+                        // todo!(
+                        //     "WHAT THE FUCK IS THIS? merging should be handled in Item not in this code!!!"
+                        // );
                         let mut extra = BTreeMap::new();
                         let mut file_names = BTreeSet::new();
                         let mut mime_type = BTreeSet::new();
@@ -550,7 +553,9 @@ pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
 
                             file_names.append(&mut body.file_names);
                         }
-
+                        // todo!(
+                        //     "WHAT THE FUCK IS THIS? It makes assumptions of what the body looks like!! Bodies are *NOT ALWAYS* ItemMetaData!!!"
+                        // );
                         Item {
                             identifier: id,
                             connections,
@@ -1346,7 +1351,7 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod phase3_merge_tests {
-    #![allow(clippy::await_holding_lock, clippy::collapsible_if)] // test guards serializes tests; nested test asserts read clearly
+    #![expect(clippy::await_holding_lock, clippy::collapsible_if)] // test guards serializes tests; nested test asserts read clearly
     use super::*;
     use crate::item::ITEM_METADATA_MIME_TYPE;
     use crate::rodeo::goat::GoatRodeoCluster;
@@ -2117,7 +2122,7 @@ pub(crate) mod phase3_merge_tests {
             }
             items.push(Item {
                 identifier: id,
-                connections: connections,
+                connections,
                 body_mime_type: Some(ITEM_METADATA_MIME_TYPE.to_string()),
                 body: Some(serde_cbor::Value::Map(Default::default())),
             });

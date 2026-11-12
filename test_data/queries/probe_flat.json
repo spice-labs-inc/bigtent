@@ -1,0 +1,6 @@
+{
+  "phases": [
+    {"name": "jars", "roots": ["pkg:maven/uk.co.real-logic/artio-core@0.118"],
+     "walk": ["contained:down"], "emit": "identifier"}
+  ]
+}
