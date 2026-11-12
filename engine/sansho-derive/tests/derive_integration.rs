@@ -1,3 +1,10 @@
+// The engine's error carries its location and its source by design; the same
+// expectation the library crates declare, restated because a test is its own crate.
+#![expect(
+    clippy::result_large_err,
+    reason = "the error carries its location and its source by design"
+)]
+
 //! The derive's integration test: a derived struct used as a Sansho
 //! source, through the public entry points.
 //!

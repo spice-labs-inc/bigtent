@@ -525,12 +525,15 @@ pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
                             for (edge_type, targets) in item.connections {
                                 connections.entry(edge_type).or_default().extend(targets);
                             }
-
+                            // todo!("WHAT THE FUCK IS UNWRAP??");
                             let body: ItemMetaData = from_value(item.body.unwrap()).unwrap();
                             file_size = body.file_size;
                             bodies.push(body);
                         }
 
+                        // todo!(
+                        //     "WHAT THE FUCK IS THIS? merging should be handled in Item not in this code!!!"
+                        // );
                         let mut extra = BTreeMap::new();
                         let mut file_names = BTreeSet::new();
                         let mut mime_type = BTreeSet::new();
@@ -550,7 +553,9 @@ pub async fn merge_fresh_with_options<PB: Into<PathBuf>>(
 
                             file_names.append(&mut body.file_names);
                         }
-
+                        // todo!(
+                        //     "WHAT THE FUCK IS THIS? It makes assumptions of what the body looks like!! Bodies are *NOT ALWAYS* ItemMetaData!!!"
+                        // );
                         Item {
                             identifier: id,
                             connections,

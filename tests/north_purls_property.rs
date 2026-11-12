@@ -288,6 +288,16 @@ proptest! {
         // V2: the template
         let v2 = v2_rows(&graph, lookup, "north_purls").expect("the template runs");
         assert_eq!(v2, reference, "V2 matches the reference model — graph {graph:?}");
+
+        // THE DEVIATION IS ONE-DIRECTIONAL: V2 emits everything V1 emits, and
+        // sometimes more (the round-frontier suppression). If this ever flips, V2 has
+        // lost an emission it used to make and the documented deviation is wrong.
+        for emitted in &v1 {
+            assert!(
+                v2.contains(emitted),
+                "V2 must emit every target V1 emits: `{emitted}` missing — graph {graph:?}"
+            );
+        }
     }
 }
 
@@ -364,7 +374,14 @@ fn flatten_strategy() -> impl Strategy<Value = Graph> {
         })
 }
 
-fn expected_flatten(graph: &Graph) -> HashSet<String> {
+/// V1'S rule, mirrored EXACTLY — the DEVIATING side.
+///
+/// V2 does NOT match this. The owner's ruling
+/// (`discussions/2026_11_02_flatten_v1_v2_deviation.md`): V1 drops a contained
+/// target that is already in the round's frontier, which makes its payload depend
+/// on traversal order. The model is kept so the property test can pin V1 to its own
+/// behaviour, which is what keeps the deviation visible instead of hidden.
+fn expected_flatten_v1(graph: &Graph) -> HashSet<String> {
     // V1's rule, mirrored EXACTLY: a round-based BFS in which a target is
     // emitted only when it is in neither THIS round's set nor the processed set.
     // Two consequences the worklist model this replaces got wrong — and the
@@ -405,14 +422,48 @@ fn expected_flatten(graph: &Graph) -> HashSet<String> {
     emitted
 }
 
+/// V2'S rule — the one that is correct.
+///
+/// `alias:to` is NAVIGATION; `contained:down` is both navigation and emission, so
+/// every `contained:down` target of an item reachable from the root is emitted,
+/// deduplicated. There is no frontier, so a target reached by two different edges is
+/// emitted once and never suppressed for having been reached first by another edge —
+/// which is the deviation from V1, and the behaviour this project intends.
+fn expected_flatten_v2(graph: &Graph) -> HashSet<String> {
+    let mut emitted: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut frontier: Vec<String> = vec![graph.root.clone()];
+    while let Some(identifier) = frontier.pop() {
+        if !seen.insert(identifier.clone()) {
+            continue;
+        }
+        let Some(item) = graph.items.iter().find(|i| i.identifier == identifier) else {
+            continue;
+        };
+        for (edge, targets) in &item.connections {
+            for target in targets {
+                if edge == "contained:down" {
+                    emitted.insert(target.clone());
+                }
+                frontier.push(target.clone());
+            }
+        }
+    }
+    emitted
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn flatten_three_ways_agree_on_every_generated_graph(graph in flatten_strategy()) {
-        let expected = expected_flatten(&graph);
-        let mut reference: Vec<String> = expected.iter().cloned().collect();
-        reference.sort();
+        // each implementation is pinned to the rule it actually implements, because
+        // the two rules DIFFER on a documented shape; asserting both against one
+        // reference would force one side to be "wrong" in the test
+        let mut reference_v1: Vec<String> = expected_flatten_v1(&graph).into_iter().collect();
+        reference_v1.sort();
+        let mut reference_v2: Vec<String> = expected_flatten_v2(&graph).into_iter().collect();
+        reference_v2.sort();
 
         let member = graph.as_member();
         let lookup = HerdOrCluster::Herd(Arc::new(GoatHerd::new(vec![member])));
@@ -424,10 +475,20 @@ proptest! {
             _ => unreachable!(),
         };
         let v1 = runtime_block(herd, &graph);
-        assert_eq!(v1, reference, "V1 matches the reference model — graph {graph:?}");
+        assert_eq!(v1, reference_v1, "V1 follows V1's rule — graph {graph:?}");
 
         // V2: the template
         let v2 = v2_rows(&graph, lookup, "flatten").expect("the template runs");
-        assert_eq!(v2, reference, "V2 matches the reference model — graph {graph:?}");
+        assert_eq!(v2, reference_v2, "V2 follows V2's rule — graph {graph:?}");
+
+        // THE DEVIATION IS ONE-DIRECTIONAL: V2 emits everything V1 emits, and
+        // sometimes more (the round-frontier suppression). If this ever flips, V2 has
+        // lost an emission it used to make and the documented deviation is wrong.
+        for emitted in &v1 {
+            assert!(
+                v2.contains(emitted),
+                "V2 must emit every target V1 emits: `{emitted}` missing — graph {graph:?}"
+            );
+        }
     }
 }

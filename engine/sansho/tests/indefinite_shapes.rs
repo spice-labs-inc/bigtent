@@ -156,3 +156,4 @@ fn chunked_text_is_assembled() {
 fn an_empty_array_slice_is_empty_not_an_error() {
     assert_eq!(eval(&[0x80], "[0:2]"), serde_json::json!([]));
 }
+

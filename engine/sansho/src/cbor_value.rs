@@ -39,9 +39,7 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
         match value {
             // the text borrows the document
             serde_cbor::Value::Text(text) => Ok(Cow::Borrowed(text.as_str())),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a String type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a string".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -50,9 +48,7 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
         match value {
             // the octets are the document's own bytes: no copy, no encoding
             serde_cbor::Value::Bytes(bytes) => Ok(bytes.as_slice()),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a byte carrier".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a byte carrier".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -60,18 +56,14 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
         match **self {
             serde_cbor::Value::Integer(n) => Ok(SanshoNumber::from_i128(n)),
             serde_cbor::Value::Float(f) => Ok(SanshoNumber::F64(f)),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a Number type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a number".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
     fn as_bool(&self) -> Result<bool, SanshoError> {
         match **self {
             serde_cbor::Value::Bool(value) => Ok(value),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a bool type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a boolean".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -85,9 +77,7 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
             serde_cbor::Value::Map(map) => Ok(map
                 .get(&serde_cbor::Value::Text(name.to_string()))
                 .map(|member| Rc::new(member) as SanshoCarrier<'a>)),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an object type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -97,9 +87,7 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
             serde_cbor::Value::Array(items) => Ok(items
                 .get(index)
                 .map(|member| Rc::new(member) as SanshoCarrier<'a>)),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an array type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -117,9 +105,7 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
                     _ => None,
                 })
                 .collect()),
-            _ => Err(SanshoError::Evaluation {
-                message: format!("entries requires an object, found {}", self.kind()),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -130,9 +116,7 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
                 .iter()
                 .map(|member| Rc::new(member) as SanshoCarrier<'a>)
                 .collect()),
-            _ => Err(SanshoError::Evaluation {
-                message: format!("elements requires an array, found {}", self.kind()),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -147,18 +131,14 @@ impl<'a> SanshoTrait<'a> for &'a serde_cbor::Value {
                     _ => None,
                 }
             }))),
-            _ => Err(SanshoError::Evaluation {
-                message: format!("as_array_str requires an array, found {}", value.kind()),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", value.kind()), function: None })),
         }
     }
     fn container_len(&self) -> Result<usize, SanshoError> {
         match **self {
             serde_cbor::Value::Array(ref items) => Ok(items.len()),
             serde_cbor::Value::Map(ref map) => Ok(map.len()),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an Array or Object".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array or an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 

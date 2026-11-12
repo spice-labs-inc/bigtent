@@ -21,40 +21,72 @@ use nom::sequence::{delimited, preceded, terminated, tuple};
 const MAX_EXPRESSION_LENGTH: usize = 16_384;
 const MAX_NESTING_DEPTH: usize = 64;
 
+/// The bound on the TREE's depth, which is not the same number as the parser's
+/// nesting bound: every recursive consumer of the tree (compilation, evaluation,
+/// rendering, the compiler's visitors, the item-gate builders) descends once per
+/// tree level, and a grouped expression costs several levels. This limit is far
+/// above anything the parser can build from 64 levels of nesting — so it never
+/// refuses a query the nesting bound allows — and far below the thousands of
+/// frames that overflow a thread stack, which is the depth a FLAT operator chain
+/// reaches because the parser does not count it as nesting at all.
+const MAX_TREE_DEPTH: usize = 1_000;
+
+/// The tree-depth bound as callers of `compile` see it: the same number, exposed
+/// because `compile` accepts a caller-built expression and must refuse the same
+/// depth `parse` refuses.
+pub const MAX_TREE_DEPTH_FOR_CALLERS: usize = MAX_TREE_DEPTH;
+
 /// Parse a complete JMESPath expression.
+/// THE TWO BOUNDS: the parser's nesting counter bounds PARSING, and this
+/// post-pass bounds the TREE. A left-associative chain (`a|b|c|…`) nests once in
+/// the parser and N times in the tree, so without the second bound every recursive
+/// consumer of the AST — compilation, evaluation, rendering, the variable and
+/// expression visitors — recurses N times on an expression the parser accepted.
+///
+/// The check is iterative, so it cannot overflow the way its consumers do, and its
+/// answer is the same `Limit` error the parser's own depth guard produces.
 pub fn parse(input: &str) -> Result<Expr, SanshoError> {
     // the length bound first (the cheapest rejection)
     if input.chars().count() > MAX_EXPRESSION_LENGTH {
-        return Err(SanshoError::Limit {
-            message: format!(
-                "expression length {} exceeds the maximum of {}",
-                input.chars().count(),
-                MAX_EXPRESSION_LENGTH
-            ),
-        });
+        return Err(SanshoError::limit(
+            None,
+            crate::error::LimitFault::ExpressionLength {
+                allowed: MAX_EXPRESSION_LENGTH,
+                observed: input.chars().count(),
+            },
+        ));
     }
     // Nesting is bounded BEFORE the recursive parser runs: an iterative
     // scan over the expression's structural characters (skipping string,
     // raw-string, and literal contexts) rejects hostile nesting without
     // recursing at all.
     if let Some(position) = excessive_depth_at(input, MAX_NESTING_DEPTH) {
-        return Err(SanshoError::Limit {
-            message: format!(
-                "expression nesting exceeds the maximum of {} at position {}",
-                MAX_NESTING_DEPTH, position
-            ),
-        });
+        return Err(SanshoError::limit(
+            Some(crate::error::Span::new(position, position)),
+            crate::error::LimitFault::NestingDepth {
+                allowed: MAX_NESTING_DEPTH,
+                observed: MAX_NESTING_DEPTH + 1,
+            },
+        ));
     }
     match terminated(parse_expr, eof)(input) {
-        Ok((_rest, expr)) => Ok(expr),
-        Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => Err(SanshoError::Parse {
-            message: "syntax error".to_string(),
-            position: input.len() - e.input.len(),
-        }),
-        Err(nom::Err::Incomplete(_)) => Err(SanshoError::Parse {
-            message: "incomplete expression".to_string(),
-            position: input.len(),
-        }),
+        // THE TREE BOUND: parser nesting is not tree depth. A flat operator chain
+        // nests once to the parser and once per operator in the tree, so this is
+        // where every recursive consumer's stack depth is decided.
+        Ok((_rest, expr)) => {
+            if crate::ast::deeper_than(&expr, MAX_TREE_DEPTH) {
+                return Err(SanshoError::limit(
+                    Some(crate::error::Span::new(0, input.len())),
+                    crate::error::LimitFault::TreeDepth {
+                        allowed: MAX_TREE_DEPTH,
+                        observed: crate::ast::max_depth(&expr),
+                    },
+                ));
+            }
+            Ok(expr)
+        }
+        Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => Err({ let at = input.len() - e.input.len(); SanshoError::parse(Some(crate::error::Span::new(at, at + 1)), None, crate::error::ParseFault::ExpectedToken { found: format!("syntax error: expected {:?}", e.code) }) }),
+        Err(nom::Err::Incomplete(_)) => Err({ let at = input.len(); SanshoError::parse(Some(crate::error::Span::new(at, at + 1)), None, crate::error::ParseFault::ExpectedToken { found: "incomplete expression".to_string() }) }),
     }
 }
 
@@ -94,7 +126,10 @@ mod lexeme {
         while i < bytes.len() {
             match bytes[i] {
                 b'\\' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
-                b'\\' => i += 1, // a plain backslash: the NEXT byte is not escaped
+                // a backslash consumes the NEXT byte as a unit, exactly as
+                // `parse_raw_string` does: pairing only one byte here would let
+                // `'a\\'` look unterminated, which disables the whole guard
+                b'\\' => i += 2,
                 b'\'' => return Some(i + 1),
                 _ => i += 1,
             }
@@ -300,7 +335,10 @@ fn parse_not(input: &str) -> PResult<'_> {
 
 // ---------- postfix chains ----------
 
-fn parse_postfixes(input: &str) -> Result<(&str, Vec<Postfix>), nom::Err<nom::error::Error<&str>>> {
+/// The postfix list with each selector's span: the type the chain is built from.
+type SpannedPostfixes<'a> = (&'a str, Vec<crate::ast::Spanned<Postfix>>);
+
+fn parse_postfixes(input: &str) -> Result<SpannedPostfixes<'_>, nom::Err<nom::error::Error<&str>>> {
     let mut rest = ws(input);
     let mut postfixes = Vec::new();
     loop {
@@ -308,7 +346,12 @@ fn parse_postfixes(input: &str) -> Result<(&str, Vec<Postfix>), nom::Err<nom::er
             Ok(v) => v,
             Err(_) => return Ok((rest, postfixes)),
         };
-        postfixes.push(post);
+        // THE SPAN: the postfix began where this iteration began and ended where the
+        // parser stopped consuming. Nothing else is needed — the parser already holds
+        // both ends of what it matched.
+        let consumed = rest.len() - next.len();
+        let span = crate::error::Span::of(input.len() - rest.len(), &rest[..consumed]);
+        postfixes.push(crate::ast::Spanned::new(post, span));
         rest = ws(next);
     }
 }
@@ -481,8 +524,14 @@ fn parse_chain(input: &str) -> PResult<'_> {
         // `*` alone is a wildcard over the current node
         let (rest, _) = char('*')(input)?;
         let (rest, mut postfixes) = parse_postfixes(rest)?;
-        postfixes.insert(0, Postfix::Wildcard { bracket: false });
-        return Ok((rest, Expr::Chain(Primary::Current, postfixes)));
+        postfixes.insert(0, crate::ast::Spanned::new(Postfix::Wildcard { bracket: false }, crate::error::Span::of(input.len() - input.len(), "*")));
+        return Ok((
+            rest,
+            Expr::Chain(
+                crate::ast::Spanned::new(Primary::Current, crate::error::Span::new(0, 1)),
+                postfixes,
+            ),
+        ));
     }
     if input.starts_with('(') {
         let (rest, inner) = cut(delimited(
@@ -494,19 +543,42 @@ fn parse_chain(input: &str) -> PResult<'_> {
         // the grouped expression. Splicing made `(foo[*].bar)[0]` evaluate
         // as `foo[*].bar[0]`, which is a different JMESPath program.
         let (rest, postfixes) = parse_postfixes(rest)?;
-        return Ok((rest, Expr::Chain(Primary::Grouped(Box::new(inner)), postfixes)));
+        // the group's own bytes: from the opening paren to its closing one
+        let consumed = input.len() - rest.len();
+        let head_span = crate::error::Span::of(0, &input[..consumed.min(input.len())]);
+        return Ok((
+            rest,
+            Expr::Chain(
+                crate::ast::Spanned::new(Primary::Grouped(Box::new(inner)), head_span),
+                postfixes,
+            ),
+        ));
     }
     // an expression may begin with a bracket selector: [0] indexes the
     // current node
     if input.starts_with('[') {
         let (rest, first) = parse_bracket_start(input)?;
         let (rest, mut postfixes) = parse_postfixes(rest)?;
-        postfixes.insert(0, first);
-        return Ok((rest, Expr::Chain(Primary::Current, postfixes)));
+        let consumed = input.len() - rest.len();
+        postfixes.insert(
+            0,
+            crate::ast::Spanned::new(first, crate::error::Span::of(0, &input[..consumed])),
+        );
+        return Ok((
+            rest,
+            Expr::Chain(
+                crate::ast::Spanned::new(Primary::Current, crate::error::Span::new(0, 1)),
+                postfixes,
+            ),
+        ));
     }
     let (rest, primary) = parse_primary(input)?;
+    // THE HEAD'S SPAN: `rest` is what the primary did not consume, so the head's bytes are
+    // the prefix `input` minus `rest`. This is where a function name in head position gets
+    // the span a compile failure reports.
+    let head_span = crate::error::Span::of(0, &input[..input.len() - rest.len()]);
     let (rest, postfixes) = parse_postfixes(rest)?;
-    Ok((rest, Expr::Chain(primary, postfixes)))
+    Ok((rest, Expr::Chain(crate::ast::Spanned::new(primary, head_span), postfixes)))
 }
 
 fn parse_primary(input: &str) -> PrimaryResult<'_> {
@@ -842,3 +914,119 @@ fn parse_multihash_primary(input: &str) -> PrimaryResult<'_> {
 
 // The parser ends here; the corpus (not this file's helpers) defines
 // conformance.
+
+#[cfg(test)]
+mod lexeme_agreement {
+    //! THE GUARD'S SCANNERS MUST AGREE WITH THE PARSERS.
+    //!
+    //! REQUIREMENT (class-A audit): the depth guard skips string literals with
+    //! `lexeme::skip_quoted`/`skip_raw`/`skip_literal`, which are a SECOND
+    //! implementation of the same lexical rules the parsers implement. Finding 1
+    //! of the third review was a disagreement in one arm: `skip_raw` advanced one
+    //! byte for a bare backslash while `parse_raw_string` pairs a backslash with
+    //! the next byte, so `'a\\'` looked unterminated and the guard disabled
+    //! itself. Fixing that arm fixed the instance; nothing addressed the class.
+    //!
+    //! THEORY OF THE TEST: enumerate every short literal over the awkward
+    //! characters (`"`, `'`, backtick, backslash, a letter) instead of listing
+    //! examples, and assert the scanners and the parsers agree on where the
+    //! literal ENDS: a literal is accepted by the parser exactly when its scanner
+    //! consumes the whole of it. Disagreement in the failing direction disables
+    //! the guard; in the other direction it makes the guard count characters
+    //! inside a string as nesting.
+    //!
+    //! LLM section: for each quote character and each content string up to five
+    //! characters, `Q + content + Q` must satisfy
+    //! `parse(..).is_ok() == (skip(..) == Some(len))`. The generation covers
+    //! doubled backslashes, escaped quotes, trailing backslashes and bare
+    //! quote-pairs, which is the whole space of short disagreements.
+
+    use super::lexeme::{skip_literal, skip_quoted, skip_raw};
+    use super::parse;
+
+    /// One literal form: its quote character, the awkward characters inside it,
+    /// and the scanner the guard uses for it.
+    type LiteralForm = (&'static str, &'static [char], fn(&str) -> Option<usize>);
+
+    /// Every content string over an alphabet, up to a length.
+    fn contents(alphabet: &[char], longest: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..longest {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for character in alphabet {
+                    let mut one = prefix.clone();
+                    one.push(*character);
+                    next.push(one);
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
+    }
+
+    /// THE SCANNER CONSUMES EXACTLY THE LITERAL THE PARSER ACCEPTED.
+    ///
+    /// The property is one-directional on purpose: an ACCEPTED literal must be
+    /// consumed whole, because a scanner that stops short or answers `None`
+    /// disables the guard for the rest of the expression — the third review's
+    /// finding. The converse does not hold and must not be asserted: `"\a"` is a
+    /// boundary-correct literal that the parser rejects for an INVALID ESCAPE,
+    /// which is a content error and says nothing about where the literal ends.
+    #[test]
+    fn every_accepted_literal_is_consumed_whole() {
+        // the awkward characters for each literal form
+        let cases: [LiteralForm; 3] = [
+            ("\"", &['\\', 'a', '"'], skip_quoted),
+            ("'", &['\\', 'a', '\''], skip_raw),
+            ("`", &['\\', 'a', '`'], skip_literal),
+        ];
+        let mut accepted = 0;
+        for (quote, alphabet, scan) in cases {
+            for content in contents(alphabet, 5) {
+                let literal = format!("{quote}{content}{quote}");
+                if parse(&literal).is_err() {
+                    continue;
+                }
+                accepted += 1;
+                assert_eq!(
+                    scan(&literal),
+                    Some(literal.len()),
+                    "`{literal}` is a literal the parser ACCEPTS, so the scanner \
+                     must consume all of it; stopping short disables the guard"
+                );
+            }
+        }
+        // the generation must actually reach accepted literals, or the assertion
+        // above is vacuous
+        assert!(
+            accepted > 50,
+            "the generation found only {accepted} accepted literals: it is not \
+             exercising the scanners"
+        );
+    }
+
+    /// The guard must NOT count characters INSIDE a string as nesting.
+    ///
+    /// THEORY OF THE TEST: a legal literal whose CONTENT is two thousand opening
+    /// brackets is not depth. If the scanner ever stopped early — which is the
+    /// same disagreement in the opposite direction — the guard would report a
+    /// `Limit` error for a perfectly ordinary query.
+    #[test]
+    fn brackets_inside_a_string_are_not_depth() {
+        for (quote, content) in [
+            ("\"", "(".repeat(2_000)),
+            ("'", "[".repeat(2_000)),
+            // a backtick literal is JSON text, so its content is a JSON string
+            ("`", format!("\"{}\"", "{".repeat(2_000))),
+        ] {
+            let expression = format!("{quote}{content}{quote}");
+            assert!(
+                parse(&expression).is_ok(),
+                "brackets inside a {quote} string are content, not nesting"
+            );
+        }
+    }
+}

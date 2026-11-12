@@ -29,11 +29,13 @@ mod tests {
                 // compliance report counts the first as "not implemented yet"
                 // and the second as a failure. The public entry maps both to an
                 // error, so the distinction is recovered from its message.
-                Err(crate::error::SanshoError::Evaluation { message })
-                    if message == "Not implemented" =>
-                {
-                    crate::DriverOutcome::NotImplemented
-                }
+                // the message became structure; the driver's NotImplemented is
+                // reported as an uncarryable evaluation, and the test asserts on
+                // the reason rather than on prose
+                Err(crate::error::SanshoError::Evaluation {
+                    reason: crate::error::EvaluationFault::NotImplemented,
+                    ..
+                }) => crate::DriverOutcome::NotImplemented,
                 Err(e) => crate::DriverOutcome::Error(e),
             }
         }
@@ -69,13 +71,13 @@ mod tests {
                             continue;
                         }
                     };
-                    let once = canonical(&parsed);
+                    let once = canonical(&parsed).expect("a canonical form");
                     let reparsed = parse(&once).unwrap_or_else(|e| {
                         panic!("canonical form of {:?} must re-parse: {e}", case.expression)
                     });
                     assert_eq!(
                         once,
-                        canonical(&reparsed),
+                        canonical(&reparsed).expect("a canonical form"),
                         "canonical form is not a fixed point for {:?}",
                         case.expression
                     );
@@ -118,8 +120,8 @@ mod tests {
             let left_parsed = parse(left).unwrap_or_else(|e| panic!("{left}: {e}"));
             let right_parsed = parse(right).unwrap_or_else(|e| panic!("{right}: {e}"));
             assert_ne!(
-                canonical(&left_parsed),
-                canonical(&right_parsed),
+                canonical(&left_parsed).expect("a canonical form"),
+                canonical(&right_parsed).expect("a canonical form"),
                 "{left:?} and {right:?} must canonicalize differently"
             );
         }
@@ -135,7 +137,7 @@ mod tests {
     fn canonical_collapses_insignificant_whitespace() {
         for expression in ["a.b", "a . b", "a\n.\nb", " a . b "] {
             let parsed = parse(expression).expect("parses");
-            assert_eq!(canonical(&parsed), "a.b", "{expression:?}");
+            assert_eq!(canonical(&parsed).expect("a canonical form"), "a.b", "{expression:?}");
         }
     }
 
@@ -229,9 +231,9 @@ mod tests {
         // was not exercising the expression it displayed.)
         let original = r##"`"\\"`.{a:`"b"`}"##;
         let parsed = parse(original).expect("parses");
-        let once = canonical(&parsed);
+        let once = canonical(&parsed).expect("a canonical form");
         let reparsed = parse(&once).expect("canonical form must re-parse");
-        assert_eq!(once, canonical(&reparsed), "fixed point for {original:?}");
+        assert_eq!(once, canonical(&reparsed).expect("a canonical form"), "fixed point for {original:?}");
     }
 }
 

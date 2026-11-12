@@ -222,9 +222,7 @@ pub trait SanshoTrait<'a>: 'a {
     /// which has no borrowable storage. A byte string is not text: it is
     /// [`Kind::Bytes`] and answers `None` here — see [`Self::as_bytes`].
     fn as_str(&self) -> Result<Cow<'_, str>, SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: "Not a String type".to_string(),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a string".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// The octets of this value, if this is a BYTE string
@@ -232,9 +230,7 @@ pub trait SanshoTrait<'a>: 'a {
     /// copied and no encoding is applied. The default is `None`: a value
     /// that is not a byte string has no octets of its own.
     fn as_bytes(&self) -> Result<&[u8], SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: "Not a byte carrier".to_string(),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a byte carrier".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// The full-width number probe: the exact integer or float value,
@@ -243,9 +239,7 @@ pub trait SanshoTrait<'a>: 'a {
     /// CBOR integer) report the `I64`/`U64` arms — numbers are
     /// full-width, never narrowed.
     fn as_sansho_number(&self) -> Result<SanshoNumber, SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: "Not a number".to_string(),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a number".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// The numeric content as a double, if this is a number: the
@@ -256,9 +250,7 @@ pub trait SanshoTrait<'a>: 'a {
 
     /// The boolean content, if this is a boolean value.
     fn as_bool(&self) -> Result<bool, SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: "Not a bool type".to_string(),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a boolean".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// Whether this is the null value.
@@ -270,17 +262,13 @@ pub trait SanshoTrait<'a>: 'a {
     /// one: a value bounded by the trait — the very thing the
     /// evaluator carries.
     fn get_key(&self, _name: &str) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: "Not an object type".to_string(),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an object".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// The `index`-th array element, if this is an array value that
     /// has one: a value bounded by the trait.
     fn get_index(&self, _index: usize) -> Result<Option<SanshoCarrier<'a>>, SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: "Not an array type".to_string(),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// The object's members, keyed by name.
@@ -289,16 +277,12 @@ pub trait SanshoTrait<'a>: 'a {
     /// collection of name/value pairs, so the iteration order of the
     /// returned map is not a contract and no caller may depend on it.
     fn as_object(&self) -> Result<HashMap<&str, SanshoCarrier<'a>>, SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: format!("requires an object, found {}", self.kind()),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an object".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// All array elements, in document order.
     fn as_elements(&self) -> Result<Vec<SanshoCarrier<'a>>, SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: format!("elements requires an array, found {}", self.kind()),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// The array's TEXT elements, in document order, skipping every element
@@ -319,17 +303,13 @@ pub trait SanshoTrait<'a>: 'a {
     fn as_array_str<'s>(
         &'s self,
     ) -> Result<Box<dyn Iterator<Item = Cow<'s, str>> + 's>, SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: format!("as_array_str requires an array, found {}", self.kind()),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// The number of members or elements, if this is an object or
     /// array; `None` for scalars.
     fn container_len(&self) -> Result<usize, SanshoError> {
-        Err(SanshoError::Evaluation {
-            message: "Not an Array or Object".to_string(),
-        })
+        Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array or an object".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     /// Convert the Sansho Trait to a human friendly string. This operation may

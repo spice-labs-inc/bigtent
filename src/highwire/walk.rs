@@ -52,8 +52,15 @@ pub type ItemGate = Arc<
 >;
 
 /// What an emit produces for one subject, compiled.
-pub type ItemEmitFn =
-    Arc<dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> Vec<Value> + Send + Sync>;
+///
+/// FALLIBLE: building a row can fail for a reason the walk must report — an emit level
+/// that cannot read the item's identifier for its error rows' context, for instance. The
+/// `Vec<Value>` this replaced could only lose that fact.
+pub type ItemEmitFn = Arc<
+    dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> Result<Vec<Value>, SanshoError>
+        + Send
+        + Sync,
+>;
 
 /// The stop rules, compiled: hard first, then soft, first match wins.
 /// The stop rules, compiled: hard first, then soft, first match wins.
@@ -154,6 +161,24 @@ pub enum AccountingEventType {
     ThreadStarted,
     /// A row was handed to a sink: the pipeline's output work.
     Emit,
+    /// An ERROR REPORT could not be delivered: the row that would have carried the
+    /// failure is the row that could not be sent, so without this event the failure
+    /// leaves no trace at all.
+    ErrorReportLost,
+    /// An ITEM GATE could not evaluate: the item is skipped as a non-match, and this
+    /// event is the record of why — without it, `continue` on an errored gate is
+    /// indistinguishable from a gate that said "no".
+    GateErrored,
+    /// A ROOT could not be fed to the pipeline: the run had already dropped its
+    /// input receiver. Like a lost stop report, it leaves no other trace — the
+    /// roots that were never delivered produce no row that could say so.
+    RootFeedLost,
+    /// A STOP REPORT could not be delivered: the consumer was gone. It is an
+    /// accounting event rather than only an error because the failure leaves no
+    /// other trace — the row that would have carried the news is the row that
+    /// could not be sent — so without this, a stop the client never saw is
+    /// indistinguishable from a stop that never happened.
+    StopReportLost,
 }
 
 pub enum SinkOperation {
@@ -275,21 +300,35 @@ pub fn walk<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, Sink
             let mut any_admitted_child = false;
 
             for (con_name, con_filter) in &connections {
-                if let Some(conns) = thing
-                    .get_key("connections")
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.get_key(con_name).ok().flatten())
-                    .and_then(|v| v.as_elements().ok())
-                {
+                // A READ THAT FAILS IS AN ERROR, not "no connections": the `.ok()` chain
+                // this replaces made an unreadable `connections` map, an unreadable edge
+                // list and a non-array edge list all indistinguishable from an item that
+                // simply has none — so the walk silently skipped an edge class.
+                let connections_value = thing.get_key("connections").map_err(|cause| {
+                    anyhow::anyhow!("an item's connections could not be read: {cause}")
+                })?;
+                if let Some(conns) = match connections_value {
+                    None => None,
+                    Some(value) => match value.get_key(con_name).map_err(|cause| {
+                        anyhow::anyhow!("an edge list could not be read: {cause}")
+                    })? {
+                        None => None,
+                        Some(named) => Some(named.as_elements().map_err(|cause| {
+                            anyhow::anyhow!("an edge list is not a list: {cause}")
+                        })?),
+                    },
+                } {
                     {
                         // a Cow: borrowed for a definite string, owned when
                         // the document chunked it
                         let mut v: Vec<std::borrow::Cow<'_, str>> = vec![];
                         for sc in &conns {
-                            if let Ok(s) = sc.as_str() {
-                                v.push(s);
-                            }
+                            // a connection target the engine cannot READ is an
+                            // error, not a missing child: dropping it silently made
+                            // the walk skip an edge the document declares, and
+                            // nothing downstream could tell that from a document
+                            // without the edge
+                            v.push(sc.as_str().map_err(|error| anyhow::anyhow!("a connection target could not be read: {error}"))?);
                         }
                         conns.len();
 
@@ -302,7 +341,15 @@ pub fn walk<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, Sink
                             // at all; `seen` only decides whether the child is
                             // re-visited — so the flag is set BEFORE the seen
                             // check, or a diamond's parent is wrongly terminal
-                            if let Ok(true) = con_filter(maybe_con.as_ref(), &depth) {
+                            // a connection FILTER that cannot evaluate is an error,
+                            // not a non-match: `Ok(false)` is a deliberate "this
+                            // edge admits nothing", while an errored gate is a
+                            // broken query, and the two were the same value here
+                            if con_filter(maybe_con.as_ref(), &depth).map_err(|cause| {
+                                anyhow::Error::new(
+                                    crate::highwire::error::HighWireError::evaluation(cause),
+                                )
+                            })? {
                                 any_admitted_child = true;
                                 if !seen.contains(maybe_con.as_ref()) {
                                     maybe_next_round.push(maybe_con.as_ref().to_string());
@@ -322,7 +369,11 @@ pub fn walk<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, Sink
             // (GateErrored) and then treated as a non-match: the item is
             // skipped either way, but the fact is not silent
             match item_filter(&thing, &walk_state) {
-                Err(_) => {
+                Err(_error) => {
+                    // RECORDED, not silent: the item is skipped as a non-match, and the
+                    // accountant is told why it was skipped. This is the `GateErrored`
+                    // the comment above promises.
+                    accountant.event(crate::highwire::walk::AccountingEventType::GateErrored);
                     continue;
                 }
                 Ok(false) => {
@@ -338,7 +389,7 @@ pub fn walk<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, Sink
 
                 // emit the stuff for this round; the rows are counted by the
                 // sinks themselves (they fire `Emit`)
-                for emit_me in emit(&thing, &walk_state) {
+                for emit_me in emit(&thing, &walk_state)? {
                     sink(emit_me, &accountant, SinkOperation::NormalMessage)?;
                 }
 
@@ -457,7 +508,7 @@ pub fn build_item_compare_function<'a>(
             // the thing is evaluated against the expression; a truthy
             // result matches (null and false do not). An evaluation
             // ERROR propagates: the walk treats it as a non-match.
-            sansho::evaluate(&program, data.clone()).map(|value| truthy(&value))
+            sansho::evaluate(&program, data.clone()).and_then(|value| truthy(&value))
         },
     ))
 }
@@ -473,7 +524,7 @@ pub fn build_item_leaf(expr: &str, cache: &ProgramCache) -> Result<ItemGate> {
     let program = compile_sansho(expr, cache)?;
     Ok(Arc::new(
         move |thing: &SanshoCarrier<'_>, _ws: &WalkState| {
-            sansho::evaluate(&program, Rc::clone(thing)).map(|value| truthy(&value))
+            sansho::evaluate(&program, Rc::clone(thing)).and_then(|value| truthy(&value))
         },
     ))
 }

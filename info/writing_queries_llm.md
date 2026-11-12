@@ -212,3 +212,26 @@ stage is named that`. Tests: `a_root_drawing_on_a_missing_phase_names_the_phase_
 `a_cycle_is_refused_and_names_a_phase_in_it`,
 `a_walk_with_no_emit_is_refused_with_its_phase_and_level`,
 `a_malformed_gate_is_refused_at_the_level_it_was_read`.
+
+## `/flatten`: the documented V1 deviation (LLM companion)
+
+DEVIATION, DELIBERATE. Do not "fix" V2 to match V1 here.
+
+* EMISSION: both surfaces emit the identifier strings of `contained:down` edges of
+  reachable items; `alias:to` is navigation only.
+* V1 (`stream_flattened_items`): round-based BFS with a frontier set. A target already
+  in the frontier or the processed set is SKIPPED. Consequence: an item reached first as
+  an alias target is not emitted when a later `contained:down` edge reaches it in the
+  same round. Payload depends on traversal order.
+* V2 (`flatten` template): no frontier. Every `contained:down` target of a reachable
+  item is emitted, deduplicated. Order-independent.
+* INVARIANT: `set(V2 output) ⊇ set(V1 output)`. Never the reverse.
+* OWNER RULING: V2 is correct; V1's suppression is a defect. Recorded in
+  `discussions/2026_11_02_flatten_v1_v2_deviation.md`.
+* TEST CONTRACT (`tests/north_purls_property.rs`): `expected_flatten_v2` models V2's
+  rule and `expected_flatten_v1` models V1's; the test asserts each implementation
+  against its own model plus the containment invariant. Do NOT "simplify" this back to a
+  single reference model — that would make one side fail by construction.
+* If a future change makes V2 emit a superset that fails containment, the deviation
+  documentation is stale: update the discussion record and this section together.
+

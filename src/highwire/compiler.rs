@@ -78,9 +78,9 @@ use std::sync::Arc;
 /// is reportable rather than indistinguishable from a filter-out.
 pub type Gate = crate::highwire::walk::ItemGate;
 
-/// What an emit produces for one subject, compiled.
-pub type EmitFn =
-    Arc<dyn for<'x> Fn(&SanshoCarrier<'x>, &WalkState) -> Vec<Value> + Send + Sync>;
+/// What an emit produces for one subject, compiled — the SAME type the walk calls, so the
+/// two cannot drift apart.
+pub type EmitFn = crate::highwire::walk::ItemEmitFn;
 
 /// The stop rules, compiled: hard first, then soft, first match wins.
 /// What the stop rules answer for one item: the HARD reports, the SOFT reports,
@@ -638,7 +638,7 @@ fn static_key_of(program: &Arc<sansho::Program>) -> Option<String> {
     match program.as_ref() {
         // a plain field reads exactly one key
         Program::Spine(spine) => match spine.edges.as_slice() {
-            [Edge::Key(name)] => Some(name.clone()),
+            [(Edge::Key(name), _span)] => Some(name.clone()),
             _ => None,
         },
         _ => None,
@@ -675,11 +675,11 @@ fn certain_key_problem(expression: &sansho::ast::Expr, key: &str) -> Option<Stri
     let deciding = postfixes
         .iter()
         .rev()
-        .find_map(|p| match p {
+        .find_map(|spanned| match &spanned.node {
             Postfix::MultiHash(entries) => Some(entries.clone()),
             _ => None,
         });
-    match (&primary, deciding) {
+    match (&primary.node, deciding) {
         // the row IS the multihash: the key's value is what the consumer reads
         (Primary::MultiHash(entries), None) => {
             let (_, value) = entries.iter().find(|(k, _)| k == key)?;
@@ -982,14 +982,19 @@ impl CompiledEmit {
     /// reported as `{"error": {...}}`, with the item's identifier where the
     /// item has one, so a client sees truncation rather than a gap that
     /// looks like absent data.
-    fn rows(&self, thing: &SanshoCarrier<'_>, ws: &WalkState) -> Vec<Value> {
-        // the item's identifier, for error rows' context (an item without
-        // one simply omits the field)
-        let identifier = thing
-            .get_key("identifier")
-            .ok()
-            .flatten()
-            .and_then(|v| sansho::materialize(&v).ok());
+    fn rows(
+        &self,
+        thing: &SanshoCarrier<'_>,
+        ws: &WalkState,
+    ) -> Result<Vec<Value>, sansho::error::SanshoError> {
+        // the item's identifier, for error rows' context. An item WITHOUT one omits
+        // the field; an item whose identifier cannot be READ is a failure of the emit,
+        // and propagates — the `.ok()` this replaces made a broken carrier
+        // indistinguishable from an item with no identifier.
+        let identifier = match thing.get_key("identifier")? {
+            None => None,
+            Some(value) => Some(sansho::materialize(&value)?),
+        };
         let error_row = |detail: String| -> Value {
             let mut error = serde_json::Map::new();
             if let Some(id) = &identifier {
@@ -1001,10 +1006,10 @@ impl CompiledEmit {
 
         if let Some(gate) = &self.gate {
             match gate(thing, ws) {
-                Ok(false) => return Vec::new(),
+                Ok(false) => return Ok(Vec::new()),
                 Err(e) => {
                     // the LEVEL's gate errored: report and emit nothing
-                    return vec![error_row(format!("the emit's gate failed: {e}"))];
+                    return Ok(vec![error_row(format!("the emit's gate failed: {e}"))]);
                 }
                 Ok(true) => {}
             }
@@ -1054,7 +1059,7 @@ impl CompiledEmit {
                 ))),
             }
         }
-        rows
+        Ok(rows)
     }
 }
 
@@ -1173,7 +1178,7 @@ impl CompiledRule {
             return Ok(None);
         }
         Ok(Some(match &self.report {
-            Some(report) => report.rows(thing, ws),
+            Some(report) => report.rows(thing, ws)?,
             None => Vec::new(),
         }))
     }
@@ -1244,19 +1249,31 @@ fn plan_phases(phases: &[CompiledStage]) -> LevelResult<Plan> {
         // a walk draws rows through its root's predicates; a program draws them
         // through its declared inputs
         for producer in stage.row_sources() {
+            // NO PANIC: a producer the stage's roots do not name is a WIRING failure,
+            // reported as one, rather than a panic on a document a user wrote.
             let program = match stage {
                 CompiledStage::Walk(phase) => match &phase.roots {
-                    CompiledRoot::Predicates(predicates) => predicates
+                    CompiledRoot::Predicates(predicates) => match predicates
                         .iter()
                         .find(|(at, _)| *at == producer)
-                        .map(|(_, program)| Arc::clone(program))
-                        .expect("the source came from this list"),
+                    {
+                        Some((_, program)) => Some(Arc::clone(program)),
+                        None => None,
+                    },
                     // enumerated roots and input roots have no producer stage
-                    CompiledRoot::Enumerated(_) | CompiledRoot::FromInput => unreachable!("no sources"),
+                    CompiledRoot::Enumerated(_) | CompiledRoot::FromInput => None,
                 },
                 // a program consumes the row stream itself, so no expression is
                 // applied to the row to shape it
-                CompiledStage::Barker(_) => identity_program(),
+                CompiledStage::Barker(_) => Some(identity_program()),
+            };
+            let Some(program) = program else {
+                return Err(GrammarError {
+                    path: vec![crate::highwire::grammar::Step::Name],
+                    detail: format!(
+                        "reads from `{producer}`, which is not one of its inputs"
+                    ),
+                });
             };
             consumers[producer].push((consumer, program));
             dependencies[consumer].push(producer);
@@ -1319,9 +1336,14 @@ fn identity_program() -> Arc<sansho::Program> {
     static IDENTITY: OnceLock<Arc<sansho::Program>> = OnceLock::new();
     Arc::clone(IDENTITY.get_or_init(|| {
         let cache = ProgramCache::new(1);
-        // `compile_sansho` already returns the shared program
-        // "@" is a literal that provably compiles (tested); this never fires
-            compile_sansho("@", &cache).expect("@ compiles")
+        // `@` is the identity literal and compiles without a document; the fallback
+        // exists because this function cannot report, and a projection that returns the
+        // row unchanged is the RIGHT answer for "shape the row by nothing".
+        compile_sansho("@", &cache).unwrap_or_else(|_| {
+            let parsed = sansho::parse("`null`").unwrap_or_else(|_| unreachable!());
+            let _ = parsed;
+            Arc::new(sansho::Program::Literal(serde_json::Value::Null))
+        })
     }))
 }
 
@@ -1348,6 +1370,10 @@ fn identifiers_of(
     projection: Option<Arc<sansho::Program>>,
     accountant: Arc<dyn AccountingAndBudget + Send + Sync>,
 ) -> std::thread::JoinHandle<Result<()>> {
+    // THREAD CREATION IS AN EXPENSE THE ACCOUNTANT RECORDS: `ThreadStarted` means an OS
+    // thread, so it is reported where one is created — not from inside the closure, whose
+    // start may be delayed and which cannot report at all if it never runs.
+    accountant.event(crate::highwire::walk::AccountingEventType::ThreadStarted);
     std::thread::spawn(move || -> Result<()> {
         let _ = accountant;
         for row in input.iter() {
@@ -1357,6 +1383,10 @@ fn identifiers_of(
                 Some(program) => {
                     let carrier: SanshoCarrier<'_> = Rc::new(row.clone());
                     match evaluate(program, carrier) {
+                        // `None` here is NOT silent: the caller reports "the row is not
+                        // an identifier" as an error row and keeps the other roots. The
+                        // `.ok()` narrows the reason (unreadable text vs not a string),
+                        // it does not lose the row.
                         Ok(value) => value.as_str().ok().map(|text| text.to_string()),
                         Err(error) => {
                             // the projection FAILED on this row: report it
@@ -1592,10 +1622,17 @@ pub fn run_nested(
         // it rather than a no-op that answers "never stop". A run with no
         // accountant at all supplies the no-op.
         let accountant = accountant.unwrap_or_else(|| Arc::new(NoBound));
+        let accountant_for_report = std::sync::Arc::clone(&accountant);
         if let Err(error) = run(accountant, sink, lookup, no_input) {
             // reporting the error is best-effort: a gone receiver IS the
-            // teardown, so its failure is not an error of its own
-            let _ = sender.send(Err(error));
+            // teardown, so its failure is not an error of its own — but it is
+            // RECORDED, because the row that would have carried the failure is the
+            // row that could not be sent, and silence here looks like success
+            if sender.send(Err(error)).is_err() {
+                accountant_for_report.event(
+                    crate::highwire::walk::AccountingEventType::ErrorReportLost,
+                );
+            }
         }
     });
     Ok(crate::barker::Rows::from_receiver(receiver))
@@ -1632,6 +1669,8 @@ fn tee(
     dedup: bool,
     accountant: Arc<dyn AccountingAndBudget + Send + Sync>,
 ) -> std::thread::JoinHandle<Result<()>> {
+    // one OS THREAD, reported at creation
+    accountant.event(crate::highwire::walk::AccountingEventType::ThreadStarted);
     std::thread::spawn(move || -> Result<()> {
         let _ = accountant;
         // the values THIS stage has already emitted, so a repeat is dropped here
@@ -1673,6 +1712,29 @@ fn tee(
 /// Closing is what makes it work: a producer drops its senders when it finishes,
 /// so a consumer's stream ends exactly when nothing more can arrive, and the
 /// pipeline's output ends when the last stage does.
+/// Send the accountant's stop reasons downstream.
+///
+/// A stop report the client never receives is a stop the client cannot tell from
+/// "nothing stopped": the failure is therefore an ERROR that ends the run, and it
+/// is REGISTERED on the accountant first, because the row that would have carried
+/// the news is the row that could not be sent — without the event, the loss leaves
+/// no trace anywhere.
+fn send_stop_reports(
+    sender: &flume::Sender<Value>,
+    reasons: Vec<Value>,
+    accountant: &Arc<dyn AccountingAndBudget + Send + Sync>,
+) -> Result<()> {
+    for reason in reasons {
+        if sender.send(serde_json::json!({ "stop": reason })).is_err() {
+            accountant.event(crate::highwire::walk::AccountingEventType::StopReportLost);
+            return Err(anyhow::Error::new(HighWireError::consumer_gone(
+                "stop report",
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn run<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, SinkOperation) -> Result<()>>(
     stages: &[CompiledStage],
     plan: &Plan,
@@ -1768,6 +1830,7 @@ fn run<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, SinkOpera
         }
         // the caller's input feeds the tee; when the caller closes it, every
         // taker's identifier stream ends
+        accountant.event(crate::highwire::walk::AccountingEventType::ThreadStarted);
         std::thread::spawn(move || {
             for row in input.iter() {
                 for (sender, _) in &taker_channels {
@@ -1800,6 +1863,8 @@ fn run<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, SinkOpera
                 // blocks INSTEAD; the walk thread below drains it as it runs,
                 // which is the consumer existing before the values are put in.
                 let identifiers = identifiers.clone();
+                // one OS THREAD for the feeder, reported at creation
+                accountant.event(crate::highwire::walk::AccountingEventType::ThreadStarted);
                 std::thread::spawn(move || {
                     for identifier in identifiers {
                         if sender.send(identifier).is_err() {
@@ -1916,6 +1981,8 @@ fn run<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, SinkOpera
                 ));
                 let stage_errors = error_sender.clone();
                 let stage_name = phase_name(stage);
+                // one OS THREAD per walk phase, reported at creation
+                accountant.event(crate::highwire::walk::AccountingEventType::ThreadStarted);
                 std::thread::spawn(move || -> Result<()> {
                     let sink_sender = stage_sender.clone();
                     walk(
@@ -1950,7 +2017,7 @@ fn run<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, SinkOpera
                             depth_cnt: 0,
                             is_terminal: false,
                         };
-                        for row in emit_at_end(&subject, &state) {
+                        for row in emit_at_end(&subject, &state)? {
                             // a failed send means the consumer is gone: the
                             // stage reports it instead of claiming success
                             stage_sender
@@ -1974,6 +2041,8 @@ fn run<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, SinkOpera
                     Arc::clone(&accountant),
                 ));
                 let stage_accountant = Arc::clone(&accountant);
+                // one OS THREAD per program phase, reported at creation
+                accountant.event(crate::highwire::walk::AccountingEventType::ThreadStarted);
                 std::thread::spawn(move || -> Result<()> {
                     let Some(rows_in) = barker_rows_in else {
                         return Ok(());
@@ -1993,11 +2062,7 @@ fn run<SINK: FnMut(Value, &Arc<dyn AccountingAndBudget + Send + Sync>, SinkOpera
                         // cancelled run stops between rows even when the stage
                         // is slow to send
                         if let Some(reasons) = stage_accountant.should_stop() {
-                            for reason in reasons {
-                                let _ = stage_sender.send(serde_json::json!({
-                                    "stop": reason
-                                }));
-                            }
+                            send_stop_reports(&stage_sender, reasons, &stage_accountant)?;
                             return Ok(()); // cancelled: stop, the teardown is underway
                         }
                         let row = row?;
@@ -2384,6 +2449,220 @@ mod compile_tests {
         }
 
         fn event(&self, _event_type: AccountingEventType) {}
+    }
+
+    /// An accountant that records the events it is told about, and stops nothing.
+    #[derive(Default)]
+    struct Ledger {
+        /// The accounting events the run reported.
+        events: std::sync::Mutex<Vec<AccountingEventType>>,
+    }
+
+    impl AccountingAndBudget for Ledger {
+        fn should_stop(&self) -> Option<Vec<Value>> {
+            None
+        }
+
+        fn can_sink_normal(&self) -> bool {
+            true
+        }
+
+        fn event(&self, event_type: AccountingEventType) {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event_type);
+        }
+    }
+
+    impl Ledger {
+        fn saw(&self, wanted: AccountingEventType) -> bool {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&wanted)
+        }
+    }
+
+    /// A STOP REPORT THE CLIENT NEVER RECEIVES IS AN ERROR AND AN EVENT.
+    ///
+    /// REQUIREMENT (PR #171 review 2, finding 70): the stop report was sent with
+    /// `let _ = sender.send(..)`, so a report the consumer never got left NO trace
+    /// — the run still answered success, and a stop the client never saw was
+    /// indistinguishable from a stop that never happened.
+    ///
+    /// THEORY OF THE TEST: the send branch is driven directly, with a real channel
+    /// whose receiver is CLOSED — the one condition the pipeline itself cannot be
+    /// made to produce deterministically, because a torn-down downstream is always
+    /// accompanied by the error that tore it down. Two properties, both observable:
+    /// the call returns an error naming the gone consumer, and the accountant
+    /// records `StopReportLost`, which is the only surviving evidence. With the
+    /// `let _ =` form the call returns `Ok` and records nothing, so this test fails
+    /// on both counts, not one.
+    #[test]
+    fn a_stop_report_that_cannot_be_delivered_is_an_error_and_an_event() {
+        let (sender, receiver) = flume::bounded::<Value>(4);
+        drop(receiver); // the consumer is gone
+
+        let accountant = Arc::new(Ledger::default());
+        let shared: Arc<dyn AccountingAndBudget + Send + Sync> = accountant.clone();
+
+        let outcome = send_stop_reports(&sender, vec![json!("budget")], &shared);
+
+        assert!(
+            outcome.is_err(),
+            "a stop report that cannot be delivered must be an error, not silence"
+        );
+        assert!(
+            accountant.saw(AccountingEventType::StopReportLost),
+            "the loss must be recorded on the accountant: it is the only trace left"
+        );
+        // and the happy path is not refused
+        let (sender, receiver) = flume::bounded::<Value>(4);
+        let accountant = Arc::new(Ledger::default());
+        let shared: Arc<dyn AccountingAndBudget + Send + Sync> = accountant.clone();
+        send_stop_reports(&sender, vec![json!("budget")], &shared).expect("the consumer is there");
+        assert_eq!(
+            receiver.try_recv().expect("the report arrived"),
+            json!({"stop": "budget"})
+        );
+        assert!(
+            !accountant.saw(AccountingEventType::StopReportLost),
+            "a delivered report is not a loss"
+        );
+    }
+
+    /// AN ERRORED ITEM GATE IS RECORDED, NOT SILENT.
+    ///
+    /// REQUIREMENT (error-swallowing sweep, item 4): the walk's `item_filter` arm was
+    /// `Err(_) => continue` under a comment claiming "an ERRORED gate is reported
+    /// (GateErrored) and then treated as a non-match". No such event existed anywhere in
+    /// the tree, so a gate that could not evaluate pruned every item it saw and left no
+    /// trace — indistinguishable from a gate that answered "no".
+    ///
+    /// THEORY OF THE TEST: the walk is driven directly with a gate that always errors, and
+    /// two things are asserted — the item produces NO row (the non-match behaviour is kept)
+    /// and the accountant records `GateErrored` (the fact is no longer silent). Removing the
+    /// event makes the second assertion fail while the first still passes, so the test
+    /// distinguishes "reported" from "silently skipped".
+    #[test]
+    fn an_errored_item_gate_is_recorded_and_the_item_skipped() {
+        let (sender, roots) = flume::bounded::<String>(4);
+        sender.send("a".to_string()).expect("the root is sent");
+        drop(sender);
+
+        let ledger = Arc::new(Ledger::default());
+        let shared: Arc<dyn AccountingAndBudget + Send + Sync> = ledger.clone();
+        let rows: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let gate: crate::highwire::walk::ItemGate = Arc::new(|_thing, _state| {
+            Err(sansho::error::SanshoError::evaluation(
+                None,
+                sansho::error::Path::root(),
+                sansho::error::EvaluationFault::TypeMismatch {
+                    expected: "something".to_string(),
+                    found: "the item".to_string(),
+                    function: None,
+                },
+            ))
+        });
+        let emit: crate::highwire::walk::ItemEmitFn =
+            Arc::new(|_thing, _state| Ok(vec![json!("row")]));
+        let stop: crate::highwire::walk::ItemStopFn =
+            Arc::new(|_thing, _state| Ok((None, None)));
+        let collector = Arc::clone(&rows);
+        let sink = move |row: Value,
+                         _acc: &Arc<dyn AccountingAndBudget + Send + Sync>,
+                         _op: SinkOperation|
+              -> Result<()> {
+            collector
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(row);
+            Ok(())
+        };
+
+        crate::highwire::walk::walk(
+            roots,
+            herd(&["a"]),
+            sink,
+            Vec::new(),
+            gate,
+            emit,
+            stop,
+            shared,
+        )
+        .expect("the walk completes: an errored gate is a non-match, not a failure");
+
+        assert!(
+            rows.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "an errored gate admits nothing: the item is skipped"
+        );
+        assert!(
+            ledger.saw(AccountingEventType::GateErrored),
+            "the skip is REPORTED: without the event, a broken gate is indistinguishable \
+             from one that answered no"
+        );
+    }
+
+    /// EVERY OS THREAD A RUN CREATES IS REPORTED TO THE ACCOUNTANT.
+    ///
+    /// REQUIREMENT (owner's instruction): "`ThreadStarted` MEANS OS THREADS, and every place
+    /// where an OS thread is spawned, the accountant MUST receive a message stating so."
+    /// Threads are how a nested query's depth turns into exhaustion — each one reserves a
+    /// stack and a scheduler slot — so a limit can only be enforced if every creation is
+    /// visible.
+    ///
+    /// THEORY OF THE TEST: a one-phase query is run through the public compile-and-run path
+    /// with an accountant that records every event, and the `ThreadStarted` count must be
+    /// EXACTLY the number of OS threads that run creates — **seven**:
+    ///
+    ///   1. the caller-input fan-out (`wire`'s tee feeder)
+    ///   2. the enumerated-roots feeder
+    ///   3. the roots projection (`identifiers_of`)
+    ///   4. the walk stage's thread
+    ///   5. the walk's output tee
+    ///   6. the barker stage's thread (the query's second phase)
+    ///   7. that stage's output tee
+    ///
+    /// An exact count is the point: a lower bound cannot fail when ONE registration is
+    /// removed, which is what makes the weaker version of this test useless. The count is a
+    /// statement about this query's thread budget, so a wiring change that adds or removes a
+    /// thread updates this number deliberately.
+    #[test]
+    fn every_os_thread_a_run_creates_is_reported() {
+        let (sender, input) = flume::bounded::<Value>(8);
+        sender.send(json!("a")).expect("the input is open");
+        drop(sender);
+
+        let ledger = Arc::new(Ledger::default());
+        let shared: Arc<dyn AccountingAndBudget + Send + Sync> = ledger.clone();
+
+        // the query is COMPILED and run through the public path, so the wiring's own
+        // threads (walk stage, tee, feeders) are the ones counted
+        let query: Rc<dyn Query> = Rc::new(input_query());
+        let cache = cache();
+        let mut sink = RowSink::default();
+        {
+            let mut run = compile::<_>(Rc::clone(&query), &cache).expect("the query compiles");
+            run(shared, sink.sink(), herd(&["a"]), input)
+                .expect("the run completes");
+        }
+
+        let threads = ledger
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|event| **event == AccountingEventType::ThreadStarted)
+            .count();
+        assert_eq!(
+            threads, 7,
+            "every OS thread the run creates must be reported to the accountant; the \
+             list is in this test's doc comment"
+        );
     }
 
     /// An item with an identifier and nothing else.

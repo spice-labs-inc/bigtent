@@ -1,3 +1,11 @@
+// The engine's error carries its location and its source text by design; boxing it
+// would add an allocation to every failure. The same expectation the library crates
+// declare, restated because each test and bench is its own crate root.
+#![expect(
+    clippy::result_large_err,
+    reason = "the error carries its location and its source by design"
+)]
+
 //! The pipeline-comparison benchmarks (the owner's request): large
 //! serialized-CBOR documents at four sizes — turn the CBOR into a serde
 //! intermediate representation and query it with the `jmespath` crate

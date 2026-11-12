@@ -21,7 +21,7 @@
 use std::fmt;
 
 /// A walk-engine or compiler failure, by kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
 pub enum HighWireError {
     /// A stage's receiver was dropped: the consumer is gone, the teardown is
     /// underway.
@@ -40,6 +40,17 @@ pub enum HighWireError {
     Wiring {
         /// Which connection is missing.
         detail: String,
+    },
+
+    /// The walk could not EVALUATE something it must evaluate: a connection
+    /// target it could not read, a connection filter that failed. Structured
+    /// rather than a formatted string so a caller can branch on the kind and read
+    /// the detail, instead of parsing prose.
+    Evaluation {
+        /// The engine's own failure, kept STRUCTURED: not a formatted string, so a
+        /// caller can match on the cause (its kind, its position) instead of
+        /// parsing a message.
+        cause: sansho::error::SanshoError,
     },
 
     /// An expression could not be built into a predicate.
@@ -77,6 +88,12 @@ impl HighWireError {
         }
     }
 
+    /// An `Evaluation` failure: the engine could not evaluate something the walk
+    /// must evaluate. The cause travels as itself.
+    pub fn evaluation(cause: sansho::error::SanshoError) -> Self {
+        HighWireError::Evaluation { cause }
+    }
+
     /// A `Nested` failure.
     pub fn nested(detail: impl Into<String>) -> Self {
         HighWireError::Nested {
@@ -91,6 +108,7 @@ impl HighWireError {
             HighWireError::ConsumerGone { .. } => "consumer_gone",
             HighWireError::Budget { .. } => "budget",
             HighWireError::Wiring { .. } => "wiring",
+            HighWireError::Evaluation { .. } => "evaluation",
             HighWireError::Build { .. } => "build",
             HighWireError::Nested { .. } => "nested",
         }
@@ -105,6 +123,7 @@ impl fmt::Display for HighWireError {
             }
             HighWireError::Budget { detail } => write!(f, "the run was ended: {detail}"),
             HighWireError::Wiring { detail } => write!(f, "the plan does not wire: {detail}"),
+            HighWireError::Evaluation { cause } => write!(f, "evaluation failed: {cause}"),
             HighWireError::Build { detail } => write!(f, "{detail}"),
             HighWireError::Nested { detail } => write!(f, "the nested query failed: {detail}"),
         }

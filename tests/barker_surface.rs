@@ -656,13 +656,12 @@ proptest::proptest! {
         // every generated call answers SOMETHING: a value row or an error
         // row — the silent-200 shape (zero rows from a call that should
         // fail) is the defect these tests exist to catch
-        if rows.iter().all(|row| row.get("error").is_none()) {
-            // no error rows: fine ONLY if a value row exists or the call
-            // legitimately succeeded
-            assert!(
-                !rows.is_empty() || true,
-                "a silent failure shape: {script} produced {rows:?}"
-            );
-        }
+        // EVERY generated call must answer with at least one row: a value row
+        // or an error row. Zero rows is the silent-200 shape this file exists
+        // to catch, so it is asserted directly — no disjunct can excuse it.
+        assert!(
+            !rows.is_empty(),
+            "a silent failure shape: {script} produced {rows:?}"
+        );
     }
 }

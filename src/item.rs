@@ -428,13 +428,19 @@ impl From<&Item> for serde_json::Value {
 
 impl From<ItemV3> for serde_json::Value {
     fn from(value: ItemV3) -> Self {
-        serde_json::to_value(&value).expect("ItemV3 serializes to JSON")
+        // UNREACHABLE BY CONSTRUCTION: an `ItemV3` is strings, integers and maps of the
+        // same, so serde_json cannot fail on it — the only failure serde_json has is a
+        // non-finite float, and this shape cannot hold one. `From` cannot report, so the
+        // alternative to this expect is a silent `Value::Null`, which would be a wrong
+        // answer instead of an impossible one.
+        serde_json::to_value(&value).expect("an ItemV3 is strings and integers: it serialises")
     }
 }
 
 impl From<&ItemV3> for serde_json::Value {
     fn from(value: &ItemV3) -> Self {
-        serde_json::to_value(value).expect("ItemV3 serializes to JSON")
+        // unreachable by construction, for the same reason as the owned impl above
+        serde_json::to_value(value).expect("an ItemV3 is strings and integers: it serialises")
     }
 }
 
@@ -512,7 +518,9 @@ impl Item {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        let mut ret = serde_json::to_value(self).expect("Should be able to serialize Item");
+        // unreachable by construction: `Item` holds strings, integers and CBOR values
+        // that already came from JSON
+        let mut ret = serde_json::to_value(self).expect("an Item serialises by construction");
         if let serde_json::Value::Object(mut m) = ret {
             m.remove_entry("reference");
             ret = serde_json::Value::Object(m);

@@ -26,7 +26,7 @@
 use starlark::Error as StarlarkError;
 
 /// A scripting-surface failure, by kind.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, serde::Serialize, Clone, thiserror::Error)]
 pub enum BarkerError {
     /// An argument's type is wrong.
     #[error("{function}: `{argument}` must be {expected}, found {found}")]

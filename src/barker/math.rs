@@ -275,7 +275,19 @@ pub fn stats(builder: &mut GlobalsBuilder) {
         use starlark::values::list::ListRef;
         let heap = eval.heap();
         let Some(list) = ListRef::from_value(values) else {
-            return Err(crate::barker::values::list_argument("tally", "values", values).err().unwrap().into());
+            // the argument check's OWN error is the failure: no unwrap on a Result that is
+        // only ever Err here
+        return Err(crate::barker::values::list_argument("tally", "values", values)
+            .err()
+            .unwrap_or_else(|| {
+                crate::barker::error::BarkerError::type_error(
+                    "tally",
+                    "values",
+                    "a list",
+                    values,
+                )
+            })
+            .into());
         };
         // (the value's identity, the value itself as the key, its count)
         let mut counts: Vec<(crate::barker::values::KeyValue, Value<'v>, i64)> = Vec::new();
@@ -300,9 +312,13 @@ pub fn stats(builder: &mut GlobalsBuilder) {
     /// `x` confined to `low..=high`.
     fn clamp(x: Value, low: Value, high: Value) -> starlark::Result<f64> {
         let (x, low, high) = (number("clamp", x)?, number("clamp", low)?, number("clamp", high)?);
-        // f64::clamp PANICS when low > high: validate instead
+        // f64::clamp PANICS when low > high AND when either bound is NaN (as
+        // documented): validate both, because a NaN bound fails the `>` test.
         if low > high {
             return Err(BarkerError::value("clamp", format!("low ({low}) exceeds high ({high})")).into());
+        }
+        if low.is_nan() || high.is_nan() {
+            return Err(BarkerError::value("clamp", "low and high must be numbers, not NaN").into());
         }
         Ok(x.clamp(low, high))
     }

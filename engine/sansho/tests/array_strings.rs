@@ -142,3 +142,60 @@ fn a_computed_array_yields_its_own_text() {
         .collect();
     assert_eq!(text, vec!["a", "b"]);
 }
+
+// ------------------------------------------------- a chunked element advances
+
+/// A CHUNKED ELEMENT MUST ADVANCE THE READER.
+///
+/// REQUIREMENT (third review, finding 7): the array reader's chunked-text arm
+/// did nothing — no `skip()`, no assembly — so the decoder never left the
+/// chunked item's head. In an indefinite-length array that re-reads the same
+/// head forever (a HANG on valid CBOR); in a definite-length array it spends the
+/// element counter without moving, so every element after the chunked one is
+/// silently dropped — the truncation this lenient read exists to avoid.
+///
+/// THEORY OF THE TEST: one array per encoding, each holding a chunked text
+/// followed by the text "z". The lenient read cannot lend a `&str` for the
+/// chunked item, so it passes over it — but it MUST pass over it, and the "z"
+/// after it must still be yielded. The definite case is the truncation trap; the
+/// indefinite case is the hang trap, which is why it runs on a worker thread
+/// with a deadline instead of in the test thread.
+///
+/// LLM section: expected yield for both arrays is exactly ["z"]. A reader that
+/// fails to advance yields [] for the definite array (the counter is consumed by
+/// re-reading the head) and never returns for the indefinite array.
+#[test]
+fn a_chunked_element_does_not_swallow_what_follows_it() {
+    // array(2): chunked text 'a'+'b' (0x7F … 0xFF), then "z"
+    let definite = vec![
+        0x82, 0x7F, 0x61, b'a', 0x61, b'b', 0xFF, 0x61, b'z',
+    ];
+    let slice: &[u8] = &definite;
+    let yielded: Vec<std::borrow::Cow<str>> = slice
+        .as_array_str()
+        .expect("an array answers")
+        .collect();
+    assert_eq!(
+        yielded,
+        vec!["z"],
+        "the element after the chunked text is read"
+    );
+
+    // the same array, indefinite: 0x9F … 0xFF
+    let indefinite = vec![
+        0x9F, 0x7F, 0x61, b'a', 0x61, b'b', 0xFF, 0x61, b'z', 0xFF,
+    ];
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let yielded: Vec<String> = (indefinite.as_slice())
+            .as_array_str()
+            .expect("an array answers")
+            .map(|text| text.into_owned())
+            .collect();
+        let _ = sender.send(yielded);
+    });
+    let yielded = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the indefinite read terminates instead of re-reading the chunked head");
+    assert_eq!(yielded, vec!["z".to_string()]);
+}

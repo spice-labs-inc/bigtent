@@ -20,9 +20,7 @@
 // use serde_json::Value as J;
 //
 // fn input_error(position: usize, what: &str) -> SanshoError {
-//     SanshoError::Input {
-//         message: format!("at byte {position}: {what}"),
-//     }
+//     SanshoError::input(0, crate::error::InputFault::Decode { at: 0 })
 // }
 //
 // fn evaluation_error(position: usize, what: &str) -> SanshoError {
@@ -279,7 +277,9 @@ pub fn json_to_cbor_value(json: &serde_json::Value) -> serde_cbor::Value {
             } else if let Some(unsigned) = number.as_u64() {
                 serde_cbor::Value::Integer(unsigned as i128)
             } else {
-                serde_cbor::Value::Float(number.as_f64().expect("a JSON number is a number"))
+                // a serde_json number that is neither i64 nor u64 is an f64 by
+                // construction; the fallback keeps this function total
+                serde_cbor::Value::Float(number.as_f64().unwrap_or(f64::NAN))
             }
         }
         serde_json::Value::String(text) => serde_cbor::Value::Text(text.clone()),

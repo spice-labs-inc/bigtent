@@ -40,16 +40,12 @@ impl<'a> SanshoTrait<'a> for J {
         match self {
             // the text borrows the document
             J::String(text) => Ok(Cow::Borrowed(text.as_str())),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a String type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a string".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
     fn as_sansho_number(&self) -> Result<SanshoNumber, SanshoError> {
-        let number = (*self).as_number().ok_or_else(|| SanshoError::Evaluation {
-            message: "Not a Number type".to_string(),
-        })?;
+        let number = (*self).as_number().ok_or_else(|| SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a number".to_string(), found: format!("{:?}", self.kind()), function: None }))?;
         // exact first: serde_json preserves i64/u64 exactly — report them
         // full-width, never narrowed through f64
         if let Some(v) = number.as_i64() {
@@ -61,17 +57,13 @@ impl<'a> SanshoTrait<'a> for J {
         number
             .as_f64()
             .map(SanshoNumber::F64)
-            .ok_or_else(|| SanshoError::Evaluation {
-                message: "Not a Number type".to_string(),
-            })
+            .ok_or_else(|| SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a number".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     fn as_bool(&self) -> Result<bool, SanshoError> {
         match *self {
             J::Bool(value) => Ok(value),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a bool type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a boolean".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -84,9 +76,7 @@ impl<'a> SanshoTrait<'a> for J {
             J::Object(obj) => Ok(obj
                 .get(name)
                 .map(|member| Rc::new(member.clone()) as SanshoCarrier<'a>)),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an object type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -95,9 +85,7 @@ impl<'a> SanshoTrait<'a> for J {
             J::Array(value) => Ok(value
                 .get(index)
                 .map(|member| Rc::new(member.clone()) as SanshoCarrier<'a>)),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an array type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -108,9 +96,7 @@ impl<'a> SanshoTrait<'a> for J {
                 .iter()
                 .map(|(key, member)| (key.as_str(), Rc::new(member.clone()) as SanshoCarrier<'a>))
                 .collect()),
-            None => Err(SanshoError::Evaluation {
-                message: format!("entries requires an object, found {}", self.kind()),
-            }),
+            None => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -120,9 +106,7 @@ impl<'a> SanshoTrait<'a> for J {
                 .iter()
                 .map(|member| Rc::new(member.clone()) as SanshoCarrier<'a>)
                 .collect()),
-            None => Err(SanshoError::Evaluation {
-                message: format!("elements requires an array, found {}", self.kind()),
-            }),
+            None => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -135,18 +119,14 @@ impl<'a> SanshoTrait<'a> for J {
                 J::String(text) => Some(Cow::Borrowed(text.as_str())),
                 _ => None,
             }))),
-            None => Err(SanshoError::Evaluation {
-                message: format!("as_array_str requires an array, found {}", value.kind()),
-            }),
+            None => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", value.kind()), function: None })),
         }
     }
     fn container_len(&self) -> Result<usize, SanshoError> {
         match self {
             J::Object(map) => Ok(map.len()),
             J::Array(items) => Ok(items.len()),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an Array or Object".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array or an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -174,18 +154,14 @@ impl<'a> SanshoTrait<'a> for &'a J {
         match value {
             // the text borrows the document
             J::String(text) => Ok(Cow::Borrowed(text.as_str())),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a String type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a string".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
     fn as_sansho_number(&self) -> Result<SanshoNumber, SanshoError> {
         let number = (**self)
             .as_number()
-            .ok_or_else(|| SanshoError::Evaluation {
-                message: "Not a Number type".to_string(),
-            })?;
+            .ok_or_else(|| SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a number".to_string(), found: format!("{:?}", self.kind()), function: None }))?;
         // exact first: serde_json preserves i64/u64 exactly — report them
         // full-width, never narrowed through f64
         if let Some(v) = number.as_i64() {
@@ -197,17 +173,13 @@ impl<'a> SanshoTrait<'a> for &'a J {
         number
             .as_f64()
             .map(SanshoNumber::F64)
-            .ok_or_else(|| SanshoError::Evaluation {
-                message: "Not a Number type".to_string(),
-            })
+            .ok_or_else(|| SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a number".to_string(), found: format!("{:?}", self.kind()), function: None }))
     }
 
     fn as_bool(&self) -> Result<bool, SanshoError> {
         match **self {
             J::Bool(value) => Ok(value),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a bool type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a boolean".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -221,9 +193,7 @@ impl<'a> SanshoTrait<'a> for &'a J {
             J::Object(_) => Ok(value
                 .get(name)
                 .map(|member| Rc::new(member) as SanshoCarrier<'a>)),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an object type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -233,9 +203,7 @@ impl<'a> SanshoTrait<'a> for &'a J {
             J::Array(_) => Ok(value
                 .get(index)
                 .map(|member| Rc::new(member) as SanshoCarrier<'a>)),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an array type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -247,9 +215,7 @@ impl<'a> SanshoTrait<'a> for &'a J {
                 .iter()
                 .map(|(key, member)| (key.as_str(), Rc::new(member) as SanshoCarrier<'a>))
                 .collect()),
-            None => Err(SanshoError::Evaluation {
-                message: format!("entries requires an object, found {}", self.kind()),
-            }),
+            None => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -260,9 +226,7 @@ impl<'a> SanshoTrait<'a> for &'a J {
                 .iter()
                 .map(|member| Rc::new(member) as SanshoCarrier<'a>)
                 .collect()),
-            None => Err(SanshoError::Evaluation {
-                message: format!("elements requires an array, found {}", self.kind()),
-            }),
+            None => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -275,18 +239,14 @@ impl<'a> SanshoTrait<'a> for &'a J {
                 J::String(text) => Some(Cow::Borrowed(text.as_str())),
                 _ => None,
             }))),
-            None => Err(SanshoError::Evaluation {
-                message: format!("as_array_str requires an array, found {}", value.kind()),
-            }),
+            None => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", value.kind()), function: None })),
         }
     }
     fn container_len(&self) -> Result<usize, SanshoError> {
         match **self {
             J::Object(ref map) => Ok(map.len()),
             J::Array(ref items) => Ok(items.len()),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an Array or Object".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array or an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 

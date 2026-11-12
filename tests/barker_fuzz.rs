@@ -408,32 +408,22 @@ fn tally_of_an_unserializable_element_is_an_error() {
 
 #[test]
 fn namespace_failures_carry_their_kind() {
-    use bigtent::barker::error::BarkerError;
-
-    // each case: the script, and the kind it must produce
-    /// A case: the script, and the kind predicate it must satisfy.
-    type KindCase = (&'static str, fn(&BarkerError) -> bool);
+    // each case: the script, and the KIND CODE its error row must carry. The
+    // code is derived from the variant (`barker_kind_code`), so asserting the
+    // code is asserting the variant — and it is what a client branches on.
+    /// A case: the script, and the kind code it must satisfy.
+    type KindCase = (&'static str, &'static str);
     let cases: Vec<KindCase> = vec![
         // a TYPE error: a string where a number belongs
-        ("x = stats.median(\"not a list\")\nemit(x)\n", |e| {
-            matches!(e, BarkerError::Type { .. })
-        }),
+        ("x = stats.median(\"not a list\")\nemit(x)\n", "type"),
         // a VALUE error: an empty median
-        ("x = stats.median([])\nemit(x)\n", |e| {
-            matches!(e, BarkerError::Value { .. })
-        }),
+        ("x = stats.median([])\nemit(x)\n", "value"),
         // a RANGE error: a percentile outside 0..=100
-        ("x = stats.percentile([1, 2], 500)\nemit(x)\n", |e| {
-            matches!(e, BarkerError::Range { .. })
-        }),
+        ("x = stats.percentile([1, 2], 500)\nemit(x)\n", "range"),
         // a PATTERN error: a broken regex
-        ("x = patterns.matches(\"a\", \"[\")\nemit(x)\n", |e| {
-            matches!(e, BarkerError::Pattern { .. })
-        }),
+        ("x = patterns.matches(\"a\", \"[\")\nemit(x)\n", "pattern"),
         // a DATE error: not RFC 3339
-        ("x = dates.year(\"nope\")\nemit(x)\n", |e| {
-            matches!(e, BarkerError::Date { .. })
-        }),
+        ("x = dates.year(\"nope\")\nemit(x)\n", "date"),
     ];
 
     for (script, expected) in cases {
@@ -442,27 +432,26 @@ fn namespace_failures_carry_their_kind() {
         sender.send(serde_json::json!(1)).expect("sends");
         drop(sender);
         let rows = run_with(program, input, None, None, None).expect("the run starts");
-        let mut seen_kind = false;
-        for row in rows {
-            if let Err(error) = row {
-                // the run's error chain still carries the kind
-                if let Some(kind) = error.downcast_ref::<BarkerError>() {
-                    assert!(expected(kind), "wrong kind for {script}: {kind:?}");
-                    seen_kind = true;
-                }
-                break;
-            }
-        }
-        // the row-level errors are prose; the KIND is verified when the run
-        // surfaces a typed error. Either path is acceptable here; what must
-        // not happen is a wrong-kind error.
-        let _ = seen_kind;
+        // a FAILURE arrives as an `Ok` row carrying `kind` (`run_with` converts
+        // every evaluator error through `error_row`), so the kind is asserted on
+        // the row: awaiting an `Err` here would never execute
+        let rows: Vec<serde_json::Value> = rows.filter_map(|row| row.ok()).collect();
+        let kind_row = rows
+            .iter()
+            .find(|row| row.get("kind").is_some())
+            .unwrap_or_else(|| panic!("{script} must answer a typed error row: {rows:?}"));
+        let kind = kind_row["kind"].as_str().unwrap_or("");
+        assert_eq!(
+            kind, expected,
+            "wrong kind for {script}: {kind_row:?}"
+        );
     }
 }
 
-/// THE ERROR ROW'S SHAPE: `{"error": <message>, "kind": <code>, "data": {...}}`
-/// — the message for humans, the code for branching, the data for the detail.
-/// A failure that is not ours carries only the message.
+/// THE ERROR ROW'S SHAPE: `{"error": <message>, "kind": <code>, "data": <the error>}`
+/// — the message for humans, the code for branching, and the data is the ERROR
+/// SERIALISED FROM ITS OWN TYPE (not assembled by hand), so the shape below is
+/// `BarkerError`'s: the variant name, then its fields.
 #[test]
 fn an_error_row_carries_the_kind_and_its_data() {
     // a TYPE failure: the row names the function, the argument, what was
@@ -471,17 +460,17 @@ fn an_error_row_carries_the_kind_and_its_data() {
     let row = rows.first().expect("the error row");
     assert_eq!(row["kind"], serde_json::json!("type"), "the kind: {row}");
     assert_eq!(
-        row["data"]["function"],
+        row["data"]["Type"]["function"],
         serde_json::json!("median"),
         "the function: {row}"
     );
     assert_eq!(
-        row["data"]["expected"],
+        row["data"]["Type"]["expected"],
         serde_json::json!("a list"),
         "what was expected: {row}"
     );
     assert!(
-        row["data"]["found"].is_string(),
+        row["data"]["Type"]["found"].is_string(),
         "what arrived: {row}"
     );
     assert!(row["error"].is_string(), "the human message: {row}");
@@ -490,17 +479,18 @@ fn an_error_row_carries_the_kind_and_its_data() {
     let rows = run("x = patterns.matches(\"a\", \"[\")\nemit(x)\n").1;
     let row = rows.first().expect("the error row");
     assert_eq!(row["kind"], serde_json::json!("pattern"));
-    assert_eq!(row["data"]["pattern"], serde_json::json!("["));
+    assert_eq!(row["data"]["Pattern"]["pattern"], serde_json::json!("["));
 
     // a DATE failure: the row carries the text that was not a date
     let rows = run("x = dates.year(\"nope\")\nemit(x)\n").1;
     let row = rows.first().expect("the error row");
     assert_eq!(row["kind"], serde_json::json!("date"));
-    assert_eq!(row["data"]["text"], serde_json::json!("nope"));
+    assert_eq!(row["data"]["Date"]["text"], serde_json::json!("nope"));
 
     // a RANGE failure: the row names the function and the detail
     let rows = run("x = stats.percentile([1, 2], 500)\nemit(x)\n").1;
     let row = rows.first().expect("the error row");
     assert_eq!(row["kind"], serde_json::json!("range"));
-    assert_eq!(row["data"]["function"], serde_json::json!("percentile"));
+    // a RANGE is its own variant, so its function is under `Range`
+    assert_eq!(row["data"]["Range"]["function"], serde_json::json!("percentile"));
 }

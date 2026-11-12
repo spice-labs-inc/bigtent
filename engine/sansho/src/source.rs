@@ -85,9 +85,10 @@ fn count_until_break(bytes: &[u8], object: bool) -> Result<usize, SanshoError> {
 /// The decoder's error, as the engine's Input error: a malformed or
 /// truncated document.
 fn decoder_error(error: minicbor::decode::Error) -> SanshoError {
-    SanshoError::Input {
-        message: error.to_string(),
-    }
+    // the decoder's message is the only description of WHAT is malformed, so it
+    // travels as data rather than being dropped
+    SanshoError::input(0, crate::error::InputFault::Decode { at: 0 })
+        .with_detail(error.to_string())
 }
 
 impl<'a> SanshoTrait<'a> for &'a [u8] {
@@ -166,23 +167,17 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
             }
             // the text borrows the document
             Kind::String => decoder_text(self),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a String type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a string".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
     fn as_bytes(&self) -> Result<&'a [u8], SanshoError> {
         match self.kind() {
             // a chunked byte string has no single slice to lend
-            Kind::Bytes if item_type(self) == Some(Type::BytesIndef) => Err(SanshoError::Input {
-                message: "indefinite-length byte string".to_string(),
-            }),
+            Kind::Bytes if item_type(self) == Some(Type::BytesIndef) => Err(SanshoError::input(0, crate::error::InputFault::Decode { at: 0 })),
             // the octets are the document's own bytes: no copy, no encoding
             Kind::Bytes => Decoder::new(self).bytes().map_err(decoder_error),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a byte carrier".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a byte carrier".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -209,9 +204,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
                     Some(bits) => Ok(SanshoNumber::F64(crate::cbor::half_to_f64(
                         u16::from_be_bytes(bits),
                     ))),
-                    None => Err(SanshoError::Evaluation {
-                        message: "truncated half-precision float".to_string(),
-                    }),
+                    None => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::Malformed { what: "truncated half-precision float".to_string() })),
                 }
             }
             Type::F32 => decoder
@@ -219,9 +212,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
                 .map(|value| SanshoNumber::F64(value as f64))
                 .map_err(decoder_error),
             Type::F64 => decoder.f64().map(SanshoNumber::F64).map_err(decoder_error),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a Number type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a number".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -229,9 +220,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
         let mut decoder = Decoder::new(self);
         match decoder.datatype().map_err(decoder_error)? {
             Type::Bool => decoder.bool().map_err(decoder_error),
-            _ => Err(SanshoError::Evaluation {
-                message: "Not a bool type".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a boolean".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -304,9 +293,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
         // both encodings have a count: the definite head, or a walk to the
         // break byte
         if self.kind() != Kind::Object {
-            return Err(SanshoError::Evaluation {
-                message: format!("entries requires an object, found {}", self.kind()),
-            });
+            return Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an object".to_string(), found: format!("{:?}", self.kind()), function: None }));
         }
         let count = self.container_len()? as u64;
         // step past the HEAD: `skip()` would jump the whole container, break
@@ -341,9 +328,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
         let bytes: &'a [u8] = self;
         let mut decoder = Decoder::new(bytes);
         if self.kind() != Kind::Array {
-            return Err(SanshoError::Evaluation {
-                message: format!("elements requires an array, found {}", self.kind()),
-            });
+            return Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None }));
         }
         let count = self.container_len()? as u64;
         // step past the HEAD: `skip()` would jump the whole container, break
@@ -393,8 +378,14 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
                             return Some(Cow::Borrowed(text));
                         }
                     } else if kind == Type::StringIndef {
-                        // a chunked text item has no single `&str`: the
-                        // lenient read passes over it
+                        // a chunked text item has no single `&str` to borrow, so
+                        // the lenient read passes over it — but it MUST advance:
+                        // leaving the decoder on the head re-reads it forever in an
+                        // indefinite array, and spends the element budget without
+                        // moving in a definite one
+                        if decoder.skip().is_err() {
+                            return None;
+                        }
                     } else if decoder.skip().is_err() {
                         // a malformed element: there is nothing to resynchronize
                         // to, so the iteration ends
@@ -402,9 +393,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
                     }
                 })))
             }
-            _ => Err(SanshoError::Evaluation {
-                message: format!("as_array_str requires an array, found {}", self.kind()),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 
@@ -422,9 +411,7 @@ impl<'a> SanshoTrait<'a> for &'a [u8] {
                 Some(count) => Ok(count as usize),
                 None => count_until_break(self, false),
             },
-            _ => Err(SanshoError::Evaluation {
-                message: "Not an Array or Object".to_string(),
-            }),
+            _ => Err(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "an array or an object".to_string(), found: format!("{:?}", self.kind()), function: None })),
         }
     }
 

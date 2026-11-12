@@ -103,3 +103,39 @@ fn escaped_delimiters_do_not_disable_the_guard() {
         }
     }
 }
+
+/// A STRING CANNOT SMUGGLE THE NESTING PAST THE GUARD.
+///
+/// REQUIREMENT (third review, finding 1): the guard's lexical helpers must agree
+/// with the parser about where a string ENDS. `skip_raw` advanced ONE byte for a
+/// bare backslash, but the parser pairs a backslash with the NEXT byte as one
+/// content unit — so for `'a\\'` (bytes: quote, a, backslash, backslash, quote)
+/// the parser closes the string at the final quote while `skip_raw` treats that
+/// quote as escaped and answers `None`. The guard then bailed out entirely
+/// (`let end = end?`), and the rest of the expression was scanned with no depth
+/// count at all — reintroducing the stack-overflow abort for a string that is
+/// perfectly legal.
+///
+/// THEORY OF THE TEST: the expression is a valid raw string with an even
+/// backslash run, followed by deep nesting. Either it is refused with a `Limit`
+/// error (the guard saw the depth) or the process aborts on a stack overflow
+/// (the guard was disabled). There is no third outcome, so this test cannot pass
+/// by accident: a `Limit` answer is only reachable when the guard stayed armed
+/// past the string.
+///
+/// LLM section: `'a\\'` is a two-character raw string containing one backslash.
+/// Sixteen thousand `(` after it must hit the depth limit, never the guard's
+/// early `None`.
+#[test]
+fn a_raw_string_with_a_doubled_backslash_cannot_disable_the_guard() {
+    let expression = format!("{}x{}", "(".repeat(2_000), ")".repeat(2_000));
+    // the same hostile shape, but reached through a leading legal raw string
+    let with_string = format!("'a\\\\' | {expression}");
+    match parse(&with_string) {
+        Err(SanshoError::Limit { .. }) => {}
+        other => panic!(
+            "the guard must stay armed after a raw string, not {other:?} — \
+             `skip_raw` disagrees with `parse_raw_string` about `'a\\\\'`"
+        ),
+    }
+}

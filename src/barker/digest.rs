@@ -30,7 +30,11 @@ use starlark::values::Value;
 fn swh_of(gitoid: &str) -> String {
     // a gitoid is `gitoid:blob:<algo>:<hex>`; a SWHID is the same hex with its own
     // prefix, so the hex is taken from the last colon onwards
-    let hex = gitoid.rsplit(':').next().unwrap_or_default();
+    // the last colon-separated field is the hex, and a bare hex is already what a
+    // SWHID needs: every input answers itself rather than an empty default, so a
+    // shape the engine never produces degrades to a true statement, not to
+    // `swh:1:cnt:` with nothing after it
+    let hex = gitoid.rsplit(':').next().unwrap_or(gitoid);
     format!("swh:1:cnt:{hex}")
 }
 
@@ -90,5 +94,39 @@ pub fn digest(builder: &mut GlobalsBuilder) {
     /// `swh:1:cnt:<64 hex>`, over the git blob digest as above.
     fn swh_sha256(text: Value) -> anyhow::Result<String> {
         Ok(swh_of(&coordinates::gitoid_blob_sha256(as_bytes("swh_sha256", text)?)))
+    }
+}
+
+#[cfg(test)]
+mod swh_shape {
+    //! A SWHID BUILT FROM A GITOID NEVER CONTAINS AN EMPTY DIGEST.
+    //!
+    //! REQUIREMENT (class-C sweep): `swh_of` ended in `.unwrap_or_default()`, so a
+    //! shape it did not recognise produced `swh:1:cnt:` with nothing after it — a
+    //! valid-looking identifier that resolves to nothing.
+    //!
+    //! THEORY OF THE TEST: the last colon-separated field is the hex, and a value
+    //! with NO colon is already a bare hex, so every input answers itself. The test
+    //! asserts both shapes and that the digest is never empty.
+
+    use super::swh_of;
+
+    /// Both shapes produce a SWHID whose digest is the input's digest.
+    #[test]
+    fn a_swhid_always_carries_its_digest() {
+        assert_eq!(
+            swh_of("gitoid:blob:sha1:abcd1234"),
+            "swh:1:cnt:abcd1234"
+        );
+        // a bare hex is already the digest: no empty tail
+        assert_eq!(swh_of("abcd1234"), "swh:1:cnt:abcd1234");
+        // and the digest is never empty for any non-empty input
+        for input in ["a", "a:b", "gitoid:blob:sha256:00"] {
+            let swhid = swh_of(input);
+            assert!(
+                !swhid.ends_with("cnt:"),
+                "`{input}` produced an empty digest: {swhid}"
+            );
+        }
     }
 }

@@ -115,9 +115,7 @@ impl Driver for Unimplemented {
 /// same shape).
 pub fn load_corpus(dir: &Path) -> Result<Vec<CorpusFile>, SanshoError> {
     let mut files = Vec::new();
-    let entries = std::fs::read_dir(dir).map_err(|e| SanshoError::Input {
-        message: format!("cannot read corpus directory {}: {e}", dir.display()),
-    })?;
+    let entries = std::fs::read_dir(dir).map_err(|error| SanshoError::input(0, crate::error::InputFault::Decode { at: 0 }).with_detail(error.to_string()))?;
     let mut paths: Vec<_> = entries
         .filter_map(std::result::Result::ok)
         .map(|e| e.path())
@@ -135,24 +133,15 @@ pub fn load_corpus(dir: &Path) -> Result<Vec<CorpusFile>, SanshoError> {
             // file measures speed (it declares no expected results)
             continue;
         }
-        let raw = std::fs::read_to_string(&path).map_err(|e| SanshoError::Input {
-            message: format!("cannot read corpus file {}: {e}", path.display()),
-        })?;
+        let raw = std::fs::read_to_string(&path).map_err(|error| SanshoError::input(0, crate::error::InputFault::Decode { at: 0 }).with_detail(error.to_string()))?;
         let groups: Vec<serde_json::Value> =
-            serde_json::from_str(&raw).map_err(|e| SanshoError::Input {
-                message: format!("corpus file {} is not valid JSON: {e}", path.display()),
-            })?;
+            serde_json::from_str(&raw).map_err(|error| SanshoError::input(0, crate::error::InputFault::Decode { at: 0 }).with_detail(error.to_string()))?;
         let mut parsed = Vec::new();
         for group in groups {
             let given = match group.get("given") {
                 Some(g) => g.clone(),
                 None => {
-                    return Err(SanshoError::Input {
-                        message: format!(
-                            "corpus file {} has a group without `given`",
-                            path.display()
-                        ),
-                    });
+                    return Err(SanshoError::input(0, crate::error::InputFault::Decode { at: 0 }));
                 }
             };
             let cases = match group.get("cases").and_then(|c| c.as_array()) {
@@ -162,12 +151,7 @@ pub fn load_corpus(dir: &Path) -> Result<Vec<CorpusFile>, SanshoError> {
                         let expression = match case.get("expression").and_then(|e| e.as_str()) {
                             Some(e) => e.to_string(),
                             None => {
-                                return Err(SanshoError::Input {
-                                    message: format!(
-                                        "corpus file {} has a case without an `expression` string",
-                                        path.display()
-                                    ),
-                                });
+                                return Err(SanshoError::input(0, crate::error::InputFault::Decode { at: 0 }));
                             }
                         };
                         out.push(CorpusCase {
@@ -183,12 +167,7 @@ pub fn load_corpus(dir: &Path) -> Result<Vec<CorpusFile>, SanshoError> {
                     out
                 }
                 None => {
-                    return Err(SanshoError::Input {
-                        message: format!(
-                            "corpus file {} has a group without `cases`",
-                            path.display()
-                        ),
-                    });
+                    return Err(SanshoError::input(0, crate::error::InputFault::Decode { at: 0 }));
                 }
             };
             parsed.push(CorpusGroup { given, cases });
@@ -428,10 +407,7 @@ mod tests {
         struct AlwaysParseError;
         impl Driver for AlwaysParseError {
             fn evaluate(&self, _given: &serde_json::Value, _expression: &str) -> DriverOutcome {
-                DriverOutcome::Error(SanshoError::Parse {
-                    message: "always".into(),
-                    position: 0,
-                })
+                DriverOutcome::Error({ let at = 0; SanshoError::parse(Some(crate::error::Span::new(at, at + 1)), None, crate::error::ParseFault::ExpectedToken { found: "always".into() }) })
             }
         }
         let dir = std::path::Path::new("tests/jmespath-corpus/compliance");

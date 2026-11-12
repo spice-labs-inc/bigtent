@@ -32,6 +32,9 @@ This directory contains technical documentation for Big Tent.
   ([LLM companion](sansho/consumer_guide_llm.md))
 * [Benchmarks](sansho/benchmarks.md) - the three-pipeline comparison, the gates, the protocol
   ([LLM companion](sansho/benchmarks_llm.md))
+* [Errors](sansho/errors.md) - the five categories, their locations, and what a client
+  branches on
+  ([LLM companion](sansho/errors_llm.md))
 * [Troubleshooting](sansho/troubleshooting.md) - the common failures and what they mean
   ([LLM companion](sansho/troubleshooting_llm.md))
 

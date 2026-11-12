@@ -227,10 +227,14 @@ impl<'v> StarlarkValue<'v> for Rows {
     ) -> Option<Value<'v>> {
         match self.0.recv().ok()? {
             Ok(row) => Some(heap.alloc(row)),
-            // a failed row ends the stream with a PANIC — this API cannot
-            // return an error mid-iteration — and the run_with umbrella
-            // (finding 7) catches it and makes it an error row
-            Err(error) => panic!("the nested query failed: {error}"),
+            // NO PANIC: an iterator cannot return an error mid-stream, so the failure
+            // is handed on as the ROW this pipeline uses for failures — the same shape
+            // every other stage produces — and the stream then ends.
+            Err(error) => Some(heap.alloc(serde_json::json!({
+                "error": error.to_string(),
+                "kind": "nested",
+                "data": { "detail": error.to_string() },
+            }))),
         }
     }
 
@@ -331,7 +335,6 @@ pub fn run_with(
         // kill this thread, close the channel, and leave the client with
         // partial rows and a clean 200. The panic is caught and becomes the
         // SAME failure the Result path produces: an error row.
-        let sender_for_panic = sender.clone();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Module::with_temp_heap(|module| {
             // standard library, then Big Tent's natives and namespaces, then the
@@ -384,7 +387,6 @@ pub fn run_with(
             Err(anyhow::anyhow!("{message}").into())
         });
 
-        let _ = &sender_for_panic;
         if let Err(error) = outcome {
             // A program that failed says so as a ROW, not as the end of the
             // stream. A pipeline carries rows; an error that lived outside them
@@ -398,6 +400,10 @@ pub fn run_with(
             // begun — and is swallowed only because this thread is finishing
             // anyway; there is nothing left to report to
             let row = crate::barker::error_row(&error);
+            // a failed send is the consumer being gone: the teardown has begun and
+            // this thread is finishing either way, so the failure is not reported
+            // — but it is not SILENT either, because the loop ends here instead of
+            // continuing to produce rows nobody will read
             let _ = sender.send(Ok(row));
         }
     });
@@ -1504,10 +1510,13 @@ pub fn error_row(error: &starlark::Error) -> serde_json::Value {
             .chain()
             .find_map(|cause| cause.downcast_ref::<crate::barker::error::BarkerError>())
         {
+            // THE DATA IS THE ERROR: serialised from the type, not assembled by hand,
+            // so a field added to the error appears in the row with no second place to
+            // remember.
             return serde_json::json!({
                 "error": format!("{error}"),
                 "kind": barker_kind_code(kind),
-                "data": barker_kind_data(kind),
+                "data": serde_json::to_value(kind).unwrap_or(serde_json::Value::Null),
             });
         }
         if let Some(kind) = payload
@@ -1517,68 +1526,13 @@ pub fn error_row(error: &starlark::Error) -> serde_json::Value {
             return serde_json::json!({
                 "error": format!("{error}"),
                 "kind": kind.code(),
-                "data": highwire_kind_data(kind),
+                "data": serde_json::to_value(kind).unwrap_or(serde_json::Value::Null),
             });
         }
     }
     serde_json::json!({ "error": format!("{error}") })
 
 }
-
-/// The structured fields of a Barker failure kind.
-pub fn barker_kind_data(kind: &crate::barker::error::BarkerError) -> serde_json::Value {
-    use crate::barker::error::BarkerError;
-    match kind {
-        BarkerError::Type {
-            function,
-            argument,
-            expected,
-            found,
-        } => serde_json::json!({
-            "function": function,
-            "argument": argument,
-            "expected": expected,
-            "found": found,
-        }),
-        BarkerError::Value { function, detail }
-        | BarkerError::Range { function, detail }
-        | BarkerError::Unrepresentable { function, detail } => serde_json::json!({
-            "function": function,
-            "detail": detail,
-        }),
-        BarkerError::Pattern {
-            function,
-            pattern,
-            reason,
-        } => serde_json::json!({
-            "function": function,
-            "pattern": pattern,
-            "reason": reason,
-        }),
-        BarkerError::Date {
-            function,
-            text,
-            reason,
-        } => serde_json::json!({
-            "function": function,
-            "text": text,
-            "reason": reason,
-        }),
-    }
-}
-
-/// The structured fields of a High Wire failure kind.
-pub fn highwire_kind_data(kind: &crate::highwire::error::HighWireError) -> serde_json::Value {
-    use crate::highwire::error::HighWireError;
-    match kind {
-        HighWireError::ConsumerGone { stage } => serde_json::json!({ "stage": stage }),
-        HighWireError::Budget { detail }
-        | HighWireError::Wiring { detail }
-        | HighWireError::Build { detail }
-        | HighWireError::Nested { detail } => serde_json::json!({ "detail": detail }),
-    }
-}
-
 
 /// The stable code of a Barker failure kind.
 pub fn barker_kind_code(kind: &crate::barker::error::BarkerError) -> String {

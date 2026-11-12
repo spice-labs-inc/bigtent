@@ -1,3 +1,11 @@
+// The engine's error carries its location and its source text by design; boxing it
+// would add an allocation to every failure. The same expectation the library crates
+// declare, restated because each test and bench is its own crate root.
+#![expect(
+    clippy::result_large_err,
+    reason = "the error carries its location and its source by design"
+)]
+
 //! The four-path benchmark suite: the
 //! data paths for the scan, full-item, and seek shapes across item
 //! sizes. The `cursor_original` numbers are the recorded baseline the

@@ -1,3 +1,11 @@
+// The engine's error carries its location and its source text by design; boxing it
+// would add an allocation to every failure. The same expectation the library crates
+// declare, restated because each test and bench is its own crate root.
+#![expect(
+    clippy::result_large_err,
+    reason = "the error carries its location and its source by design"
+)]
+
 //! Non-finite numbers at the JSON boundary.
 //!
 //! REQUIREMENT (second review, finding 19, decided by the owner — option 1):
@@ -100,10 +108,23 @@ fn mean_is_not_a_function_but_avg_is() {
     // as any unknown function is — never evaluated to an average
     let parsed = sansho::parse("mean(@)").expect("parses");
     match sansho::compile(&parsed, None) {
-        Err(error) => assert!(
-            format!("{error}").contains("unknown function"),
-            "the refusal names the unknown function: {error}"
-        ),
+        // the refusal is STRUCTURE, not prose: the reason is the variant, and the span
+        // points at the name
+        Err(sansho::error::SanshoError::Compile { span, reason, .. }) => {
+            assert_eq!(
+                reason,
+                sansho::error::CompileFault::UnknownFunction {
+                    name: "mean".to_string()
+                },
+                "the refusal names the unknown function as a variant"
+            );
+            assert_eq!(
+                span,
+                Some(sansho::error::Span::new(0, 4)),
+                "and points at `mean`"
+            );
+        }
+        Err(other) => panic!("the refusal must be a COMPILE failure, got {other:?}"),
         Ok(program) => {
             let outcome = evaluate(&program, &bytes[..]);
             assert!(

@@ -23,28 +23,58 @@ use starlark::values::{Value, ValueLike};
 /// to detect. A native that guards against a NaN has to be able to receive one.
 ///
 /// `None` for anything that is not a number.
-pub fn as_number(value: Value) -> Option<f64> {
+pub fn as_number(value: Value) -> Result<f64, NumberFault> {
     if let Some(float) = value.downcast_ref::<StarlarkFloat>() {
-        return Some(float.0);
+        return Ok(float.0);
+    }
+    if let Some(integer) = value.unpack_i32() {
+        return Ok(f64::from(integer));
     }
     // Starlark integers are arbitrary precision; `i64` carries what a query
-    // computes in practice, including epoch milliseconds, which do not fit in an
-    // `i32`.
-    value.unpack_i32().map(f64::from).or_else(|| {
-        value
-            .to_json_value()
-            .ok()
-            .and_then(|json| json.as_i64())
-            .map(|integer| integer as f64)
-    })
+    // computes in practice, including epoch milliseconds. An integer that does not
+    // fit is NOT "not a number" — it IS a number, too large to carry — which is
+    // Python's OverflowError, and the distinction is what `NumberFault` keeps.
+    match value.to_json_value() {
+        Ok(json) => match json.as_i64() {
+            Some(integer) => Ok(integer as f64),
+            None if json.is_number() => Err(NumberFault::TooLarge),
+            None => Err(NumberFault::NotANumber),
+        },
+        Err(_) => Err(NumberFault::TooLarge),
+    }
 }
 
-/// A Starlark integer as an `i64`.
-pub fn as_integer(value: Value) -> Option<i64> {
-    value
-        .unpack_i32()
-        .map(i64::from)
-        .or_else(|| value.to_json_value().ok().and_then(|json| json.as_i64()))
+/// Why a value is not usable as a number — Python's split, exactly.
+///
+/// `TypeError` (wrong kind of thing), `ValueError` (right kind, unusable value) and
+/// `OverflowError` (right kind, too large) are three different failures in the
+/// reference dialect, and a bare `Option` collapsed the last two into the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberFault {
+    /// Not a number at all: Python's `TypeError`.
+    NotANumber,
+    /// A number that cannot be carried in an `f64`/`i64`: Python's
+    /// `OverflowError`.
+    TooLarge,
+}
+
+/// A Starlark integer as an `i64`, or WHY it is not one.
+///
+/// The `Option` this replaces fused "not a number" with "a number too large to carry",
+/// and every caller then reported the second as the first — Python's `TypeError` where it
+/// should have been `OverflowError`. `NumberFault` keeps them apart, as `as_number` does.
+pub fn as_integer(value: Value) -> Result<i64, NumberFault> {
+    if let Some(integer) = value.unpack_i32() {
+        return Ok(i64::from(integer));
+    }
+    match value.to_json_value() {
+        Ok(json) => match json.as_i64() {
+            Some(integer) => Ok(integer),
+            None if json.is_number() => Err(NumberFault::TooLarge),
+            None => Err(NumberFault::NotANumber),
+        },
+        Err(_) => Err(NumberFault::TooLarge),
+    }
 }
 
 /// A Starlark list as a sequence of numbers.
@@ -57,13 +87,22 @@ pub fn as_numbers(function: &'static str, value: Value) -> Result<Vec<f64>, Bark
     };
     let mut numbers = Vec::with_capacity(list.len());
     for (position, element) in list.iter().enumerate() {
-        let Some(number) = as_number(element) else {
-            return Err(BarkerError::Type {
-                function,
-                argument: "values",
-                expected: "a list of numbers",
-                found: format!("`{}` at element {position}", element.get_type()),
-            });
+        let number = match as_number(element) {
+            Ok(number) => number,
+            Err(NumberFault::NotANumber) => {
+                return Err(BarkerError::Type {
+                    function,
+                    argument: "values",
+                    expected: "a list of numbers",
+                    found: format!("`{}` at element {position}", element.get_type()),
+                })
+            }
+            Err(NumberFault::TooLarge) => {
+                return Err(BarkerError::range(
+                    function,
+                    format!("`values` element {position} is too large to carry"),
+                ))
+            }
         };
         numbers.push(number);
     }
@@ -108,7 +147,13 @@ pub fn to_json_limited(value: Value, depth: usize) -> anyhow::Result<serde_json:
         return Ok(serde_json::Value::Bool(flag));
     }
     if let Some(number) = value.downcast_ref::<StarlarkFloat>() {
-        return Ok(serde_json::json!(number.0));
+        // `json!(expr)` is `to_value(expr).unwrap()`, and serde_json refuses a
+        // non-finite float — so the macro would PANIC here, contradicting this
+        // function's contract that an unrepresentable value is an error. Refuse
+        // it explicitly, the same way an unrepresentable dict key is refused.
+        let finite = serde_json::Number::from_f64(number.0)
+            .ok_or_else(|| anyhow::anyhow!("a non-finite number cannot become a row"))?;
+        return Ok(serde_json::Value::Number(finite));
     }
     if let Some(integer) = value.unpack_i32() {
         return Ok(serde_json::json!(integer));
@@ -237,8 +282,20 @@ pub fn number_argument(
     argument: &'static str,
     value: Value,
 ) -> Result<f64, BarkerError> {
-    as_number(value)
-        .ok_or_else(|| BarkerError::type_error(function, argument, "a number", value))
+    match as_number(value) {
+        Ok(number) => Ok(number),
+        Err(NumberFault::NotANumber) => Err(BarkerError::type_error(
+            function,
+            argument,
+            "a number",
+            value,
+        )),
+        // Python's OverflowError, naming the value the script actually passed
+        Err(NumberFault::TooLarge) => Err(BarkerError::range(
+            function,
+            format!("`{argument}` is too large to carry, found `{}`", value.get_type()),
+        )),
+    }
 }
 
 /// A Starlark string as `&str`, or a TYPE error naming the argument.
@@ -279,13 +336,20 @@ pub fn integer_argument(
     argument: &'static str,
     value: Value,
 ) -> Result<i64, BarkerError> {
-    let number = as_number(value)
-        .ok_or_else(|| BarkerError::type_error(function, argument, "a number", value))?;
+    let number = number_argument(function, argument, value)?;
     let shown = show_number(number);
-    if !number.is_finite() {
+    // Python's split, exactly: `int(float("nan"))` is ValueError and
+    // `int(float("inf"))` is OverflowError
+    if number.is_nan() {
         return Err(BarkerError::value(
             function,
-            format!("`{argument}` must be a finite number, found {shown}"),
+            format!("`{argument}` cannot be NaN, found {shown}"),
+        ));
+    }
+    if !number.is_finite() {
+        return Err(BarkerError::range(
+            function,
+            format!("`{argument}` must be finite, found {shown}"),
         ));
     }
     if number.fract() != 0.0 {

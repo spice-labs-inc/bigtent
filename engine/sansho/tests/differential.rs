@@ -1,3 +1,11 @@
+// The engine's error carries its location and its source text by design; boxing it
+// would add an allocation to every failure. The same expectation the library crates
+// declare, restated because each test and bench is its own crate root.
+#![expect(
+    clippy::result_large_err,
+    reason = "the error carries its location and its source by design"
+)]
+
 //! The differential tests: the cursor backend (raw CBOR bytes) against
 //! the materialized backend (in-memory JSON) — the corpus's
 //! backend-agreement requirement, plus the byte-level
@@ -42,9 +50,10 @@ impl Driver for CursorEngine {
         let bytes = match serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(given)) {
             Ok(bytes) => bytes,
             Err(e) => {
-                return DriverOutcome::Error(sansho::SanshoError::Input {
-                    message: format!("fixture encoding: {e}"),
-                });
+                return DriverOutcome::Error(sansho::SanshoError::input(
+                    0,
+                    sansho::error::InputFault::Read { at: 0, detail: e.to_string() },
+                ));
             }
         };
         let parsed = match parse(expression) {

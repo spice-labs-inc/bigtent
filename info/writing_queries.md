@@ -221,6 +221,55 @@ emit({"elapsed_ms": now_ms() - t0})
 `load` cannot reach the filesystem: the dialect enables it and no loader is
 configured, so it is an error rather than a file read.
 
+## What a failure row looks like
+
+A stage that fails answers with a ROW, not a truncated stream and not a silent 200:
+
+```json
+{
+  "error": "compile error at bytes 5..9: UnknownFunction { name: \"mean\" }",
+  "kind": "compile",
+  "data": { "category": "compile",
+            "span": {"start": 5, "end": 9},
+            "reason": {"UnknownFunction": {"name": "mean"}} }
+}
+```
+
+* `error` is the human line.
+* `kind` is the category — `input`, `parse`, `compile`, `evaluation` or `limit` — so a
+  client branches without parsing prose.
+* `data` is the **error itself, serialised**, so it carries the same structure the engine
+  used: the span in the expression, `path` for an evaluation failure (the document location,
+  e.g. `["body", {"Index": 3}]`), and the reason as a named variant.
+
+## The `/flatten` deviation from V1
+
+`/flatten` in V2 does **not** reproduce V1's payload exactly, and the difference is
+deliberate: V2's behaviour is the correct one.
+
+Both surfaces emit the identifier strings of an item's `contained:down` edges, using
+`alias:to` only as navigation. They differ when the same target is reached twice within
+one round of the traversal:
+
+* **V1** keeps a frontier set and skips a target that is already in it. So if `i0` has
+  an `alias:to` edge to `i5` and `i1` (reached in the same round) has a
+  `contained:down` edge to `i5`, V1 emits `i2` only — the `i5` hop is suppressed
+  because the alias edge reached it first. V1's payload therefore depends on traversal
+  order rather than on the graph.
+* **V2** has no frontier: it emits every `contained:down` target of every reachable
+  item, deduplicated. The same graph yields `i2` and `i5`.
+
+Rules that follow from this:
+
+* V2 always emits **at least** what V1 emits; it never loses an emission.
+* An equivalence test for `/flatten` must compare against V2's rule, not V1's. The
+  current test pins both sides to their own rule and additionally asserts the
+  one-directional containment, so the deviation cannot silently grow or disappear.
+  See `flatten_three_ways_agree_on_every_generated_graph` and
+  `expected_flatten_v2` in `tests/north_purls_property.rs`.
+* The decision and its reasoning are recorded in
+  `discussions/2026_11_02_flatten_v1_v2_deviation.md`.
+
 ## Serving a query over HTTP
 
 The V2 surface serves the named queries at `/v2/query`:

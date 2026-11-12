@@ -1,3 +1,12 @@
+// THE ERROR TYPE IS DELIBERATELY LARGE, AND BOXING IT WOULD BE THE WRONG TRADE:
+// it carries a span, the document path and the expression text, because a diagnostic
+// that does not carry them cannot point at anything. Boxing every error to shrink a
+// `Result` would add an allocation on the failure path of the whole engine.
+#![expect(
+    clippy::result_large_err,
+    reason = "the error carries its location and its source text by design"
+)]
+
 //! # Sansho — a JMESPath projection engine for single CBOR documents
 //!
 //! Sansho evaluates a JMESPath expression against one CBOR document and
@@ -93,9 +102,7 @@ pub fn evaluate<'a, T: SanshoTrait<'a>>(
         .map(eval::flow_value)
         .map_err(|e| match e {
             Stop::Error(e) => e,
-            Stop::NotImplemented => SanshoError::Evaluation {
-                message: "Not implemented".to_string(),
-            },
+            Stop::NotImplemented => SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::NotImplemented),
         })
 }
 
@@ -146,13 +153,13 @@ impl MaterializationBudget {
     fn count_node(&mut self) -> Result<(), SanshoError> {
         self.nodes += 1;
         if self.nodes > MAX_MATERIALIZED_NODES {
-            return Err(SanshoError::Limit {
-                message: format!(
-                    "materialization exceeds {} nodes (shared structures can denote \
-                     exponentially many); narrow the expression",
-                    MAX_MATERIALIZED_NODES
-                ),
-            });
+            return Err(SanshoError::limit(
+                None,
+                crate::error::LimitFault::OutputNodes {
+                    allowed: MAX_MATERIALIZED_NODES as usize,
+                    observed: self.nodes as usize,
+                },
+            ));
         }
         Ok(())
     }
@@ -160,12 +167,13 @@ impl MaterializationBudget {
     fn count_bytes(&mut self, bytes: u64) -> Result<(), SanshoError> {
         self.bytes += bytes;
         if self.bytes > MAX_MATERIALIZED_STRING_BYTES {
-            return Err(SanshoError::Limit {
-                message: format!(
-                    "materialization exceeds {} bytes of string text; narrow the expression",
-                    MAX_MATERIALIZED_STRING_BYTES
-                ),
-            });
+            return Err(SanshoError::limit(
+                None,
+                crate::error::LimitFault::OutputBytes {
+                    allowed: MAX_MATERIALIZED_STRING_BYTES,
+                    observed: self.bytes,
+                },
+            ));
         }
         Ok(())
     }

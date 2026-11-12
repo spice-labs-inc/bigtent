@@ -918,14 +918,14 @@ impl GoatRodeoCluster {
 async fn test_antialias() {
     use std::{path::PathBuf, time::Instant};
     let start = Instant::now();
-    let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
+    let goat_rodeo_test_data: PathBuf = "../goatrodeo/target/test-out/res_for_big_tent/".into();
     // punt test if the files don't exist
     if !goat_rodeo_test_data.is_dir() {
         return;
     }
 
     let mut files = GoatRodeoCluster::cluster_files_in_dir(
-        "../goatrodeo/res_for_big_tent/".into(),
+        "../goatrodeo/target/test-out/res_for_big_tent/".into(),
         true,
         vec![],
     )
@@ -983,7 +983,7 @@ async fn test_generated_cluster() {
     let test_paths: Vec<String> = vec![
         "../../tmp/oc_dest/result_aa".into(),
         "../../tmp/oc_dest/result_ab".into(),
-        "../goatrodeo/res_for_big_tent/".into(),
+        "../goatrodeo/target/test-out/res_for_big_tent/".into(),
     ];
 
     for test_path in &test_paths {
@@ -1038,14 +1038,14 @@ async fn test_generated_cluster() {
 async fn test_files_in_dir() {
     use std::time::{Duration, Instant};
 
-    let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
+    let goat_rodeo_test_data: PathBuf = "../goatrodeo/target/test-out/res_for_big_tent/".into();
     // punt test if the files don't exist
     if !goat_rodeo_test_data.is_dir() {
         return;
     }
 
     let files = match GoatRodeoCluster::cluster_files_in_dir(
-        "../goatrodeo/res_for_big_tent/".into(),
+        "../goatrodeo/target/test-out/res_for_big_tent/".into(),
         true,
         vec![],
     )
@@ -1151,7 +1151,7 @@ async fn test_generated_cluster_no_index() {
     let test_paths: Vec<String> = vec![
         "../../tmp/oc_dest/result_aa".into(),
         "../../tmp/oc_dest/result_ab".into(),
-        "../goatrodeo/res_for_big_tent/".into(),
+        "../goatrodeo/target/test-out/res_for_big_tent/".into(),
     ];
 
     for test_path in &test_paths {
@@ -1209,14 +1209,14 @@ async fn test_generated_cluster_no_index() {
 async fn test_files_in_dir_no_index_load() {
     use std::time::Instant;
 
-    let goat_rodeo_test_data: PathBuf = "../goatrodeo/res_for_big_tent/".into();
+    let goat_rodeo_test_data: PathBuf = "../goatrodeo/target/test-out/res_for_big_tent/".into();
     // punt test if the files don't exist
     if !goat_rodeo_test_data.is_dir() {
         return;
     }
 
     let files = match GoatRodeoCluster::cluster_files_in_dir(
-        "../goatrodeo/res_for_big_tent/".into(),
+        "../goatrodeo/target/test-out/res_for_big_tent/".into(),
         false,
         vec![],
     )

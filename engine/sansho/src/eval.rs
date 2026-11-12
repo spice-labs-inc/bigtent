@@ -59,9 +59,8 @@ impl Stop {
     pub fn into_error(self) -> SanshoError {
         match self {
             Stop::Error(e) => e,
-            Stop::NotImplemented => SanshoError::Compile {
-                message: "expression uses constructs not yet implemented".to_string(),
-            },
+            Stop::NotImplemented => SanshoError::compile(None, None, crate::error::CompileFault::InvalidStructure { detail: "expression uses constructs not yet implemented".to_string(),
+            }),
         }
     }
 }
@@ -135,7 +134,7 @@ pub(crate) fn eval<'a>(program: &Program, node: SanshoCarrier<'a>) -> Result<Flo
         }
         Program::And(left, right) => {
             let left_value = flow_value(eval(left, node.clone())?);
-            if truthy(&left_value) {
+            if truthy(&left_value)? {
                 eval(right, node)
             } else {
                 Ok(Flow::Value(left_value))
@@ -143,14 +142,14 @@ pub(crate) fn eval<'a>(program: &Program, node: SanshoCarrier<'a>) -> Result<Flo
         }
         Program::Or(left, right) => {
             let left_value = flow_value(eval(left, node.clone())?);
-            if truthy(&left_value) {
+            if truthy(&left_value)? {
                 Ok(Flow::Value(left_value))
             } else {
                 eval(right, node)
             }
         }
         Program::Not(inner) => {
-            let value = !truthy(&flow_value(eval(inner, node)?));
+            let value = !truthy(&flow_value(eval(inner, node)?))?;
             Ok(Flow::Value(Rc::new(value)))
         }
     }
@@ -160,15 +159,52 @@ pub(crate) fn eval<'a>(program: &Program, node: SanshoCarrier<'a>) -> Result<Flo
 /// projecting edge collects its elements into a grouping and the REMAINING
 /// edges then apply at that collection's level; otherwise the chain walks the
 /// single position.
-fn eval_spine<'a>(node: SanshoCarrier<'a>, edges: &[Edge]) -> Result<Flow<'a>, Stop> {
+fn eval_spine<'a>(
+    node: SanshoCarrier<'a>,
+    edges: &[(Edge, crate::error::Span)],
+) -> Result<Flow<'a>, Stop> {
+    let mut path = crate::error::Path::root();
+    eval_spine_at(node, edges, &mut path)
+}
+
+/// The spine walk with the document path it has followed so far, so a failure can
+/// say WHERE IN THE DOCUMENT it happened and not only where in the expression.
+fn eval_spine_at<'a>(
+    node: SanshoCarrier<'a>,
+    edges: &[(Edge, crate::error::Span)],
+    path: &mut crate::error::Path,
+) -> Result<Flow<'a>, Stop> {
     match edges {
         [] => Ok(Flow::Value(node)),
-        [edge, rest @ ..] => eval_edge(node, edge, rest),
+        // EVERY failure raised while applying this selector is given the selector's
+        // span on the way out: the selector is where it happened, and the carrier
+        // that raised the fault had a value, not a position.
+        [(edge, span), rest @ ..] => eval_edge(node, edge, rest, path)
+            .map_err(|stop| stop.at(*span, path)),
+    }
+}
+
+impl Stop {
+    /// The stop with a span and a document path attached, when it did not have them.
+    ///
+    /// The carrier that raised the fault answered through the trait surface: it had a
+    /// value and no position. The evaluator knows both the selector's bytes and the
+    /// path it walked to get here, so it supplies them.
+    fn at(self, span: crate::error::Span, path: &crate::error::Path) -> Self {
+        match self {
+            Stop::Error(error) => Stop::Error(error.with_span(span).with_path(path)),
+            other => other,
+        }
     }
 }
 
 /// Apply ONE edge to a trait value, then the remaining edges.
-fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
+fn eval_edge<'a>(
+    node: SanshoCarrier<'a>,
+    edge: &Edge,
+    rest: &[(Edge, crate::error::Span)],
+    path: &mut crate::error::Path,
+) -> Result<Flow<'a>, Stop> {
     match edge {
         Edge::Compute(program) => {
             // a value-construct spliced into the chain: the program evaluates
@@ -179,13 +215,22 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
             // project on that value `(foo[*].bar)[0]` instead of per element
             // `foo[*].bar[0]`, which is the whole semantics of grouping.
             let flow = eval(program, node)?;
-            continue_flow(Flow::Value(flow_value(flow)), rest)
+            continue_flow(Flow::Value(flow_value(flow)), rest, path)
         }
         Edge::Key(name) => match node.kind() {
             // the specification's null semantics: a miss on a value that is
             // not an object is null, never an error
             Kind::Object => match node.get_key(name).map_err(Stop::from)? {
-                Some(child) => continue_single(child, rest),
+                Some(child) => {
+                    // the member is WHERE the walk went: a failure below names it
+                    let deeper = path.field(name.clone());
+                    let mut deeper = deeper;
+                    let outcome = continue_single(child, rest, &mut deeper);
+                    if outcome.is_ok() {
+                        *path = deeper;
+                    }
+                    outcome
+                }
                 None => Ok(Flow::Value(null_value())),
             },
             _ => Ok(Flow::Value(null_value())),
@@ -193,7 +238,10 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
         Edge::Index(index) => match node.kind() {
             // a miss on a value that is not an array is null
             Kind::Array => {
-                let len = node.container_len().unwrap_or(0) as i64;
+                // a length the engine cannot read is an ERROR, not length zero:
+                // the default would slice to a selected-nothing range and answer
+                // `[]` for a document nobody can read
+                let len = node.container_len().map_err(Stop::from)? as i64;
                 let effective = if *index < 0 { len + index } else { *index };
                 let resolved = if effective >= 0 && effective < len {
                     node.get_index(effective as usize).map_err(Stop::from)?
@@ -201,7 +249,7 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
                     None
                 };
                 match resolved {
-                    Some(child) => continue_single(child, rest),
+                    Some(child) => continue_single(child, rest, path),
                     None => Ok(Flow::Value(null_value())),
                 }
             }
@@ -214,24 +262,27 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
                 for (_, member) in node.as_object().map_err(Stop::from)? {
                     elements.push(member);
                 }
-                project(elements, rest)
+                project(elements, rest, path)
             }
             _ => Ok(Flow::Value(null_value())),
         },
         // the bracket form reads array elements only
         Edge::WildcardBracket => match node.kind() {
-            Kind::Array => project(node.as_elements().map_err(Stop::from)?, rest),
+            Kind::Array => project(node.as_elements().map_err(Stop::from)?, rest, path),
             _ => Ok(Flow::Value(null_value())),
         },
         Edge::Filter(predicate) => match node.kind() {
-            Kind::Array => project(filter_elements(node, predicate)?, rest),
+            Kind::Array => project(filter_elements(node, predicate)?, rest, path),
             _ => Ok(Flow::Value(null_value())),
         },
         // the slice is a projection over the selected range (arrays), or the
         // sliced string (strings)
         Edge::Slice(spec) => match node.kind() {
             Kind::Array => {
-                let len = node.container_len().unwrap_or(0) as i64;
+                // a length the engine cannot read is an ERROR, not length zero:
+                // the default would slice to a selected-nothing range and answer
+                // `[]` for a document nobody can read
+                let len = node.container_len().map_err(Stop::from)? as i64;
                 let selected = slice_indices(len, spec)?;
                 let mut elements: Vec<SanshoCarrier<'a>> = Vec::with_capacity(selected.len());
                 for index in selected {
@@ -239,10 +290,13 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
                         elements.push(element);
                     }
                 }
-                project(elements, rest)
+                project(elements, rest, path)
             }
             Kind::String => {
-                let text = node.as_str().map(|s| s.to_string()).unwrap_or_default();
+                // undecodable text is an ERROR, not empty text: `unwrap_or_default`
+                // here answered `""` to a slice of a damaged item, which is the
+                // same silent-answer shape as the length default above
+                let text = node.as_str().map_err(Stop::from)?.to_string();
                 let chars: Vec<char> = text.chars().collect();
                 let selected = slice_indices(chars.len() as i64, spec)?;
                 let sliced: String = selected
@@ -257,7 +311,7 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
             // the flatten of the current value: dissolve array-valued results
             // one level
             let flow = flatten_value(node)?;
-            continue_flow(flow, rest)
+            continue_flow(flow, rest, path)
         }
     }
 }
@@ -265,26 +319,40 @@ fn eval_edge<'a>(node: SanshoCarrier<'a>, edge: &Edge, rest: &[Edge]) -> Result<
 /// Collect the elements into a grouping at their own level, then apply the
 /// REMAINING edges at that collection's level — the two-step split that keeps
 /// a projection from adding a level per edge.
-fn project<'a>(elements: Vec<SanshoCarrier<'a>>, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
+fn project<'a>(
+    elements: Vec<SanshoCarrier<'a>>,
+    rest: &[(Edge, crate::error::Span)],
+    path: &mut crate::error::Path,
+) -> Result<Flow<'a>, Stop> {
     let flow = Flow::Items(elements.into_iter().map(Flow::Value).collect());
-    continue_flow(flow, rest)
+    continue_flow(flow, rest, path)
 }
 
 /// Continue the spine on a SINGLE member position (a key/index hit): the
 /// remaining edges walk the member; an empty remainder is the member itself.
-fn continue_single<'a>(child: SanshoCarrier<'a>, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
+fn continue_single<'a>(
+    child: SanshoCarrier<'a>,
+    rest: &[(Edge, crate::error::Span)],
+    path: &mut crate::error::Path,
+) -> Result<Flow<'a>, Stop> {
     match rest {
         [] => Ok(Flow::Value(child)),
-        [edge, more @ ..] => eval_edge(child, edge, more),
+        [(edge, span), more @ ..] => eval_edge(child, edge, more, path)
+            .map_err(|stop| stop.at(*span, path)),
     }
 }
 
 /// Continue the spine on a FLOW: the remaining edges apply; an empty remainder
 /// passes the flow through.
-fn continue_flow<'a>(flow: Flow<'a>, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
+fn continue_flow<'a>(
+    flow: Flow<'a>,
+    rest: &[(Edge, crate::error::Span)],
+    path: &mut crate::error::Path,
+) -> Result<Flow<'a>, Stop> {
     match rest {
         [] => Ok(flow),
-        [edge, more @ ..] => eval_flow(flow, edge, more),
+        [(edge, span), more @ ..] => eval_flow(flow, edge, more, path)
+            .map_err(|stop| stop.at(*span, path)),
     }
 }
 
@@ -295,22 +363,27 @@ fn continue_flow<'a>(flow: Flow<'a>, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
 /// item stays (a wildcard on a scalar inside a projection is a valid empty
 /// row). The flatten dissolves array-valued items one level INTO this
 /// collection.
-fn eval_flow<'a>(flow: Flow<'a>, edge: &Edge, rest: &[Edge]) -> Result<Flow<'a>, Stop> {
+fn eval_flow<'a>(
+    flow: Flow<'a>,
+    edge: &Edge,
+    rest: &[(Edge, crate::error::Span)],
+    path: &mut crate::error::Path,
+) -> Result<Flow<'a>, Stop> {
     match edge {
         Edge::Flatten => {
             // a computed flatten: dissolve arrays one level into this collection
             let mut flows = Vec::new();
             flatten_into(flow, &mut flows)?;
-            continue_flow(Flow::Items(flows), rest)
+            continue_flow(Flow::Items(flows), rest, path)
         }
         _ => match flow {
-            Flow::Value(value) => eval_edge(value, edge, rest),
+            Flow::Value(value) => eval_edge(value, edge, rest, path),
             Flow::Items(items) => {
                 let mut results = Vec::new();
                 for item in items {
                     collect_projected(item, edge, &mut results)?;
                 }
-                continue_flow(Flow::Items(results), rest)
+                continue_flow(Flow::Items(results), rest, path)
             }
         },
     }
@@ -326,13 +399,16 @@ fn collect_projected<'a>(
     results: &mut Vec<Flow<'a>>,
 ) -> Result<(), Stop> {
     match item {
-        Flow::Value(value) => match eval_edge(value, edge, &[])? {
-            Flow::Value(result) if result.is_null() => Ok(()),
-            flow => {
-                results.push(flow);
-                Ok(())
+        Flow::Value(value) => {
+            let mut here = crate::error::Path::root();
+            match eval_edge(value, edge, &[], &mut here)? {
+                Flow::Value(result) if result.is_null() => Ok(()),
+                flow => {
+                    results.push(flow);
+                    Ok(())
+                }
             }
-        },
+        }
         Flow::Items(items) => {
             let mut nested = Vec::new();
             for item in items {
@@ -422,9 +498,9 @@ fn filter_elements<'a>(
                     "ends_with" => text.ends_with(prefix.as_str()),
                     _ => text.contains(prefix.as_str()),
                 },
-                Err(_) => truthy(&flow_value(eval(predicate, element.clone())?)),
+                Err(_) => truthy(&flow_value(eval(predicate, element.clone())?))?,
             },
-            _ => truthy(&flow_value(eval(predicate, element.clone())?)),
+            _ => truthy(&flow_value(eval(predicate, element.clone())?))?,
         };
         if keep {
             kept.push(element);
@@ -441,15 +517,19 @@ fn null_value<'a>() -> SanshoCarrier<'a> {
 /// The specification's truthiness: false for null and false, an empty
 /// string, an empty array, an empty object; true for numbers (zero
 /// included) and true.
-pub fn truthy<'a>(value: &(dyn SanshoTrait<'a> + 'a)) -> bool {
-    match value.kind() {
+/// FALLIBLE, on purpose: answering `false` for an item the engine cannot READ
+/// conflates "empty" with "unreadable" and silently drops the item from a filter
+/// or a gate. A read error propagates to the caller, as it does everywhere else in
+/// this evaluator.
+pub fn truthy<'a>(value: &(dyn SanshoTrait<'a> + 'a)) -> Result<bool, SanshoError> {
+    Ok(match value.kind() {
         Kind::Null => false,
-        Kind::Bool => value.as_bool().unwrap_or(false),
-        Kind::String => value.as_str().map(|s| !s.is_empty()).unwrap_or(false),
-        Kind::Array | Kind::Object => value.container_len().map(|len| len > 0).unwrap_or(false),
+        Kind::Bool => value.as_bool()?,
+        Kind::String => !value.as_str()?.is_empty(),
+        Kind::Array | Kind::Object => value.container_len()? > 0,
         Kind::Number => true,
         Kind::Bytes => true,
-    }
+    })
 }
 
 /// Value equality over the trait: the same kind and the same content,
@@ -481,12 +561,14 @@ fn trait_equal_at<'a>(
         return Ok(true);
     }
     if depth > MAX_EQUALITY_DEPTH {
-        return Err(Stop::Error(SanshoError::Limit {
-            message: format!(
-                "equality exceeds a nesting depth of {MAX_EQUALITY_DEPTH}; \
-                 deep structures cannot be compared cheaply"
-            ),
-        }));
+        // the comparison budget: it names the bound and how deep the walk had got
+        return Err(Stop::Error(SanshoError::limit(
+            None,
+            crate::error::LimitFault::ComparisonDepth {
+                allowed: MAX_EQUALITY_DEPTH as usize,
+                observed: depth as usize,
+            },
+        )));
     }
     if left.kind() != right.kind() {
         return Ok(false);
@@ -629,11 +711,7 @@ fn eval_function<'a>(
             }
             [FnArgP::Value(array_program), FnArgP::Ref(program)] => (program, array_program),
             _ => {
-                return Err(Stop::Error(SanshoError::Evaluation {
-                    message: format!(
-                        "function {name} requires (expression-reference, array) or (array, expression-reference)"
-                    ),
-                }));
+                return Err(Stop::Error(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::BadArguments { function: name.to_string(), detail: "requires (reference, array) or (array, reference)".to_string() })));
             }
         };
         let array = flow_value(eval(array_arg, node.clone())?);
@@ -722,9 +800,7 @@ fn eval_function<'a>(
         match arg {
             FnArgP::Value(program) => values.push(flow_value(eval(program, node.clone())?)),
             FnArgP::Ref(_) => {
-                return Err(Stop::Error(SanshoError::Evaluation {
-                    message: format!("function {name} does not accept expression references"),
-                }));
+                return Err(Stop::Error(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::BadArguments { function: name.to_string(), detail: "does not accept expression references".to_string() })));
             }
         }
     }
@@ -732,7 +808,11 @@ fn eval_function<'a>(
     // the argument-passing functions hand an argument through unchanged:
     // no copy of the document's data
     if name == "to_array" && values.len() == 1 {
-        let one = values.into_iter().next().expect("one argument");
+        // NO PANIC: `next` is `Some` because the length was just checked, and the
+        // fallback keeps the promise the module doc makes even if that check changes
+        let Some(one) = values.into_iter().next() else {
+            return Ok(null_value());
+        };
         return Ok(match one.kind() {
             Kind::Array => one,
             _ => Rc::new(vec![one]),
@@ -763,7 +843,9 @@ fn eval_function<'a>(
 
     match (name, (values.first().cloned(), values.get(1))) {
         ("length", (Some(one), _)) => match one.kind() {
-            Kind::String => Ok(Rc::new(string_length(one.clone()) as u64)),
+            // the character count of text the engine cannot DECODE is an error:
+            // counting it as zero answers a question nobody could ask
+            Kind::String => Ok(Rc::new(one.as_str().map_err(Stop::from)?.chars().count() as u64)),
             Kind::Array | Kind::Object => one
                 .container_len()
                 .map_err(Stop::from)
@@ -901,7 +983,10 @@ fn eval_function<'a>(
             }
             Kind::String => match one.as_str() {
                 Ok(text) => Ok(Rc::new(text.chars().rev().collect::<String>())),
-                _ => Err(type_error("reverse", kind_name(one.clone()))),
+                // a text the engine cannot DECODE is not a permission error: the
+                // type was right, the content was not, so the read's own error is
+                // the one to report
+                Err(error) => Err(Stop::from(error)),
             },
             _ => Err(type_error("reverse", kind_name(one.clone()))),
         },
@@ -910,13 +995,14 @@ fn eval_function<'a>(
             Ok(Rc::new(string_for(&one, false)?) as SanshoCarrier<'a>)
         }
         ("to_number", (Some(one), None)) => match one.kind() {
-            Kind::Number => Ok(number_value(one.as_f64().unwrap_or(0.0))),
-            Kind::String => Ok(match one.as_str() {
-                Ok(s) => match s.trim().parse::<f64>().ok() {
-                    Some(value) => number_value(value),
-                    _ => null_value(),
-                },
-                _ => null_value(),
+            // an unreadable number is an ERROR, not zero
+            Kind::Number => Ok(number_value(one.as_f64().map_err(Stop::from)?)),
+            // `null` is the specification's answer for a string that is merely not
+            // numeric; text the engine cannot DECODE is a different fact and is
+            // reported as such
+            Kind::String => Ok(match one.as_str().map_err(Stop::from)?.trim().parse::<f64>() {
+                Ok(value) => number_value(value),
+                Err(_) => null_value(),
             }),
             _ => Ok(null_value()),
         },
@@ -1057,11 +1143,6 @@ fn string_for_counted<'b>(
     }
 }
 
-/// A string's character count, for `length`.
-fn string_length<'a>(value: SanshoCarrier<'a>) -> usize {
-    value.as_str().map(|s| s.chars().count()).unwrap_or(0)
-}
-
 /// The numeric coercion for the numeric functions: a number (never NaN),
 /// or an invalid-type error naming the function.
 fn numeric<'a>(
@@ -1084,23 +1165,15 @@ fn order_values<'a>(
     match (left.kind(), right.kind()) {
         (Kind::Number, Kind::Number) => match (left.as_f64(), right.as_f64()) {
             (Ok(a), Ok(b)) => a.partial_cmp(&b).ok_or_else(|| {
-                Stop::Error(SanshoError::Evaluation {
-                    message: "cannot order NaN".to_string(),
-                })
+                Stop::Error(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::NotOrderable { left: "NaN".to_string(), right: "anything".to_string() }))
             }),
-            _ => Err(Stop::Error(SanshoError::Evaluation {
-                message: "cannot order numbers".to_string(),
-            })),
+            _ => Err(Stop::Error(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::NotOrderable { left: "a number".to_string(), right: "a number".to_string() }))),
         },
         (Kind::String, Kind::String) => match (left.as_str(), right.as_str()) {
             (Ok(a), Ok(b)) => Ok(a.as_ref().cmp(b.as_ref())),
-            _ => Err(Stop::Error(SanshoError::Evaluation {
-                message: "cannot order strings".to_string(),
-            })),
+            _ => Err(Stop::Error(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::NotOrderable { left: "a string".to_string(), right: "a string".to_string() }))),
         },
-        _ => Err(Stop::Error(SanshoError::Evaluation {
-            message: format!("cannot order {} and {}", kind_name(left), kind_name(right)),
-        })),
+        _ => Err(Stop::Error(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::NotOrderable { left: kind_name(left).to_string(), right: kind_name(right).to_string() }))),
     }
 }
 
@@ -1126,7 +1199,7 @@ fn leaf_predicate_shape(predicate: &Program) -> Option<(String, String)> {
     if pred_spine.edges.len() != 1 {
         return None;
     }
-    let Edge::Compute(inner) = &pred_spine.edges[0] else {
+    let Edge::Compute(inner) = &pred_spine.edges[0].0 else {
         return None;
     };
     let Program::Function(name, args) = &**inner else {
@@ -1150,7 +1223,7 @@ fn leaf_predicate_shape(predicate: &Program) -> Option<(String, String)> {
     if prefix_spine.edges.len() != 1 {
         return None;
     }
-    let Edge::Compute(prefix_inner) = &prefix_spine.edges[0] else {
+    let Edge::Compute(prefix_inner) = &prefix_spine.edges[0].0 else {
         return None;
     };
     let Program::Literal(prefix) = &**prefix_inner else {
@@ -1166,9 +1239,7 @@ fn leaf_predicate_shape(predicate: &Program) -> Option<(String, String)> {
 }
 
 fn type_error(function: &str, found: &str) -> Stop {
-    Stop::Error(SanshoError::Evaluation {
-        message: format!("function {function} received invalid type: {found}"),
-    })
+    Stop::Error(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::TypeMismatch { expected: "a value the function accepts".to_string(), found: found.to_string(), function: Some(function.to_string()) }))
 }
 
 /// The specification's slice algorithm: clamp bounds per sign of step;
@@ -1176,9 +1247,7 @@ fn type_error(function: &str, found: &str) -> Stop {
 fn slice_indices(len: i64, spec: &crate::ast::SliceSpec) -> Result<Vec<i64>, Stop> {
     let step = spec.step.unwrap_or(1);
     if step == 0 {
-        return Err(Stop::Error(SanshoError::Evaluation {
-            message: "slice step cannot be zero".to_string(),
-        }));
+        return Err(Stop::Error(SanshoError::evaluation(None, crate::error::Path::root(), crate::error::EvaluationFault::InvalidArgument { what: "a slice step cannot be zero".to_string() })));
     }
     let clamp = |v: i64| if v < 0 { v + len } else { v };
     let mut indices = Vec::new();

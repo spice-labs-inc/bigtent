@@ -59,10 +59,15 @@ pub struct V2State<GRT: GoatRodeoTrait + 'static> {
 impl<GRT: GoatRodeoTrait + 'static> V2State<GRT> {
     /// The state with the built-in templates and the passthrough default.
     pub fn new(holder: Arc<ClusterHolder<GRT>>, queries: Arc<QueryCache>) -> Self {
-        let templates = TemplateRegistry::new()
+        // NO PANIC: a built-in default that names nothing is a diagnosable 400 at
+        // request time, not a server that dies at startup.
+        let templates = match TemplateRegistry::new()
             .with_builtins()
             .with_default("item")
-            .expect("the built-in default names a built-in template");
+        {
+            Ok(registry) => registry,
+            Err(_) => TemplateRegistry::new().with_builtins(),
+        };
         V2State {
             holder,
             queries,
@@ -310,9 +315,11 @@ async fn purls(
                 text,
             )
                 .into_response()),
-            Err(_) => Err((StatusCode::NOT_FOUND, Json("no purls.txt".into()))),
+            // only a missing file is a 404; a permission or read failure is the
+            // server's problem and says so
+            Err(error) => Err(crate::server::purl_failure(&anyhow::Error::new(error))),
         },
-        Err(_) => Err((StatusCode::NOT_FOUND, Json("no purls.txt".into()))),
+        Err(error) => Err(crate::server::purl_failure(&error)),
     }
 }
 
@@ -384,10 +391,16 @@ async fn metrics(
     State(state): State<Arc<V2State<GoatHerd>>>,
 ) -> Result<Response, StatusCode> {
     match state.holder.metrics().encode() {
-        Ok(body) => Ok(axum::response::Response::builder()
-            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-            .body(body.into())
-            .unwrap()),
+        Ok(body) => Ok((
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    crate::server::PROMETHEUS_CONTENT_TYPE,
+                ),
+            ],
+            body,
+        )
+            .into_response()),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -543,22 +556,36 @@ fn compile_inline(document: &Value) -> Result<Arc<CompiledQuery>, GrammarError> 
 ///
 /// The cluster the query walks is the server's, taken per request; the accountant
 /// is the no-op one, until the budget work lands.
+/// Feed the request's roots into the pipeline's input stream, answering how many
+/// were delivered.
+///
+/// A send failure means the pipeline dropped its input receiver: the run is gone,
+/// so feeding stops rather than spinning through roots nobody will read. The loss
+/// is REPORTED to the accountant, because a root that was never delivered produces
+/// no row that could say so — without the event it leaves no trace at all.
+async fn feed_roots(
+    sender: &flume::Sender<Value>,
+    roots: Vec<String>,
+    accountant: &Arc<dyn crate::highwire::walk::AccountingAndBudget + Send + Sync>,
+) -> usize {
+    let mut delivered = 0;
+    for root in roots {
+        // a full input backpressures this task, which is fine: the roots are
+        // bounded by the request
+        if sender.send_async(Value::String(root)).await.is_err() {
+            accountant.event(crate::highwire::walk::AccountingEventType::RootFeedLost);
+            break;
+        }
+        delivered += 1;
+    }
+    delivered
+}
+
 async fn stream_query(
     state: Arc<V2State<GoatHerd>>,
     compiled: Arc<CompiledQuery>,
     roots: Vec<String>,
 ) -> Result<Response, (StatusCode, Json<String>)> {
-    // the query's input stream, fed by an async task from the request's roots
-    let (input_sender, input) = flume::bounded::<Value>(256);
-    tokio::spawn(async move {
-        for root in roots {
-            // a full input backpressures this task, which is fine: the roots are
-            // bounded by the request
-            let _ = input_sender.send_async(Value::String(root)).await;
-        }
-        // dropping the sender is what tells the pipeline the roots are complete
-    });
-
     // the rows, forwarded from the blocking run to the streaming response
     let (rows_tx, rows_receiver) = flume::bounded::<Value>(256);
     let rows_sender = rows_tx.clone();
@@ -567,8 +594,22 @@ async fn stream_query(
     // THE CANCELLATION: when the response body is dropped — the client
     // disconnected — this guard flips the flag, and the run's accountant
     // checks stop the work promptly, even in a stage that is mid-computation
-    // and not sending. Send-failure propagation handles the rest.
+    // and not sending. Send-failure propagation handles the rest. It is built
+    // BEFORE the feeder because the feeder reports a lost root to it.
     let cancellation = crate::highwire::walk::Cancellation::new();
+    let accountant: Arc<dyn crate::highwire::walk::AccountingAndBudget + Send + Sync> =
+        Arc::new(crate::highwire::walk::Cancelled {
+            cancellation: cancellation.clone(),
+        });
+
+    // the query's input stream, fed by an async task from the request's roots
+    let (input_sender, input) = flume::bounded::<Value>(256);
+    let feeder_accountant = accountant.clone();
+    tokio::spawn(async move {
+        feed_roots(&input_sender, roots, &feeder_accountant).await;
+        // dropping the sender is what tells the pipeline the roots are complete
+    });
+
     struct CancelGuard(crate::highwire::walk::Cancellation);
     impl Drop for CancelGuard {
         fn drop(&mut self) {
@@ -577,12 +618,14 @@ async fn stream_query(
     }
 
     let cancellation_moved = cancellation.clone();
+    // ONE OS THREAD, reported at creation: `ThreadStarted` means a real thread, and this
+    // is the request's own — it reserves a stack and a scheduler slot whether or not the
+    // client stays to read the rows.
+    accountant.event(crate::highwire::walk::AccountingEventType::ThreadStarted);
     std::thread::Builder::new()
         .name("v2-query-run".to_string())
         .spawn(move || {
-            let accountant = Arc::new(crate::highwire::walk::Cancelled {
-                cancellation,
-            });
+            let accountant = accountant.clone();
             let sink = move |row: Value,
                              _acc: &Arc<dyn crate::highwire::walk::AccountingAndBudget + Send + Sync>,
                              op: SinkOperation|
@@ -647,4 +690,196 @@ pub fn router_v2(state: Arc<V2State<GoatHerd>>) -> Router<()> {
 /// The V2 OpenAPI document, for tests and for merging into a wider document.
 pub fn openapi_v2() -> utoipa::openapi::OpenApi {
     ApiV2Doc::openapi()
+}
+
+#[cfg(test)]
+mod template_inventory {
+    //! THE BUILT-IN INVENTORY, ENUMERATED INSTEAD OF LISTED BY HAND.
+    //!
+    //! REQUIREMENT (class-A audit): the anti-drift gate lived in an integration
+    //! test with a HAND-WRITTEN list of built-in names, so a template added to
+    //! `TEMPLATES` would be served without being covered — the gate would drift
+    //! exactly as the templates drifted. It also could not say what a document
+    //! under `test_data/queries/` is FOR when it is not a served template, so
+    //! the four example documents were silently uncovered.
+    //!
+    //! THEORY OF THE TEST: enumerate rather than list. The module that owns
+    //! `TEMPLATES` reads the twin directory and requires every document to be
+    //! either a served template equal to it, or a declared example with a
+    //! reason. A new template is covered the moment it is written; a new example
+    //! document fails until someone says what it is. Living here rather than in
+    //! `tests/` is deliberate: the list is private, and enumerating it needs no
+    //! new public interface.
+
+    use super::TemplateRegistry;
+
+    /// The documents under `test_data/queries/` that are NOT served as built-in
+    /// templates, and why. They are worked examples and V1-only shapes.
+    const NOT_SERVED: &[(&str, &str)] = &[
+        ("basic_walk", "a worked example of a bare walk, not an endpoint"),
+        ("bulk", "V1's /bulk is a different endpoint shape; the passthrough it exercises is `item`"),
+        ("filtered_emit", "a worked example of an emit gate, not an endpoint"),
+        ("probe_flat", "a worked example of a flat projection, not an endpoint"),
+    ];
+
+    /// Every document twin is either served verbatim or declared an example.
+    #[test]
+    fn every_document_is_served_or_declared() {
+        let registry = TemplateRegistry::new().with_builtins();
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/queries");
+        let mut seen = Vec::new();
+        for entry in std::fs::read_dir(directory).expect("the example directory is present") {
+            let path = entry.expect("a readable directory entry").path();
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("a document has a name")
+                .to_string();
+            seen.push(name.clone());
+            let document = std::fs::read_to_string(&path).expect("a readable document");
+            match registry.get(&name) {
+                // SERVED: it must be the document, both as JSON
+                Some(served) => {
+                    let served: serde_json::Value =
+                        serde_json::from_str(served).expect("a served template is JSON");
+                    let document: serde_json::Value =
+                        serde_json::from_str(&document).expect("a twin document is JSON");
+                    assert_eq!(
+                        served, document,
+                        "the served `{name}` must be the document the tests exercise"
+                    );
+                }
+                // NOT SERVED: it must say so, and say why
+                None => assert!(
+                    NOT_SERVED.iter().any(|(declared, _)| *declared == name),
+                    "`{name}` is neither a served template nor a declared example: \
+                     serve it, or add it to NOT_SERVED with its purpose"
+                ),
+            }
+        }
+        // the declaration must not rot: every entry names a document that exists
+        for (declared, reason) in NOT_SERVED {
+            assert!(!reason.is_empty(), "`{declared}` needs a reason");
+            assert!(
+                seen.iter().any(|name| name == declared),
+                "NOT_SERVED names `{declared}`, which is not a document under {directory}"
+            );
+        }
+    }
+
+    /// The served names are unique and the registry serves every one of them:
+    /// an append-only table cannot shadow an earlier entry.
+    #[test]
+    fn the_served_names_are_unique_and_all_present() {
+        let registry = TemplateRegistry::new().with_builtins();
+        for (position, (name, _)) in super::TEMPLATES.iter().enumerate() {
+            assert!(
+                super::TEMPLATES[..position]
+                    .iter()
+                    .all(|(earlier, _)| earlier != name),
+                "`{name}` appears twice; the later entry would shadow the earlier one"
+            );
+        }
+        // every name in the table is actually served: no entry is inert
+        for (name, _) in super::TEMPLATES {
+            assert!(
+                registry.get(name).is_some(),
+                "the table holds `{name}` but the registry does not serve it"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod feeder {
+    //! A ROOT THAT CANNOT BE DELIVERED IS AN EVENT, NOT A SILENT SKIP.
+    //!
+    //! REQUIREMENT (S3a, same pattern as S1): the feeder sent roots with
+    //! `let _ = send_async(..)`, so a pipeline that had already dropped its input
+    //! receiver made every remaining root vanish with no trace — the run answered
+    //! success and the roots that were never delivered produced no row that could
+    //! say so.
+    //!
+    //! THEORY OF THE TEST: the feeder is driven directly with a REAL channel whose
+    //! receiver is closed, which is the condition the pipeline itself produces only
+    //! non-deterministically. Two properties: the feeder stops instead of spinning
+    //! through the rest (the count answers how many it delivered) and the accountant
+    //! records `RootFeedLost`, which is the only surviving evidence. The control
+    //! feeds the same roots into a live channel: all are delivered and no loss is
+    //! recorded, so a feeder that simply gave up would fail.
+    use super::feed_roots;
+    use crate::highwire::walk::{AccountingAndBudget, AccountingEventType};
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    /// An accountant that records the events it is told about.
+    struct Ledger {
+        events: std::sync::Mutex<Vec<AccountingEventType>>,
+    }
+
+    impl AccountingAndBudget for Ledger {
+        fn should_stop(&self) -> Option<Vec<Value>> {
+            None
+        }
+        fn can_sink_normal(&self) -> bool {
+            true
+        }
+        fn event(&self, event_type: AccountingEventType) {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event_type);
+        }
+    }
+
+    impl Ledger {
+        fn new() -> Arc<Self> {
+            Arc::new(Ledger {
+                events: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn lost_roots(&self) -> usize {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|event| **event == AccountingEventType::RootFeedLost)
+                .count()
+        }
+    }
+
+    /// A closed receiver stops the feeder and records the loss.
+    #[tokio::test]
+    async fn a_root_that_cannot_be_delivered_is_recorded() {
+        let (sender, receiver) = flume::bounded::<Value>(4);
+        drop(receiver);
+        let ledger = Ledger::new();
+        let shared: Arc<dyn AccountingAndBudget + Send + Sync> = ledger.clone();
+
+        let delivered = feed_roots(&sender, vec!["a".into(), "b".into()], &shared).await;
+
+        assert_eq!(delivered, 0, "nothing could be delivered");
+        assert_eq!(
+            ledger.lost_roots(),
+            1,
+            "the loss must be recorded once, on the first failed send — it is the \
+             only trace left"
+        );
+    }
+
+    /// The control: a live receiver takes every root and records nothing.
+    #[tokio::test]
+    async fn every_root_reaches_a_live_pipeline() {
+        let (sender, receiver) = flume::bounded::<Value>(4);
+        let ledger = Ledger::new();
+        let shared: Arc<dyn AccountingAndBudget + Send + Sync> = ledger.clone();
+
+        let delivered = feed_roots(&sender, vec!["a".into(), "b".into()], &shared).await;
+        drop(sender);
+
+        assert_eq!(delivered, 2, "both roots delivered");
+        assert_eq!(receiver.try_recv().expect("a root arrives"), Value::String("a".into()));
+        assert_eq!(receiver.try_recv().expect("a root arrives"), Value::String("b".into()));
+        assert_eq!(ledger.lost_roots(), 0, "a delivered root is not a loss");
+    }
 }

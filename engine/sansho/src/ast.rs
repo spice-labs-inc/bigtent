@@ -8,6 +8,7 @@
 //! be a fixed point under re-parsing and must not collide across
 //! expressions of different meaning — both are tested here.
 
+use crate::error::{SanshoError, Span};
 use serde_json::Value as J;
 
 /// A comparison operator.
@@ -92,6 +93,23 @@ pub enum Primary {
 /// Precedence, loosest to tightest: pipe (`|`), logical or (`||`),
 /// logical and (`&&`), comparators, not (`!`), then the postfix chain
 /// off its primary.
+/// A node with the place it came from: two `usize`, and the reason the evaluator can
+/// say WHERE an evaluation failed instead of formatting a sentence about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spanned<T> {
+    /// The node.
+    pub node: T,
+    /// The bytes of the expression it was parsed from.
+    pub span: Span,
+}
+
+impl<T> Spanned<T> {
+    /// A node with its span.
+    pub fn new(node: T, span: Span) -> Self {
+        Spanned { node, span }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Expr {
     Pipe(Box<Expr>, Box<Expr>),
@@ -99,12 +117,12 @@ pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Compare(CmpOp, Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
-    Chain(Primary, Vec<Postfix>),
+    Chain(Spanned<Primary>, Vec<Spanned<Postfix>>),
 }
 
 /// Render an identifier canonically: unquoted when it matches the
 /// unquoted-identifier grammar, quoted (as a JSON string) otherwise.
-pub fn canonical_identifier(name: &str) -> String {
+pub fn canonical_identifier(name: &str, failure: &mut Option<SanshoError>) -> String {
     let unquoted = !name.is_empty()
         && name
             .chars()
@@ -115,18 +133,35 @@ pub fn canonical_identifier(name: &str) -> String {
     if unquoted {
         name.to_string()
     } else {
-        // JSON string escaping (not Rust Debug escaping): the canonical
-        // form must re-parse through the expression grammar, whose quoted
-        // identifiers accept JSON escapes
-        serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""))
+        // JSON string escaping (not Rust Debug escaping): the canonical form must
+        // re-parse through the expression grammar, whose quoted identifiers accept
+        // JSON escapes. The hand-built fallback that stood here would have produced
+        // DIFFERENT escaping from serde's for a name containing a quote or a
+        // backslash, so a serialization failure now travels out of `canonical`
+        // instead of quietly changing what the key means.
+        match serde_json::to_string(name) {
+            Ok(quoted) => quoted,
+            Err(error) => {
+                if failure.is_none() {
+                    *failure = Some(SanshoError::compile(None, None, crate::error::CompileFault::InvalidStructure { detail: format!("an identifier cannot be rendered canonically: {error}"),
+                    }));
+                }
+                "null".to_string()
+            }
+        }
     }
 }
 
 /// Render a literal canonically: backtick-quoted re-serialization of the
 /// parsed JSON value, with embedded backticks escaped.
-pub fn canonical_literal(value: &J) -> String {
-    let json = serde_json::to_string(value).unwrap_or_else(|_| "null".into());
-    format!("`{}`", json.replace('`', "\\`"))
+/// FALLIBLE, because a literal that cannot be serialized is NOT the literal
+/// `null`: the canonical form is a cache key, and a default here made an
+/// unserializable literal share an identity with `null`. The error names the
+/// literal's own failure instead.
+pub fn canonical_literal(value: &J) -> Result<String, SanshoError> {
+    let json = serde_json::to_string(value).map_err(|error| SanshoError::compile(None, None, crate::error::CompileFault::InvalidStructure { detail: format!("a literal cannot be rendered canonically: {error}"),
+    }))?;
+    Ok(format!("`{}`", json.replace('`', "\\`")))
 }
 
 /// The canonical form of an expression.
@@ -142,14 +177,14 @@ const PREC_PRIMARY: u8 = 6;
 
 /// Render `expr` as a child of a parent at level `parent`, parenthesizing it
 /// when its own binding is looser than the parent's context requires.
-fn render_child(expr: &Expr, parent: u8, out: &mut String) {
+fn render_child(expr: &Expr, parent: u8, out: &mut String, failure: &mut Option<SanshoError>) {
     let needs_parens = expr_precedence(expr) < parent;
     if needs_parens {
         out.push('(');
-        render(expr, out);
+        render(expr, out, failure);
         out.push(')');
     } else {
-        render(expr, out);
+        render(expr, out, failure);
     }
 }
 
@@ -166,77 +201,95 @@ fn expr_precedence(expr: &Expr) -> u8 {
     }
 }
 
-pub fn canonical(expr: &Expr) -> String {
+/// FALLIBLE, because a literal that cannot be rendered has no canonical form to
+/// stand for it: an earlier version substituted `null` and produced a cache KEY
+/// that collided with the literal null.
+pub fn canonical(expr: &Expr) -> Result<String, SanshoError> {
     let mut out = String::new();
-    render(expr, &mut out);
-    out
+    let mut failure: Option<SanshoError> = None;
+    render(expr, &mut out, &mut failure);
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(out),
+    }
 }
 
-fn render(expr: &Expr, out: &mut String) {
+fn render(expr: &Expr, out: &mut String, failure: &mut Option<SanshoError>) {
     match expr {
         Expr::Pipe(left, right) => {
-            render_child(left, PREC_PIPE, out);
+            render_child(left, PREC_PIPE, out, failure);
             out.push_str(" | ");
-            render_child(right, PREC_PIPE, out);
+            render_child(right, PREC_PIPE, out, failure);
         }
         Expr::Or(left, right) => {
-            render_child(left, PREC_OR, out);
+            render_child(left, PREC_OR, out, failure);
             out.push_str(" || ");
-            render_child(right, PREC_OR, out);
+            render_child(right, PREC_OR, out, failure);
         }
         Expr::And(left, right) => {
-            render_child(left, PREC_AND, out);
+            render_child(left, PREC_AND, out, failure);
             out.push_str(" && ");
-            render_child(right, PREC_AND, out);
+            render_child(right, PREC_AND, out, failure);
         }
         Expr::Compare(op, left, right) => {
-            render_child(left, PREC_COMPARE, out);
+            render_child(left, PREC_COMPARE, out, failure);
             out.push(' ');
             out.push_str(op.as_str());
             out.push(' ');
-            render_child(right, PREC_COMPARE, out);
+            render_child(right, PREC_COMPARE, out, failure);
         }
         Expr::Not(inner) => {
             out.push('!');
-            render_child(inner.as_ref(), PREC_NOT, out);
+            render_child(inner.as_ref(), PREC_NOT, out, failure);
         }
         Expr::Chain(primary, postfixes) => {
-            render_primary(primary, out);
+            render_primary(primary, out, failure);
             for post in postfixes {
-                render_postfix(post, out);
+                render_postfix(&post.node, out, failure);
             }
         }
     }
 }
 
-fn render_primary(primary: &Primary, out: &mut String) {
+fn render_primary(spanned: &Spanned<Primary>, out: &mut String, failure: &mut Option<SanshoError>) {
+    let primary = &spanned.node;
     match primary {
         Primary::Grouped(inner) => {
             out.push('(');
-            render(inner, out);
+            render(inner, out, failure);
             out.push(')');
         }
         Primary::Current => out.push('@'),
-        Primary::Literal(value) => out.push_str(&canonical_literal(value)),
+        Primary::Literal(value) => match canonical_literal(value) {
+            Ok(text) => out.push_str(&text),
+            Err(error) => {
+                // the error travels out of `canonical`; the placeholder only
+                // keeps this rendering well formed while it does
+                if failure.is_none() {
+                    *failure = Some(error);
+                }
+                out.push_str("null");
+            }
+        },
         Primary::RawString(s) => {
             out.push('\'');
             // the raw string's quotes are escaped back on the way out
             out.push_str(&s.replace('\'', "\\\'"));
             out.push('\'');
         }
-        Primary::Field(name) => out.push_str(&canonical_identifier(name)),
+        Primary::Field(name) => out.push_str(&canonical_identifier(name, failure)),
         Primary::Function(name, args) => {
-            out.push_str(&canonical_identifier(name));
+            out.push_str(&canonical_identifier(name, failure));
             out.push('(');
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
                 match arg {
-                    FnArg::Value(e) => render(e, out),
+                    FnArg::Value(e) => render(e, out, failure),
                     FnArg::Ref(e) => {
                         out.push('&');
-                        render(e, out);
+                        render(e, out, failure);
                     }
                 }
             }
@@ -248,7 +301,7 @@ fn render_primary(primary: &Primary, out: &mut String) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                render(item, out);
+                render(item, out, failure);
             }
             out.push(']');
         }
@@ -258,20 +311,20 @@ fn render_primary(primary: &Primary, out: &mut String) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(&canonical_identifier(k));
+                out.push_str(&canonical_identifier(k, failure));
                 out.push_str(": ");
-                render(v, out);
+                render(v, out, failure);
             }
             out.push('}');
         }
     }
 }
 
-fn render_postfix(post: &Postfix, out: &mut String) {
+fn render_postfix(post: &Postfix, out: &mut String, failure: &mut Option<SanshoError>) {
     match post {
         Postfix::Field(name) => {
             out.push('.');
-            out.push_str(&canonical_identifier(name));
+            out.push_str(&canonical_identifier(name, failure));
         }
         Postfix::Wildcard { bracket } => {
             if *bracket {
@@ -299,12 +352,16 @@ fn render_postfix(post: &Postfix, out: &mut String) {
         }
         Postfix::Filter(pred) => {
             out.push_str("[?");
-            render(pred, out);
+            render(pred, out, failure);
             out.push(']');
         }
         Postfix::Function(name, args) => {
             out.push('.');
-            render_primary(&Primary::Function(name.clone(), args.clone()), out);
+            render_primary(
+                &Spanned::new(Primary::Function(name.clone(), args.clone()), Span::new(0, 0)),
+                out,
+                failure,
+            );
         }
         Postfix::MultiList(items) => {
             // the postfix form always carries the dot: foo.[a, b]
@@ -314,7 +371,7 @@ fn render_postfix(post: &Postfix, out: &mut String) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                render(item, out);
+                render(item, out, failure);
             }
             out.push(']');
         }
@@ -325,9 +382,9 @@ fn render_postfix(post: &Postfix, out: &mut String) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(&canonical_identifier(k));
+                out.push_str(&canonical_identifier(k, failure));
                 out.push_str(": ");
-                render(v, out);
+                render(v, out, failure);
             }
             out.push('}');
         }
@@ -408,7 +465,7 @@ fn certainly_not_an_array(expression: &Expr) -> bool {
         Expr::Compare(..) | Expr::Not(_) => true,
         Expr::Chain(primary, postfixes) => match postfixes.iter().rev().find_map(array_decides) {
             Some(not_an_array) => not_an_array,
-            None => match primary {
+            None => match &primary.node {
                 // the current node can be an array
                 Primary::Current => false,
                 // a group is whatever the grouped expression yields — ask it
@@ -424,7 +481,8 @@ fn certainly_not_an_array(expression: &Expr) -> bool {
 }
 
 /// A postfix that settles whether the value is an array.
-fn array_decides(postfix: &Postfix) -> Option<bool> {
+fn array_decides(spanned: &Spanned<Postfix>) -> Option<bool> {
+    let postfix = &spanned.node;
     match postfix {
         // always an array
         Postfix::Flatten | Postfix::Filter(_) | Postfix::MultiList(_) | Postfix::Wildcard { .. } => {
@@ -438,7 +496,8 @@ fn array_decides(postfix: &Postfix) -> Option<bool> {
 }
 
 /// A postfix whose result type it settles on its own, whatever came before it.
-fn postfix_decides(postfix: &Postfix) -> Option<bool> {
+fn postfix_decides(spanned: &Spanned<Postfix>) -> Option<bool> {
+    let postfix = &spanned.node;
     match postfix {
         // a flatten always yields an array
         Postfix::Flatten => Some(false),
@@ -458,7 +517,8 @@ fn postfix_decides(postfix: &Postfix) -> Option<bool> {
 }
 
 /// The primary, with the postfixes that do not decide for themselves.
-fn can_be_a_string_primary(primary: &Primary, postfixes: &[Postfix]) -> bool {
+fn can_be_a_string_primary(spanned: &Spanned<Primary>, postfixes: &[Spanned<Postfix>]) -> bool {
+    let primary = &spanned.node;
     match primary {
         // the current node can be anything
         Primary::Current => true,
@@ -480,11 +540,142 @@ fn can_be_a_string_primary(primary: &Primary, postfixes: &[Postfix]) -> bool {
         // the primary was, because the function decides its own result type
         (postfixes
             .last()
-            .map(|postfix| matches!(postfix, Postfix::Function(..)))
+            .map(|postfix| matches!(postfix.node, Postfix::Function(..)))
             .unwrap_or(false))
         .then_some(true)
     })
     .unwrap_or(false)
+}
+
+
+
+/// Whether an expression's tree is deeper than `limit`, measured ITERATIVELY.
+///
+/// THE ONE GUARD THE AST WALKERS NEED. The parser's depth limit bounds PARSING,
+/// and a left-associative operator chain (`a|b|c|…`) is one level of parser
+/// nesting while the tree it builds is N levels deep. Every recursive consumer of
+/// the tree — `compile_program`, `eval`, `canonical`'s renderer, the compiler's
+/// variable and expression visitors, the item gate's builders, `can_be_a_string`,
+/// `certainly_not_an_array` — then recurses N times on an expression the parser
+/// happily accepted, and a 4,000-pipe query overflows the stack and aborts the
+/// process.
+///
+/// The check itself uses an explicit stack, so it cannot overflow the way the code
+/// it protects does.
+pub fn deeper_than(expr: &Expr, limit: usize) -> bool {
+    let mut stack: Vec<(&Expr, usize)> = vec![(expr, 1)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > limit {
+            return true;
+        }
+        let next = depth + 1;
+        match node {
+            Expr::Pipe(left, right) | Expr::Or(left, right) | Expr::And(left, right) => {
+                stack.push((left, next));
+                stack.push((right, next));
+            }
+            Expr::Compare(_, left, right) => {
+                stack.push((left, next));
+                stack.push((right, next));
+            }
+            Expr::Not(inner) => stack.push((inner, next)),
+            Expr::Chain(primary, postfixes) => {
+                push_primary(&primary.node, next, &mut stack);
+                for postfix in postfixes {
+                    push_postfix(&postfix.node, next, &mut stack);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// How deep the expression's tree actually is, measured iteratively.
+///
+/// The counterpart of [`deeper_than`]: when the bound is exceeded, the failure must
+/// say HOW deep it was, not merely that it was too deep.
+pub fn max_depth(expr: &Expr) -> usize {
+    let mut deepest = 0;
+    let mut stack: Vec<(&Expr, usize)> = vec![(expr, 1)];
+    while let Some((node, depth)) = stack.pop() {
+        deepest = deepest.max(depth);
+        let next = depth + 1;
+        match node {
+            Expr::Pipe(left, right) | Expr::Or(left, right) | Expr::And(left, right) => {
+                stack.push((left, next));
+                stack.push((right, next));
+            }
+            Expr::Compare(_, left, right) => {
+                stack.push((left, next));
+                stack.push((right, next));
+            }
+            Expr::Not(inner) => stack.push((inner, next)),
+            Expr::Chain(primary, postfixes) => {
+                push_primary(&primary.node, next, &mut stack);
+                for postfix in postfixes {
+                    push_postfix(&postfix.node, next, &mut stack);
+                }
+            }
+        }
+    }
+    deepest
+}
+
+/// The sub-expressions of a primary, at `depth`.
+fn push_primary<'e>(primary: &'e Primary, depth: usize, stack: &mut Vec<(&'e Expr, usize)>) {
+    match primary {
+        Primary::Grouped(inner) => stack.push((inner, depth)),
+        Primary::Function(_, arguments) => {
+            for argument in arguments {
+                push_argument(argument, depth, stack);
+            }
+        }
+        Primary::MultiList(items) => {
+            for item in items {
+                stack.push((item, depth));
+            }
+        }
+        Primary::MultiHash(entries) => {
+            for (_, value) in entries {
+                stack.push((value, depth));
+            }
+        }
+        Primary::Current | Primary::Literal(_) | Primary::RawString(_) | Primary::Field(_) => {}
+    }
+}
+
+/// The sub-expressions of a postfix, at `depth`.
+fn push_postfix<'e>(postfix: &'e Postfix, depth: usize, stack: &mut Vec<(&'e Expr, usize)>) {
+    match postfix {
+        Postfix::Filter(predicate) => stack.push((predicate, depth)),
+        Postfix::Function(_, arguments) => {
+            for argument in arguments {
+                push_argument(argument, depth, stack);
+            }
+        }
+        Postfix::MultiList(items) => {
+            for item in items {
+                stack.push((item, depth));
+            }
+        }
+        Postfix::MultiHash(entries) => {
+            for (_, value) in entries {
+                stack.push((value, depth));
+            }
+        }
+        Postfix::Field(_)
+        | Postfix::Wildcard { .. }
+        | Postfix::Flatten
+        | Postfix::Index(_)
+        | Postfix::Slice(_) => {}
+    }
+}
+
+/// A function argument's expression, at `depth`.
+fn push_argument<'e>(argument: &'e FnArg, depth: usize, stack: &mut Vec<(&'e Expr, usize)>) {
+    match argument {
+        FnArg::Value(expr) | FnArg::Ref(expr) => stack.push((expr, depth)),
+    }
 }
 
 #[cfg(test)]

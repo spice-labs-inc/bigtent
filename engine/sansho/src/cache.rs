@@ -36,11 +36,14 @@ struct CacheKey {
 }
 
 impl CacheKey {
-    fn of_expr(expr: &Expr) -> Self {
-        CacheKey {
-            canonical: crate::canonical(expr),
+    /// FALLIBLE: the canonical form can fail to render (a literal that cannot be
+    /// serialized), and a key built from a substitute would be a key for a
+    /// different expression.
+    fn of_expr(expr: &Expr) -> Result<Self, SanshoError> {
+        Ok(CacheKey {
+            canonical: crate::canonical(expr)?,
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        }
+        })
     }
 }
 
@@ -68,8 +71,8 @@ impl ProgramCache {
 
     /// Fetch the cached program for a parsed expression, touching it as
     /// most-recently-used; counts the hit.
-    pub(crate) fn get(&self, expr: &Expr) -> Option<Arc<Program>> {
-        let key = CacheKey::of_expr(expr);
+    pub(crate) fn get(&self, expr: &Expr) -> Result<Option<Arc<Program>>, SanshoError> {
+        let key = CacheKey::of_expr(expr)?;
         // a POISONED lock is recovered, not fatal: the cache is a derived
         // structure rebuilt by compiling, so the data behind a poisoned lock
         // (a half-updated LRU order) is repaired by the next insert rather than
@@ -79,19 +82,23 @@ impl ProgramCache {
         if inner.entries.contains_key(&key) {
             // raced past the check is impossible: the get follows the contains;
         // the graceful form keeps no panic path
-        let program = inner.entries.get(&key)?.clone();
+            let program = inner.entries.get(&key).cloned();
             inner.hits += 1;
             inner.order.retain(|k| k != &key);
             inner.order.push(key);
-            return Some(program);
+            // the contains-key check above found it, so the entry is there
+            if let Some(program) = program {
+                return Ok(Some(program));
+            }
+            return Ok(None);
         }
-        None
+        Ok(None)
     }
 
     /// Insert a freshly compiled program (counting the miss), evicting
     /// least-recently-used entries while over the bound.
-    pub(crate) fn put(&self, expr: &Expr, program: Arc<Program>) {
-        let key = CacheKey::of_expr(expr);
+    pub(crate) fn put(&self, expr: &Expr, program: Arc<Program>) -> Result<(), SanshoError> {
+        let key = CacheKey::of_expr(expr)?;
         // a POISONED lock is recovered, not fatal: the cache is a derived
         // structure rebuilt by compiling, so the data behind a poisoned lock
         // (a half-updated LRU order) is repaired by the next insert rather than
@@ -102,7 +109,7 @@ impl ProgramCache {
         // zero entries, so nothing is inserted rather than one program being
         // held by a cache whose bound is zero.
         if inner.max_entries == 0 {
-            return;
+            return Ok(());
         }
         // IDEMPOTENT: `get` and `put` are separate lock acquisitions, so another
         // thread may have compiled and inserted this same expression while this
@@ -111,7 +118,7 @@ impl ProgramCache {
         // miss nor touches the LRU order (a duplicate key there would corrupt
         // it), nor evicts anything.
         if inner.entries.contains_key(&key) {
-            return;
+            return Ok(());
         }
         inner.misses += 1;
         while inner.entries.len() >= inner.max_entries && !inner.entries.is_empty() {
@@ -126,6 +133,7 @@ impl ProgramCache {
         }
         inner.entries.insert(key.clone(), program);
         inner.order.push(key);
+        Ok(())
     }
 
     /// The cache's statistics: (hits, misses, evictions, entries).

@@ -1,3 +1,11 @@
+// The engine's error carries its location and its source text by design; boxing it
+// would add an allocation to every failure. The same expectation the library crates
+// declare, restated because each test and bench is its own crate root.
+#![expect(
+    clippy::result_large_err,
+    reason = "the error carries its location and its source by design"
+)]
+
 //! The zero-copy byte source
 //! differential-tested against the existing materializing cursor — over
 //! the compliance corpus, generated documents, and the escape-case
@@ -16,9 +24,10 @@ impl Driver for CborNodeEngine {
         let bytes = match serde_cbor::to_vec(&sansho::cbor::json_to_cbor_value(given)) {
             Ok(bytes) => bytes,
             Err(e) => {
-                return DriverOutcome::Error(sansho::SanshoError::Input {
-                    message: format!("fixture encoding: {e}"),
-                });
+                return DriverOutcome::Error(sansho::SanshoError::input(
+                    0,
+                    sansho::error::InputFault::Read { at: 0, detail: e.to_string() },
+                ));
             }
         };
         let parsed = match sansho::parse(expression) {
